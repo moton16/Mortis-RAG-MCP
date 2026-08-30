@@ -1,0 +1,23 @@
+# Personal / machine-specific config — NEVER distribute.
+# app.toml may contain personal vault paths and env-var references.
+config/app.toml
+.vault_mcp/
+vaults.toml
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# Tooling / test artifacts
+.pytest_cache/
+.smoke_vaults.toml
+
+# OS noise
+Thumbs.db
+.DS_Store

@@ -1,0 +1,52 @@
+# Obsidian RAG MCP application configuration example.
+# Copy this file to config/app.toml (or ~/.vault_mcp/config.toml) and replace
+# provider-specific values. The runtime parser remains the source of truth
+# for accepted keys.
+#
+# 0.3.0 起本服务不再绑定任何笔记目录：把你的文件夹注册为知识库只需调用一次
+# kb_init 工具（注册表持久化在 ~/.vault_mcp/vaults.toml，跨重启/跨设备可用）。
+# 因此这里没有 [vault].path —— 旧配置里的该项仍会被识别并自动迁移进注册表。
+
+[embedding]
+# static is deterministic/local and must not call an LLM or external model.
+# Set mode = "external" only when the external endpoint is available.
+mode = "static"
+dimension = 384
+endpoint = "https://api.siliconflow.cn/v1/embeddings"
+model = "BAAI/bge-m3"
+send_dimensions = false
+# Prefer environment interpolation over committing a secret.
+# api_key 为空时会自动回退读取环境变量 VAULT_MCP_API_KEY。
+api_key = "${VAULT_MCP_API_KEY}"
+timeout = 30
+
+[reranker]
+enabled = false
+endpoint = "https://api.siliconflow.cn/v1/rerank"
+model = "BAAI/bge-reranker-v2-m3"
+api_key = "${VAULT_MCP_API_KEY}"
+timeout = 30
+# When enabled, provider failure must fall back to base retrieval order.
+
+[index]
+chunk_size = 1200
+chunk_overlap = 0
+debounce_seconds = 0.5
+
+[cache]
+# Disk cache of chunk signatures + embeddings so restarts skip re-embedding.
+# Defaults: enabled = true (when the section is absent it is still enabled),
+# dir = ~/.vault_mcp_cache, embedding_max_workers = 6.
+enabled = true
+# Concurrent embedding requests during full rebuilds.
+embedding_max_workers = 2
+# placement = "home" (default): cache under `dir`, shared for all vaults.
+# placement = "vault": cache inside each vault's own `.mcp_cache/` subfolder,
+# keeping every vault's vectors next to its notes. Recommended when
+# distributing vault folders to other machines/users.
+placement = "home"
+subdir = ".mcp_cache"
+
+# The current indexer always filters .md files, .obsidian, and common
+# temporary Markdown names (~*.md, *.tmp.md, *.swp.md, *.swo.md).
+# Those filters are implementation defaults, not configurable keys today.
