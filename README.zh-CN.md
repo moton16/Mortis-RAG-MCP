@@ -131,8 +131,13 @@ python -m venv .venv
 python -m pip install --upgrade pip
 python -m pip install -e .
 
-# 若环境 pip 构建隔离报错（Cannot import 'setuptools.build_meta'）：
-python -m pip install -e . --no-build-isolation
+# 若报 Cannot import 'setuptools.build_meta'：这是环境缺/坏 setuptools（Codex/Trae
+# 等捆绑 Python 常见），不是本包问题。先修构建环境再重试：
+# python -m pip install --upgrade pip setuptools wheel
+# 仍失败（离线/构建隔离异常）再退而求其次：
+# python -m pip install -e . --no-build-isolation
+# 注："零依赖"指运行时依赖（dependencies=[]）；从源码安装需要 setuptools 作为
+# PEP 517 构建后端，健康环境下 pip 会自动提供。
 
 # 可选：numpy 加速语义检索
 python -m pip install numpy

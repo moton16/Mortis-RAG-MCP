@@ -17,7 +17,10 @@ python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 python -m pip install -e .
-# 若 pip 构建隔离报错（Cannot import 'setuptools.build_meta'）：
+# 若报 Cannot import 'setuptools.build_meta'（Codex/Trae 等捆绑 Python 常见）：
+# 这是环境缺/坏 setuptools，不是本包问题。先修构建环境，再重试：
+# python -m pip install --upgrade pip setuptools wheel
+# 仍失败（如离线/构建隔离异常）再退而求其次：
 # python -m pip install -e . --no-build-isolation
 # 可选加速（批量余弦用 numpy）：
 # python -m pip install numpy

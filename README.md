@@ -36,11 +36,20 @@ python -m pip install --upgrade pip
 python -m pip install -e .
 ```
 
-If pip build isolation fails with `Cannot import 'setuptools.build_meta'` (some bundled runtimes), use:
+If pip build isolation fails with `Cannot import 'setuptools.build_meta'` (some bundled runtimes like Codex/Trae ship a stripped pip/setuptools), this is an environment problem, not a package problem — the build backend needs setuptools. Fix the build environment first, then retry:
+
+```powershell
+python -m pip install --upgrade pip setuptools wheel
+python -m pip install -e .
+```
+
+Only if that still fails (e.g. offline / broken isolation) fall back to:
 
 ```powershell
 python -m pip install -e . --no-build-isolation
 ```
+
+Note: "zero dependencies" refers to **runtime** dependencies (`dependencies = []`); building from source requires setuptools as the PEP 517 build backend, which pip provides automatically in a healthy environment.
 
 ## Configuration
 
