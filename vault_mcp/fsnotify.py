@@ -99,9 +99,11 @@ WAIT_TIMEOUT = 258
 WAIT_FAILED = 0xFFFFFFFF
 
 # 单次读取的缓冲区大小。超出部分会触发 ERROR_NOTIFY_ENUM_DIR。
-# 递归监视整棵 vault 时 64KB 偏小（深层目录树 + Obsidian 高频写 workspace.json
-# 很容易撑爆），256KB 能显著降低溢出频率。
-BUFFER_SIZE = 256 * 1024
+# 刻意保持 64KB 不放大：MSDN 明确写了网络目录（UNC / 映射盘）上超过 64KB 会
+# 直接报 ERROR_INVALID_PARAMETER，而本模块对 "issued == False" 的处理是退出
+# 监听线程并静默降级为轮询 —— 放大会让网络盘上的库永久失去原生监听。
+# 溢出频率靠 _OVERFLOW_BACKOFF_* 的退避来兜，而不是靠加大缓冲区。
+BUFFER_SIZE = 64 * 1024
 
 # 缓冲区溢出后的退避：不 sleep 直接重试会形成紧密自旋（100% CPU），
 # 而且每次循环都派发一次全量同步。连续溢出时指数退避，成功读取一次即清零。
@@ -528,9 +530,9 @@ class WindowsDirectoryWatcher:
                     )
                     continue
 
+                overflow_count = 0
                 if transferred.value <= 0:
                     continue
-                overflow_count = 0
                 events = parse_notify_buffer(buffer[: transferred.value])
                 if events:
                     self._emit(events)

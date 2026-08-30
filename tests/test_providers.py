@@ -481,3 +481,44 @@ def test_embedding_rejects_duplicate_response_index(monkeypatch):
 
     with pytest.raises(ProviderError, match="indexes"):
         provider.embed(["a", "b"])
+
+
+# --------------------------------------------------------------------------
+# 配置解析的边界：NaN / bool / 非整数浮点（_numeric 引入的校验）
+# --------------------------------------------------------------------------
+
+
+def _write_toml(tmp_path: Path, body: str) -> Path:
+    toml = tmp_path / "app.toml"
+    content = '[vault]\npath = "%s"\n%s\n' % ((tmp_path / "vault").as_posix(), body)
+    toml.write_text(content, encoding="utf-8")
+    return toml
+
+
+@pytest.mark.parametrize(
+    ("body", "message"),
+    [
+        ('[embedding]\nmode = "static"\ntimeout = nan', "finite"),
+        ('[embedding]\nmode = "static"\ntimeout = true', "boolean"),
+        ('[index]\nrrf_per_route = 40.5', "integer"),
+        ('[embedding]\nmode = "static"\nmax_retries = "3 次"', "must be a int"),
+        ('[embedding]\nmode = "static"\ntimeout = 9999', "must be <="),
+    ],
+)
+def test_config_numeric_rejects_nonsense_values(tmp_path, body, message):
+    with pytest.raises(ValueError, match=message):
+        load_config(_write_toml(tmp_path, body))
+
+
+def test_config_numeric_accepts_legitimate_values(tmp_path):
+    toml = _write_toml(
+        tmp_path,
+        '[embedding]\nmode = "static"\ntimeout = 12.5\nmax_retries = 0\n'
+        "[index]\nrrf_per_route = 40\nmax_top_k = 500",
+    )
+
+    config = load_config(toml)
+    assert config.embedding.timeout == 12.5
+    assert config.embedding.max_retries == 0
+    assert config.rrf_per_route == 40
+    assert config.max_top_k == 500

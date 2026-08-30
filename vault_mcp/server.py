@@ -685,14 +685,22 @@ def serve_stdio(config_path: str | Path | None = None) -> int:
             except Exception as exc:
                 response = _json_error(None, -32000, str(exc))
             if response is not None:
-                # 写出也要在 try 内：笔记内容里若夹带孤立代理字符（ surrogate ），
-                # 序列化会在这一步抛 UnicodeEncodeError 并逃出循环，整个进程被杀。
+                # 笔记内容里可能夹带孤立代理项（surrogate，来自 os 解码的文件名
+                # 或粘贴内容）。注意：json.dumps(ensure_ascii=False) 对代理项并
+                # 不报错，UnicodeEncodeError 发生在 write() 编码那一刻 —— 只包
+                # dumps 是死代码，write 也必须在 try 内，否则异常逃出循环直接
+                # 杀掉进程。回退到 ensure_ascii=True 会把代理项转成转义序列，
+                # 序列化与写出都能通过。
                 try:
-                    payload = json.dumps(response, ensure_ascii=False, separators=(",", ":"))
+                    sys.stdout.write(
+                        json.dumps(response, ensure_ascii=False, separators=(",", ":")) + "\n"
+                    )
+                    sys.stdout.flush()
                 except UnicodeEncodeError:
-                    payload = json.dumps(response, ensure_ascii=True, separators=(",", ":"))
-                sys.stdout.write(payload + "\n")
-                sys.stdout.flush()
+                    sys.stdout.write(
+                        json.dumps(response, ensure_ascii=True, separators=(",", ":")) + "\n"
+                    )
+                    sys.stdout.flush()
         return 0
     finally:
         for indexer in server._indexers.values():

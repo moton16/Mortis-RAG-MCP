@@ -1033,7 +1033,7 @@ class MarkdownIndexer:
         failed_files 持久化到磁盘只是为了跨进程重启的可观测性。
         """
         # 先做一轮内容哈希复用：已经算过的内容不再花钱重算一次。
-        self._reuse_vectors_by_content_hash()
+        reused = self._reuse_vectors_by_content_hash()
 
         failed_before = dict(self.failed_files)
         pending: dict[str, list[Chunk]] = {}
@@ -1042,7 +1042,8 @@ class MarkdownIndexer:
             if missing:
                 pending[source] = missing
         if not pending:
-            return self.failed_files != failed_before
+            # 复用到已有向量的 chunk 也需要落盘，否则下轮重新花钱重算。
+            return reused > 0 or self.failed_files != failed_before
         pending_chunks = [chunk for chunks in pending.values() for chunk in chunks]
 
         if self.config.embedding.mode != "external":
@@ -1056,7 +1057,7 @@ class MarkdownIndexer:
                 else:
                     # 补向量成功即撤销旧失败记录，否则持久化文件会永久撒谎。
                     self.failed_files.pop(source, None)
-            return self._embedding_changed_state(pending_chunks, failed_before)
+            return self._embedding_changed_state(pending_chunks, failed_before, reused)
 
         max_workers = self.config.cache.embedding_max_workers
         tasks = list(pending.items())
@@ -1068,7 +1069,7 @@ class MarkdownIndexer:
                     self.failed_files[source] = str(exc)
                 else:
                     self.failed_files.pop(source, None)
-            return self._embedding_changed_state(pending_chunks, failed_before)
+            return self._embedding_changed_state(pending_chunks, failed_before, reused)
 
         failures: dict[str, str] = {}
         with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="vault-emb") as pool:
@@ -1087,10 +1088,13 @@ class MarkdownIndexer:
                 self.failed_files[source] = failures[source]
             else:
                 self.failed_files.pop(source, None)
-        return self._embedding_changed_state(pending_chunks, failed_before)
+        return self._embedding_changed_state(pending_chunks, failed_before, reused)
 
     def _embedding_changed_state(
-        self, pending_chunks: list[Chunk], failed_before: dict[str, str]
+        self,
+        pending_chunks: list[Chunk],
+        failed_before: dict[str, str],
+        reused: int = 0,
     ) -> bool:
         """本轮 embedding 是否真的改变了需要落盘的状态。
 
@@ -1100,7 +1104,7 @@ class MarkdownIndexer:
         文件事件 → 防抖后再 sync → 再失败 → 再写缓存，形成自激死循环，
         每轮都把全部 pending chunk 重发一遍（真的会烧钱）。
         """
-        if self.failed_files != failed_before:
+        if reused > 0 or self.failed_files != failed_before:
             return True
         return any(self._chunk_has_vector(chunk) for chunk in pending_chunks)
 

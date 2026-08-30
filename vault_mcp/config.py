@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 import re
 from dataclasses import dataclass, field
@@ -268,12 +269,18 @@ def _numeric(
     traceback，把 rrf_per_route 写成 40.5 会被静默截断成 40。
     """
     raw = section.get(key, flat.get(key, default))
+    # bool 是 int 的子类：int(True) == 1 会让 `timeout = true` 悄悄变成 1 秒。
+    if isinstance(raw, bool):
+        raise ValueError(f"config key '{key}' must be a {kind.__name__}, got a boolean")
     try:
         value = kind(raw)
     except (TypeError, ValueError):
         raise ValueError(f"config key '{key}' must be a {kind.__name__}, got {raw!r}") from None
     if kind is int and isinstance(raw, float) and raw != int(raw):
         raise ValueError(f"config key '{key}' must be an integer, got {raw!r}")
+    # NaN 与任何值的比较都是 False，min/max 校验会全部放行，必须显式挡掉。
+    if kind is float and not math.isfinite(value):
+        raise ValueError(f"config key '{key}' must be a finite number, got {raw!r}")
     if minimum is not None and value < minimum:
         raise ValueError(f"config key '{key}' must be >= {minimum}, got {value}")
     if maximum is not None and value > maximum:
