@@ -367,6 +367,7 @@ class MarkdownIndexer:
         self._vectors_cache_path: Path | None = None
         self._fts_cache_path: Path | None = None
         self._vectors_db_path: Path | None = None
+        self._failed_cache_path: Path | None = None
         self._fts: FtsIndex | None = None
         self._vector_backend: Any = None
         if self.config.cache.enabled and self.config.cache.dir:
@@ -377,6 +378,7 @@ class MarkdownIndexer:
                 self._vectors_cache_path = None
                 self._fts_cache_path = None
                 self._vectors_db_path = None
+                self._failed_cache_path = None
         # FTS index: derived/rebuildable; any failure degrades to hybrid-off.
         if self.config.use_hybrid and self._fts_cache_path is not None:
             try:
@@ -439,7 +441,11 @@ class MarkdownIndexer:
         self._fts_cache_path = fts_dir / f"vault_{key}.fts.sqlite"
         # sqlite-vec backend keeps its own db (never shares the FTS file).
         self._vectors_db_path = vectors_dir / f"vault_{key}.vec.sqlite"
+        # 失败名单：与 chunks/vectors/fts 平级的纯可观测性文件，进程重启后
+        # 让 kb_stats 仍能报出上一轮的失败原因。
+        self._failed_cache_path = base / f"vault_{key}.failed.json"
         self._load_chunks_cache()
+        self._load_failed_files()
         # With the disk-backed sqlite_vec backend, vectors are not loaded into
         # RAM (that's the memory win); the disk store is migrated/flushed by
         # _ensure_disk_vectors_migrated() on first sync.
@@ -523,11 +529,51 @@ class MarkdownIndexer:
                 if vector is not None:
                     chunk.embedding = vector
 
+    def _load_failed_files(self) -> None:
+        """Restore the previous run's failure map (source -> error message).
+
+        纯可观测性：失败文件在下次 sync 时本来就会重试（判据是缺向量而不是这
+        份名单），所以文件不存在/损坏/字段缺失一律静默忽略，绝不抛异常。
+        """
+        if self._failed_cache_path is None:
+            return
+        try:
+            payload = json.loads(self._failed_cache_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, ValueError):
+            return
+        files = payload.get("files") if isinstance(payload, dict) else None
+        if not isinstance(files, dict):
+            return
+        for source, error in files.items():
+            if isinstance(source, str):
+                self.failed_files[source] = str(error)
+
+    def _save_failed_files(self) -> None:
+        """Persist the failure map so kb_stats stays informative across restarts.
+
+        名单为空时直接删文件，不留空壳。缓存 IO 是尽力而为：这里失败绝不能
+        拖垮 sync，所以所有异常都吞掉。
+        """
+        if self._failed_cache_path is None:
+            return
+        try:
+            if not self.failed_files:
+                if self._failed_cache_path.exists():
+                    self._failed_cache_path.unlink()
+                return
+            payload = json.dumps({"version": 1, "files": dict(self.failed_files)}, ensure_ascii=False)
+            tmp = self._failed_cache_path.with_suffix(self._failed_cache_path.suffix + ".tmp")
+            tmp.write_text(payload, encoding="utf-8")
+            tmp.replace(self._failed_cache_path)
+        except OSError:
+            pass
+
     def _save_cache(self) -> None:
         """Persist both layers under a single lock; failures degrade gracefully."""
         with self._cache_lock:
             self._save_chunks_cache()
             self._save_vectors_cache()
+            self._save_failed_files()
 
     def _save_chunks_cache(self) -> None:
         if self._chunks_cache_path is None:
@@ -724,6 +770,11 @@ class MarkdownIndexer:
         cache was invalidated (model/dimension change) this re-embeds the whole
         corpus while reusing the text chunks; when only a few files changed it
         embeds just those chunks.
+
+        注意：失败文件的重试是天然的——这里的判据是"缺向量"（memory 后端看
+        chunk.embedding is None，磁盘后端看 chunk.id not in _disk_vectors），
+        而不是看 failed_files 字典，所以这里不需要任何额外重试逻辑；把
+        failed_files 持久化到磁盘只是为了跨进程重启的可观测性。
         """
         pending: dict[str, list[Chunk]] = {}
         for source, chunks in self._chunks.items():
@@ -746,6 +797,9 @@ class MarkdownIndexer:
                         chunk.embedding = _to_emb(vector)
                 except Exception as exc:
                     self.failed_files[source] = str(exc)
+                else:
+                    # 补向量成功即撤销旧失败记录，否则持久化文件会永久撒谎。
+                    self.failed_files.pop(source, None)
             return set(self._chunks)
 
         max_workers = self.config.cache.embedding_max_workers
@@ -756,6 +810,8 @@ class MarkdownIndexer:
                     self._embed_one_file(source, chunks, self.embedding_provider)
                 except Exception as exc:
                     self.failed_files[source] = str(exc)
+                else:
+                    self.failed_files.pop(source, None)
             return set(self._chunks)
 
         failures: dict[str, str] = {}
@@ -770,8 +826,11 @@ class MarkdownIndexer:
                     future.result()
                 except Exception as exc:
                     failures[source] = str(exc)
-        for source, exc in failures.items():
-            self.failed_files[source] = exc
+        for source in pending:
+            if source in failures:
+                self.failed_files[source] = failures[source]
+            else:
+                self.failed_files.pop(source, None)
         return set(self._chunks)
 
     @staticmethod
@@ -1483,7 +1542,7 @@ class MarkdownIndexer:
         """
         removed = True
         with self._cache_lock:
-            for cache_file in (self._chunks_cache_path, self._vectors_cache_path):
+            for cache_file in (self._chunks_cache_path, self._vectors_cache_path, self._failed_cache_path):
                 if cache_file is None:
                     continue
                 try:
@@ -1493,6 +1552,9 @@ class MarkdownIndexer:
                     removed = False
             self._chunks_cache_path = None
             self._vectors_cache_path = None
+            self._failed_cache_path = None
+            # 缓存整体丢弃，失败名单也随之作废（它只是缓存的附属观测数据）。
+            self.failed_files.clear()
         # FTS index + optional sqlite-vec backend share the cache lifecycle.
         if self._fts is not None:
             try:
@@ -1515,7 +1577,12 @@ class MarkdownIndexer:
     def rebuild(self) -> list[Chunk]:
         """Drop both cache layers and the in-memory index, then rebuild from scratch."""
         with self._cache_lock:
-            for cache_file in (self._chunks_cache_path, self._vectors_cache_path, self._fts_cache_path):
+            for cache_file in (
+                self._chunks_cache_path,
+                self._vectors_cache_path,
+                self._fts_cache_path,
+                self._failed_cache_path,
+            ):
                 if cache_file is not None:
                     try:
                         if cache_file.exists():
