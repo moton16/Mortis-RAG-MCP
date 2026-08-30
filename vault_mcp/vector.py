@@ -261,6 +261,21 @@ class SqliteVecBackend:
         except Exception:
             return 0
 
+    def close(self) -> None:
+        """Release the sqlite connection WITHOUT deleting the db file.
+
+        与 purge() 的区别：purge 是「连库一起删」（缓存清理语义），close 只是
+        放开文件句柄——快照导入要把新的 vec.sqlite 落到同一路径，必须先关掉
+        持有旧文件的连接，重开后由导入的数据接管。
+        """
+        if self._conn is not None:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+            self._conn = None
+        self.available = False
+
     def purge(self) -> None:
         if self._conn is not None:
             try:

@@ -9,6 +9,7 @@ import struct
 import threading
 import time
 import zlib
+import zipfile
 from array import array
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -45,6 +46,13 @@ _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp", ".avif"
 
 _CACHE_MAGIC = b"VMCPC"
 _CACHE_VERSION = 1
+
+# 快照（kb_export / kb_import）：把两个缓存层打包成 zip 随库迁移，换机不再
+# 全量重新 embedding。导入端会按本机 _cache_key() 重命名落地，并对 .bin 里
+# 的 meta 做本地重写（cache key 是路径派生的，跨机器必然不同）。
+_SNAPSHOT_FORMAT = "vault-mcp-snapshot"
+_SNAPSHOT_VERSION = 1
+_SNAPSHOT_MEMBERS = frozenset({"manifest.json", "chunks.bin", "vectors.bin", "vectors.sqlite", "fts.sqlite"})
 
 # Embeddings are stored as float32 arrays (4 bytes/dim) instead of Python lists
 # to keep memory sane: 6157 chunks x 4096 dims would otherwise cost ~800MB.
@@ -1915,6 +1923,264 @@ class MarkdownIndexer:
             return result
 
     _READABLE_SUFFIXES = {".md", ".markdown"}
+
+    # ------------------------------------------------------------------ snapshot
+
+    def export_snapshot(self, out_path: str | Path) -> dict[str, Any]:
+        """把本库的索引缓存（chunks + 向量 + FTS）打包成 zip 快照。
+
+        快照是缓存层原样搬运，不含任何机器相关路径；导入端按自己的 cache key
+        重命名落地。前提是缓存已启用且做过至少一次 sync（否则没有可导出的东西）。
+        """
+        if self._chunks_cache_path is None:
+            raise ValueError("cache is disabled; enable [cache] before exporting a snapshot")
+        if not self._chunks:
+            raise ValueError("index is empty; run a sync (or kb_rebuild) before exporting")
+
+        # 把当前内存态刷进缓存文件再打包，保证快照 = 此刻的索引。
+        self._save_cache()
+
+        vectors_member: str | None = None
+        if self._vectors_on_disk:
+            if self._vectors_db_path is not None and self._vectors_db_path.exists():
+                vectors_member = "vectors.sqlite"
+        elif self._vectors_cache_path is not None and self._vectors_cache_path.exists():
+            vectors_member = "vectors.bin"
+
+        vector_count = sum(
+            1 for chunk in self.all_chunks() if self._chunk_has_vector(chunk)
+        )
+        manifest = {
+            "format": _SNAPSHOT_FORMAT,
+            "format_version": _SNAPSHOT_VERSION,
+            "cache_key": self._cache_key(),
+            "chunks_meta": self._chunks_meta(),
+            "vectors_meta": self._vectors_meta(),
+            "backend": getattr(self._vector_backend, "name", self.config.vector.backend),
+            "stats": {
+                "files": len(self._chunks),
+                "chunks": len(self.all_chunks()),
+                "vectors": vector_count,
+            },
+        }
+
+        out = Path(out_path).expanduser()
+        out.parent.mkdir(parents=True, exist_ok=True)
+        tmp = out.with_suffix(out.suffix + ".tmp")
+        try:
+            with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
+                zf.write(self._chunks_cache_path, "chunks.bin")
+                if vectors_member is not None:
+                    source = self._vectors_db_path if vectors_member == "vectors.sqlite" else self._vectors_cache_path
+                    zf.write(source, vectors_member)
+                if self._fts is not None and self._fts_cache_path is not None and self._fts_cache_path.exists():
+                    zf.write(self._fts_cache_path, "fts.sqlite")
+            tmp.replace(out)
+        finally:
+            if tmp.exists():
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+        return {
+            "exported": True,
+            "path": str(out),
+            "backend": manifest["backend"],
+            **manifest["stats"],
+        }
+
+    def import_snapshot(self, snapshot: str | Path, force: bool = False) -> dict[str, Any]:
+        """从快照恢复索引缓存；随后一次 sync 应当 0 次 embedding API 调用。
+
+        安全与兼容：
+
+        * zip 成员按**白名单**精确匹配，多余的成员（含 ../ 穿越名）直接拒绝；
+          落地路径全部来自本机缓存配置，从不使用压缩包内的名字拼路径。
+        * .bin 里的 meta 含源机器的 cache key，导入时用本机 _chunks_meta() /
+          _vectors_meta() 重写后再落地。
+        * 向量层的 model/dimension 与本机配置不一致时拒绝导入（force=true 可
+          强制，但此时只导入文本层，向量作废由本地重新 embedding——错维度的
+          向量对检索是毒药）。
+
+        前提：本库缓存已启用、目录已注册（先 kb_init 再 kb_import）。
+        """
+        if self._chunks_cache_path is None:
+            raise ValueError("cache is disabled; enable [cache] before importing a snapshot")
+        src = Path(snapshot).expanduser()
+        if not src.is_file():
+            raise ValueError(f"snapshot not found: {src}")
+
+        with zipfile.ZipFile(src) as zf:
+            names = set(zf.namelist())
+            unknown = names - _SNAPSHOT_MEMBERS
+            if unknown:
+                raise ValueError(f"snapshot contains unexpected members: {sorted(unknown)}")
+            if "manifest.json" not in names or "chunks.bin" not in names:
+                raise ValueError("snapshot is missing manifest.json or chunks.bin")
+            try:
+                manifest = json.loads(zf.read("manifest.json").decode("utf-8"))
+            except (ValueError, UnicodeDecodeError) as exc:
+                raise ValueError(f"snapshot manifest is corrupt: {exc}") from exc
+            if (
+                not isinstance(manifest, dict)
+                or manifest.get("format") != _SNAPSHOT_FORMAT
+                or manifest.get("format_version") != _SNAPSHOT_VERSION
+            ):
+                raise ValueError(
+                    f"not a {_SNAPSHOT_FORMAT} v{_SNAPSHOT_VERSION} archive; got "
+                    f"format={manifest.get('format')!r} version={manifest.get('format_version')!r}"
+                )
+
+            local_vectors_meta = self._vectors_meta()
+            snapshot_vectors_meta = manifest.get("vectors_meta") or {}
+            vectors_member = "vectors.sqlite" if "vectors.sqlite" in names else ("vectors.bin" if "vectors.bin" in names else None)
+            skip_vectors = vectors_member is None
+            if vectors_member == "vectors.bin" and (
+                snapshot_vectors_meta.get("embedding_model") != local_vectors_meta["embedding_model"]
+                or snapshot_vectors_meta.get("dimension") != local_vectors_meta["dimension"]
+            ):
+                if not force:
+                    raise ValueError(
+                        "snapshot vectors were built with model="
+                        f"{snapshot_vectors_meta.get('embedding_model')!r} dimension={snapshot_vectors_meta.get('dimension')!r} "
+                        "but this config uses model="
+                        f"{local_vectors_meta['embedding_model']!r} dimension={local_vectors_meta['dimension']!r}; "
+                        "pass force=true to import the text layer only and re-embed"
+                    )
+                skip_vectors = True
+
+            with self._cache_lock:
+                with self._sync_lock:
+                    return self._import_snapshot_locked(src, zf, vectors_member, skip_vectors)
+
+    def _import_snapshot_locked(
+        self,
+        src: Path,
+        zf: zipfile.ZipFile,
+        vectors_member: str | None,
+        skip_vectors: bool,
+    ) -> dict[str, Any]:
+        # 1) 文本层：解码 -> 按本机 meta 重写 -> 原子落地。
+        chunk_count, file_count = self._import_chunks_member(zf)
+
+        # 2) 向量层：.bin 重写 meta；sqlite 原样搬运（关连接 -> 换文件 -> 重开）。
+        vector_count: int | None = None
+        if vectors_member is not None and not skip_vectors:
+            if vectors_member == "vectors.bin":
+                vector_count = self._import_vectors_bin_member(zf)
+            else:
+                vector_count = self._import_vectors_sqlite_member(zf)
+
+        # 3) FTS：能搬就搬；无论搬没搬，都按导入后的 chunk 集对账一次。
+        if "fts.sqlite" in zf.namelist() and self._fts_cache_path is not None:
+            self._replace_live_file(self._fts_cache_path, zf.read("fts.sqlite"), close_fts=True)
+        self._recreate_fts()
+        self._fts_ensure_populated()
+
+        # 4) 用导入后的缓存文件重建内存态（向量按 id 挂回 chunk）。
+        self._chunks.clear()
+        self._signatures.clear()
+        self._pending_vectors.clear()
+        self.failed_files.clear()
+        self._load_chunks_cache()
+        self._load_failed_files()
+        if not self._vectors_on_disk:
+            self._load_vectors_cache()
+
+        return {
+            "imported": True,
+            "path": str(src),
+            "files": len(self._chunks),
+            "chunks": chunk_count,
+            "file_count": file_count,
+            "vectors": vector_count,
+            "vectors_imported": vectors_member is not None and not skip_vectors,
+            "backend": getattr(self._vector_backend, "name", self.config.vector.backend),
+        }
+
+    # ---------------------------------------------------------------- snapshot 内部
+
+    def _import_chunks_member(self, zf: zipfile.ZipFile) -> tuple[int, int]:
+        loaded = self._decode_member(zf, "chunks.bin", _CacheCodec.load)
+        if loaded is None:
+            raise ValueError("snapshot chunks.bin is corrupt")
+        meta, files = loaded
+        # chunks 层必须无向量（向量只属于向量层）；导入时不信任包内数据，统一剥离。
+        clean: dict[str, tuple[str, list[Chunk]]] = {
+            source: (signature, [self._strip_embedding(chunk) for chunk in chunks])
+            for source, (signature, chunks) in files.items()
+        }
+        _CacheCodec.dump(self._chunks_cache_path, self._chunks_meta(), clean)  # type: ignore[arg-type]
+        total = sum(len(chunks) for _, chunks in clean.values())
+        return total, len(clean)
+
+    def _import_vectors_bin_member(self, zf: zipfile.ZipFile) -> int:
+        loaded = self._decode_member(zf, "vectors.bin", _VectorsCodec.load)
+        if loaded is None:
+            raise ValueError("snapshot vectors.bin is corrupt")
+        meta, vectors = loaded
+        _VectorsCodec.dump(self._vectors_cache_path, self._vectors_meta(), vectors)  # type: ignore[arg-type]
+        return len(vectors)
+
+    def _import_vectors_sqlite_member(self, zf: zipfile.ZipFile) -> int:
+        if self._vectors_db_path is None:
+            raise ValueError("sqlite_vec vector store is unavailable for this vault")
+        closer = getattr(self._vector_backend, "close", None)
+        if closer is not None:
+            closer()
+        self._replace_live_file(self._vectors_db_path, zf.read("vectors.sqlite"), close_fts=False)
+        # 重开后由导入的数据接管；磁盘记账集在下一次 sync 的
+        # _ensure_disk_vectors_migrated 里按库内实际 id 重建。
+        backend = create_vector_backend(self.config.vector, self, self._vectors_db_path)
+        self._vector_backend = backend
+        self._vectors_on_disk = bool(getattr(backend, "on_disk", False))
+        self._disk_vectors = set()
+        return len(backend.list_ids())
+
+    def _decode_member(self, zf: zipfile.ZipFile, member: str, loader: Callable[[Path], Any]) -> Any:
+        """把 zip 成员写到缓存目录的临时文件后用既有 loader 解码。
+
+        _CacheCodec / _VectorsCodec 只认 Path，而它们真正的校验对象（meta）要
+        在解码之后由导入逻辑重写，所以这里只负责把字节安全地交给 loader。
+        """
+        scratch_dir = (self._chunks_cache_path or self._vectors_cache_path).parent  # type: ignore[union-attr]
+        tmp = scratch_dir / (member + ".importing")
+        try:
+            tmp.write_bytes(zf.read(member))
+            return loader(tmp)
+        finally:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+    def _replace_live_file(self, target: Path, payload: bytes, *, close_fts: bool) -> None:
+        """原子替换一个可能正被本实例打开的缓存文件（sqlite）。"""
+        if close_fts and self._fts is not None:
+            try:
+                self._fts.close()
+            except Exception:
+                pass
+            self._fts = None
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target.with_suffix(target.suffix + ".importing")
+        tmp.write_bytes(payload)
+        tmp.replace(target)
+
+    def _recreate_fts(self) -> None:
+        if self._fts is not None:
+            try:
+                self._fts.close()
+            except Exception:
+                pass
+            self._fts = None
+        if self.config.use_hybrid and self._fts_cache_path is not None:
+            try:
+                fts = FtsIndex(self._fts_cache_path)
+                self._fts = fts if fts.available else None
+            except Exception:
+                self._fts = None
 
     def _safe_path(self, source: str) -> Path:
         # kb_read 只能读 Markdown：拒绝任意扩展名，防止把私钥/配置等任意

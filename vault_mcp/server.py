@@ -120,6 +120,23 @@ def _tool_definitions() -> list[dict[str, Any]]:
             }},
         },
         {
+            "name": "kb_export",
+            "description": "把知识库的索引快照（chunks + 向量 + FTS）导出为 zip 文件，用于换机/换目录迁移，导入后无需全量重新 embedding。要求缓存已启用且完成过至少一次索引。",
+            "inputSchema": {"type": "object", "required": ["out_path"], "properties": {
+                "out_path": {"type": "string", "description": "必填，快照输出路径（.zip）"},
+                "vault_path": {"type": "string", "description": vault_path_hint},
+            }},
+        },
+        {
+            "name": "kb_import",
+            "description": "从 kb_export 生成的快照恢复索引缓存（先 kb_init 注册目标目录再调用）。导入后的下一次同步应当 0 次 embedding 调用；快照的向量模型/维度与本机配置不一致时拒绝，除非 force=true（此时只导入文本层并本地重嵌）。",
+            "inputSchema": {"type": "object", "required": ["snapshot"], "properties": {
+                "snapshot": {"type": "string", "description": "必填，快照 zip 文件路径"},
+                "force": {"type": "boolean", "default": False, "description": "模型/维度不一致时强制导入（仅文本层，向量重算）"},
+                "vault_path": {"type": "string", "description": vault_path_hint},
+            }},
+        },
+        {
             "name": "kb_rebuild",
             "description": "删除指定知识库的磁盘缓存并强制全量重建索引（首次建库或内容大改后用）。",
             "inputSchema": {"type": "object", "properties": {
@@ -507,6 +524,21 @@ class VaultMcpServer:
             indexer = self._indexer_for(arguments)
             indexer.rebuild()
             return _text_content(indexer.stats())
+        if name == "kb_export":
+            indexer = self._indexer_for(arguments)
+            out_path = str(arguments.get("out_path", "")).strip()
+            if not out_path:
+                raise ValueError("out_path is required for kb_export")
+            return _text_content(indexer.export_snapshot(out_path))
+        if name == "kb_import":
+            indexer = self._indexer_for(arguments)
+            snapshot = str(arguments.get("snapshot", "")).strip()
+            if not snapshot:
+                raise ValueError("snapshot is required for kb_import")
+            force = arguments.get("force", False)
+            if isinstance(force, str):
+                force = force.strip().lower() in {"1", "true", "yes", "on"}
+            return _text_content(indexer.import_snapshot(snapshot, force=bool(force)))
         if name == "kb_search":
             explicit = str(arguments.get("vault_path") or "").strip()
             if not explicit and len(self.registry.load()) > 1:
