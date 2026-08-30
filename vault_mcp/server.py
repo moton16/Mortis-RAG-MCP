@@ -47,6 +47,14 @@ def _tool_definitions() -> list[dict[str, Any]]:
             "inputSchema": {"type": "object", "properties": {}},
         },
         {
+            "name": "kb_set_weight",
+            "description": "设置知识库的检索权重：跨库检索时该库所有 chunk 的分数会乘以该系数，用于表达\"这个库更重要\"（默认 1.0，取值 0 < w <= 100）。",
+            "inputSchema": {"type": "object", "required": ["vault_path", "weight"], "properties": {
+                "vault_path": {"type": "string", "description": "必填，已注册知识库的绝对路径"},
+                "weight": {"type": "number", "exclusiveMinimum": 0, "maximum": 100, "description": "必填，权重系数，取值 0 < weight <= 100；1.0 为默认不放大"},
+            }},
+        },
+        {
             "name": "kb_rebuild",
             "description": "删除指定知识库的磁盘缓存并强制全量重建索引（首次建库或内容大改后用）。",
             "inputSchema": {"type": "object", "properties": {
@@ -64,6 +72,7 @@ def _tool_definitions() -> list[dict[str, Any]]:
             "inputSchema": {"type": "object", "required": ["query"], "properties": {
                 "query": {"type": "string"}, "top_k": {"type": "integer", "minimum": 1, "default": 10}, "use_rerank": {"type": "boolean", "default": True},
                 "vault_path": {"type": "string", "description": "可选，已注册知识库的绝对路径；缺省时跨全部注册库检索"},
+                "group_by_vault": {"type": "boolean", "default": False, "description": "可选，仅跨库检索（不传 vault_path）时生效：结果按知识库分组返回 groups，每组取 top_k 条"},
             }},
         },
         {
@@ -226,6 +235,7 @@ class VaultMcpServer:
                 "name": entry.name,
                 "path": entry.path,
                 "registered_at": entry.registered_at,
+                "weight": entry.weight,
                 "exists": exists,
                 "indexed": indexer is not None,
                 "files": len(indexer._chunks) if indexer is not None else None,
@@ -281,8 +291,11 @@ class VaultMcpServer:
             "cache_purged": cache_purged,
         }
 
-    def _fanout_search(self, query: str, top_k: int, use_rerank: bool) -> dict[str, Any]:
-        """Search across every registered (existing) vault, merge and rerank once."""
+    def _fanout_search(self, query: str, top_k: int, use_rerank: bool, group_by_vault: bool = False) -> dict[str, Any]:
+        """Search across every registered (existing) vault, merge and rerank once.
+
+        group_by_vault=True 时返回按库分组的结果（每组 top_k 条），否则平铺返回。
+        """
         per_vault_k = max(top_k, 20)
         entries = [entry for entry in self.registry.load() if Path(entry.path).is_dir()]
         if not entries:
@@ -311,6 +324,13 @@ class VaultMcpServer:
             except Exception as exc:
                 errors[entry.path] = str(exc)
 
+        # 库级权重：分数乘以该库 weight 后再参与全局排序。
+        # 直接改 chunk.score 是安全的：每次检索都会由 indexer 的 _hybrid_rank /
+        # lexical 分支整体重算分数（chunk 本身是每次搜索新构造的对象），这里放大
+        # 不会污染后续查询。全部 weight 为默认 1.0 时结果与加权前逐字节一致。
+        for entry, chunk in merged:
+            chunk.score = chunk.score * entry.weight
+
         merged.sort(key=lambda pair: (-pair[1].score, pair[1].source, pair[1].metadata["chunk_index"]))
         pairs = merged
         if use_rerank and merged:
@@ -324,6 +344,27 @@ class VaultMcpServer:
                 reranked = rerank_chunks(query, pool, provider, cap=self.config.rerank_cap)
                 origin = {id(chunk): entry for entry, chunk in merged}
                 pairs = [(origin[id(chunk)], chunk) for chunk in reranked]
+
+        if group_by_vault:
+            # 分组模式：保持融合后的组内顺序，按库切桶；组顺序取各组最高分降序。
+            buckets: dict[str, dict[str, Any]] = {}
+            for entry, chunk in pairs:
+                group = buckets.get(entry.path)
+                if group is None:
+                    group = {"vault": entry.path, "vault_name": entry.name, "chunks": []}
+                    buckets[entry.path] = group
+                if len(group["chunks"]) >= max(0, top_k):
+                    continue
+                data = chunk.to_dict()
+                data["vault"] = entry.path
+                data["vault_name"] = entry.name
+                group["chunks"].append(data)
+            # top_k<=0 时桶是空的，直接丢掉（max 不接受空序列）。
+            groups = sorted(
+                (group for group in buckets.values() if group["chunks"]),
+                key=lambda group: -max(chunk["score"] for chunk in group["chunks"]),
+            )
+            return {"groups": groups, "searched": searched, "errors": errors}
 
         out_chunks = []
         for entry, chunk in pairs[: max(0, top_k)]:
@@ -344,6 +385,18 @@ class VaultMcpServer:
             return _text_content(self._kb_unregister(arguments))
         if name == "kb_vaults":
             return _text_content(self._list_vaults())
+        if name == "kb_set_weight":
+            vault_path = str(arguments.get("vault_path", "")).strip()
+            if not vault_path:
+                raise ValueError("vault_path is required for kb_set_weight")
+            if "weight" not in arguments:
+                raise ValueError("weight is required for kb_set_weight")
+            try:
+                weight = float(arguments["weight"])
+            except (TypeError, ValueError):
+                raise ValueError(f"weight must be a number in (0, 100]: {arguments['weight']}")
+            entry = self.registry.set_weight(vault_path, weight)
+            return _text_content({"path": entry.path, "name": entry.name, "weight": entry.weight})
         if name == "kb_rebuild":
             indexer = self._indexer_for(arguments)
             indexer.rebuild()
@@ -356,7 +409,10 @@ class VaultMcpServer:
                 use_rerank = arguments.get("use_rerank", True)
                 if isinstance(use_rerank, str):
                     use_rerank = use_rerank.strip().lower() in {"1", "true", "yes", "on"}
-                return _text_content(self._fanout_search(query, top_k, bool(use_rerank)))
+                group_by_vault = arguments.get("group_by_vault", False)
+                if isinstance(group_by_vault, str):
+                    group_by_vault = group_by_vault.strip().lower() in {"1", "true", "yes", "on"}
+                return _text_content(self._fanout_search(query, top_k, bool(use_rerank), bool(group_by_vault)))
         indexer = self._indexer_for(arguments)
         indexer.sync()
         if name == "kb_list":

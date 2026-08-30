@@ -111,6 +111,123 @@ def test_stdio_unknown_vault_path_returns_error(tmp_path):
     assert "kb_init" in r2["error"]["message"]
 
 
+def _register_two_vaults(config: Path, vault_a: Path, vault_b: Path, shared: str) -> None:
+    vault_a.mkdir(parents=True)
+    vault_b.mkdir(parents=True)
+    # 两个库放同一段内容，保证基础分相同，排序差异只能来自库权重。
+    (vault_a / "alpha.md").write_text(f"# Alpha\n{shared}", encoding="utf-8")
+    (vault_b / "beta.md").write_text(f"# Beta\n{shared}", encoding="utf-8")
+    config.write_text('mode = "static"\n', encoding="utf-8")
+
+
+def _search(config: Path, arguments: dict) -> dict:
+    responses = _run_stdio(config, [
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "kb_search", "arguments": arguments}},
+    ])
+    return json.loads(responses[1]["result"]["content"][0]["text"])
+
+
+def test_fanout_weight_pushes_higher_weight_vault_first(tmp_path):
+    vault_a = tmp_path / "权重低"
+    vault_b = tmp_path / "权重高"
+    shared = "跨库共享内容 SHARED777"
+    config = tmp_path / "app.toml"
+    _register_two_vaults(config, vault_a, vault_b, shared)
+
+    _run_stdio(config, [
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "kb_init", "arguments": {"path": str(vault_a)}}},
+        {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "kb_init", "arguments": {"path": str(vault_b)}}},
+        {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "kb_set_weight", "arguments": {"vault_path": str(vault_b), "weight": 2.0}}},
+    ])
+
+    data = _search(config, {"query": "SHARED777", "top_k": 2})
+    assert len(data["chunks"]) == 2
+    assert data["chunks"][0]["vault"] == str(vault_b)
+    assert data["chunks"][0]["vault_name"] == "权重高"
+    # 浮点比较用 >=，避免相等分数下的舍入抖动。
+    assert data["chunks"][0]["score"] >= data["chunks"][1]["score"] * 1.999
+
+
+def test_fanout_default_weight_matches_single_vault_scores(tmp_path):
+    """回归：所有库都是默认 1.0 时，fan-out 不得改动任何分数。"""
+    vault_a = tmp_path / "库A"
+    vault_b = tmp_path / "库B"
+    shared = "跨库共享内容 SHARED888"
+    config = tmp_path / "app.toml"
+    _register_two_vaults(config, vault_a, vault_b, shared)
+
+    _run_stdio(config, [
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "kb_init", "arguments": {"path": str(vault_a)}}},
+        {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "kb_init", "arguments": {"path": str(vault_b)}}},
+    ])
+
+    single = _search(config, {"query": "SHARED888", "top_k": 1, "vault_path": str(vault_a)})
+    fanout = _search(config, {"query": "SHARED888", "top_k": 2})
+    alpha = [chunk for chunk in fanout["chunks"] if chunk["source"] == "alpha.md"]
+    assert alpha and alpha[0]["score"] == single["chunks"][0]["score"]
+
+
+def test_fanout_group_by_vault_returns_grouped_results(tmp_path):
+    vault_a = tmp_path / "分组A"
+    vault_b = tmp_path / "分组B"
+    shared = "跨库共享内容 SHARED999"
+    config = tmp_path / "app.toml"
+    _register_two_vaults(config, vault_a, vault_b, shared)
+
+    _run_stdio(config, [
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "kb_init", "arguments": {"path": str(vault_a)}}},
+        {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "kb_init", "arguments": {"path": str(vault_b)}}},
+        {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "kb_set_weight", "arguments": {"vault_path": str(vault_b), "weight": 3.0}}},
+    ])
+
+    data = _search(config, {"query": "SHARED999", "top_k": 1, "group_by_vault": True})
+    assert "chunks" not in data
+    assert len(data["groups"]) == 2
+    # 组顺序按组内最高分降序：权重 3.0 的库排在前面。
+    assert data["groups"][0]["vault"] == str(vault_b)
+    assert data["groups"][0]["vault_name"] == "分组B"
+    top_a = max(chunk["score"] for chunk in data["groups"][0]["chunks"])
+    top_b = max(chunk["score"] for chunk in data["groups"][1]["chunks"])
+    assert top_a >= top_b
+    # 分组模式下 top_k 作用于每个库，各组最多取 top_k 条。
+    assert all(len(group["chunks"]) <= 1 for group in data["groups"])
+    assert all(chunk["vault"] == group["vault"] for group in data["groups"] for chunk in group["chunks"])
+
+
+def test_kb_set_weight_updates_registry_and_vault_listing(tmp_path, monkeypatch):
+    from vault_mcp.server import VaultMcpServer
+
+    vault = tmp_path / "库"
+    vault.mkdir()
+    (vault / "note.md").write_text("# Note\n可调权重的内容 WEIGHT123", encoding="utf-8")
+    config = tmp_path / "app.toml"
+    config.write_text('mode = "static"\n', encoding="utf-8")
+    monkeypatch.setenv("VAULT_MCP_REGISTRY", str(tmp_path / "vaults.toml"))
+
+    server = VaultMcpServer(config)
+    server.call_tool("kb_init", {"path": str(vault)})
+    result = server.call_tool("kb_set_weight", {"vault_path": str(vault), "weight": 2.5})
+    set_result = json.loads(result["content"][0]["text"])
+    assert set_result["weight"] == 2.5
+    assert set_result["path"] == str(vault)
+
+    listing = json.loads(server.call_tool("kb_vaults", {})["content"][0]["text"])
+    assert listing["vaults"][0]["weight"] == 2.5
+
+    # 越界权重必须走 ValueError（call_tool 不吞异常，MCP 层会转成 -32602）。
+    for bad in (0, 200):
+        try:
+            server.call_tool("kb_set_weight", {"vault_path": str(vault), "weight": bad})
+            raised = False
+        except ValueError:
+            raised = True
+        assert raised
+
+
 def test_kb_vaults_lists_registered_entries(tmp_path):
     vault_one = tmp_path / "库一"
     vault_two = tmp_path / "库二"

@@ -15,7 +15,7 @@ from typing import Any
 
 from .config import read_toml_file
 
-REGISTRY_VERSION = 1
+REGISTRY_VERSION = 2
 
 
 def user_config_dir() -> Path:
@@ -47,6 +47,7 @@ class VaultEntry:
     path: str            # resolved absolute path at registration time
     name: str            # display name, defaults to the folder name
     registered_at: float  # time.time()
+    weight: float = 1.0  # 跨库检索时该库分数的放大系数：>1 表示更偏好这个库
 
 
 class VaultRegistry:
@@ -77,11 +78,17 @@ class VaultRegistry:
                         registered_at = float(raw.get("registered_at", 0.0))
                     except (TypeError, ValueError):
                         registered_at = 0.0
+                    # weight 是 0.4.2 新增字段：老 toml 里没有，回退默认 1.0（不放大）。
+                    try:
+                        weight = float(raw.get("weight", 1.0))
+                    except (TypeError, ValueError):
+                        weight = 1.0
                     file_entries.append(
                         VaultEntry(
                             path=path_value,
                             name=str(raw.get("name", "")) or Path(path_value).name,
                             registered_at=registered_at,
+                            weight=weight,
                         )
                     )
             except Exception:
@@ -102,6 +109,7 @@ class VaultRegistry:
             lines.append(f"path = '{entry.path}'")
             lines.append(f'name = "{entry.name}"')
             lines.append(f"registered_at = {entry.registered_at!r}")
+            lines.append(f"weight = {entry.weight}")
             lines.append("")
         tmp = self.path.with_suffix(".toml.tmp")
         tmp.write_text("\n".join(lines), encoding="utf-8")
@@ -109,7 +117,7 @@ class VaultRegistry:
 
     # ------------------------------------------------------------ mutation
 
-    def add(self, path: str | os.PathLike[str], name: str | None = None, *, persist: bool = True) -> VaultEntry:
+    def add(self, path: str | os.PathLike[str], name: str | None = None, *, persist: bool = True, weight: float = 1.0) -> VaultEntry:
         resolved = str(Path(path).expanduser().resolve())
         entries = self.load()
         for entry in entries:
@@ -119,6 +127,7 @@ class VaultRegistry:
             path=resolved,
             name=name or Path(resolved).name,
             registered_at=time.time(),
+            weight=float(weight),
         )
         entries.append(entry)
         if persist:
@@ -133,6 +142,23 @@ class VaultRegistry:
         for index, entry in enumerate(entries):
             if normalize_vault_key(entry.path) == target:
                 entries.pop(index)
+                self.save(entries)
+                return entry
+        raise ValueError(f"vault not registered: {path}")
+
+    def set_weight(self, path: str | os.PathLike[str], weight: float) -> VaultEntry:
+        """调整单个库的检索权重（跨库 fan-out 时该库分数的放大系数）。"""
+        try:
+            weight = float(weight)
+        except (TypeError, ValueError):
+            raise ValueError(f"invalid weight: {weight}")
+        if not 0 < weight <= 100:
+            raise ValueError(f"weight must be in (0, 100]: {weight}")
+        target = normalize_vault_key(path)
+        entries = self.load()
+        for entry in entries:
+            if normalize_vault_key(entry.path) == target:
+                entry.weight = weight
                 self.save(entries)
                 return entry
         raise ValueError(f"vault not registered: {path}")
