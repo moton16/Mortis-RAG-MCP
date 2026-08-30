@@ -18,6 +18,7 @@ change, not a code change.
 from __future__ import annotations
 
 import sqlite3
+from array import array
 from typing import Any, Iterable, Protocol, runtime_checkable
 
 from .config import VectorConfig
@@ -36,6 +37,15 @@ class VectorBackend(Protocol):
 
     def upsert_vectors(self, vectors: dict[str, Any]) -> None:
         """Store/replace vectors keyed by chunk_id. None-safe."""
+        ...
+
+    def get_vectors(self, chunk_ids: Iterable[str]) -> dict[str, Any]:
+        """Read back stored vectors: {chunk_id: array('f')}.
+
+        Used by the indexer's content-hash reuse round, which needs the vector of
+        an already-embedded chunk to hand to a duplicate chunk with a different
+        id. Missing/failed ids are simply absent from the result — never raise.
+        """
         ...
 
     def delete_vectors(self, chunk_ids: Iterable[str]) -> None:
@@ -74,6 +84,16 @@ class MemoryVectorBackend:
 
     def upsert_vectors(self, vectors: dict[str, Any]) -> None:
         return None
+
+    def get_vectors(self, chunk_ids: Iterable[str]) -> dict[str, Any]:
+        wanted = {str(chunk_id) for chunk_id in chunk_ids}
+        out: dict[str, Any] = {}
+        if not wanted:
+            return out
+        for chunk in self._indexer.all_chunks():
+            if chunk.id in wanted and chunk.embedding is not None and len(chunk.embedding):
+                out[chunk.id] = chunk.embedding
+        return out
 
     def delete_vectors(self, chunk_ids: Iterable[str]) -> None:
         return None
@@ -179,6 +199,37 @@ class SqliteVecBackend:
                 )
         except Exception:
             pass
+
+    def get_vectors(self, chunk_ids: Iterable[str]) -> dict[str, Any]:
+        """Read back vectors from the vec0 table (content-hash reuse round).
+
+        A vec0 column selected normally comes back as the raw float32 blob it was
+        stored as, so it can be rebuilt with array('f').frombytes. Anything that
+        doesn't decode is skipped: the caller just re-embeds those chunks.
+        """
+        out: dict[str, Any] = {}
+        if not self.available or self._conn is None:
+            return out
+        try:
+            for chunk_id in chunk_ids:
+                vid = self._vid_for(chunk_id)
+                if vid is None:
+                    continue
+                try:
+                    row = self._conn.execute(
+                        "SELECT embedding FROM vec0_chunks WHERE rowid = ?", (vid,)
+                    ).fetchone()
+                    if row is None or row[0] is None:
+                        continue
+                    vector = array("f")
+                    vector.frombytes(row[0])
+                    if len(vector):
+                        out[str(chunk_id)] = vector
+                except Exception:
+                    continue
+        except Exception:
+            return out
+        return out
 
     def delete_vectors(self, chunk_ids: Iterable[str]) -> None:
         if not self.available or self._conn is None:

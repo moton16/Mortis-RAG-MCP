@@ -13,7 +13,7 @@ from array import array
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from .config import AppConfig
 from .fts import FtsIndex
@@ -187,6 +187,26 @@ def _to_emb(vectors: Iterable[float]) -> array:
     return array(_EMB_DTYPE, vectors)
 
 
+def dedupe_by_content_hash(items: list[Any], chunk_of: Callable[[Any], Chunk] | None = None) -> list[Any]:
+    """按 content_hash 保序去重：同一份内容只留排在最前面的那条。
+
+    items 默认就是 Chunk 列表；跨库 fan-out 传的是 (vault_entry, chunk) 元组，
+    用 chunk_of 把 chunk 取出来即可。没有 content_hash 的老 chunk 一律保留——
+    宁可多返回一条，也不能把内容未知的 chunk 误判成重复删掉。
+    """
+    extract = chunk_of if chunk_of is not None else (lambda item: item)
+    seen: set[str] = set()
+    kept: list[Any] = []
+    for item in items:
+        digest = extract(item).metadata.get("content_hash")
+        if digest is None:
+            kept.append(item)
+            continue
+        if digest in seen:
+            continue
+        seen.add(digest)
+        kept.append(item)
+    return kept
 
 
 class _CacheCodec:
@@ -403,6 +423,9 @@ class MarkdownIndexer:
                 self.reranker_provider = None
         self._chunks: dict[str, list[Chunk]] = {}
         self._signatures: dict[str, str] = {}
+        # 文本层缓存失效时，初始化阶段读出来的向量暂存到这里，等 sync 重建
+        # 文本后再按 chunk.id 补挂（见 _load_vectors_cache / _attach_pending_vectors）。
+        self._pending_vectors: dict[str, Any] = {}
         self.failed_files: dict[str, str] = {}
         self.last_sync: float | None = None
         self._watch_stop = threading.Event()
@@ -526,12 +549,13 @@ class MarkdownIndexer:
         # chunker 是文本层的手工失效开关：chunk 元数据每多一个字段就 +1，
         # 让老缓存重建一次。这里刻意不碰向量层——向量按 chunk.id（sha1 of
         # source+index+content）匹配，content 不变则 id 不变，所以 bump 之后
-        # 老向量全部命中，不会触发任何重新 embedding。
+        # 老向量全部命中，不会触发任何重新 embedding（前提是这批向量要能活到
+        # 重建之后，见 _load_vectors_cache 的 _pending_vectors 兜底）。
         return {
             "key": self._cache_key(),
             "chunk_size": self.config.chunk_size,
             "chunk_overlap": self.config.chunk_overlap,
-            "chunker": 2,
+            "chunker": 3,
         }
 
     def _vectors_meta(self) -> dict[str, Any]:
@@ -574,9 +598,33 @@ class MarkdownIndexer:
         meta, vectors = loaded
         if meta != self._vectors_meta():
             return
+        if not self._chunks:
+            # 文本层缓存被判失效时（chunker 版本提升），初始化到这一步
+            # self._chunks 还是空的，向量无处可挂。直接丢掉的话，sync 重建
+            # 出来的每个 chunk 都"缺向量"，整个库会被重新 embedding 一遍——
+            # 而这正是 bump chunker 想避免的代价。先存着，等 sync 重建文本后
+            # 由 _attach_pending_vectors 按 id 补挂。
+            self._pending_vectors.update(vectors)
+            return
         for chunks in self._chunks.values():
             for chunk in chunks:
                 vector = vectors.get(chunk.id)
+                if vector is not None:
+                    chunk.embedding = vector
+
+    def _attach_pending_vectors(self) -> None:
+        """把初始化时无处可挂的向量按 chunk.id 补挂到重建出来的 chunk 上。
+
+        命中与否只看 chunk.id，与文本层是否重建无关：内容没变的 chunk id 一定
+        不变，向量也就一定是有效的。
+        """
+        if not self._pending_vectors:
+            return
+        pending = self._pending_vectors
+        self._pending_vectors = {}
+        for chunks in self._chunks.values():
+            for chunk in chunks:
+                vector = pending.get(chunk.id)
                 if vector is not None:
                     chunk.embedding = vector
 
@@ -722,6 +770,9 @@ class MarkdownIndexer:
         # Disk-backed mode: on first sync (or after a crash) make sure the
         # vector store matches the in-memory chunk set before embedding.
         self._ensure_disk_vectors_migrated()
+        # 文本层刚被重建过（chunker 版本提升 / 缓存损坏）时，把初始化阶段
+        # 暂存的老向量挂回去，避免整个库重新 embedding。
+        self._attach_pending_vectors()
 
         # Vector layer: embed every chunk that lacks a vector. When the vectors
         # cache was invalidated (model/dimension change) this re-embeds the whole
@@ -822,6 +873,65 @@ class MarkdownIndexer:
         if self._fts is not None:
             self._fts.delete_source(source)
 
+    def _chunk_has_vector(self, chunk: Chunk) -> bool:
+        """这个 chunk 已经有可用向量了吗？
+
+        磁盘后端看是否落盘；刚复用/刚算出来、还留在 RAM 里等 flush 的也算有
+        （flush 会按它自己的 chunk.id 落盘，所以复用的向量最终会以副本形式
+        各存一份——这是刻意的，磁盘省的是 RAM 而不是磁盘）。
+        """
+        if self._vectors_on_disk:
+            return chunk.id in self._disk_vectors or chunk.embedding is not None
+        return chunk.embedding is not None and len(chunk.embedding) > 0
+
+    def _reuse_vectors_by_content_hash(self) -> int:
+        """把已有向量按 content_hash 复用到内容相同但还没有向量的 chunk 上。
+
+        典型场景：库里有一份整目录的备份（教材/ 与 教材_Raw_Backup/），两处
+        正文逐字相同，但 chunk.id 因为 source 不同而不一样——与其把同一段文本
+        送进 embedding API 两次，不如直接复用已经算出来的向量。返回复用条数。
+
+        只读使用向量，所以多个 chunk 可以安全共享同一个 array 对象。
+        """
+        missing: list[Chunk] = []
+        donors: dict[str, Chunk] = {}
+        for chunks in self._chunks.values():
+            for chunk in chunks:
+                digest = chunk.metadata.get("content_hash")
+                if not digest:
+                    continue
+                if self._chunk_has_vector(chunk):
+                    donors.setdefault(digest, chunk)
+                else:
+                    missing.append(chunk)
+        if not missing or not donors:
+            return 0
+
+        needed = {chunk.metadata.get("content_hash") for chunk in missing}
+        reusable: dict[str, Any] = {}
+        if self._vectors_on_disk:
+            # 磁盘后端：chunk.embedding 在 flush 后是 None，得从 vec0 表读回来。
+            by_id = {chunk.id: digest for digest, chunk in donors.items() if digest in needed}
+            for chunk_id, vector in self._vector_backend.get_vectors(by_id).items():
+                digest = by_id.get(chunk_id)
+                if digest is not None:
+                    reusable[digest] = vector
+        else:
+            for digest, chunk in donors.items():
+                if digest in needed and chunk.embedding is not None and len(chunk.embedding):
+                    reusable[digest] = chunk.embedding
+        if not reusable:
+            return 0
+
+        reused = 0
+        for chunk in missing:
+            vector = reusable.get(chunk.metadata.get("content_hash"))
+            if vector is None:
+                continue
+            chunk.embedding = vector
+            reused += 1
+        return reused
+
     def _embed_missing(self) -> set[str]:
         """Embed every chunk that has no vector yet.
 
@@ -835,14 +945,12 @@ class MarkdownIndexer:
         而不是看 failed_files 字典，所以这里不需要任何额外重试逻辑；把
         failed_files 持久化到磁盘只是为了跨进程重启的可观测性。
         """
+        # 先做一轮内容哈希复用：已经算过的内容不再花钱重算一次。
+        self._reuse_vectors_by_content_hash()
+
         pending: dict[str, list[Chunk]] = {}
         for source, chunks in self._chunks.items():
-            if self._vectors_on_disk:
-                # Disk-backed mode: "missing" means not yet persisted; the RAM
-                # embedding is transient and cleared after flushing.
-                missing = [chunk for chunk in chunks if chunk.id not in self._disk_vectors]
-            else:
-                missing = [chunk for chunk in chunks if chunk.embedding is None or not len(chunk.embedding)]
+            missing = [chunk for chunk in chunks if not self._chunk_has_vector(chunk)]
             if missing:
                 pending[source] = missing
         if not pending:
@@ -894,9 +1002,27 @@ class MarkdownIndexer:
 
     @staticmethod
     def _embed_one_file(source: str, chunks: list[Chunk], provider: EmbeddingProvider) -> None:
-        vectors = provider.embed([chunk.content for chunk in chunks])
-        for chunk, vector in zip(chunks, vectors):
-            chunk.embedding = _to_emb(vector)
+        # 同一个文件里也可能出现逐字重复的段落（复制粘贴、模板套话），按内容
+        # 哈希去重后只请求一次，回填时同 hash 的 chunk 共用同一个向量。
+        # 老 chunk 没有 content_hash 时退回用正文算一个，行为与去重前一致。
+        contents: dict[str, str] = {}
+        order: list[str] = []
+        keys: list[str] = []
+        for chunk in chunks:
+            digest = chunk.metadata.get("content_hash")
+            if not digest:
+                digest = hashlib.sha256(chunk.content.encode("utf-8")).hexdigest()[:16]
+            keys.append(digest)
+            if digest not in contents:
+                contents[digest] = chunk.content
+                order.append(digest)
+        vectors = provider.embed([contents[digest] for digest in order])
+        # 按哈希回填而不是按位置，避免 provider 少返回向量时整批错位。
+        by_hash = dict(zip(order, vectors))
+        for chunk, digest in zip(chunks, keys):
+            vector = by_hash.get(digest)
+            if vector is not None:
+                chunk.embedding = _to_emb(vector)
 
     def _load_ignore_patterns(self) -> list[str]:
         patterns = list(self.config.exclude_patterns)
@@ -1144,16 +1270,21 @@ class MarkdownIndexer:
             # epoch 秒，供 kb_search 的 mtime_after / mtime_before 过滤；
             # 老缓存里没有这个字段，SearchFilter 会放行而不是判为不匹配。
             "mtime": mtime,
+            # chunk 正文的 sha256 前 16 位：内容完全相同的 chunk（重复备份、
+            # 复制粘贴的段落）共享同一个哈希，embedding 与检索去重都靠它。
+            "content_hash": hashlib.sha256(content.encode("utf-8")).hexdigest()[:16],
         })
 
     def all_chunks(self) -> list[Chunk]:
         return [chunk for source in sorted(self._chunks) for chunk in self._chunks[source]]
 
-    def search(self, query: str, top_k: int = 10, use_rerank: bool = False, query_vector: Iterable[float] | None = None, filters: SearchFilter | None = None) -> list[Chunk]:
+    def search(self, query: str, top_k: int = 10, use_rerank: bool = False, query_vector: Iterable[float] | None = None, filters: SearchFilter | None = None, dedupe: bool = True) -> list[Chunk]:
         query = query.strip()
         all_chunks = self.all_chunks()
         if not query:
             ranked = list(all_chunks)
+            if dedupe:
+                ranked = dedupe_by_content_hash(ranked)
             if filters is None:
                 return ranked[: max(0, top_k)]
             ranked = [chunk for chunk in ranked if filters.matches(chunk)]
@@ -1224,6 +1355,11 @@ class MarkdownIndexer:
 
         if use_rerank and self.reranker_provider and ranked:
             ranked = rerank_chunks(query, ranked, self.reranker_provider, cap=self.config.rerank_cap)
+
+        # 内容完全相同的 chunk（重复备份）只留排在最前面的那条，否则同一段
+        # 内容会占掉 top_k 里的好几格，把其它库/其它文件的结果挤出去。
+        if dedupe:
+            ranked = dedupe_by_content_hash(ranked)
 
         if filters is None:
             return ranked[: max(0, top_k)]

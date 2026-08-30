@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import load_config, resolve_config_path
-from .indexer import Chunk, MarkdownIndexer, SearchFilter, rerank_chunks
+from .indexer import Chunk, MarkdownIndexer, SearchFilter, dedupe_by_content_hash, rerank_chunks
 from .registry import VaultEntry, VaultRegistry, registry_path
 
 SERVER_INFO = {"name": "mortis-rag-mcp", "version": "0.4.1", "title": "Mortis'RAG MCP"}
@@ -143,6 +143,7 @@ def _tool_definitions() -> list[dict[str, Any]]:
                 "mtime_before": {"type": ["number", "string"], "description": "可选，只保留修改时间 <= 该值的文件；epoch 秒或 ISO 8601 字符串"},
                 "offset": {"type": "integer", "minimum": 0, "default": 0, "description": "可选，跳过前 N 条结果（分页用）"},
                 "limit": {"type": "integer", "minimum": 1, "description": "可选，本页最多返回条数；缺省时用 top_k"},
+                "dedupe": {"type": "boolean", "default": True, "description": "可选，默认 true：正文完全相同的 chunk 只保留排在最前面的一条（重复备份/复制段落不再占多格 top_k）"},
             }},
         },
         {
@@ -361,7 +362,7 @@ class VaultMcpServer:
             "cache_purged": cache_purged,
         }
 
-    def _fanout_search(self, query: str, top_k: int, use_rerank: bool, group_by_vault: bool = False, filters: SearchFilter | None = None) -> dict[str, Any]:
+    def _fanout_search(self, query: str, top_k: int, use_rerank: bool, group_by_vault: bool = False, filters: SearchFilter | None = None, dedupe: bool = True) -> dict[str, Any]:
         """Search across every registered (existing) vault, merge and rerank once.
 
         group_by_vault=True 时返回按库分组的结果（每组 top_k 条），否则平铺返回。
@@ -398,7 +399,7 @@ class VaultMcpServer:
             try:
                 indexer = self._indexer_for({"vault_path": entry.path})
                 indexer.sync()
-                chunks = indexer.search(query, per_vault_k, False, query_vector=query_vector, filters=per_vault_filters)
+                chunks = indexer.search(query, per_vault_k, False, query_vector=query_vector, filters=per_vault_filters, dedupe=dedupe)
                 for chunk in chunks:
                     merged.append((entry, chunk))
                 searched.append(entry.path)
@@ -414,6 +415,9 @@ class VaultMcpServer:
 
         merged.sort(key=lambda pair: (-pair[1].score, pair[1].source, pair[1].metadata["chunk_index"]))
         pairs = merged
+        # 跨库再去重一次：同一份内容可能躺在两个库里（比如一个库是另一个的备份）。
+        if dedupe:
+            pairs = dedupe_by_content_hash(pairs, chunk_of=lambda pair: pair[1])
         if use_rerank and merged:
             provider = None
             for indexer in self._indexers.values():
@@ -502,7 +506,10 @@ class VaultMcpServer:
                 group_by_vault = arguments.get("group_by_vault", False)
                 if isinstance(group_by_vault, str):
                     group_by_vault = group_by_vault.strip().lower() in {"1", "true", "yes", "on"}
-                return _text_content(self._fanout_search(query, top_k, bool(use_rerank), bool(group_by_vault), _search_filter(arguments)))
+                dedupe = arguments.get("dedupe", True)
+                if isinstance(dedupe, str):
+                    dedupe = dedupe.strip().lower() not in {"0", "false", "no", "off"}
+                return _text_content(self._fanout_search(query, top_k, bool(use_rerank), bool(group_by_vault), _search_filter(arguments), bool(dedupe)))
         indexer = self._indexer_for(arguments)
         indexer.sync()
         if name == "kb_list":
@@ -513,7 +520,10 @@ class VaultMcpServer:
             use_rerank = arguments.get("use_rerank", True)
             if isinstance(use_rerank, str):
                 use_rerank = use_rerank.strip().lower() in {"1", "true", "yes", "on"}
-            results = indexer.search(query, top_k, bool(use_rerank), filters=_search_filter(arguments))
+            dedupe = arguments.get("dedupe", True)
+            if isinstance(dedupe, str):
+                dedupe = dedupe.strip().lower() not in {"0", "false", "no", "off"}
+            results = indexer.search(query, top_k, bool(use_rerank), filters=_search_filter(arguments), dedupe=bool(dedupe))
             return _text_content({"chunks": [chunk.to_dict() for chunk in results]})
         if name == "kb_read":
             source = str(arguments.get("source", ""))
