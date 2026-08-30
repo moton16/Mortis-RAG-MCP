@@ -49,6 +49,7 @@ import os
 import struct
 import sys
 import threading
+import time
 from typing import Any, Callable
 
 # --------------------------------------------------------------------- 动作常量
@@ -98,8 +99,14 @@ WAIT_TIMEOUT = 258
 WAIT_FAILED = 0xFFFFFFFF
 
 # 单次读取的缓冲区大小。超出部分会触发 ERROR_NOTIFY_ENUM_DIR。
-# 64KB 是实践中的常用取值。
-BUFFER_SIZE = 64 * 1024
+# 递归监视整棵 vault 时 64KB 偏小（深层目录树 + Obsidian 高频写 workspace.json
+# 很容易撑爆），256KB 能显著降低溢出频率。
+BUFFER_SIZE = 256 * 1024
+
+# 缓冲区溢出后的退避：不 sleep 直接重试会形成紧密自旋（100% CPU），
+# 而且每次循环都派发一次全量同步。连续溢出时指数退避，成功读取一次即清零。
+_OVERFLOW_BACKOFF_BASE = 0.05
+_OVERFLOW_BACKOFF_MAX = 1.0
 
 # FILE_NOTIFY_INFORMATION 三个 DWORD 头（NextEntryOffset / Action /
 # FileNameLength）的总字节数，FileName 从第 12 字节开始。
@@ -440,6 +447,8 @@ class WindowsDirectoryWatcher:
         overlapped = _OVERLAPPED()
         transferred = wt.DWORD(0)
         wait_handles = (wt.HANDLE * 2)()
+        # 连续缓冲区溢出计数，用于指数退避（见下方 ERROR_NOTIFY_ENUM_DIR 分支）。
+        overflow_count = 0
 
         with self._lock:
             dir_handle = self._dir_handle
@@ -507,12 +516,21 @@ class WindowsDirectoryWatcher:
                     if ctypes.get_last_error() == ERROR_OPERATION_ABORTED:
                         return
                     # 典型是 ERROR_NOTIFY_ENUM_DIR：变更太多装不进缓冲区，只有一次
-                    # 全量同步才能恢复一致。
+                    # 全量同步才能恢复一致。但立刻重试会紧密自旋（持续高频写入的
+                    # 目录每次都会再次溢出），所以按连续溢出次数退避。
                     self._emit(None)
+                    overflow_count += 1
+                    time.sleep(
+                        min(
+                            _OVERFLOW_BACKOFF_BASE * (2 ** (overflow_count - 1)),
+                            _OVERFLOW_BACKOFF_MAX,
+                        )
+                    )
                     continue
 
                 if transferred.value <= 0:
                     continue
+                overflow_count = 0
                 events = parse_notify_buffer(buffer[: transferred.value])
                 if events:
                     self._emit(events)

@@ -20,7 +20,7 @@ from .config import AppConfig
 from . import fsnotify
 from .fsnotify import WindowsDirectoryWatcher, watcher_available
 from .fts import FtsIndex
-from .providers import EmbeddingProvider, RerankerProvider, create_embedding_provider, create_reranker_provider
+from .providers import EmbeddingProvider, ProviderError, RerankerProvider, create_embedding_provider, create_reranker_provider
 from .vector import create_vector_backend
 
 _RRF_K = 60
@@ -1100,6 +1100,12 @@ class MarkdownIndexer:
                 contents[digest] = chunk.content
                 order.append(digest)
         vectors = provider.embed([contents[digest] for digest in order])
+        # provider 层已校验条数，这里再兜一次：zip() 截断会让部分 chunk 静默
+        # 拿不到向量，既不报错也不进 failed_files，之后每轮 sync 重复付费。
+        if len(vectors) != len(order):
+            raise ProviderError(
+                f"embedding returned {len(vectors)} vectors for {len(order)} unique chunks"
+            )
         # 按哈希回填而不是按位置，避免 provider 少返回向量时整批错位。
         by_hash = dict(zip(order, vectors))
         for chunk, digest in zip(chunks, keys):
@@ -1364,6 +1370,12 @@ class MarkdownIndexer:
         return [chunk for source in sorted(self._chunks) for chunk in self._chunks[source]]
 
     def search(self, query: str, top_k: int = 10, use_rerank: bool = False, query_vector: Iterable[float] | None = None, filters: SearchFilter | None = None, dedupe: bool = True) -> list[Chunk]:
+        # 兜底夹取：server 层已夹过一次，这里再夹一道，保证任何调用方都不会
+        # 把 10**9 这样的值透传给 sqlite-vec 的 KNN 堆或候选池切片。
+        try:
+            top_k = max(1, min(int(top_k), self.config.max_top_k))
+        except (TypeError, ValueError):
+            top_k = 10
         query = query.strip()
         all_chunks = self.all_chunks()
         if not query:

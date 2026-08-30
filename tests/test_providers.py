@@ -7,6 +7,7 @@ from urllib.request import Request
 import pytest
 
 from vault_mcp.config import AppConfig, EmbeddingConfig, RerankerConfig, load_config
+from vault_mcp import providers
 from vault_mcp.providers import ExternalEmbeddingProvider, ExternalRerankerProvider, ProviderError, StaticEmbeddingProvider
 
 
@@ -39,7 +40,10 @@ def test_external_embedding_request_has_expected_json(monkeypatch):
     def fake_urlopen(request, timeout):
         captured["request"] = request
         captured["timeout"] = timeout
-        return _JsonResponse({"data": [{"embedding": [0.1, 0.2]}]})
+        # 条数必须与输入一致：provider 会校验，少返回会抛 ProviderError。
+        return _JsonResponse(
+            {"data": [{"index": 0, "embedding": [0.1, 0.2]}, {"index": 1, "embedding": [0.3, 0.4]}]}
+        )
 
     monkeypatch.setattr("vault_mcp.providers.urlopen", fake_urlopen)
     provider = ExternalEmbeddingProvider(
@@ -49,7 +53,7 @@ def test_external_embedding_request_has_expected_json(monkeypatch):
         timeout=7,
     )
 
-    assert provider.embed(["你好", "world"]) == [[0.1, 0.2]]
+    assert provider.embed(["你好", "world"]) == [[0.1, 0.2], [0.3, 0.4]]
     request = captured["request"]
     assert isinstance(request, Request)
     assert request.full_url == "https://embedding.test/v1/embeddings"
@@ -152,7 +156,8 @@ def test_embedding_retries_after_429_then_succeeds(monkeypatch):
 
     assert provider.embed(["hello"]) == [[0.3, 0.4]]
     assert len(calls) == 2
-    assert sleeps == [1.0]
+    assert len(sleeps) == 1
+    assert 1.0 <= sleeps[0] <= 1.0 * 1.5
 
 
 def test_embedding_retries_after_500_then_succeeds(monkeypatch):
@@ -171,7 +176,8 @@ def test_embedding_retries_after_500_then_succeeds(monkeypatch):
 
     assert provider.embed(["hello"]) == [[1.0]]
     assert len(calls) == 2
-    assert sleeps == [1.0]
+    assert len(sleeps) == 1
+    assert 1.0 <= sleeps[0] <= 1.0 * 1.5
 
 
 def test_embedding_does_not_retry_on_404(monkeypatch):
@@ -205,7 +211,9 @@ def test_embedding_gives_up_after_max_retries(monkeypatch):
         provider.embed(["hello"])
     assert len(calls) == 3
     assert "after 3 attempts" in str(excinfo.value)
-    assert sleeps == [1.0, 2.0]
+    assert len(sleeps) == 2
+    assert 1.0 <= sleeps[0] <= 1.5
+    assert 2.0 <= sleeps[1] <= 3.0
 
 
 def test_embedding_backoff_grows_exponentially(monkeypatch):
@@ -222,7 +230,12 @@ def test_embedding_backoff_grows_exponentially(monkeypatch):
 
     with pytest.raises(ProviderError):
         provider.embed(["hello"])
-    assert sleeps == [1.0, 2.0, 4.0]
+    assert len(sleeps) == 3
+    # 退避带向上抖动，只断言量级与单调性。
+    assert 1.0 <= sleeps[0] <= 1.5
+    assert 2.0 <= sleeps[1] <= 3.0
+    assert 4.0 <= sleeps[2] <= 6.0
+    assert sleeps[0] < sleeps[1] < sleeps[2]
 
 
 def test_embedding_honors_retry_after_header(monkeypatch):
@@ -237,8 +250,8 @@ def test_embedding_honors_retry_after_header(monkeypatch):
 
     with pytest.raises(ProviderError):
         provider.embed(["hello"])
-    assert all(seconds >= 5.0 for seconds in sleeps)
-    assert sleeps == [5.0, 5.0]
+    assert len(sleeps) == 2
+    assert all(5.0 <= seconds <= 7.5 for seconds in sleeps)
 
 
 def test_embedding_ignores_non_numeric_retry_after_header(monkeypatch):
@@ -254,7 +267,9 @@ def test_embedding_ignores_non_numeric_retry_after_header(monkeypatch):
     with pytest.raises(ProviderError):
         provider.embed(["hello"])
     # HTTP-date 形式不解析，退回指数退避。
-    assert sleeps == [1.0, 2.0]
+    assert len(sleeps) == 2
+    assert 1.0 <= sleeps[0] <= 1.5
+    assert 2.0 <= sleeps[1] <= 3.0
 
 
 def test_embedding_splits_requests_by_batch_size(monkeypatch):
@@ -339,3 +354,130 @@ def test_embedding_retry_defaults():
 def test_embedding_retry_settings_reject_invalid_values(overrides):
     with pytest.raises(ValueError):
         AppConfig(embedding=EmbeddingConfig(mode="external", **overrides))
+
+
+# --------------------------------------------------------------------------
+# B0 止血：退避上限与响应校验（单批路径此前完全裸奔）
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("raw", ["inf", "Infinity", "1e999", "nan"])
+def test_retry_after_non_finite_values_are_ignored(monkeypatch, raw):
+    sleeps: list[float] = []
+
+    def fake_urlopen(request, timeout):
+        raise _http_error(429, {"Retry-After": raw})
+
+    monkeypatch.setattr("vault_mcp.providers.urlopen", fake_urlopen)
+    monkeypatch.setattr("vault_mcp.providers._sleep", sleeps.append)
+    provider = ExternalEmbeddingProvider(endpoint=ENDPOINT, model="m", max_retries=1)
+
+    with pytest.raises(ProviderError):
+        provider.embed(["hello"])
+    # 关键：绝不能出现 inf/nan —— time.sleep(inf) 会把线程永久挂死。
+    assert len(sleeps) == 1
+    assert sleeps[0] == sleeps[0]  # 非 nan
+    assert sleeps[0] <= providers._MAX_BACKOFF
+
+
+def test_retry_after_is_capped_by_max_backoff(monkeypatch):
+    sleeps: list[float] = []
+
+    def fake_urlopen(request, timeout):
+        raise _http_error(429, {"Retry-After": "86400"})
+
+    monkeypatch.setattr("vault_mcp.providers.urlopen", fake_urlopen)
+    monkeypatch.setattr("vault_mcp.providers._sleep", sleeps.append)
+    provider = ExternalEmbeddingProvider(endpoint=ENDPOINT, model="m", max_retries=2)
+
+    with pytest.raises(ProviderError):
+        provider.embed(["hello"])
+    # 服务端让等一天，本地只等到上限：持有锁的线程不能睡死。
+    assert all(seconds <= providers._MAX_BACKOFF for seconds in sleeps)
+
+
+def test_backoff_jitters_to_avoid_thundering_herd(monkeypatch):
+    sleeps: list[float] = []
+
+    def fake_urlopen(request, timeout):
+        raise _http_error(429, {"Retry-After": "10"})
+
+    monkeypatch.setattr("vault_mcp.providers.urlopen", fake_urlopen)
+    monkeypatch.setattr("vault_mcp.providers._sleep", sleeps.append)
+    provider = ExternalEmbeddingProvider(endpoint=ENDPOINT, model="m", max_retries=4)
+
+    with pytest.raises(ProviderError):
+        provider.embed(["hello"])
+    # 同一个 Retry-After 下多次等待不应完全相同，否则 6 个 worker 同时醒来。
+    assert len(set(sleeps)) > 1
+    assert all(10.0 <= seconds <= 15.0 for seconds in sleeps)
+
+
+def test_single_batch_short_response_is_rejected(monkeypatch):
+    """默认 batch_size=32，单文件多数走这条路径，此前完全没有条数校验。"""
+
+    def fake_urlopen(request, timeout):
+        payload = json.loads(request.data.decode("utf-8"))
+        # 上游少返回一个向量：回填时 zip() 会静默截断并让后续 chunk 错位。
+        return _JsonResponse({"data": [{"embedding": [1.0]} for _ in payload["input"][:-1]]})
+
+    monkeypatch.setattr("vault_mcp.providers.urlopen", fake_urlopen)
+    provider = ExternalEmbeddingProvider(endpoint=ENDPOINT, model="m")
+
+    with pytest.raises(ProviderError, match="vectors for"):
+        provider.embed(["a", "b", "c"])
+
+
+def test_multi_batch_short_response_is_rejected(monkeypatch):
+    """batch_size=2 + 4 条输入才会真正进切片循环，验证第二条路径也有校验。"""
+    calls: list[int] = []
+
+    def fake_urlopen(request, timeout):
+        payload = json.loads(request.data.decode("utf-8"))
+        calls.append(len(payload["input"]))
+        return _JsonResponse({"data": [{"embedding": [1.0]}]})
+
+    monkeypatch.setattr("vault_mcp.providers.urlopen", fake_urlopen)
+    provider = ExternalEmbeddingProvider(endpoint=ENDPOINT, model="m", batch_size=2)
+
+    with pytest.raises(ProviderError, match="vectors for"):
+        provider.embed(["a", "b", "c", "d"])
+    # 第一批就被拒，不应继续发后续批次。
+    assert calls == [2]
+
+
+def test_embedding_reorders_response_by_index(monkeypatch):
+    def fake_urlopen(request, timeout):
+        # 乱序返回但带正确的 index：必须按 index 还原，而不是按返回顺序。
+        return _JsonResponse(
+            {
+                "data": [
+                    {"index": 2, "embedding": [3.0]},
+                    {"index": 0, "embedding": [1.0]},
+                    {"index": 1, "embedding": [2.0]},
+                ]
+            }
+        )
+
+    monkeypatch.setattr("vault_mcp.providers.urlopen", fake_urlopen)
+    provider = ExternalEmbeddingProvider(endpoint=ENDPOINT, model="m")
+
+    assert provider.embed(["a", "b", "c"]) == [[1.0], [2.0], [3.0]]
+
+
+def test_embedding_rejects_duplicate_response_index(monkeypatch):
+    def fake_urlopen(request, timeout):
+        return _JsonResponse(
+            {
+                "data": [
+                    {"index": 0, "embedding": [1.0]},
+                    {"index": 0, "embedding": [2.0]},
+                ]
+            }
+        )
+
+    monkeypatch.setattr("vault_mcp.providers.urlopen", fake_urlopen)
+    provider = ExternalEmbeddingProvider(endpoint=ENDPOINT, model="m")
+
+    with pytest.raises(ProviderError, match="indexes"):
+        provider.embed(["a", "b"])

@@ -63,11 +63,25 @@ def _parse_int(value: Any) -> int | None:
         return None
 
 
-def _search_filter(arguments: dict[str, Any]) -> SearchFilter:
+def _parse_top_k(value: Any, maximum: int) -> int:
+    """top_k 解析：非法值退回默认 10，并夹到 [1, config.max_top_k]。
+
+    此前这里是裸 int()，LLM 传个 "10.5" 或 null 就让整次搜索报错；
+    传 10**9 则让 sqlite-vec 去建千万级 KNN 堆。
+    """
+    parsed = _parse_int(value)
+    if parsed is None:
+        return 10
+    return max(1, min(parsed, maximum))
+
+
+def _search_filter(arguments: dict[str, Any], max_limit: int = 200) -> SearchFilter:
     """从 kb_search 的 arguments 构造 SearchFilter，全部字段都可缺省。"""
     limit = _parse_int(arguments.get("limit"))
     if limit is not None and limit < 1:
         limit = None
+    if limit is not None:
+        limit = min(limit, max_limit)
     offset = _parse_int(arguments.get("offset"))
     return SearchFilter(
         path_prefix=str(arguments.get("path_prefix") or "").strip(),
@@ -543,7 +557,7 @@ class VaultMcpServer:
             explicit = str(arguments.get("vault_path") or "").strip()
             if not explicit and len(self.registry.load()) > 1:
                 query = str(arguments.get("query", ""))
-                top_k = int(arguments.get("top_k", 10))
+                top_k = _parse_top_k(arguments.get("top_k", 10), self.config.max_top_k)
                 use_rerank = arguments.get("use_rerank", True)
                 if isinstance(use_rerank, str):
                     use_rerank = use_rerank.strip().lower() in {"1", "true", "yes", "on"}
@@ -553,21 +567,21 @@ class VaultMcpServer:
                 dedupe = arguments.get("dedupe", True)
                 if isinstance(dedupe, str):
                     dedupe = dedupe.strip().lower() not in {"0", "false", "no", "off"}
-                return _text_content(self._fanout_search(query, top_k, bool(use_rerank), bool(group_by_vault), _search_filter(arguments), bool(dedupe)))
+                return _text_content(self._fanout_search(query, top_k, bool(use_rerank), bool(group_by_vault), _search_filter(arguments, self.config.max_top_k), bool(dedupe)))
         indexer = self._indexer_for(arguments)
         indexer.sync()
         if name == "kb_list":
             return _text_content({"files": indexer.list_files()})
         if name == "kb_search":
             query = str(arguments.get("query", ""))
-            top_k = int(arguments.get("top_k", 10))
+            top_k = _parse_top_k(arguments.get("top_k", 10), self.config.max_top_k)
             use_rerank = arguments.get("use_rerank", True)
             if isinstance(use_rerank, str):
                 use_rerank = use_rerank.strip().lower() in {"1", "true", "yes", "on"}
             dedupe = arguments.get("dedupe", True)
             if isinstance(dedupe, str):
                 dedupe = dedupe.strip().lower() not in {"0", "false", "no", "off"}
-            results = indexer.search(query, top_k, bool(use_rerank), filters=_search_filter(arguments), dedupe=bool(dedupe))
+            results = indexer.search(query, top_k, bool(use_rerank), filters=_search_filter(arguments, self.config.max_top_k), dedupe=bool(dedupe))
             return _text_content({"chunks": [chunk.to_dict() for chunk in results]})
         if name == "kb_read":
             source = str(arguments.get("source", ""))
@@ -662,7 +676,13 @@ def serve_stdio(config_path: str | Path | None = None) -> int:
             except Exception as exc:
                 response = _json_error(None, -32000, str(exc))
             if response is not None:
-                sys.stdout.write(json.dumps(response, ensure_ascii=False, separators=(",", ":")) + "\n")
+                # 写出也要在 try 内：笔记内容里若夹带孤立代理字符（ surrogate ），
+                # 序列化会在这一步抛 UnicodeEncodeError 并逃出循环，整个进程被杀。
+                try:
+                    payload = json.dumps(response, ensure_ascii=False, separators=(",", ":"))
+                except UnicodeEncodeError:
+                    payload = json.dumps(response, ensure_ascii=True, separators=(",", ":"))
+                sys.stdout.write(payload + "\n")
                 sys.stdout.flush()
         return 0
     finally:
