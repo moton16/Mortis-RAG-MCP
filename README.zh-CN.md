@@ -4,7 +4,7 @@
 > 提供结构化切片检索、原文读取、增量索引、向量语义召回与重排序能力，供 AI Agent（WorkBuddy / Codex / Trae 等）通过 MCP 协议调用。
 
 - 仓库：`Mortis-RAG-MCP`（Python 包名保持 `vault_mcp`，控制台脚本新增 `mortis-rag-mcp`，旧 `vault-mcp` 兼容保留）
-- 当前版本：`vault-mcp 0.3.0`
+- 当前版本：`mortis-rag-mcp 0.4.0`（混合检索：FTS5 BM25 + RRF 三路融合）
 - 知识库：**不绑定任何路径** —— 任意文件夹通过 `kb_init` 注册为知识库，注册表持久化于 `~/.vault_mcp/vaults.toml`（跨重启/跨设备可用）
 
 > **新用户看这里**：下载后如何初始化（装包 → 配 key → 接入 MCP 客户端 → `kb_init` 建库 → 安装配套 Skill），见 [docs/QUICKSTART.md](docs/QUICKSTART.md)。
@@ -306,6 +306,17 @@ python -m pytest -q tests/test_mcp_stdio.py
 - 并发 embedding（`embedding_max_workers=6`）：348 文件全量重建从 ~9 分钟降到 ~2.5 分钟。
 - 多 vault 支持（`vault_path` 参数）、子库支持（`kb_vaults`）、强制重建（`kb_rebuild`）、缓存 placement（home/vault）。
 - 补充测试：`test_cache.py`、`test_multivault.py`、`test_subvaults.py`。
+
+### 阶段 4：混合检索 —— FTS5 BM25 + RRF 三路融合（2026-08-30，本会话）
+
+**目标**：把自研的「bigram 词法软信号 + 余弦加法融合」升级为业界收敛的标准答案（basic-memory / obsidian-mcp-server / RAGLite 同款），零新增依赖。
+
+- **FTS5 索引**（新模块 `fts.py`）：每库一个 `{cache_root}/{namespace}/fts/vault_{key}.fts.sqlite`，trigram 分词器（原生 SQLite 支持，中文可用），BM25 排序；journal_mode=MEMORY（派生索引，可重建，不追求持久性）；`_sync_locked` 增量钩子按 source 增删改，与 sha256 签名比对联动。
+- **三路 RRF**（`_hybrid_rank`）：路 A = FTS5 BM25（仅保留 ≥3 字符 token 的查询词，`"AND"` 连接）；路 B = 向量余弦原始分快照；路 C = 保留原 bigram 词法层（**天然补上 trigram 对 2 字中文如"银狼"的 0 命中缺口**）。RRF k=60、每路 top-40，融合后走既有 rerank top-60 → top_k。
+- **开关**：`[index] use_hybrid`（默认 true）；false 时逐字走旧路径。FTS 索引依赖 `[cache] enabled = true`，缓存关闭时自动降级旧行为。
+- **向量抽象层**（新模块 `vector.py`）：`VectorBackend` Protocol + `MemoryVectorBackend`（默认，包装现有 numpy 暴力扫描，存储格式不变）+ 可选 `SqliteVecBackend`（`[vector] backend="sqlite_vec"` 且 `pip install sqlite-vec` 成功才激活，失败静默回退 memory）——为库规模上 5 万切片后的 Phase 2 预留无损升级位。
+- **stats() 新增**：`use_hybrid` / `fts_enabled` / `vector_backend`（纯增量，兼容旧客户端）。
+- **测试**：52 个用例全绿（新增 `test_hybrid.py` 7 项：三路 RRF 合并、2 字 CJK bigram 兜底、开关还原旧行为、FTS 缺失/失败降级、增量同步更新 FTS、rebuild/purge 清理、stats 新键）。实测确认：13k 条 1024 维向量 KNN 14.8ms、FTS 中文 BM25 命中正确、trigram <3 字查询 0 命中（由 bigram 路兜底）。
 
 ### 阶段 3：通用化改造 —— 用户级 Vault 注册表（2026-08-30，本会话）
 

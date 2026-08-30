@@ -32,6 +32,14 @@ timeout = 30
 chunk_size = 1200
 chunk_overlap = 0
 debounce_seconds = 0.5
+# 混合检索：FTS5 BM25 + 向量余弦 + bigram 词法三路 RRF 融合（默认 true）。
+# 设为 false 完整还原旧「词法软信号 + 余弦」行为。需要 [cache] enabled = true。
+use_hybrid = true
+
+[vector]
+# 向量存储后端："memory"（默认，numpy 暴力扫描，零依赖）或
+# "sqlite_vec"（可选：pip install sqlite-vec 后启用，未安装自动回退 memory）。
+backend = "memory"
 
 [cache]
 # Disk cache of chunk signatures + embeddings so restarts skip re-embedding.

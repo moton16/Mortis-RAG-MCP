@@ -16,7 +16,12 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .config import AppConfig
+from .fts import FtsIndex
 from .providers import EmbeddingProvider, RerankerProvider, create_embedding_provider, create_reranker_provider
+from .vector import create_vector_backend
+
+_RRF_K = 60
+_RRF_PER_ROUTE = 40
 
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
 _WORD_RE = re.compile(r"[\w]+", re.UNICODE)
@@ -361,12 +366,27 @@ class MarkdownIndexer:
         self._cache_lock = threading.Lock()
         self._chunks_cache_path: Path | None = None
         self._vectors_cache_path: Path | None = None
+        self._fts_cache_path: Path | None = None
+        self._fts: FtsIndex | None = None
+        self._vector_backend: Any = None
         if self.config.cache.enabled and self.config.cache.dir:
             try:
                 self._init_cache_paths()
             except OSError:
                 self._chunks_cache_path = None
                 self._vectors_cache_path = None
+                self._fts_cache_path = None
+        # FTS index: derived/rebuildable; any failure degrades to hybrid-off.
+        if self.config.use_hybrid and self._fts_cache_path is not None:
+            try:
+                self._fts = FtsIndex(self._fts_cache_path)
+                if not self._fts.available:
+                    self._fts = None
+            except Exception:
+                self._fts = None
+        # Vector backend seam: default memory (numpy brute-force over chunk.embedding);
+        # sqlite_vec only when configured AND importable, else falls back to memory.
+        self._vector_backend = create_vector_backend(self.config.vector, self, self._fts_cache_path)
 
     def _cache_key(self) -> str:
         """Stable cache identity.
@@ -388,12 +408,15 @@ class MarkdownIndexer:
         base = root / namespace
         chunks_dir = base / "chunks"
         vectors_dir = base / "vectors"
+        fts_dir = base / "fts"
         chunks_dir.mkdir(parents=True, exist_ok=True)
         vectors_dir.mkdir(parents=True, exist_ok=True)
+        fts_dir.mkdir(parents=True, exist_ok=True)
         key = self._cache_key()
         self._chunks_cache_path = chunks_dir / f"vault_{key}.chunks.bin"
         model_hash = hashlib.sha256(self.config.embedding.model.encode("utf-8")).hexdigest()[:8]
         self._vectors_cache_path = vectors_dir / f"vault_{key}.{model_hash}.{self.config.embedding.dimension}.vec.bin"
+        self._fts_cache_path = fts_dir / f"vault_{key}.fts.sqlite"
         self._load_chunks_cache()
         self._load_vectors_cache()
         self._sweep_stale_cache()
@@ -405,12 +428,13 @@ class MarkdownIndexer:
             return
         cutoff = time.time() - max_age * 86400
         root = self._cache_root()
-        for cache_file in root.rglob("*.bin"):
-            try:
-                if cache_file.stat().st_mtime < cutoff:
-                    cache_file.unlink()
-            except OSError:
-                pass
+        for pattern in ("*.bin", "*.sqlite"):
+            for cache_file in root.rglob(pattern):
+                try:
+                    if cache_file.stat().st_mtime < cutoff:
+                        cache_file.unlink()
+                except OSError:
+                    pass
 
     def _cache_root(self) -> Path:
         if self.config.cache.placement == "vault":
@@ -541,6 +565,7 @@ class MarkdownIndexer:
                 self.failed_files[source] = str(exc)
                 self._chunks.pop(source, None)
                 self._signatures.pop(source, None)
+                self._fts_delete(source)
 
         # Text layer: changed files update the index even if embedding fails
         # afterwards, so lexical search still works without vectors.
@@ -548,6 +573,7 @@ class MarkdownIndexer:
             self._chunks[source] = chunks
             self._signatures[source] = signature
             self.failed_files.pop(source, None)
+            self._fts_upsert(source, chunks)
 
         # Vector layer: embed every chunk that lacks a vector. When the vectors
         # cache was invalidated (model/dimension change) this re-embeds the whole
@@ -556,12 +582,36 @@ class MarkdownIndexer:
         self._embed_missing()
 
         for source in set(self._chunks) - found:
+            removed_ids = [chunk.id for chunk in self._chunks.get(source, [])]
             self._chunks.pop(source, None)
             self._signatures.pop(source, None)
             self.failed_files.pop(source, None)
+            self._fts_delete(source)
+            if removed_ids:
+                try:
+                    self._vector_backend.delete_vectors(removed_ids)
+                except Exception:
+                    pass
         self.last_sync = time.time()
         self._save_cache()
         return self.all_chunks()
+
+    def _fts_upsert(self, source: str, chunks: list[Chunk]) -> None:
+        if self._fts is None:
+            return
+        try:
+            self._fts.upsert_source(source, chunks)
+        except Exception:
+            # A broken FTS index must never take the sync down; degrade to off.
+            try:
+                self._fts.close()
+            except Exception:
+                pass
+            self._fts = None
+
+    def _fts_delete(self, source: str) -> None:
+        if self._fts is not None:
+            self._fts.delete_source(source)
 
     def _embed_missing(self) -> set[str]:
         """Embed every chunk that has no vector yet.
@@ -885,34 +935,113 @@ class MarkdownIndexer:
             exact_boost = 1 if query.lower() in haystack else 0
             lexical[chunk.id] = float(token_hits + exact_boost * 10)
 
-        ranked: list[Chunk] = []
+        # Semantic route: raw cosine, snapshotted BEFORE any lexical fusion so
+        # both the hybrid (RRF) and legacy paths can use it independently.
+        semantic_chunks: list[Chunk] = []
+        semantic_snapshot: dict[str, float] = {}
         if self.config.embedding.mode == "external":
             try:
                 # Callers doing multi-vault fan-out embed the query once and
                 # pass it in, so N vaults cost one embed call instead of N.
                 if query_vector is None:
                     query_vector = self.embedding_provider.embed([query])[0]
-                semantic = self._semantic_rank(query_vector, all_chunks)
-                if semantic:
-                    # Cosine dominates; lexical similarity breaks ties so exact
-                    # term matches float above purely paraphrased hits.
-                    lex_max = max(lexical[chunk.id] for chunk in semantic) or 1.0
-                    for chunk in semantic:
-                        chunk.score = chunk.score + (lexical[chunk.id] / lex_max) * 0.2
-                    ranked = semantic
+                semantic_chunks = self._semantic_rank(query_vector, all_chunks)
+                semantic_snapshot = {chunk.id: chunk.score for chunk in semantic_chunks}
             except Exception:
                 pass
 
+        hybrid = self.config.use_hybrid and self._fts is not None and self._fts.available
+        if hybrid:
+            ranked = self._hybrid_rank(query, all_chunks, lexical, semantic_snapshot)
+        else:
+            ranked = []
         if not ranked:
-            ranked = [chunk for chunk in all_chunks if lexical[chunk.id] > 0]
-            for chunk in ranked:
-                chunk.score = lexical[chunk.id]
+            # Legacy path, unchanged: cosine dominates, lexical breaks ties.
+            if semantic_chunks:
+                lex_max = max(lexical[chunk.id] for chunk in semantic_chunks) or 1.0
+                for chunk in semantic_chunks:
+                    chunk.score = chunk.score + (lexical[chunk.id] / lex_max) * 0.2
+                ranked = semantic_chunks
+            else:
+                ranked = [chunk for chunk in all_chunks if lexical[chunk.id] > 0]
+                for chunk in ranked:
+                    chunk.score = lexical[chunk.id]
 
         ranked.sort(key=lambda chunk: (-chunk.score, chunk.source, chunk.metadata["chunk_index"]))
 
         if use_rerank and self.reranker_provider and ranked:
             ranked = rerank_chunks(query, ranked, self.reranker_provider)
         return ranked[: max(0, top_k)]
+
+    def _fts_query(self, query: str) -> str | None:
+        """Build an FTS5 MATCH expression from tokens of length >= 3.
+
+        Returns None when no such token survives (e.g. a 2-char CJK query like
+        "银狼"), so the caller skips the BM25 route and the bigram lexical route
+        covers the query instead. Trigram cannot match <3-char queries.
+        """
+        terms: list[str] = []
+        for piece in _WORD_RE.findall(query):
+            for word in _ASCII_RE.findall(piece):
+                if len(word) >= 3:
+                    terms.append('"' + word.lower().replace('"', '""') + '"')
+            for cjk in _CJK_RE.findall(piece):
+                if len(cjk) >= 3:
+                    terms.append('"' + cjk.replace('"', '""') + '"')
+        if not terms:
+            return None
+        return " AND ".join(terms)
+
+    def _hybrid_rank(
+        self,
+        query: str,
+        all_chunks: list[Chunk],
+        lexical: dict[str, float],
+        semantic_snapshot: dict[str, float],
+    ) -> list[Chunk]:
+        """Three-route RRF fusion: FTS5 BM25 + vector cosine + bigram lexical.
+
+        chunk.score becomes the RRF value (comparable across vaults), then the
+        caller sorts and reranks as usual. Any single route failing or empty is
+        simply absent — search never throws.
+        """
+        by_id = {chunk.id: chunk for chunk in all_chunks}
+        routes: list[list[str]] = []
+
+        # Route A: FTS5 BM25 (trigram). Skipped when the query has no >=3-char token.
+        fts_sql = self._fts_query(query)
+        if fts_sql is not None and self._fts is not None:
+            try:
+                routes.append([chunk_id for chunk_id, _score in self._fts.search(fts_sql, _RRF_PER_ROUTE)])
+            except Exception:
+                pass
+
+        # Route B: vector cosine, raw and descending.
+        if semantic_snapshot:
+            ordered = sorted(semantic_snapshot.items(), key=lambda item: -item[1])
+            routes.append([chunk_id for chunk_id, _score in ordered[:_RRF_PER_ROUTE]])
+
+        # Route C: bigram lexical soft scores, descending, score > 0 only.
+        lexical_ordered = sorted(
+            ((chunk_id, score) for chunk_id, score in lexical.items() if score > 0),
+            key=lambda item: -item[1],
+        )
+        if lexical_ordered:
+            routes.append([chunk_id for chunk_id, _score in lexical_ordered[:_RRF_PER_ROUTE]])
+
+        if not routes:
+            return []
+
+        fused: dict[str, float] = {}
+        for route in routes:
+            for rank, chunk_id in enumerate(route, start=1):
+                fused[chunk_id] = fused.get(chunk_id, 0.0) + 1.0 / (_RRF_K + rank)
+
+        ranked = [by_id[chunk_id] for chunk_id in fused if chunk_id in by_id]
+        for chunk in ranked:
+            chunk.score = fused[chunk.id]
+        ranked.sort(key=lambda chunk: (-chunk.score, chunk.source, chunk.metadata["chunk_index"]))
+        return ranked
 
     @staticmethod
     def _query_tokens(query: str) -> list[str]:
@@ -1014,6 +1143,9 @@ class MarkdownIndexer:
             "cache_enabled": self._chunks_cache_path is not None or self._vectors_cache_path is not None,
             "cache_key": self._cache_key(),
             "cache_namespace": self.config.cache.namespace,
+            "use_hybrid": self.config.use_hybrid,
+            "fts_enabled": self._fts is not None and self._fts.available,
+            "vector_backend": getattr(self._vector_backend, "name", self.config.vector.backend),
         }
 
     def get_exemptions(self) -> dict[str, Any]:
@@ -1243,23 +1375,59 @@ class MarkdownIndexer:
                     removed = False
             self._chunks_cache_path = None
             self._vectors_cache_path = None
+        # FTS index + optional sqlite-vec backend share the cache lifecycle.
+        if self._fts is not None:
+            try:
+                self._fts.close()
+            except Exception:
+                pass
+            self._fts = None
+        if self._fts_cache_path is not None:
+            try:
+                if self._fts_cache_path.exists():
+                    self._fts_cache_path.unlink()
+            except OSError:
+                removed = False
+        try:
+            self._vector_backend.purge()
+        except Exception:
+            pass
         return removed
 
     def rebuild(self) -> list[Chunk]:
         """Drop both cache layers and the in-memory index, then rebuild from scratch."""
         with self._cache_lock:
-            for cache_file in (self._chunks_cache_path, self._vectors_cache_path):
+            for cache_file in (self._chunks_cache_path, self._vectors_cache_path, self._fts_cache_path):
                 if cache_file is not None:
                     try:
                         if cache_file.exists():
                             cache_file.unlink()
                     except OSError:
                         pass
+            if self._fts is not None:
+                try:
+                    self._fts.close()
+                except Exception:
+                    pass
+                self._fts = None
         with self._sync_lock:
             self._chunks.clear()
             self._signatures.clear()
             self.failed_files.clear()
-            return self._sync_locked()
+            result = self._sync_locked()
+            # _sync_locked's FTS hooks are no-ops while _fts is None; recreate the
+            # index instance so the rebuild actually repopulates it.
+            if self.config.use_hybrid and self._fts_cache_path is not None:
+                try:
+                    self._fts = FtsIndex(self._fts_cache_path)
+                    if not self._fts.available:
+                        self._fts = None
+                except Exception:
+                    self._fts = None
+                if self._fts is not None:
+                    for source, chunks in self._chunks.items():
+                        self._fts_upsert(source, chunks)
+            return result
 
     _READABLE_SUFFIXES = {".md", ".markdown"}
 

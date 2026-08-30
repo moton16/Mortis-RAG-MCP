@@ -18,6 +18,7 @@ A standard-library-only MCP server for Obsidian-style Markdown knowledge bases (
 - **Disk cache**: chunk signatures + float32 embeddings are persisted (default `~/.vault_mcp_cache`), so restarts skip the full embedding pass (`kb_stats` reports `cache_enabled`).
 - **Concurrent embedding**: changed files are embedded in parallel (`cache.embedding_max_workers`).
 - **Cache placement**: `cache.placement = "vault"` stores each vault's vectors inside that vault's `.mcp_cache/` subfolder (configurable via `cache.subdir`) instead of the shared home cache. Recommended when distributing vault folders.
+- **Hybrid search (0.4.0)**: `kb_search` fuses three routes with RRF — FTS5 BM25 (trigram tokenizer, native SQLite), vector cosine, and a bigram lexical layer (covers <3-char CJK queries that trigram can't match). Toggle with `[index] use_hybrid` (default true); `[vector] backend` reserves a storage abstraction seam (default `memory`; optional `sqlite_vec`).
 - Config resolution chain: `--app-config` > `VAULT_MCP_CONFIG` env var > `~/.vault_mcp/config.toml` > built-in defaults. A legacy `[vault].path` in the config is auto-imported into the registry on first run. API keys fall back to the `VAULT_MCP_API_KEY` environment variable.
 - Ignores `.obsidian`, the cache subfolder, non-Markdown files, and common temporary Markdown files. `source` is always vault-relative with `/` separators.
 

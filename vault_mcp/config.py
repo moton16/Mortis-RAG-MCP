@@ -39,6 +39,13 @@ class RerankerConfig:
     timeout: float = 30.0
 
 
+@dataclass(slots=True)
+class VectorConfig:
+    # 向量存储后端："memory"（默认，numpy 暴力扫描 + 现有 .bin 缓存）或
+    # "sqlite_vec"（可选依赖 sqlite-vec，未安装时自动回退 memory）。
+    backend: str = "memory"
+
+
 DEFAULT_CACHE_DIR = os.path.join(os.path.expanduser("~"), ".vault_mcp_cache")
 
 
@@ -79,7 +86,11 @@ class AppConfig:
     vault_path: str = ""
     embedding: EmbeddingConfig = field(default_factory=EmbeddingConfig)
     reranker: RerankerConfig = field(default_factory=RerankerConfig)
+    vector: VectorConfig = field(default_factory=VectorConfig)
     cache: CacheConfig = field(default_factory=CacheConfig)
+    # 混合检索开关：true（默认）用 FTS5 BM25 + 向量余弦 + bigram 词法三路 RRF
+    # 融合；false 完整还原旧的「词法软信号 + 余弦」行为。
+    use_hybrid: bool = True
     chunk_size: int = 1200
     chunk_overlap: int = 0
     debounce_seconds: float = 0.5
@@ -104,6 +115,8 @@ class AppConfig:
             raise ValueError("cache.namespace must not be empty")
         if self.cache.max_age_days < 0:
             raise ValueError("cache.max_age_days must be >= 0")
+        if self.vector.backend not in {"memory", "sqlite_vec"}:
+            raise ValueError("vector.backend must be 'memory' or 'sqlite_vec'")
         if self.chunk_size < 1:
             raise ValueError("chunk_size must be positive")
         if self.chunk_overlap < 0 or self.chunk_overlap >= self.chunk_size:
@@ -199,6 +212,7 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
     vault = _section(data, "vault")
     embedding = {**data, **_section(data, "embedding")}
     reranker = {**data, **_section(data, "reranker")}
+    vector = {**data, **_section(data, "vector")}
     cache = {**data, **_section(data, "cache")}
     index = _section(data, "index")
 
@@ -253,7 +267,9 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
         vault_path=str(vault_path),
         embedding=emb,
         reranker=rer,
+        vector=VectorConfig(backend=str(vector.get("backend", "memory")).lower()),
         cache=cch,
+        use_hybrid=bool(index.get("use_hybrid", data.get("use_hybrid", True))),
         chunk_size=int(index.get("chunk_size", data.get("chunk_size", 1200))),
         chunk_overlap=int(index.get("chunk_overlap", data.get("chunk_overlap", 0))),
         debounce_seconds=float(index.get("debounce_seconds", data.get("debounce_seconds", 0.5))),
