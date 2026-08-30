@@ -153,3 +153,18 @@ def test_stats_exposes_new_keys(tmp_path):
     assert stats["use_hybrid"] is True
     assert stats["fts_enabled"] is True
     assert stats["vector_backend"] == "memory"
+
+
+def test_warm_cache_upgrade_populates_fts(tmp_path):
+    """A second indexer over an unchanged vault (warm .bin cache, no file
+    changes) must still populate FTS — the sync-only hook would never fire."""
+    (tmp_path / "a.md").write_text("# A\n星核猎手专属内容", encoding="utf-8")
+    first = _hybrid_indexer(tmp_path, _static_config(tmp_path))
+    assert first._fts is not None
+    assert first._fts.count() == len(first.all_chunks())
+
+    second = MarkdownIndexer(tmp_path, _static_config(tmp_path))
+    second.sync()
+    assert second._fts is not None
+    assert second._fts.count() == len(second.all_chunks())
+    assert second.search("星核猎手", top_k=5, use_rerank=False)

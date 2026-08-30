@@ -316,7 +316,7 @@ python -m pytest -q tests/test_mcp_stdio.py
 - **开关**：`[index] use_hybrid`（默认 true）；false 时逐字走旧路径。FTS 索引依赖 `[cache] enabled = true`，缓存关闭时自动降级旧行为。
 - **向量抽象层**（新模块 `vector.py`）：`VectorBackend` Protocol + `MemoryVectorBackend`（默认，包装现有 numpy 暴力扫描，存储格式不变）+ 可选 `SqliteVecBackend`（`[vector] backend="sqlite_vec"` 且 `pip install sqlite-vec` 成功才激活，失败静默回退 memory）——为库规模上 5 万切片后的 Phase 2 预留无损升级位。
 - **stats() 新增**：`use_hybrid` / `fts_enabled` / `vector_backend`（纯增量，兼容旧客户端）。
-- **测试**：52 个用例全绿（新增 `test_hybrid.py` 7 项：三路 RRF 合并、2 字 CJK bigram 兜底、开关还原旧行为、FTS 缺失/失败降级、增量同步更新 FTS、rebuild/purge 清理、stats 新键）。实测确认：13k 条 1024 维向量 KNN 14.8ms、FTS 中文 BM25 命中正确、trigram <3 字查询 0 命中（由 bigram 路兜底）。
+- **测试**：53 个用例全绿（新增 `test_hybrid.py` 8 项：三路 RRF 合并、2 字 CJK bigram 兜底、开关还原旧行为、FTS 缺失/失败降级、增量同步更新 FTS、rebuild/purge 清理、stats 新键）。实测确认：13k 条 1024 维向量 KNN 14.8ms、FTS 中文 BM25 命中正确、trigram <3 字查询 0 命中（由 bigram 路兜底）。
 
 ### 阶段 3：通用化改造 —— 用户级 Vault 注册表（2026-08-30，本会话）
 

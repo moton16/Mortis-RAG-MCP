@@ -382,6 +382,13 @@ class MarkdownIndexer:
                 self._fts = FtsIndex(self._fts_cache_path)
                 if not self._fts.available:
                     self._fts = None
+                else:
+                    # Warm-cache upgrade path: chunks were loaded from the .bin
+                    # cache, so no file counts as "changed" and sync() alone would
+                    # never populate FTS. Rebuild from in-memory chunks whenever
+                    # the row count differs from the chunk count (also covers a
+                    # crash mid-build). Idempotent: upsert is delete-by-source.
+                    self._fts_ensure_populated()
             except Exception:
                 self._fts = None
         # Vector backend seam: default memory (numpy brute-force over chunk.embedding);
@@ -607,6 +614,22 @@ class MarkdownIndexer:
                 self._fts.close()
             except Exception:
                 pass
+            self._fts = None
+
+    def _fts_ensure_populated(self) -> None:
+        """Populate FTS from in-memory chunks when the row count is stale.
+
+        Covers the warm-cache upgrade (no changed files -> sync writes nothing)
+        and crash-mid-build states. Idempotent via delete-by-source upserts.
+        """
+        if self._fts is None:
+            return
+        try:
+            total = len(self.all_chunks())
+            if total and self._fts.count() != total:
+                for source, chunks in self._chunks.items():
+                    self._fts_upsert(source, chunks)
+        except Exception:
             self._fts = None
 
     def _fts_delete(self, source: str) -> None:
