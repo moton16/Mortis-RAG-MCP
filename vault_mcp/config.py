@@ -106,6 +106,13 @@ class AppConfig:
     rrf_per_route: int = 40
     rerank_cap: int = 60
     debounce_seconds: float = 0.5
+    # 文件监听方式："auto"（默认）= Windows 原生 ReadDirectoryChangesW 可用就用，
+    # 否则退回轮询；"native" = 优先原生，启动失败退回轮询；"poll" = 始终轮询
+    #（0.4.1 及以前的行为）。
+    watch_method: str = "auto"
+    # 原生监听生效期间的低频兜底：每隔这么多秒做一次全量 sha256 对账，覆盖
+    # 原生事件可能丢失的极端情况。<=0 关闭兜底同步（只保留事件驱动）。
+    watch_fallback_interval: float = 30.0
     exclude_patterns: list[str] = field(default_factory=lambda: list(DEFAULT_EXCLUDE_PATTERNS))
     exclude_tags: list[str] = field(default_factory=lambda: list(DEFAULT_EXCLUDE_TAGS))
     exclude_frontmatter_keys: list[str] = field(default_factory=lambda: list(DEFAULT_EXCLUDE_FRONTMATTER_KEYS))
@@ -143,6 +150,10 @@ class AppConfig:
             raise ValueError("rrf_per_route must be >= 1")
         if self.rerank_cap < 1:
             raise ValueError("rerank_cap must be >= 1")
+        if self.watch_method not in {"auto", "native", "poll"}:
+            raise ValueError("watch_method must be 'auto', 'native' or 'poll'")
+        if self.watch_fallback_interval < 0:
+            raise ValueError("watch_fallback_interval must be >= 0")
 
 
 def _env(value: Any) -> Any:
@@ -300,6 +311,8 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
         rrf_per_route=int(index.get("rrf_per_route", data.get("rrf_per_route", 40))),
         rerank_cap=int(index.get("rerank_cap", data.get("rerank_cap", 60))),
         debounce_seconds=float(index.get("debounce_seconds", data.get("debounce_seconds", 0.5))),
+        watch_method=str(index.get("watch_method", data.get("watch_method", "auto"))).strip().lower(),
+        watch_fallback_interval=float(index.get("watch_fallback_interval", data.get("watch_fallback_interval", 30.0))),
         exclude_patterns=exclude_patterns,
         exclude_tags=exclude_tags,
         exclude_frontmatter_keys=exclude_fm,

@@ -16,11 +16,17 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from .config import AppConfig
+from . import fsnotify
+from .fsnotify import WindowsDirectoryWatcher, watcher_available
 from .fts import FtsIndex
 from .providers import EmbeddingProvider, RerankerProvider, create_embedding_provider, create_reranker_provider
 from .vector import create_vector_backend
 
 _RRF_K = 60
+
+# native 监听回调的防抖延迟上限：编辑器保存风暴（事件持续不断）会让防抖定时器
+# 一直顺延，超过这个窗口就必须同步一次，不能让事件流饿死同步。
+_FS_MAX_DEBOUNCE_WAIT = 5.0
 
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
 _WORD_RE = re.compile(r"[\w]+", re.UNICODE)
@@ -430,6 +436,14 @@ class MarkdownIndexer:
         self.last_sync: float | None = None
         self._watch_stop = threading.Event()
         self._watch_thread: threading.Thread | None = None
+        # native 监听（Windows ReadDirectoryChangesW）：watcher 本体 + 防抖状态。
+        # 防抖定时器到点后做一次全量 sync；事件密集时不断顺延但受
+        # _FS_MAX_DEBOUNCE_WAIT 封顶（见 _on_fs_events）。
+        self._fs_watcher: WindowsDirectoryWatcher | None = None
+        self._fs_debounce_lock = threading.Lock()
+        self._fs_debounce_timer: threading.Timer | None = None
+        self._fs_pending_since: float | None = None
+        self._fs_debounce_seconds: float = 0.5
         self._sync_lock = threading.Lock()
         self._cache_lock = threading.Lock()
         self._chunks_cache_path: Path | None = None
@@ -723,6 +737,7 @@ class MarkdownIndexer:
 
     def _sync_locked(self) -> list[Chunk]:
         self.vault_path.mkdir(parents=True, exist_ok=True)
+        failed_before = dict(self.failed_files)
         found: set[str] = set()
         changed: list[tuple[str, str, list[Chunk]]] = []
         for path in self._markdown_files():
@@ -778,11 +793,12 @@ class MarkdownIndexer:
         # cache was invalidated (model/dimension change) this re-embeds the whole
         # corpus while reusing the text chunks; when only a few files changed it
         # embeds just those chunks.
-        self._embed_missing()
+        embed_did_work = self._embed_missing()
         # Disk-backed mode: persist newly embedded vectors and release RAM.
         self._flush_vectors_to_disk()
 
-        for source in set(self._chunks) - found:
+        removed: set[str] = set(self._chunks) - found
+        for source in removed:
             removed_ids = [chunk.id for chunk in self._chunks.get(source, [])]
             self._chunks.pop(source, None)
             self._signatures.pop(source, None)
@@ -795,7 +811,10 @@ class MarkdownIndexer:
                 except Exception:
                     pass
         self.last_sync = time.time()
-        self._save_cache()
+        # 什么都没变时跳过缓存重写：原生监听（[cache] placement = "vault"）下，
+        # 每次写缓存都会再次触发文件事件，无变化也重写等于自激的同步死循环。
+        if changed or removed or embed_did_work or self.failed_files != failed_before:
+            self._save_cache()
         return self.all_chunks()
 
     def _ensure_disk_vectors_migrated(self) -> None:
@@ -932,13 +951,14 @@ class MarkdownIndexer:
             reused += 1
         return reused
 
-    def _embed_missing(self) -> set[str]:
+    def _embed_missing(self) -> bool:
         """Embed every chunk that has no vector yet.
 
-        Returns the set of sources whose chunks all got vectors. When the vectors
-        cache was invalidated (model/dimension change) this re-embeds the whole
-        corpus while reusing the text chunks; when only a few files changed it
-        embeds just those chunks.
+        Returns True when there was embedding work to do (or failures to record),
+        so the caller knows whether the cache files need rewriting. When the
+        vectors cache was invalidated (model/dimension change) this re-embeds the
+        whole corpus while reusing the text chunks; when only a few files changed
+        it embeds just those chunks.
 
         注意：失败文件的重试是天然的——这里的判据是"缺向量"（memory 后端看
         chunk.embedding is None，磁盘后端看 chunk.id not in _disk_vectors），
@@ -954,7 +974,7 @@ class MarkdownIndexer:
             if missing:
                 pending[source] = missing
         if not pending:
-            return set(self._chunks)
+            return False
 
         if self.config.embedding.mode != "external":
             for source, chunks in pending.items():
@@ -967,7 +987,7 @@ class MarkdownIndexer:
                 else:
                     # 补向量成功即撤销旧失败记录，否则持久化文件会永久撒谎。
                     self.failed_files.pop(source, None)
-            return set(self._chunks)
+            return True
 
         max_workers = self.config.cache.embedding_max_workers
         tasks = list(pending.items())
@@ -979,7 +999,7 @@ class MarkdownIndexer:
                     self.failed_files[source] = str(exc)
                 else:
                     self.failed_files.pop(source, None)
-            return set(self._chunks)
+            return True
 
         failures: dict[str, str] = {}
         with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="vault-emb") as pool:
@@ -998,7 +1018,7 @@ class MarkdownIndexer:
                 self.failed_files[source] = failures[source]
             else:
                 self.failed_files.pop(source, None)
-        return set(self._chunks)
+        return True
 
     @staticmethod
     def _embed_one_file(source: str, chunks: list[Chunk], provider: EmbeddingProvider) -> None:
@@ -1853,15 +1873,100 @@ class MarkdownIndexer:
     def start_watching(self, interval: float = 0.25, debounce_seconds: float | None = None) -> None:
         if self._watch_thread and self._watch_thread.is_alive():
             return
+        if self._fs_watcher is not None and self._fs_watcher.is_alive():
+            return
         debounce = self.config.debounce_seconds if debounce_seconds is None else debounce_seconds
+        self._fs_debounce_seconds = debounce
         self.sync()
         self._watch_stop.clear()
+        method = self.config.watch_method
+        # auto：平台支持就用原生；native：优先原生（比如想在非 Windows 上显式
+        # 表达意图）；两者启动失败都静默退回轮询，监听永不因此失效。
+        if method in {"auto", "native"} and (method == "native" or watcher_available()):
+            watcher = WindowsDirectoryWatcher(self.vault_path, self._on_fs_events)
+            if watcher.start():
+                self._fs_watcher = watcher
+                self._watch_thread = threading.Thread(
+                    target=self._native_watch_loop, args=(interval, debounce), daemon=True, name="vault-watch-native"
+                )
+                self._watch_thread.start()
+                return
+            self._fs_watcher = None
         self._watch_thread = threading.Thread(target=self._watch_loop, args=(interval, debounce), daemon=True)
         self._watch_thread.start()
 
+    def _on_fs_events(self, events: list[tuple[int, str]] | None) -> None:
+        """原生监听的回调：把「库里有动静」翻译成一次防抖后的全量 sync。
+
+        事件里带哪些路径完全不重要——正确性由 sync() 的全量 sha256 对账兜底，
+        这里不解析、不增量处理。events=None（内核缓冲区溢出，具体改动不可知）
+        也走同一条路，反正 sync 本来就是全量的。
+        """
+        with self._fs_debounce_lock:
+            now = time.monotonic()
+            if self._fs_pending_since is None:
+                self._fs_pending_since = now
+            # 防抖：事件安静 debounce 秒后才同步；事件持续到达就不断顺延定时器，
+            # 但受 _FS_MAX_DEBOUNCE_WAIT 封顶（延迟归零，尽快同步一次）。
+            delay = self._fs_debounce_seconds
+            if now - self._fs_pending_since >= _FS_MAX_DEBOUNCE_WAIT:
+                delay = 0.0
+            if self._fs_debounce_timer is not None:
+                self._fs_debounce_timer.cancel()
+            timer = threading.Timer(delay, self._fs_fire_sync)
+            timer.daemon = True
+            self._fs_debounce_timer = timer
+        timer.start()
+
+    def _fs_fire_sync(self) -> None:
+        with self._fs_debounce_lock:
+            self._fs_debounce_timer = None
+            self._fs_pending_since = None
+        if self._watch_stop.is_set():
+            return
+        try:
+            self.sync()
+        except Exception:
+            pass
+
+    def _native_watch_loop(self, interval: float, debounce: float) -> None:
+        """原生监听生效期间的兜底循环，职责有二：
+
+        1. 低频（watch_fallback_interval，默认 30s）全量对账，覆盖原生事件可能
+           丢失的极端情况——sync 是全量 sha256 对账，多跑只是白花一点 IO；
+        2. 盯住 watcher 线程存活性：一旦它退出（句柄失效等），退回全速轮询，
+           监听永不静默失效。
+        """
+        fallback_interval = self.config.watch_fallback_interval
+        while not self._watch_stop.is_set():
+            if self._fs_watcher is None or not self._fs_watcher.is_alive():
+                break
+            if self._watch_stop.wait(fallback_interval if fallback_interval > 0 else interval):
+                return
+            if self._fs_watcher is None or not self._fs_watcher.is_alive():
+                break
+            if fallback_interval > 0:
+                try:
+                    self.sync()
+                except Exception:
+                    pass
+        if self._watch_stop.is_set():
+            return
+        # 降级：原生线程已退出，退回 0.25s 全速轮询（0.4.1 行为）。
+        watcher = self._fs_watcher
+        self._fs_watcher = None
+        if watcher is not None:
+            watcher.stop()
+        self._watch_loop(interval, debounce)
+
     def _watch_loop(self, interval: float, debounce: float) -> None:
         pending_since: float | None = None
+        # 基线必须取在 sync 之前：先 sync 后取基线的话，「sync 完成到取基线之间」
+        # 落盘的改动会被当成已同步而从此丢失——线程刚启动时这个窗口最大（主线程
+        # 往往在 watcher 线程第一次扫描前就写完了文件）。先取基线再 sync，两者
+        # 之间出现的改动由随后的 sync 补上，之后的改动才由轮询发现。
         previous = self._quick_signatures()
+        self.sync()
         while not self._watch_stop.wait(interval):
             current = self._quick_signatures()
             if current != previous:
@@ -1878,6 +1983,14 @@ class MarkdownIndexer:
 
     def stop_watching(self) -> None:
         self._watch_stop.set()
+        with self._fs_debounce_lock:
+            timer, self._fs_debounce_timer = self._fs_debounce_timer, None
+            self._fs_pending_since = None
+        if timer is not None:
+            timer.cancel()
+        watcher, self._fs_watcher = self._fs_watcher, None
+        if watcher is not None:
+            watcher.stop()
         if self._watch_thread:
             self._watch_thread.join(timeout=2)
             self._watch_thread = None

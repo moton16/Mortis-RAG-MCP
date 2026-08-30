@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import atexit
 import json
 import sys
 import threading
@@ -209,6 +210,17 @@ class VaultMcpServer:
         self._migrate_legacy()
         # 所有已注册库在后台线程串行预索引，MCP 握手（initialize）永不阻塞。
         self._start_background_index()
+        # 原生监听持有目录句柄；serve_stdio 有 finally 清理，但嵌入式用法
+        # （测试、脚本）没有——注册 atexit 保证句柄在进程退出前释放。
+        atexit.register(self.shutdown)
+
+    def shutdown(self) -> None:
+        """停掉所有知识库的文件监听（幂等，可重复调用）。"""
+        for indexer in list(self._indexers.values()):
+            try:
+                indexer.stop_watching()
+            except Exception:
+                pass
 
     def _migrate_legacy(self) -> None:
         """First run after upgrading: import the legacy [vault].path into the
