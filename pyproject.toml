@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mortis-rag-mcp"
-version = "0.4.1"
+version = "0.5.0"
 description = "Mortis'RAG MCP - registry-based Markdown knowledge base RAG server (MCP over stdio, zero runtime dependencies)"
 requires-python = ">=3.10"
 dependencies = []

@@ -13,7 +13,7 @@ from .config import load_config, resolve_config_path
 from .indexer import Chunk, MarkdownIndexer, SearchFilter, dedupe_by_content_hash, rerank_chunks
 from .registry import VaultEntry, VaultRegistry, registry_path
 
-SERVER_INFO = {"name": "mortis-rag-mcp", "version": "0.4.1", "title": "Mortis'RAG MCP"}
+SERVER_INFO = {"name": "mortis-rag-mcp", "version": "0.5.0", "title": "Mortis'RAG MCP"}
 
 
 def _parse_epoch(value: Any) -> float | None:

@@ -159,6 +159,9 @@ dimension = 1024
 send_dimensions = false                        # bge-m3 不接受 dimensions 字段
 api_key = "${VAULT_MCP_API_KEY}"               # 环境变量插值，或留空回退 VAULT_MCP_API_KEY
 timeout = 60
+max_retries = 3                                # 0.5.0：首败后的额外重试次数（指数退避）
+batch_size = 32                                # 0.5.0：单请求最大文本数（<=0 = 旧的整文件单请求）
+retry_backoff = 1.0                            # 0.5.0：退避基数秒；429 时服务端 Retry-After 优先
 
 [reranker]
 enabled = true
@@ -171,6 +174,11 @@ timeout = 60
 chunk_size = 1200        # 按字符数切块
 chunk_overlap = 150      # 相邻块重叠字符数（防止剧情长文切块断裂）
 debounce_seconds = 0.5   # 文件变更防抖
+rrf_per_route = 40       # 0.5.0：RRF 每路候选宽度（原硬编码）
+rerank_cap = 60          # 0.5.0：单次 rerank API 的 chunk 上限（原硬编码）
+watch_method = "auto"    # 0.5.0：auto=可用就用原生事件 / native=优先原生 / poll=0.4.x 轮询
+watch_fallback_interval = 30.0  # 0.5.0：原生监听期间的全量对账周期秒（0=关闭）
+inject_image_captions = false   # 0.5.0：图片 alt/图注注入；开启=可检索但会全量重嵌，慎开
 
 [cache]
 enabled = true
@@ -194,7 +202,7 @@ python -m vault_mcp --serve-mcp-stdio --app-config .\config\app.toml
 
 ### 3.4 功能模块 / API 调用方式
 
-共 9 个工具，均为 `tools/call` 的 JSON-RPC 请求：
+共 12 个工具，均为 `tools/call` 的 JSON-RPC 请求：
 
 #### `kb_init` — 注册知识库（0.3.0 新增，首次使用必调）
 
@@ -232,6 +240,13 @@ python -m vault_mcp --serve-mcp-stdio --app-config .\config\app.toml
 - `top_k`：返回条数，默认 10。
 - `use_rerank`：默认 `true`，调用免费 bge-reranker-v2-m3 对 top-60 精排。
 - `vault_path`：可选，**已注册**知识库的绝对路径；**缺省时跨全部注册库 fan-out 检索**（每库取候选 → 合并 → query 只 embed 一次 → 统一 rerank 一次），结果每项带 `vault`（注册路径）与 `vault_name` 字段，另有 `searched`/`errors` 汇总。
+- **0.5.0 过滤与分页**（过滤在 rerank 之前执行，不浪费配额；fan-out 时过滤逐库生效、分页在全局合并后一次完成）：
+  - `path_prefix`：只保留 `source` 以该前缀开头的 chunk（如 `"教材/"`）；
+  - `tags`：frontmatter 标签过滤，命中任一即可（大小写不敏感，自动去 `#`）；
+  - `mtime_after` / `mtime_before`：按文件内容最后修改时间过滤（epoch 秒或 ISO 8601 字符串，闭区间）；
+  - `offset` / `limit`：分页参数，`limit` 缺省回落到 `top_k`；
+  - `group_by_vault`：仅 fan-out 生效，按库分组返回 `groups`（组序按各组最高分降序，每组各取一页）；
+  - `dedupe`：默认 `true`，正文完全相同的 chunk 只保留最前一条（重复备份不再占 top_k）。
 - 检索链路：bigram 词法软打分 → 全库 embedding 余弦召回（numpy 加速）→ 词法加分融合 →（可选）rerank 精排 → 返回 top_k。
 
 返回（`chunks[]` 内每项，fan-out 时多出 `vault`/`vault_name`）：
@@ -239,7 +254,7 @@ python -m vault_mcp --serve-mcp-stdio --app-config .\config\app.toml
 {
   "id": "sha1...", "content": "切片原文", "score": 0.93,
   "source": "星穹铁道.md", "title": "卡芙卡与银狼",
-  "metadata": {"heading": "卡芙卡与银狼", "start_line": 1, "end_line": 5, "chunk_index": 0, "tags": []}
+  "metadata": {"heading": "卡芙卡与银狼", "start_line": 1, "end_line": 5, "chunk_index": 0, "tags": [], "mtime": 1788000000.0, "content_hash": "0123456789abcdef"}
 }
 ```
 
@@ -279,6 +294,28 @@ python -m vault_mcp --serve-mcp-stdio --app-config .\config\app.toml
 {"name": "kb_rebuild", "arguments": {"vault_path": "C:\\Users\\you\\1\\Obsidian Vault"}}
 ```
 首次建库、模型/维度/切块参数变更、缓存损坏时使用。
+
+#### `kb_set_weight` — 设置库级检索权重（0.5.0 新增）
+
+```json
+{"name": "kb_set_weight", "arguments": {"vault_path": "D:\\笔记\\工作库", "weight": 2.5}}
+```
+
+- 跨库 fan-out 检索时，该库所有 chunk 的分数先乘以 `weight` 再参与全局排序，用于表达「这个库更重要」。
+- 取值 0 < weight <= 100，默认 1.0（不放大）；权重持久化在注册表（v2），老 toml 自动容错为 1.0。
+- 配合 `kb_search` 的 `group_by_vault = true` 可以「权重定组序、组内看相关度」。
+
+#### `kb_export` / `kb_import` — 索引快照迁移（0.5.0 新增）
+
+```json
+{"name": "kb_export", "arguments": {"out_path": "D:\\backup\\work-snapshot.zip", "vault_path": "D:\\笔记\\工作库"}}
+{"name": "kb_import", "arguments": {"snapshot": "D:\\backup\\work-snapshot.zip", "vault_path": "D:\\笔记\\工作库"}}
+```
+
+- 换机/换目录不再需要全量重新 embedding：`kb_export` 把 chunks + 向量 + FTS 三层缓存连同 manifest（格式版本/cache key/模型维度/统计）打包成 zip；在新机器上先 `kb_init` 注册目标目录，再 `kb_import` 恢复。
+- **核心承诺：导入后的下一次同步 0 次 embedding API 调用**（文本层、向量、FTS 原样落地；本机 cache key 由导入逻辑自动重写）。
+- 安全：zip 成员按白名单精确校验（路径穿越名直接拒绝）；快照的向量模型/维度与本机配置不一致时拒绝导入，`force = true` 可强制——此时只导入文本层，向量由本地重新计算。
+- 前提：`[cache] enabled = true` 且导出前完成过至少一次索引。
 
 ### 3.5 运行测试
 
@@ -491,3 +528,4 @@ python -m pytest -q tests/test_mcp_stdio.py
 | 2026-08-07 | 磁盘缓存、增量同步、并发 embedding、多库/子库、kb_rebuild |
 | 2026-08-08 | 管线修复：词法软信号+bigram 分词、rerank 默认开启、numpy 语义加速、维度 1024、chunk_overlap 修复、缓存 meta 补全；备份于 `E:\Softwares\WorkCache\2026-08-08-17-37-58\bak\` |
 | 2026-08-08 | 分层持久化缓存落地：chunks/vectors 两层独立失效、缓存 key 规范化（normcase+realpath / cache.id）、换模型只重算向量、namespace/max_age_days 配置、测试隔离；备份于 `bak\*.cachefix.*` |
+| 2026-08-30 | 0.5.0（分支 `feat/embedding-resilience-and-search-upgrades`）：embedding 重试/退避/切批、failed_files 持久化、检索过滤+分页+内容去重、库级权重+分组 fan-out、图片 alt/图注注入（opt-in）、Windows 原生目录监听（fsnotify）、kb_export/kb_import 快照迁移、RRF/rerank 参数可配置；默认配置升级 0 次重嵌 |
