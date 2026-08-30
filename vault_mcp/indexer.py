@@ -21,7 +21,6 @@ from .providers import EmbeddingProvider, RerankerProvider, create_embedding_pro
 from .vector import create_vector_backend
 
 _RRF_K = 60
-_RRF_PER_ROUTE = 40
 
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
 _WORD_RE = re.compile(r"[\w]+", re.UNICODE)
@@ -1057,8 +1056,9 @@ class MarkdownIndexer:
                 # pass it in, so N vaults cost one embed call instead of N.
                 if query_vector is None:
                     query_vector = self.embedding_provider.embed([query])[0]
-                # 60 covers the rerank candidate cap; RRF caps at 40 per route.
-                vec_limit = max(top_k, _RRF_PER_ROUTE, 60)
+                # Rerank candidate cap + per-route RRF width both come from
+                # config so callers can trade recall vs API payload size.
+                vec_limit = max(top_k, self.config.rrf_per_route, self.config.rerank_cap)
                 pairs = self._vector_backend.query(query_vector, vec_limit)
                 semantic_snapshot = dict(pairs)
                 for chunk in all_chunks:
@@ -1088,7 +1088,7 @@ class MarkdownIndexer:
         ranked.sort(key=lambda chunk: (-chunk.score, chunk.source, chunk.metadata["chunk_index"]))
 
         if use_rerank and self.reranker_provider and ranked:
-            ranked = rerank_chunks(query, ranked, self.reranker_provider)
+            ranked = rerank_chunks(query, ranked, self.reranker_provider, cap=self.config.rerank_cap)
         return ranked[: max(0, top_k)]
 
     def _fts_query(self, query: str) -> str | None:
@@ -1130,14 +1130,14 @@ class MarkdownIndexer:
         fts_sql = self._fts_query(query)
         if fts_sql is not None and self._fts is not None:
             try:
-                routes.append([chunk_id for chunk_id, _score in self._fts.search(fts_sql, _RRF_PER_ROUTE)])
+                routes.append([chunk_id for chunk_id, _score in self._fts.search(fts_sql, self.config.rrf_per_route)])
             except Exception:
                 pass
 
         # Route B: vector cosine, raw and descending.
         if semantic_snapshot:
             ordered = sorted(semantic_snapshot.items(), key=lambda item: -item[1])
-            routes.append([chunk_id for chunk_id, _score in ordered[:_RRF_PER_ROUTE]])
+            routes.append([chunk_id for chunk_id, _score in ordered[: self.config.rrf_per_route]])
 
         # Route C: bigram lexical soft scores, descending, score > 0 only.
         lexical_ordered = sorted(
@@ -1145,7 +1145,7 @@ class MarkdownIndexer:
             key=lambda item: -item[1],
         )
         if lexical_ordered:
-            routes.append([chunk_id for chunk_id, _score in lexical_ordered[:_RRF_PER_ROUTE]])
+            routes.append([chunk_id for chunk_id, _score in lexical_ordered[: self.config.rrf_per_route]])
 
         if not routes:
             return []

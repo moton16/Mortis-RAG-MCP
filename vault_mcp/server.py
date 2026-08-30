@@ -321,7 +321,7 @@ class VaultMcpServer:
                     break
             if provider is not None:
                 pool = [chunk for _, chunk in merged]
-                reranked = rerank_chunks(query, pool, provider)
+                reranked = rerank_chunks(query, pool, provider, cap=self.config.rerank_cap)
                 origin = {id(chunk): entry for entry, chunk in merged}
                 pairs = [(origin[id(chunk)], chunk) for chunk in reranked]
 
