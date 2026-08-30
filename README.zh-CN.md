@@ -7,6 +7,8 @@
 - 当前版本：`vault-mcp 0.3.0`
 - 知识库：**不绑定任何路径** —— 任意文件夹通过 `kb_init` 注册为知识库，注册表持久化于 `~/.vault_mcp/vaults.toml`（跨重启/跨设备可用）
 
+> **新用户看这里**：下载后如何初始化（装包 → 配 key → 接入 MCP 客户端 → `kb_init` 建库 → 安装配套 Skill），见 [docs/QUICKSTART.md](docs/QUICKSTART.md)。
+
 ---
 
 ## 一、技术栈清单
