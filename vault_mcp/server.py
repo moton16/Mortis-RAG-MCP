@@ -11,7 +11,7 @@ from .config import load_config, resolve_config_path
 from .indexer import MarkdownIndexer, Chunk, rerank_chunks
 from .registry import VaultEntry, VaultRegistry, registry_path
 
-SERVER_INFO = {"name": "mortis-rag-mcp", "version": "0.4.0", "title": "Mortis'RAG MCP"}
+SERVER_INFO = {"name": "mortis-rag-mcp", "version": "0.4.1", "title": "Mortis'RAG MCP"}
 
 
 def _json_result(request_id: Any, result: Any) -> dict[str, Any]:

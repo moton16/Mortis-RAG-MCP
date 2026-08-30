@@ -3,6 +3,22 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 与
 [Semantic Versioning](https://semver.org/lang/zh-CN/)。提交信息为 Conventional Commits。
 
+## [0.4.1] - 2026-08-30
+
+### Fixed
+
+- **安装兜底指引补全**：此前 `Cannot import 'setuptools.build_meta'` 的文档兜底只写了
+  `--no-build-isolation`，对"setuptools 缺失/损坏"（Codex/Trae 等捆绑 Python 常见）的场景
+  无效，用户被迫先修 pip 才能装包。现在三份文档（README 中英 / QUICKSTART）统一改为：
+  `pip install --upgrade pip setuptools wheel` 修环境 → 重试 → 极端情况才降级
+  `--no-build-isolation`；并明确"零依赖"指运行时依赖（`dependencies=[]`），
+  setuptools 仅是 PEP 517 构建后端。
+
+### Changed
+
+- 配套 Skill 同步至 0.4.0 语义（v3.0.0）：三路 RRF 混合检索、2 字中文 bigram 兜底、
+  `use_hybrid` / `[vector] backend` 配置文档、stats 新字段、重复副本豁免技巧。
+
 ## [0.4.0] - 2026-08-30
 
 ### Added
