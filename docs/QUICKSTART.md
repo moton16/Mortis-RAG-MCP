@@ -21,6 +21,8 @@ python -m pip install -e .
 # python -m pip install -e . --no-build-isolation
 # 可选加速（批量余弦用 numpy）：
 # python -m pip install numpy
+# 可选：磁盘向量后端（向量不占内存，13k 切片约省 55MB RAM）：
+# python -m pip install "mortis-rag-mcp[vec]"   # 然后配置里开 [vector] backend = "sqlite_vec"
 ```
 
 ## 2. 配置
@@ -36,7 +38,8 @@ Copy-Item .\config\app.toml.example .\config\app.toml
    - 环境变量（推荐）：设置 `VAULT_MCP_API_KEY=<你的key>`，配置里保持 `${VAULT_MCP_API_KEY}` 即可
    - 或直接在配置里写死 `${别的环境变量名}`（支持 `${ENV_VAR}` 插值）
 3. `[reranker]`：要精排就 `enabled = true`（bge-reranker-v2-m3 免费）
-4. 分发给别人的库文件夹想连缓存一起带走：`[cache]` 里 `placement = "vault"`
+4. `[vector]`：默认 `backend = "memory"`（向量驻内存）；想省内存改成 `"sqlite_vec"`（需先装 `mortis-rag-mcp[vec]`，首次切换自动迁移旧缓存，零重嵌）
+5. 分发给别人的库文件夹想连缓存一起带走：`[cache]` 里 `placement = "vault"`
 
 ## 3. 接入 MCP 客户端
 

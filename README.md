@@ -4,6 +4,8 @@ A standard-library-only MCP server for Obsidian-style Markdown knowledge bases (
 
 > **New here?** Follow [docs/QUICKSTART.md](docs/QUICKSTART.md): clone → install → configure your API key → wire up your MCP client → `kb_init` your notes folder → optionally install the companion skill from [`skills/vault-mcp/`](skills/vault-mcp/SKILL.md).
 
+> **Release notes:** see [CHANGELOG.md](CHANGELOG.md) for per-version changes (0.4.0 = hybrid search + disk-backed vector backend).
+
 ## Implemented
 
 - `kb_init` / `kb_unregister`: register / unregister any folder as a knowledge base (persistent registry, per-vault file watcher, optional cache purge).
