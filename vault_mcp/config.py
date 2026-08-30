@@ -100,6 +100,10 @@ class AppConfig:
     use_hybrid: bool = True
     chunk_size: int = 1200
     chunk_overlap: int = 0
+    # 图片 alt/图注注入（opt-in，默认关）：开启后在每张图片所在行后插入一行
+    # `[图片: alt 图注 (文件名)]`，让图片的 alt/图注变得可检索。注意这会改变
+    # chunk content → chunk.id，等价于全库重新 embedding——所以默认必须关闭。
+    inject_image_captions: bool = False
     # Hybrid search tuning: how many candidates each RRF route (FTS5 BM25 /
     # vector cosine / bigram lexical) contributes to the fused pool, and the
     # cap on how many chunks a single rerank API call may carry.
@@ -308,6 +312,7 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
         use_hybrid=bool(index.get("use_hybrid", data.get("use_hybrid", True))),
         chunk_size=int(index.get("chunk_size", data.get("chunk_size", 1200))),
         chunk_overlap=int(index.get("chunk_overlap", data.get("chunk_overlap", 0))),
+        inject_image_captions=bool(index.get("inject_image_captions", data.get("inject_image_captions", False))),
         rrf_per_route=int(index.get("rrf_per_route", data.get("rrf_per_route", 40))),
         rerank_cap=int(index.get("rerank_cap", data.get("rerank_cap", 60))),
         debounce_seconds=float(index.get("debounce_seconds", data.get("debounce_seconds", 0.5))),

@@ -36,6 +36,13 @@ _CJK_RE = re.compile(r"[\u4e00-\u9fff]+")
 _BLOCK_IGNORE_START = re.compile(r"^\s*<!--\s*(?:rag-ignore|rag:ignore|no-rag|norag)\s*-->", re.IGNORECASE)
 _BLOCK_IGNORE_END = re.compile(r"^\s*<!--\s*(?:/rag-ignore|/rag:ignore|/no-rag|/norag|end-rag-ignore)\s*-->", re.IGNORECASE)
 
+# 图片注入（inject_image_captions）：标准 Markdown 图片与 Obsidian wiki 图片嵌入。
+_MD_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\(\s*([^)\s]+)(?:\s+\"([^\"]*)\")?\s*\)")
+_WIKI_IMAGE_RE = re.compile(r"!\[\[([^\]|]+)(?:\|([^\]]*))?\]\]")
+_FENCE_RE = re.compile(r"^\s*(?:```|~~~)")
+# wiki 嵌入只有在图片扩展名时才当图片处理：![[另一篇笔记]] 不是图片。
+_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp", ".avif"}
+
 _CACHE_MAGIC = b"VMCPC"
 _CACHE_VERSION = 1
 
@@ -213,6 +220,54 @@ def dedupe_by_content_hash(items: list[Any], chunk_of: Callable[[Any], Chunk] | 
         seen.add(digest)
         kept.append(item)
     return kept
+
+
+def _image_note(alt: str, caption: str, path: str) -> str:
+    """一张图片对应的一行注入文本：`[图片: alt 图注 (文件名)]`。"""
+    name = Path(path.replace("\\", "/")).stem
+    descriptor = " ".join(part for part in (alt, caption) if part)
+    return f"[图片: {descriptor} ({name})]" if descriptor else f"[图片: {name}]"
+
+
+def _image_notes_for_line(line: str) -> list[str]:
+    """提取一行里的所有图片，返回要插入的注入行（没有图片则返回空列表）。"""
+    notes: list[str] = []
+    for match in _MD_IMAGE_RE.finditer(line):
+        alt = match.group(1).strip()
+        path = match.group(2)
+        title = (match.group(3) or "").strip()
+        notes.append(_image_note(alt, title, path))
+    for match in _WIKI_IMAGE_RE.finditer(line):
+        path = match.group(1).strip()
+        caption = (match.group(2) or "").strip()
+        if Path(path.replace("\\", "/")).suffix.lower() not in _IMAGE_EXTS:
+            continue
+        notes.append(_image_note("", caption, path))
+    return notes
+
+
+def _inject_image_notes(lines: list[str]) -> list[str]:
+    """把图片的 alt / 图注变成可检索的正文行（纯函数，不修改输入）。
+
+    Markdown 里的图片只有路径引用，alt 与图注（Obsidian 的 ``![[path|图注]]``）
+    原本不会进入 chunk 正文，语义检索不到「这张图讲了什么」。本函数在每张图片
+    所在行之后插入一行 ``[图片: alt 图注 (文件名)]``。
+
+    代价：chunk content 变了 → chunk.id 变了 → 全库重新 embedding。所以由
+    ``config.inject_image_captions`` 门控，默认必须关闭。代码块（``` / ~~~）
+    里的图片语法只是示例文本，不注入。
+    """
+    result: list[str] = []
+    in_fence = False
+    for line in lines:
+        result.append(line)
+        if _FENCE_RE.match(line):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        result.extend(_image_notes_for_line(line))
+    return result
 
 
 class _CacheCodec:
@@ -569,7 +624,7 @@ class MarkdownIndexer:
             "key": self._cache_key(),
             "chunk_size": self.config.chunk_size,
             "chunk_overlap": self.config.chunk_overlap,
-            "chunker": 3,
+            "chunker": 4,
         }
 
     def _vectors_meta(self) -> dict[str, Any]:
@@ -1097,6 +1152,8 @@ class MarkdownIndexer:
         body_start = frontmatter_end + 1
         body = lines[body_start:]
         body, _ = self._strip_ignored_blocks(body)
+        if self.config.inject_image_captions:
+            body = _inject_image_notes(body)
         title = self._title(source, body)
         sections: list[tuple[str, int, list[str]]] = []
         current_heading = title
