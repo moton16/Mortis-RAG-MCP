@@ -509,6 +509,10 @@ class MarkdownIndexer:
         self._fs_debounce_seconds: float = 0.5
         self._sync_lock = threading.Lock()
         self._cache_lock = threading.Lock()
+        # 是否正在 sync（供 kb_stats 报进度）；连续失败次数用于监听线程的退避。
+        self._indexing = False
+        self._sync_failures = 0
+        self._stopping = False
         self._chunks_cache_path: Path | None = None
         self._vectors_cache_path: Path | None = None
         self._fts_cache_path: Path | None = None
@@ -1031,13 +1035,15 @@ class MarkdownIndexer:
         # 先做一轮内容哈希复用：已经算过的内容不再花钱重算一次。
         self._reuse_vectors_by_content_hash()
 
+        failed_before = dict(self.failed_files)
         pending: dict[str, list[Chunk]] = {}
         for source, chunks in self._chunks.items():
             missing = [chunk for chunk in chunks if not self._chunk_has_vector(chunk)]
             if missing:
                 pending[source] = missing
         if not pending:
-            return False
+            return self.failed_files != failed_before
+        pending_chunks = [chunk for chunks in pending.values() for chunk in chunks]
 
         if self.config.embedding.mode != "external":
             for source, chunks in pending.items():
@@ -1050,7 +1056,7 @@ class MarkdownIndexer:
                 else:
                     # 补向量成功即撤销旧失败记录，否则持久化文件会永久撒谎。
                     self.failed_files.pop(source, None)
-            return True
+            return self._embedding_changed_state(pending_chunks, failed_before)
 
         max_workers = self.config.cache.embedding_max_workers
         tasks = list(pending.items())
@@ -1062,7 +1068,7 @@ class MarkdownIndexer:
                     self.failed_files[source] = str(exc)
                 else:
                     self.failed_files.pop(source, None)
-            return True
+            return self._embedding_changed_state(pending_chunks, failed_before)
 
         failures: dict[str, str] = {}
         with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="vault-emb") as pool:
@@ -1081,7 +1087,22 @@ class MarkdownIndexer:
                 self.failed_files[source] = failures[source]
             else:
                 self.failed_files.pop(source, None)
-        return True
+        return self._embedding_changed_state(pending_chunks, failed_before)
+
+    def _embedding_changed_state(
+        self, pending_chunks: list[Chunk], failed_before: dict[str, str]
+    ) -> bool:
+        """本轮 embedding 是否真的改变了需要落盘的状态。
+
+        关键：全部失败时必须返回 False。此前三条路径一律 return True，
+        于是 _sync_locked 每轮都重写 chunks.bin / vectors / fts / failed.json；
+        在 [cache] placement = "vault" + 原生递归监听下，写缓存立刻再次触发
+        文件事件 → 防抖后再 sync → 再失败 → 再写缓存，形成自激死循环，
+        每轮都把全部 pending chunk 重发一遍（真的会烧钱）。
+        """
+        if self.failed_files != failed_before:
+            return True
+        return any(self._chunk_has_vector(chunk) for chunk in pending_chunks)
 
     @staticmethod
     def _embed_one_file(source: str, chunks: list[Chunk], provider: EmbeddingProvider) -> None:
@@ -1367,7 +1388,27 @@ class MarkdownIndexer:
         })
 
     def all_chunks(self) -> list[Chunk]:
-        return [chunk for source in sorted(self._chunks) for chunk in self._chunks[source]]
+        """全部 chunk 的快照。
+
+        刻意不加锁：sync() 会持 _sync_lock 跑完整个索引 + embedding（大库是
+        分钟级），读路径若等这把锁，所有搜索都会被一次全量重建阻塞。这里改用
+        乐观快照——用 .get() 容忍并发 pop（KeyError），遇到 "dictionary changed
+        size during iteration" 退避重试。PR 新增的 30s 无条件兜底 sync 把并发
+        窗口从"仅文件变动时"扩大到"每 30s 必有"，此前这两种异常会直接变成
+        MCP -32000。
+        """
+        for attempt in range(4):
+            try:
+                return [
+                    chunk
+                    for source in sorted(self._chunks)
+                    for chunk in self._chunks.get(source, [])
+                ]
+            except RuntimeError:
+                if attempt == 3:
+                    raise
+                time.sleep(0.01 * (attempt + 1))
+        return []
 
     def search(self, query: str, top_k: int = 10, use_rerank: bool = False, query_vector: Iterable[float] | None = None, filters: SearchFilter | None = None, dedupe: bool = True) -> list[Chunk]:
         # 兜底夹取：server 层已夹过一次，这里再夹一道，保证任何调用方都不会
@@ -2062,9 +2103,13 @@ class MarkdownIndexer:
                     )
                 skip_vectors = True
 
-            with self._cache_lock:
-                with self._sync_lock:
-                    return self._import_snapshot_locked(src, zf, vectors_member, skip_vectors)
+            # 锁序必须与 sync() 一致（_sync_lock → _cache_lock）。此前这里是
+            # _cache_lock → _sync_lock 的反向嵌套，kb_import 撞上 watcher 的
+            # 30s 对账 sync 就是 ABBA 死锁：两个线程永久互等，之后所有
+            # kb_search / kb_list 排队在 _sync_lock 上，整个 MCP 服务冻结。
+            # 导入体本身会在锁内从磁盘重载全部状态，无需外层再持 _cache_lock。
+            with self._sync_lock:
+                return self._import_snapshot_locked(src, zf, vectors_member, skip_vectors)
 
     def _import_snapshot_locked(
         self,
@@ -2206,13 +2251,24 @@ class MarkdownIndexer:
         return candidate
 
     def start_watching(self, interval: float = 0.25, debounce_seconds: float | None = None) -> None:
+        if getattr(self, "_stopping", False) and self._watch_thread is not None:
+            # 上一次 stop 还没真正收干净，先把残留线程收掉再启新的。
+            self._watch_thread.join(timeout=2)
+            if self._watch_thread.is_alive():
+                return
+            self._watch_thread = None
+            self._stopping = False
         if self._watch_thread and self._watch_thread.is_alive():
             return
         if self._fs_watcher is not None and self._fs_watcher.is_alive():
             return
         debounce = self.config.debounce_seconds if debounce_seconds is None else debounce_seconds
         self._fs_debounce_seconds = debounce
-        self.sync()
+        # 注意：这里刻意不再内联 sync()。此前首轮全量索引在调用方线程里同步跑，
+        # 而 start_watching 由首个工具调用（server._indexer_for）触发，于是
+        # kb_init 返回的 "indexing: started in background" 是假的 —— 请求会
+        # 阻塞到整个库索引 + embedding 完成（大库是分钟到小时级），客户端往往
+        # 直接超时。首轮 sync 交给下面起的监听线程去做。
         self._watch_stop.clear()
         method = self.config.watch_method
         # auto：平台支持就用原生；native：优先原生（比如想在非 Windows 上显式
@@ -2259,10 +2315,23 @@ class MarkdownIndexer:
             self._fs_pending_since = None
         if self._watch_stop.is_set():
             return
+        self._run_sync_quietly()
+
+    def _run_sync_quietly(self) -> None:
+        """sync() 的守护包装：监听线程里的任何异常都不能把线程打死。
+
+        轮询/兜底循环此前直接 try/except 包住 sync()，但异常吞掉后没有任何
+        痕迹；这里统一加退避记账，避免端点持续故障时变成紧密自旋。
+        """
+        self._indexing = True
         try:
             self.sync()
+            self._sync_failures = 0
         except Exception:
-            pass
+            self._sync_failures = getattr(self, "_sync_failures", 0) + 1
+            time.sleep(min(0.5 * (2 ** min(self._sync_failures - 1, 4)), 5.0))
+        finally:
+            self._indexing = False
 
     def _native_watch_loop(self, interval: float, debounce: float) -> None:
         """原生监听生效期间的兜底循环，职责有二：
@@ -2273,6 +2342,10 @@ class MarkdownIndexer:
            监听永不静默失效。
         """
         fallback_interval = self.config.watch_fallback_interval
+        # 首轮全量 sync：watch_fallback_interval=0 时兜底循环一次都不会跑，
+        # 没有这一句就永远等不到第一次索引。
+        if not self._watch_stop.is_set():
+            self._run_sync_quietly()
         while not self._watch_stop.is_set():
             if self._fs_watcher is None or not self._fs_watcher.is_alive():
                 break
@@ -2281,10 +2354,7 @@ class MarkdownIndexer:
             if self._fs_watcher is None or not self._fs_watcher.is_alive():
                 break
             if fallback_interval > 0:
-                try:
-                    self.sync()
-                except Exception:
-                    pass
+                self._run_sync_quietly()
         if self._watch_stop.is_set():
             return
         # 降级：原生线程已退出，退回 0.25s 全速轮询（0.4.1 行为）。
@@ -2301,13 +2371,13 @@ class MarkdownIndexer:
         # 往往在 watcher 线程第一次扫描前就写完了文件）。先取基线再 sync，两者
         # 之间出现的改动由随后的 sync 补上，之后的改动才由轮询发现。
         previous = self._quick_signatures()
-        self.sync()
+        self._run_sync_quietly()
         while not self._watch_stop.wait(interval):
             current = self._quick_signatures()
             if current != previous:
                 pending_since = pending_since or time.monotonic()
                 if time.monotonic() - pending_since >= debounce:
-                    self.sync()
+                    self._run_sync_quietly()
                     previous = self._quick_signatures()
                     pending_since = None
             else:
@@ -2326,6 +2396,18 @@ class MarkdownIndexer:
         watcher, self._fs_watcher = self._fs_watcher, None
         if watcher is not None:
             watcher.stop()
-        if self._watch_thread:
+        # 防抖 Timer 也是线程：已触发但还在跑 sync 的实例必须等它结束，
+        # 否则 stop_watching 返回后仍会往正在关闭的缓存里写。
+        if timer is not None and timer.is_alive():
+            timer.join(timeout=2)
+        if self._watch_thread is not None:
             self._watch_thread.join(timeout=2)
-            self._watch_thread = None
+            if self._watch_thread.is_alive():
+                # 线程没停就别把引用丢掉：持引用才能让下一次 stop_watching
+                # 继续 join，也让 is_alive() 对外如实反映"还在跑"。
+                # 丢掉引用会导致 kb_unregister→kb_init 同一目录时新旧两个
+                # watcher 并存，各自写同一批缓存文件（cache key 相同）。
+                self._stopping = True
+            else:
+                self._watch_thread = None
+                self._stopping = False

@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import os
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -58,6 +59,9 @@ class VaultRegistry:
         # Session-only entries used when the registry file can't be written
         # (e.g. read-only home dir): vault keeps working until the process exits.
         self._memory_entries: list[VaultEntry] = []
+        # add/remove/set_weight 都是 load→改→save 的读改写序列，而后台启动线程
+        # 会并发 load()。锁只保证进程内一致（跨进程文件锁不在本轮范围）。
+        self._lock = threading.RLock()
 
     # ------------------------------------------------------------------ io
 
@@ -118,33 +122,35 @@ class VaultRegistry:
     # ------------------------------------------------------------ mutation
 
     def add(self, path: str | os.PathLike[str], name: str | None = None, *, persist: bool = True, weight: float = 1.0) -> VaultEntry:
-        resolved = str(Path(path).expanduser().resolve())
-        entries = self.load()
-        for entry in entries:
-            if normalize_vault_key(entry.path) == normalize_vault_key(resolved):
-                raise ValueError(f"vault already registered as '{entry.name}': {entry.path}")
-        entry = VaultEntry(
-            path=resolved,
-            name=name or Path(resolved).name,
-            registered_at=time.time(),
-            weight=float(weight),
-        )
-        entries.append(entry)
-        if persist:
-            self.save(entries)
-        else:
-            self._memory_entries.append(entry)
-        return entry
+        with self._lock:
+            resolved = str(Path(path).expanduser().resolve())
+            entries = self.load()
+            for entry in entries:
+                if normalize_vault_key(entry.path) == normalize_vault_key(resolved):
+                    raise ValueError(f"vault already registered as '{entry.name}': {entry.path}")
+            entry = VaultEntry(
+                path=resolved,
+                name=name or Path(resolved).name,
+                registered_at=time.time(),
+                weight=float(weight),
+            )
+            entries.append(entry)
+            if persist:
+                self.save(entries)
+            else:
+                self._memory_entries.append(entry)
+            return entry
 
     def remove(self, path: str | os.PathLike[str]) -> VaultEntry:
-        target = normalize_vault_key(path)
-        entries = self.load()
-        for index, entry in enumerate(entries):
-            if normalize_vault_key(entry.path) == target:
-                entries.pop(index)
-                self.save(entries)
-                return entry
-        raise ValueError(f"vault not registered: {path}")
+        with self._lock:
+            target = normalize_vault_key(path)
+            entries = self.load()
+            for index, entry in enumerate(entries):
+                if normalize_vault_key(entry.path) == target:
+                    entries.pop(index)
+                    self.save(entries)
+                    return entry
+            raise ValueError(f"vault not registered: {path}")
 
     def set_weight(self, path: str | os.PathLike[str], weight: float) -> VaultEntry:
         """调整单个库的检索权重（跨库 fan-out 时该库分数的放大系数）。"""
@@ -154,14 +160,15 @@ class VaultRegistry:
             raise ValueError(f"invalid weight: {weight}")
         if not 0 < weight <= 100:
             raise ValueError(f"weight must be in (0, 100]: {weight}")
-        target = normalize_vault_key(path)
-        entries = self.load()
-        for entry in entries:
-            if normalize_vault_key(entry.path) == target:
-                entry.weight = weight
-                self.save(entries)
-                return entry
-        raise ValueError(f"vault not registered: {path}")
+        with self._lock:
+            target = normalize_vault_key(path)
+            entries = self.load()
+            for entry in entries:
+                if normalize_vault_key(entry.path) == target:
+                    entry.weight = weight
+                    self.save(entries)
+                    return entry
+            raise ValueError(f"vault not registered: {path}")
 
     def get(self, path: str | os.PathLike[str]) -> VaultEntry | None:
         target = normalize_vault_key(path)

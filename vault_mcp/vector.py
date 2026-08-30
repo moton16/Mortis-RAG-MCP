@@ -17,7 +17,9 @@ change, not a code change.
 
 from __future__ import annotations
 
+import functools
 import sqlite3
+import threading
 from array import array
 from typing import Any, Iterable, Protocol, runtime_checkable
 
@@ -123,6 +125,10 @@ class SqliteVecBackend:
         self._conn: sqlite3.Connection | None = None
         self._serialize = None
         self.available = False
+        # 所有数据库操作的串行锁（见 _serialized）；_closed 让"已关闭"与
+        # "不可用"可区分，避免 close() 之后的调用被静默当成零结果。
+        self._lock = threading.RLock()
+        self._closed = False
         try:
             import sqlite_vec  # type: ignore
 
@@ -148,14 +154,33 @@ class SqliteVecBackend:
         except Exception:
             self._conn = None
 
+    @staticmethod
+    def _serialized(func):
+        """把数据库操作串行化。
+
+        连接是 check_same_thread=False 建的（watcher 线程、sync 线程、搜索
+        线程都会访问），但 sqlite3 连接本身不是线程安全的：并发 execute 会抛
+        "Cannot operate on a closed database" 或直接返回错乱结果，而这里所有
+        except 都把它们吞成「零结果」—— 语义路由静默消失。
+        """
+
+        @functools.wraps(func)
+        def wrapper(self, *args, **kwargs):
+            with self._lock:
+                return func(self, *args, **kwargs)
+
+        return wrapper
+
     @property
     def path(self) -> Any:
         return self._db_path
 
+    @_serialized
     def _vid_for(self, chunk_id: str) -> int | None:
         row = self._conn.execute("SELECT vid FROM vec_ids WHERE chunk_id = ?", (chunk_id,)).fetchone()
         return int(row[0]) if row else None
 
+    @_serialized
     def query(self, query_vector: Iterable[float], limit: int | None = None) -> list[tuple[str, float]]:
         if not self.available or self._conn is None:
             return []
@@ -172,6 +197,7 @@ class SqliteVecBackend:
         except Exception:
             return []
 
+    @_serialized
     def upsert_vectors(self, vectors: dict[str, Any]) -> None:
         if not self.available or self._conn is None or not vectors:
             return
@@ -200,6 +226,7 @@ class SqliteVecBackend:
         except Exception:
             pass
 
+    @_serialized
     def get_vectors(self, chunk_ids: Iterable[str]) -> dict[str, Any]:
         """Read back vectors from the vec0 table (content-hash reuse round).
 
@@ -231,6 +258,7 @@ class SqliteVecBackend:
             return out
         return out
 
+    @_serialized
     def delete_vectors(self, chunk_ids: Iterable[str]) -> None:
         if not self.available or self._conn is None:
             return
@@ -245,6 +273,7 @@ class SqliteVecBackend:
         except Exception:
             pass
 
+    @_serialized
     def list_ids(self) -> list[str]:
         if not self.available or self._conn is None:
             return []
@@ -253,6 +282,7 @@ class SqliteVecBackend:
         except Exception:
             return []
 
+    @_serialized
     def count(self) -> int:
         if not self.available or self._conn is None:
             return 0
@@ -261,6 +291,7 @@ class SqliteVecBackend:
         except Exception:
             return 0
 
+    @_serialized
     def close(self) -> None:
         """Release the sqlite connection WITHOUT deleting the db file.
 
@@ -275,7 +306,9 @@ class SqliteVecBackend:
                 pass
             self._conn = None
         self.available = False
+        self._closed = True
 
+    @_serialized
     def purge(self) -> None:
         if self._conn is not None:
             try:

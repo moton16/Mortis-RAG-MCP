@@ -236,6 +236,7 @@ class VaultMcpServer:
         self.config = load_config(resolve_config_path(config_path))
         self.registry = VaultRegistry()
         self._indexers: dict[str, MarkdownIndexer] = {}
+        self._indexers_lock = threading.Lock()
         self._startup_lock = threading.Lock()
         self._started = False
         self._migrate_legacy()
@@ -333,10 +334,18 @@ class VaultMcpServer:
         vault_path = self._resolve_vault_path(raw)
         key = str(Path(vault_path).expanduser().resolve())
         indexer = self._indexers.get(key)
-        if indexer is None:
-            indexer = MarkdownIndexer(vault_path, self.config)
-            indexer.start_watching()
-            self._indexers[key] = indexer
+        if indexer is not None:
+            return indexer
+        # 双检锁：后台启动线程（_startup_index_all）与 stdio 主线程会同时走到
+        # 这里，此前两者各造一个 MarkdownIndexer、各跑一次全量 sync、各起一个
+        # watcher；败者被字典覆盖后再也拿不到引用，它的 watcher 线程与目录句柄
+        # 永久泄漏（Windows 上句柄还会锁住目录，导致无法重命名/删除）。
+        with self._indexers_lock:
+            indexer = self._indexers.get(key)
+            if indexer is None:
+                indexer = MarkdownIndexer(vault_path, self.config)
+                indexer.start_watching()
+                self._indexers[key] = indexer
         return indexer
 
     def _list_vaults(self) -> dict[str, Any]:
@@ -463,7 +472,7 @@ class VaultMcpServer:
             pairs = dedupe_by_content_hash(pairs, chunk_of=lambda pair: pair[1])
         if use_rerank and merged:
             provider = None
-            for indexer in self._indexers.values():
+            for indexer in list(self._indexers.values()):
                 if indexer.reranker_provider is not None:
                     provider = indexer.reranker_provider
                     break
