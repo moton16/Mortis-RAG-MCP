@@ -4,14 +4,78 @@ import json
 import sys
 import threading
 from argparse import ArgumentParser
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from .config import load_config, resolve_config_path
-from .indexer import MarkdownIndexer, Chunk, rerank_chunks
+from .indexer import Chunk, MarkdownIndexer, SearchFilter, rerank_chunks
 from .registry import VaultEntry, VaultRegistry, registry_path
 
 SERVER_INFO = {"name": "mortis-rag-mcp", "version": "0.4.1", "title": "Mortis'RAG MCP"}
+
+
+def _parse_epoch(value: Any) -> float | None:
+    """把 MCP 参数解析成 epoch 秒：接受数字、数字字符串和 ISO 8601 字符串。
+
+    解析不出来就返回 None（该条件不生效），绝不抛异常——参数来自外部客户端，
+    一个拼写错误的时间不该让整个 kb_search 失败。
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        pass
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def _parse_tags(value: Any) -> list[str] | None:
+    """tags 参数归一化：逗号分隔的字符串和字符串数组都接受，空值返回 None。"""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        items: list[Any] = [part for part in value.split(",")]
+    elif isinstance(value, (list, tuple)):
+        items = list(value)
+    else:
+        return None
+    tags = [str(item).strip() for item in items if str(item).strip()]
+    return tags or None
+
+
+def _parse_int(value: Any) -> int | None:
+    """防御式整数解析：解析失败返回 None（该条件不生效）。"""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _search_filter(arguments: dict[str, Any]) -> SearchFilter:
+    """从 kb_search 的 arguments 构造 SearchFilter，全部字段都可缺省。"""
+    limit = _parse_int(arguments.get("limit"))
+    if limit is not None and limit < 1:
+        limit = None
+    offset = _parse_int(arguments.get("offset"))
+    return SearchFilter(
+        path_prefix=str(arguments.get("path_prefix") or "").strip(),
+        tags=_parse_tags(arguments.get("tags")),
+        mtime_after=_parse_epoch(arguments.get("mtime_after")),
+        mtime_before=_parse_epoch(arguments.get("mtime_before")),
+        offset=max(0, offset) if offset is not None else 0,
+        limit=limit,
+    )
 
 
 def _json_result(request_id: Any, result: Any) -> dict[str, Any]:
@@ -73,6 +137,12 @@ def _tool_definitions() -> list[dict[str, Any]]:
                 "query": {"type": "string"}, "top_k": {"type": "integer", "minimum": 1, "default": 10}, "use_rerank": {"type": "boolean", "default": True},
                 "vault_path": {"type": "string", "description": "可选，已注册知识库的绝对路径；缺省时跨全部注册库检索"},
                 "group_by_vault": {"type": "boolean", "default": False, "description": "可选，仅跨库检索（不传 vault_path）时生效：结果按知识库分组返回 groups，每组取 top_k 条"},
+                "path_prefix": {"type": "string", "description": "可选，只保留 source 以该前缀开头的 chunk（source 是库内相对 posix 路径，如 '教材/'）"},
+                "tags": {"type": "array", "items": {"type": "string"}, "description": "可选，frontmatter 标签过滤：命中任一标签即保留（大小写不敏感，自动去掉 '#' 前缀）"},
+                "mtime_after": {"type": ["number", "string"], "description": "可选，只保留修改时间 >= 该值的文件；epoch 秒或 ISO 8601 字符串（如 '2026-01-01'）"},
+                "mtime_before": {"type": ["number", "string"], "description": "可选，只保留修改时间 <= 该值的文件；epoch 秒或 ISO 8601 字符串"},
+                "offset": {"type": "integer", "minimum": 0, "default": 0, "description": "可选，跳过前 N 条结果（分页用）"},
+                "limit": {"type": "integer", "minimum": 1, "description": "可选，本页最多返回条数；缺省时用 top_k"},
             }},
         },
         {
@@ -291,12 +361,23 @@ class VaultMcpServer:
             "cache_purged": cache_purged,
         }
 
-    def _fanout_search(self, query: str, top_k: int, use_rerank: bool, group_by_vault: bool = False) -> dict[str, Any]:
+    def _fanout_search(self, query: str, top_k: int, use_rerank: bool, group_by_vault: bool = False, filters: SearchFilter | None = None) -> dict[str, Any]:
         """Search across every registered (existing) vault, merge and rerank once.
 
         group_by_vault=True 时返回按库分组的结果（每组 top_k 条），否则平铺返回。
+        filters 的过滤条件对每个库分别生效，分页（offset/limit）只在最后合并
+        排序后的全局结果上做一次——否则各库各翻一页，合并出来的顺序没有意义。
         """
         per_vault_k = max(top_k, 20)
+        # 单库检索只吃过滤条件，不吃分页：分页留到全局合并之后。
+        per_vault_filters: SearchFilter | None = None
+        if filters is not None:
+            per_vault_filters = SearchFilter(
+                path_prefix=filters.path_prefix,
+                tags=filters.tags,
+                mtime_after=filters.mtime_after,
+                mtime_before=filters.mtime_before,
+            )
         entries = [entry for entry in self.registry.load() if Path(entry.path).is_dir()]
         if not entries:
             raise ValueError("no readable registered vaults; call kb_init first")
@@ -317,7 +398,7 @@ class VaultMcpServer:
             try:
                 indexer = self._indexer_for({"vault_path": entry.path})
                 indexer.sync()
-                chunks = indexer.search(query, per_vault_k, False, query_vector=query_vector)
+                chunks = indexer.search(query, per_vault_k, False, query_vector=query_vector, filters=per_vault_filters)
                 for chunk in chunks:
                     merged.append((entry, chunk))
                 searched.append(entry.path)
@@ -345,29 +426,38 @@ class VaultMcpServer:
                 origin = {id(chunk): entry for entry, chunk in merged}
                 pairs = [(origin[id(chunk)], chunk) for chunk in reranked]
 
+        if filters is not None:
+            start, end = filters.page_slice(top_k)
+        else:
+            start, end = 0, max(0, top_k)
+
         if group_by_vault:
             # 分组模式：保持融合后的组内顺序，按库切桶；组顺序取各组最高分降序。
+            # 分页在这里是"每组各翻一页"——全局先切一刀会让低分库整组消失，
+            # 那不是分组检索要的语义。offset/limit 缺省时等价于原来的 top_k 截断。
             buckets: dict[str, dict[str, Any]] = {}
             for entry, chunk in pairs:
                 group = buckets.get(entry.path)
                 if group is None:
                     group = {"vault": entry.path, "vault_name": entry.name, "chunks": []}
                     buckets[entry.path] = group
-                if len(group["chunks"]) >= max(0, top_k):
-                    continue
                 data = chunk.to_dict()
                 data["vault"] = entry.path
                 data["vault_name"] = entry.name
                 group["chunks"].append(data)
-            # top_k<=0 时桶是空的，直接丢掉（max 不接受空序列）。
+            for group in buckets.values():
+                group["chunks"] = group["chunks"][start:end]
+            # 切片后桶可能空了，直接丢掉（max 不接受空序列）。
             groups = sorted(
                 (group for group in buckets.values() if group["chunks"]),
                 key=lambda group: -max(chunk["score"] for chunk in group["chunks"]),
             )
             return {"groups": groups, "searched": searched, "errors": errors}
 
+        pairs = pairs[start:end]
+
         out_chunks = []
-        for entry, chunk in pairs[: max(0, top_k)]:
+        for entry, chunk in pairs:
             data = chunk.to_dict()
             data["vault"] = entry.path
             data["vault_name"] = entry.name
@@ -412,7 +502,7 @@ class VaultMcpServer:
                 group_by_vault = arguments.get("group_by_vault", False)
                 if isinstance(group_by_vault, str):
                     group_by_vault = group_by_vault.strip().lower() in {"1", "true", "yes", "on"}
-                return _text_content(self._fanout_search(query, top_k, bool(use_rerank), bool(group_by_vault)))
+                return _text_content(self._fanout_search(query, top_k, bool(use_rerank), bool(group_by_vault), _search_filter(arguments)))
         indexer = self._indexer_for(arguments)
         indexer.sync()
         if name == "kb_list":
@@ -423,7 +513,8 @@ class VaultMcpServer:
             use_rerank = arguments.get("use_rerank", True)
             if isinstance(use_rerank, str):
                 use_rerank = use_rerank.strip().lower() in {"1", "true", "yes", "on"}
-            return _text_content({"chunks": [chunk.to_dict() for chunk in indexer.search(query, top_k, bool(use_rerank))]})
+            results = indexer.search(query, top_k, bool(use_rerank), filters=_search_filter(arguments))
+            return _text_content({"chunks": [chunk.to_dict() for chunk in results]})
         if name == "kb_read":
             source = str(arguments.get("source", ""))
             heading = arguments.get("heading")

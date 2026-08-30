@@ -105,15 +105,38 @@ class FtsIndex:
 
     # --------------------------------------------------------------- query
 
-    def search(self, match_sql: str, limit: int) -> list[tuple[str, float]]:
-        """BM25 top-N: returns [(chunk_id, bm25_score)] best-first (bm25 ascending)."""
+    @staticmethod
+    def _like_prefix(path_prefix: str) -> str:
+        """把目录前缀转成 LIKE 用的模式串：转义 % / _ / \\ 三个通配符。
+
+        LIKE 里没有转义符的话，路径中带 _ 的目录名（如 raw_notes/）会匹配到
+        任意字符，过滤结果就比预期宽。
+        """
+        escaped = path_prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        return escaped + "%"
+
+    def search(self, match_sql: str, limit: int, path_prefix: str = "") -> list[tuple[str, float]]:
+        """BM25 top-N: returns [(chunk_id, bm25_score)] best-first (bm25 ascending).
+
+        path_prefix 非空时把 source 前缀条件下推到 SQL 层（source 是 UNINDEXED
+        列，可直接出现在 WHERE 里，零 schema 变更）。这纯粹是减少候选量的优化，
+        正确性由调用方的统一后过滤兜底。
+        """
         with self._lock:
             conn = self._connect()
-            rows = conn.execute(
-                "SELECT chunk_id, bm25(chunks_fts) FROM chunks_fts "
-                "WHERE chunks_fts MATCH ? ORDER BY bm25(chunks_fts) LIMIT ?",
-                (match_sql, max(1, int(limit))),
-            ).fetchall()
+            if path_prefix:
+                rows = conn.execute(
+                    "SELECT chunk_id, bm25(chunks_fts) FROM chunks_fts "
+                    "WHERE chunks_fts MATCH ? AND source LIKE ? ESCAPE '\\' "
+                    "ORDER BY bm25(chunks_fts) LIMIT ?",
+                    (match_sql, self._like_prefix(path_prefix), max(1, int(limit))),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT chunk_id, bm25(chunks_fts) FROM chunks_fts "
+                    "WHERE chunks_fts MATCH ? ORDER BY bm25(chunks_fts) LIMIT ?",
+                    (match_sql, max(1, int(limit))),
+                ).fetchall()
             return [(str(chunk_id), float(score)) for chunk_id, score in rows]
 
     def close(self) -> None:

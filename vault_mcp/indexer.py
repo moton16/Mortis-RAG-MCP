@@ -129,6 +129,50 @@ class Chunk:
         }
 
 
+@dataclass
+class SearchFilter:
+    """kb_search 的过滤条件与分页参数（全部可选）。
+
+    过滤统一在融合排序之后做（FTS 那一路的 path_prefix 只是减少候选量的 SQL
+    层下推），所以即使 FTS 索引缺失、或查询太短走不了 BM25，结果集依然正确——
+    下推只影响速度，不影响语义。
+    """
+
+    path_prefix: str = ""
+    tags: list[str] | None = None
+    mtime_after: float | None = None
+    mtime_before: float | None = None
+    offset: int = 0
+    limit: int | None = None
+
+    def matches(self, chunk: Chunk) -> bool:
+        """chunk 是否满足全部已设置的条件（未设置的条件一律放行）。"""
+        if self.path_prefix and not chunk.source.startswith(self.path_prefix):
+            return False
+        if self.tags:
+            wanted = {str(tag).lower().lstrip("#") for tag in self.tags if str(tag).strip()}
+            if wanted:
+                # 清洗规则与 _is_frontmatter_exempt 保持一致：小写 + 去 # 前缀。
+                have = {str(tag).lower().lstrip("#") for tag in chunk.metadata.get("tags") or []}
+                if not (wanted & have):
+                    return False
+        # 老缓存产生的 chunk 没有 mtime 字段，视为"时间未知"直接放行，
+        # 否则一次过滤条件就会让整个历史索引检索不到。
+        mtime = chunk.metadata.get("mtime")
+        if mtime is not None:
+            if self.mtime_after is not None and mtime < self.mtime_after:
+                return False
+            if self.mtime_before is not None and mtime > self.mtime_before:
+                return False
+        return True
+
+    def page_slice(self, default_limit: int) -> tuple[int, int]:
+        """分页区间 [start, end)：limit 未设置时回落到调用方的 top_k。"""
+        start = max(0, int(self.offset))
+        limit = self.limit if self.limit is not None else default_limit
+        return start, start + max(0, int(limit))
+
+
 def _pack_str(buf: bytearray, text: str) -> None:
     data = text.encode("utf-8")
     buf += struct.pack("<I", len(data))
@@ -141,6 +185,8 @@ def _pack_u32(buf: bytearray, value: int) -> None:
 
 def _to_emb(vectors: Iterable[float]) -> array:
     return array(_EMB_DTYPE, vectors)
+
+
 
 
 class _CacheCodec:
@@ -477,10 +523,15 @@ class MarkdownIndexer:
     # ------------------------------------------------------------------ cache
 
     def _chunks_meta(self) -> dict[str, Any]:
+        # chunker 是文本层的手工失效开关：chunk 元数据每多一个字段就 +1，
+        # 让老缓存重建一次。这里刻意不碰向量层——向量按 chunk.id（sha1 of
+        # source+index+content）匹配，content 不变则 id 不变，所以 bump 之后
+        # 老向量全部命中，不会触发任何重新 embedding。
         return {
             "key": self._cache_key(),
             "chunk_size": self.config.chunk_size,
             "chunk_overlap": self.config.chunk_overlap,
+            "chunker": 2,
         }
 
     def _vectors_meta(self) -> dict[str, Any]:
@@ -635,7 +686,15 @@ class MarkdownIndexer:
                 if self._signatures.get(source) == signature:
                     continue
                 text = raw.decode("utf-8-sig")
-                chunks = self._chunk_file(source, text)
+                # 顺手复用上面 read_bytes 已经打开的目录项做一次 stat，记录文件
+                # 修改时间供 mtime 过滤用：签名未变的文件不会走到这里，所以这个
+                # mtime 语义上是"内容最后一次变化的时间"，而不是每次 touch 都更新。
+                mtime: float | None = None
+                try:
+                    mtime = path.stat().st_mtime
+                except OSError:
+                    mtime = None
+                chunks = self._chunk_file(source, text, mtime)
                 changed.append((source, signature, chunks))
             except Exception as exc:
                 self.failed_files[source] = str(exc)
@@ -883,7 +942,7 @@ class MarkdownIndexer:
     def _source(self, path: Path) -> str:
         return path.relative_to(self.vault_path).as_posix()
 
-    def _chunk_file(self, source: str, text: str) -> list[Chunk]:
+    def _chunk_file(self, source: str, text: str, mtime: float | None = None) -> list[Chunk]:
         lines = text.splitlines()
         frontmatter_end, tags, properties = self._frontmatter(lines)
         is_fm_exempt, _ = self._is_frontmatter_exempt(tags, properties)
@@ -918,7 +977,7 @@ class MarkdownIndexer:
         if not sections and body:
             if any(line.strip() for line in body):
                 sections = [(title, body_start + 1, body)]
-        return self._make_chunks(source, title, tags, sections)
+        return self._make_chunks(source, title, tags, sections, mtime)
 
     @staticmethod
     def _frontmatter(lines: list[str]) -> tuple[int, list[str], dict[str, Any]]:
@@ -1032,6 +1091,7 @@ class MarkdownIndexer:
         title: str,
         tags: list[str],
         sections: list[tuple[str, int, list[str]]],
+        mtime: float | None = None,
     ) -> list[Chunk]:
         result: list[Chunk] = []
         chunk_index = 0
@@ -1044,7 +1104,7 @@ class MarkdownIndexer:
             carry_length = 0
             for offset, line in enumerate(lines):
                 if current and current_length + len(line) + 1 > self.config.chunk_size:
-                    result.append(self._new_chunk(source, title, heading, current_start, start + offset - 1, chunk_index, tags, current))
+                    result.append(self._new_chunk(source, title, heading, current_start, start + offset - 1, chunk_index, tags, current, mtime))
                     chunk_index += 1
                     carry, carry_length = self._overlap_tail(current, overlap)
                     current = list(carry)
@@ -1053,7 +1113,7 @@ class MarkdownIndexer:
                 current.append(line)
                 current_length += len(line) + 1
             if current:
-                result.append(self._new_chunk(source, title, heading, current_start, start + len(lines) - 1, chunk_index, tags, current))
+                result.append(self._new_chunk(source, title, heading, current_start, start + len(lines) - 1, chunk_index, tags, current, mtime))
                 chunk_index += 1
         return result
 
@@ -1072,7 +1132,7 @@ class MarkdownIndexer:
         return list(reversed(tail)), length
 
     @staticmethod
-    def _new_chunk(source: str, title: str, heading: str, start: int, end: int, index: int, tags: list[str], lines: list[str]) -> Chunk:
+    def _new_chunk(source: str, title: str, heading: str, start: int, end: int, index: int, tags: list[str], lines: list[str], mtime: float | None = None) -> Chunk:
         content = "\n".join(lines).strip()
         identifier = hashlib.sha1(f"{source}\0{index}\0{content}".encode("utf-8")).hexdigest()
         return Chunk(identifier, content, source, title, {
@@ -1081,16 +1141,24 @@ class MarkdownIndexer:
             "end_line": max(start, end),
             "chunk_index": index,
             "tags": list(tags),
+            # epoch 秒，供 kb_search 的 mtime_after / mtime_before 过滤；
+            # 老缓存里没有这个字段，SearchFilter 会放行而不是判为不匹配。
+            "mtime": mtime,
         })
 
     def all_chunks(self) -> list[Chunk]:
         return [chunk for source in sorted(self._chunks) for chunk in self._chunks[source]]
 
-    def search(self, query: str, top_k: int = 10, use_rerank: bool = False, query_vector: Iterable[float] | None = None) -> list[Chunk]:
+    def search(self, query: str, top_k: int = 10, use_rerank: bool = False, query_vector: Iterable[float] | None = None, filters: SearchFilter | None = None) -> list[Chunk]:
         query = query.strip()
         all_chunks = self.all_chunks()
         if not query:
-            return all_chunks[: max(0, top_k)]
+            ranked = list(all_chunks)
+            if filters is None:
+                return ranked[: max(0, top_k)]
+            ranked = [chunk for chunk in ranked if filters.matches(chunk)]
+            start, end = filters.page_slice(top_k)
+            return ranked[start:end]
 
         query_tokens = self._query_tokens(query)
 
@@ -1129,7 +1197,10 @@ class MarkdownIndexer:
 
         hybrid = self.config.use_hybrid and self._fts is not None and self._fts.available
         if hybrid:
-            ranked = self._hybrid_rank(query, all_chunks, lexical, semantic_snapshot)
+            # path_prefix 下推到 FTS 的 SQL 层只是减少候选量（source 是 UNINDEXED
+            # 列，可直接进 WHERE）；过滤的正确性由下面的统一后过滤保证。
+            prefix = filters.path_prefix if filters is not None else ""
+            ranked = self._hybrid_rank(query, all_chunks, lexical, semantic_snapshot, path_prefix=prefix)
         else:
             ranked = []
         if not ranked:
@@ -1146,9 +1217,18 @@ class MarkdownIndexer:
 
         ranked.sort(key=lambda chunk: (-chunk.score, chunk.source, chunk.metadata["chunk_index"]))
 
+        # 过滤放在 rerank 之前：rerank 是要花钱/花时间的配额，不能浪费在马上
+        # 会被过滤掉的条目上。
+        if filters is not None:
+            ranked = [chunk for chunk in ranked if filters.matches(chunk)]
+
         if use_rerank and self.reranker_provider and ranked:
             ranked = rerank_chunks(query, ranked, self.reranker_provider, cap=self.config.rerank_cap)
-        return ranked[: max(0, top_k)]
+
+        if filters is None:
+            return ranked[: max(0, top_k)]
+        start, end = filters.page_slice(top_k)
+        return ranked[start:end]
 
     def _fts_query(self, query: str) -> str | None:
         """Build an FTS5 MATCH expression from tokens of length >= 3.
@@ -1175,6 +1255,7 @@ class MarkdownIndexer:
         all_chunks: list[Chunk],
         lexical: dict[str, float],
         semantic_snapshot: dict[str, float],
+        path_prefix: str = "",
     ) -> list[Chunk]:
         """Three-route RRF fusion: FTS5 BM25 + vector cosine + bigram lexical.
 
@@ -1189,7 +1270,7 @@ class MarkdownIndexer:
         fts_sql = self._fts_query(query)
         if fts_sql is not None and self._fts is not None:
             try:
-                routes.append([chunk_id for chunk_id, _score in self._fts.search(fts_sql, self.config.rrf_per_route)])
+                routes.append([chunk_id for chunk_id, _score in self._fts.search(fts_sql, self.config.rrf_per_route, path_prefix)])
             except Exception:
                 pass
 
