@@ -28,6 +28,13 @@ class EmbeddingConfig:
     # (Qwen3-Embedding series) accept it; fixed-dimension models (bge-m3) reject
     # it with HTTP 400, so set this to false for those.
     send_dimensions: bool = True
+    # Extra attempts after the first failure (0 keeps the old fail-fast behavior).
+    max_retries: int = 3
+    # Max texts per embedding HTTP request. <=0 disables batching and sends
+    # every chunk of a file in one request (old behavior).
+    batch_size: int = 32
+    # Base seconds for the exponential backoff between retries.
+    retry_backoff: float = 1.0
 
 
 @dataclass(slots=True)
@@ -110,6 +117,12 @@ class AppConfig:
             raise ValueError("embedding.mode must be 'static' or 'external'")
         if self.embedding.dimension < 1:
             raise ValueError("embedding.dimension must be positive")
+        if self.embedding.max_retries < 0:
+            raise ValueError("embedding.max_retries must be >= 0")
+        if self.embedding.batch_size < 0:
+            raise ValueError("embedding.batch_size must be >= 0")
+        if self.embedding.retry_backoff <= 0:
+            raise ValueError("embedding.retry_backoff must be positive")
         if self.cache.embedding_max_workers < 1:
             raise ValueError("cache.embedding_max_workers must be positive")
         if self.cache.placement not in {"home", "vault"}:
@@ -234,6 +247,9 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
         timeout=float(embedding.get("timeout", 30.0)),
         dimension=int(embedding.get("dimension", 384)),
         send_dimensions=bool(embedding.get("send_dimensions", True)),
+        max_retries=int(embedding.get("max_retries", 3)),
+        batch_size=int(embedding.get("batch_size", 32)),
+        retry_backoff=float(embedding.get("retry_backoff", 1.0)),
     )
     rer = RerankerConfig(
         enabled=bool(reranker.get("enabled", False)),
