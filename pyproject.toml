@@ -9,6 +9,11 @@ description = "Mortis'RAG MCP - registry-based Markdown knowledge base RAG serve
 requires-python = ">=3.10"
 dependencies = []
 
+[project.optional-dependencies]
+# Optional disk-backed vector storage (sqlite-vec). Not required for core use;
+# enables [vector] backend = "sqlite_vec" to keep embeddings off RAM.
+vec = ["sqlite-vec>=0.1.9"]
+
 [project.scripts]
 mortis-rag-mcp = "vault_mcp.__main__:main"
 vault-mcp = "vault_mcp.__main__:main"  # legacy alias kept for existing connectors

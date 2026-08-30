@@ -38,7 +38,9 @@ use_hybrid = true
 
 [vector]
 # 向量存储后端："memory"（默认，numpy 暴力扫描，零依赖）或
-# "sqlite_vec"（可选：pip install sqlite-vec 后启用，未安装自动回退 memory）。
+# "sqlite_vec"（磁盘后端：pip install "mortis-rag-mcp[vec]" 后启用；向量存
+# 磁盘 sqlite，不驻留内存——13k 切片约释放 55MB RAM；首次切换自动从 .bin
+# 缓存迁移，不触发全量重嵌；未安装/加载失败自动回退 memory）。
 backend = "memory"
 
 [cache]

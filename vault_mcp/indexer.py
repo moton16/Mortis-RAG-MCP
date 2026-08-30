@@ -367,6 +367,7 @@ class MarkdownIndexer:
         self._chunks_cache_path: Path | None = None
         self._vectors_cache_path: Path | None = None
         self._fts_cache_path: Path | None = None
+        self._vectors_db_path: Path | None = None
         self._fts: FtsIndex | None = None
         self._vector_backend: Any = None
         if self.config.cache.enabled and self.config.cache.dir:
@@ -376,6 +377,7 @@ class MarkdownIndexer:
                 self._chunks_cache_path = None
                 self._vectors_cache_path = None
                 self._fts_cache_path = None
+                self._vectors_db_path = None
         # FTS index: derived/rebuildable; any failure degrades to hybrid-off.
         if self.config.use_hybrid and self._fts_cache_path is not None:
             try:
@@ -392,8 +394,20 @@ class MarkdownIndexer:
             except Exception:
                 self._fts = None
         # Vector backend seam: default memory (numpy brute-force over chunk.embedding);
-        # sqlite_vec only when configured AND importable, else falls back to memory.
-        self._vector_backend = create_vector_backend(self.config.vector, self, self._fts_cache_path)
+        # sqlite_vec when configured AND importable, else falls back to memory.
+        self._vector_backend = create_vector_backend(self.config.vector, self, self._vectors_db_path)
+        # Disk-backed mode (sqlite_vec): embeddings are NOT retained on Chunk —
+        # that is the actual memory win. RAM bookkeeping set tracks which chunk
+        # ids are already persisted so sync never re-embeds them.
+        self._vectors_on_disk = bool(getattr(self._vector_backend, "on_disk", False))
+        self._disk_vectors: set[str] = set()
+        if not self._vectors_on_disk and self.config.vector.backend == "sqlite_vec":
+            # Configured sqlite_vec but import/load failed -> fell back to memory;
+            # the vectors cache was skipped during init, so load it now.
+            try:
+                self._load_vectors_cache()
+            except Exception:
+                pass
 
     def _cache_key(self) -> str:
         """Stable cache identity.
@@ -424,8 +438,14 @@ class MarkdownIndexer:
         model_hash = hashlib.sha256(self.config.embedding.model.encode("utf-8")).hexdigest()[:8]
         self._vectors_cache_path = vectors_dir / f"vault_{key}.{model_hash}.{self.config.embedding.dimension}.vec.bin"
         self._fts_cache_path = fts_dir / f"vault_{key}.fts.sqlite"
+        # sqlite-vec backend keeps its own db (never shares the FTS file).
+        self._vectors_db_path = vectors_dir / f"vault_{key}.vec.sqlite"
         self._load_chunks_cache()
-        self._load_vectors_cache()
+        # With the disk-backed sqlite_vec backend, vectors are not loaded into
+        # RAM (that's the memory win); the disk store is migrated/flushed by
+        # _ensure_disk_vectors_migrated() on first sync.
+        if self.config.vector.backend != "sqlite_vec":
+            self._load_vectors_cache()
         self._sweep_stale_cache()
 
     def _sweep_stale_cache(self) -> None:
@@ -533,6 +553,10 @@ class MarkdownIndexer:
         return Chunk(chunk.id, chunk.content, chunk.source, chunk.title, dict(chunk.metadata), embedding=None)
 
     def _save_vectors_cache(self) -> None:
+        # Disk-backed mode: vectors live in vec.sqlite, never re-written to .bin
+        # (the stale .bin stays as the one-time migration source).
+        if getattr(self, "_vectors_on_disk", False):
+            return
         if self._vectors_cache_path is None:
             return
         vectors: dict[str, array] = {}
@@ -577,16 +601,31 @@ class MarkdownIndexer:
         # Text layer: changed files update the index even if embedding fails
         # afterwards, so lexical search still works without vectors.
         for source, signature, chunks in changed:
+            old_chunks = self._chunks.get(source)
             self._chunks[source] = chunks
             self._signatures[source] = signature
             self.failed_files.pop(source, None)
             self._fts_upsert(source, chunks)
+            # Disk-backed mode: re-chunking a file orphans its old vector ids.
+            if self._vectors_on_disk and old_chunks:
+                old_ids = [chunk.id for chunk in old_chunks]
+                try:
+                    self._vector_backend.delete_vectors(old_ids)
+                    self._disk_vectors.difference_update(old_ids)
+                except Exception:
+                    pass
+
+        # Disk-backed mode: on first sync (or after a crash) make sure the
+        # vector store matches the in-memory chunk set before embedding.
+        self._ensure_disk_vectors_migrated()
 
         # Vector layer: embed every chunk that lacks a vector. When the vectors
         # cache was invalidated (model/dimension change) this re-embeds the whole
         # corpus while reusing the text chunks; when only a few files changed it
         # embeds just those chunks.
         self._embed_missing()
+        # Disk-backed mode: persist newly embedded vectors and release RAM.
+        self._flush_vectors_to_disk()
 
         for source in set(self._chunks) - found:
             removed_ids = [chunk.id for chunk in self._chunks.get(source, [])]
@@ -597,11 +636,54 @@ class MarkdownIndexer:
             if removed_ids:
                 try:
                     self._vector_backend.delete_vectors(removed_ids)
+                    self._disk_vectors.difference_update(removed_ids)
                 except Exception:
                     pass
         self.last_sync = time.time()
         self._save_cache()
         return self.all_chunks()
+
+    def _ensure_disk_vectors_migrated(self) -> None:
+        """Reconcile the disk vector store with in-memory chunks.
+
+        Rebuilds the RAM bookkeeping set from the disk store, and performs a
+        one-time migration from the legacy .vec.bin when the disk store is
+        empty (so switching backends never triggers a full re-embed).
+        """
+        if not self._vectors_on_disk or self._disk_vectors:
+            return
+        try:
+            stored = set(self._vector_backend.list_ids())
+            self._disk_vectors = stored
+            if not stored and self._chunks:
+                # Migrate the legacy .bin into the disk store once.
+                if self._vectors_cache_path is not None and self._vectors_cache_path.exists():
+                    self._load_vectors_cache()
+                self._flush_vectors_to_disk()
+        except Exception:
+            pass
+
+    def _flush_vectors_to_disk(self) -> None:
+        """Upsert all in-RAM embeddings into the disk store, then drop them
+        from Chunk to release resident memory. On failure keep them in RAM."""
+        if not self._vectors_on_disk:
+            return
+        vectors = {
+            chunk.id: chunk.embedding
+            for chunks in self._chunks.values()
+            for chunk in chunks
+            if chunk.embedding is not None and len(chunk.embedding)
+        }
+        if not vectors:
+            return
+        try:
+            self._vector_backend.upsert_vectors(vectors)
+            self._disk_vectors.update(vectors)
+            for chunk in self.all_chunks():
+                if chunk.id in vectors:
+                    chunk.embedding = None
+        except Exception:
+            pass
 
     def _fts_upsert(self, source: str, chunks: list[Chunk]) -> None:
         if self._fts is None:
@@ -646,7 +728,12 @@ class MarkdownIndexer:
         """
         pending: dict[str, list[Chunk]] = {}
         for source, chunks in self._chunks.items():
-            missing = [chunk for chunk in chunks if chunk.embedding is None or not len(chunk.embedding)]
+            if self._vectors_on_disk:
+                # Disk-backed mode: "missing" means not yet persisted; the RAM
+                # embedding is transient and cleared after flushing.
+                missing = [chunk for chunk in chunks if chunk.id not in self._disk_vectors]
+            else:
+                missing = [chunk for chunk in chunks if chunk.embedding is None or not len(chunk.embedding)]
             if missing:
                 pending[source] = missing
         if not pending:
@@ -960,6 +1047,8 @@ class MarkdownIndexer:
 
         # Semantic route: raw cosine, snapshotted BEFORE any lexical fusion so
         # both the hybrid (RRF) and legacy paths can use it independently.
+        # Queries always go through the vector backend (memory brute-force or
+        # disk-backed sqlite-vec KNN).
         semantic_chunks: list[Chunk] = []
         semantic_snapshot: dict[str, float] = {}
         if self.config.embedding.mode == "external":
@@ -968,8 +1057,14 @@ class MarkdownIndexer:
                 # pass it in, so N vaults cost one embed call instead of N.
                 if query_vector is None:
                     query_vector = self.embedding_provider.embed([query])[0]
-                semantic_chunks = self._semantic_rank(query_vector, all_chunks)
-                semantic_snapshot = {chunk.id: chunk.score for chunk in semantic_chunks}
+                # 60 covers the rerank candidate cap; RRF caps at 40 per route.
+                vec_limit = max(top_k, _RRF_PER_ROUTE, 60)
+                pairs = self._vector_backend.query(query_vector, vec_limit)
+                semantic_snapshot = dict(pairs)
+                for chunk in all_chunks:
+                    if chunk.id in semantic_snapshot:
+                        chunk.score = semantic_snapshot[chunk.id]
+                        semantic_chunks.append(chunk)
             except Exception:
                 pass
 
@@ -1437,6 +1532,12 @@ class MarkdownIndexer:
             self._chunks.clear()
             self._signatures.clear()
             self.failed_files.clear()
+            self._disk_vectors.clear()
+            if self._vectors_on_disk:
+                try:
+                    self._vector_backend.purge()
+                except Exception:
+                    pass
             result = self._sync_locked()
             # _sync_locked's FTS hooks are no-ops while _fts is None; recreate the
             # index instance so the rebuild actually repopulates it.
