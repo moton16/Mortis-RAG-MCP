@@ -224,4 +224,7 @@ def create_embedding_provider(config: EmbeddingConfig) -> EmbeddingProvider:
 def create_reranker_provider(config: RerankerConfig) -> ExternalRerankerProvider | None:
     if not config.enabled:
         return None
-    return ExternalRerankerProvider(config.endpoint, config.model, config.api_key, config.timeout)
+    return ExternalRerankerProvider(
+        config.endpoint, config.model, config.api_key, config.timeout,
+        max_retries=config.max_retries, retry_backoff=config.retry_backoff,
+    )

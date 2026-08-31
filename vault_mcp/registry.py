@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+import json
+
 import os
 import threading
 import time
@@ -109,9 +111,13 @@ class VaultRegistry:
         lines = [f"version = {REGISTRY_VERSION}", ""]
         for entry in entries:
             lines.append("[[vaults]]")
-            # Literal strings keep Windows backslashes readable and safe.
-            lines.append(f"path = '{entry.path}'")
-            lines.append(f'name = "{entry.name}"')
+            # 字符串值一律用 json.dumps 序列化（TOML basic string 兼容，能转义
+            # 引号/反斜杠/换行）。此前 name 用 f-string 裸拼：name 来自 LLM 可控
+            # 的 kb_init 参数，一个 `"` 或换行就让整个 vaults.toml 不可解析，
+            # load() 把它当成空表，下一次 save 静默覆盖掉所有其它库的注册。
+            # （Windows 反斜杠在 json 转义后仍可被 tomllib 正确解析。）
+            lines.append(f"path = {json.dumps(entry.path, ensure_ascii=False)}")
+            lines.append(f"name = {json.dumps(entry.name, ensure_ascii=False)}")
             lines.append(f"registered_at = {entry.registered_at!r}")
             lines.append(f"weight = {entry.weight}")
             lines.append("")

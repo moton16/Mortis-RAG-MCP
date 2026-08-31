@@ -45,6 +45,12 @@ class RerankerConfig:
     model: str = ""
     api_key: str = ""
     timeout: float = 30.0
+    # rerank 走的是 kb_search 的同步交互路径，重试次数必须能单独控制：
+    # 此前 create_reranker_provider 从不透传，永远硬编码 3 次 × timeout，
+    # 端点不可达时一次搜索卡 4×timeout（timeout=30 约 126 秒），且异常被
+    # rerank_chunks 吞成"搜索卡死"。默认 1 次重试是交互路径的合理折中。
+    max_retries: int = 1
+    retry_backoff: float = 1.0
 
 
 @dataclass(slots=True)
@@ -82,7 +88,18 @@ class CacheConfig:
     max_age_days: int = 0
 
 
-DEFAULT_EXCLUDE_PATTERNS = [".obsidian"]
+DEFAULT_EXCLUDE_PATTERNS = [
+    ".obsidian",
+    # Obsidian 的默认回收站：里面的"已删除"笔记不该再被检索（隐私）。
+    ".trash",
+    # git / 同步盘元数据目录：rglob 无法剪枝时只做事后过滤，会在每次
+    # 轮询里遍历 .git/objects 下数十万对象。
+    ".git",
+    ".stversions",
+    ".stfolder",
+    "node_modules",
+    ".DS_Store",
+]
 DEFAULT_EXCLUDE_TAGS = ["no-rag", "private", "draft", "私密", "豁免"]
 DEFAULT_EXCLUDE_FRONTMATTER_KEYS = ["rag_exclude", "rag_ignore", "no_rag"]
 
@@ -317,6 +334,8 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
         model=str(_env(reranker.get("model", ""))),
         api_key=str(_env(reranker.get("api_key", "")) or os.getenv(API_KEY_ENV_VAR, "")),
         timeout=_numeric(reranker, data, "timeout", float, 30.0, 0.0, 300.0),
+        max_retries=_numeric(reranker, data, "max_retries", int, 1, 0, 10),
+        retry_backoff=_numeric(reranker, data, "retry_backoff", float, 1.0, 0.0, 60.0),
     )
     cch = CacheConfig(
         dir=str(_env(cache.get("dir", DEFAULT_CACHE_DIR))),

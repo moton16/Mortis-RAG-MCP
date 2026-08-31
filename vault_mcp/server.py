@@ -180,7 +180,7 @@ def _tool_definitions() -> list[dict[str, Any]]:
         },
         {
             "name": "kb_read",
-            "description": "读取知识库原文，不调用 LLM。多库环境下建议显式传 vault_path（fan-out 结果中的 source 是库内相对路径）。",
+            "description": "读取知识库原文（不调用 LLM 生成回答；若索引有未同步的变更会先触发一次增量同步，可能调用 embedding API，建议带上 start_line/end_line 限定范围避免一次拉全篇）。多库环境下建议显式传 vault_path（fan-out 结果中的 source 是库内相对路径）。",
             "inputSchema": {"type": "object", "required": ["source"], "properties": {
                 "source": {"type": "string"}, "heading": {"type": "string"}, "start_line": {"type": "integer", "minimum": 1}, "end_line": {"type": "integer", "minimum": 1},
                 "vault_path": {"type": "string", "description": vault_path_hint},
@@ -389,10 +389,13 @@ class VaultMcpServer:
         }
 
     def _kb_unregister(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        path = str(arguments.get("path", "")).strip()
-        if not path:
+        raw = str(arguments.get("path", "")).strip()
+        if not raw:
             raise ValueError("path is required for kb_unregister")
         purge = bool(arguments.get("purge_cache", False))
+        # 与 kb_set_weight 一致：统一解析为规范化绝对路径再查注册表，
+        # 避免相对路径按服务进程 CWD 解析出不可预测的行为。
+        path = self._resolve_vault_path(raw)
         entry = self.registry.get(path)
         if entry is None:
             raise ValueError(f"vault not registered: {path}")
@@ -477,10 +480,17 @@ class VaultMcpServer:
                     provider = indexer.reranker_provider
                     break
             if provider is not None:
-                pool = [chunk for _, chunk in merged]
+                # rerank 的候选池必须来自去重+加权后的 pairs，而不是未去重的
+                # merged：否则 449-472 行的去重被这条路径整体撤销（默认
+                # use_rerank=True 时两个卖点在默认路径上互相抵消）。
+                pool = [chunk for _, chunk in pairs]
                 reranked = rerank_chunks(query, pool, provider, cap=self.config.rerank_cap)
-                origin = {id(chunk): entry for entry, chunk in merged}
+                origin = {id(chunk): entry for entry, chunk in pairs}
                 pairs = [(origin[id(chunk)], chunk) for chunk in reranked]
+                # rerank 覆盖了 chunk.score，把库级权重乘回去，否则 465-466 行
+                # 的加权在这条路径上失效。
+                for entry, chunk in pairs:
+                    chunk.score = chunk.score * entry.weight
 
         if filters is not None:
             start, end = filters.page_slice(top_k)
@@ -532,9 +542,9 @@ class VaultMcpServer:
         if name == "kb_vaults":
             return _text_content(self._list_vaults())
         if name == "kb_set_weight":
-            vault_path = str(arguments.get("vault_path", "")).strip()
-            if not vault_path:
-                raise ValueError("vault_path is required for kb_set_weight")
+            # 统一走 _resolve_vault_path：此前直接按原始字符串查注册表，
+            # 相对路径会按 stdio 服务进程的任意 CWD 解析，行为不可预测。
+            vault_path = self._resolve_vault_path(str(arguments.get("vault_path") or "").strip())
             if "weight" not in arguments:
                 raise ValueError("weight is required for kb_set_weight")
             try:
@@ -552,7 +562,22 @@ class VaultMcpServer:
             out_path = str(arguments.get("out_path", "")).strip()
             if not out_path:
                 raise ValueError("out_path is required for kb_export")
-            return _text_content(indexer.export_snapshot(out_path))
+            # 信任边界：out_path 直通 tmp.replace(out)，此前零校验 —— 被提示
+            # 注入或跑偏的 LLM 可以用 zip 字节原子覆盖任意用户可写文件（文档、
+            # 配置、.ssh/authorized_keys）。对比 kb_read 特意做了 _safe_path
+            # 沙箱，这里至少要做到：绝对路径 + .zip 后缀 + 不静默覆盖。
+            out = Path(out_path).expanduser()
+            if not out.is_absolute():
+                raise ValueError("out_path must be an absolute path for kb_export")
+            if out.suffix.lower() != ".zip":
+                raise ValueError("out_path must end with .zip for kb_export")
+            if out.exists():
+                overwrite = str(arguments.get("overwrite", "")).strip().lower()
+                if overwrite not in {"1", "true", "yes", "on"}:
+                    raise ValueError(
+                        f"out_path already exists: {out}; pass overwrite=true to replace it"
+                    )
+            return _text_content(indexer.export_snapshot(out))
         if name == "kb_import":
             indexer = self._indexer_for(arguments)
             snapshot = str(arguments.get("snapshot", "")).strip()
@@ -593,10 +618,16 @@ class VaultMcpServer:
             results = indexer.search(query, top_k, bool(use_rerank), filters=_search_filter(arguments, self.config.max_top_k), dedupe=bool(dedupe))
             return _text_content({"chunks": [chunk.to_dict() for chunk in results]})
         if name == "kb_read":
-            source = str(arguments.get("source", ""))
+            source = str(arguments.get("source", "")).strip()
+            if not source:
+                raise ValueError("source is required for kb_read")
             heading = arguments.get("heading")
-            start_line = arguments.get("start_line")
-            end_line = arguments.get("end_line")
+            start_line = _parse_int(arguments.get("start_line"))
+            end_line = _parse_int(arguments.get("end_line"))
+            if start_line is not None and start_line < 1:
+                raise ValueError("start_line must be >= 1")
+            if end_line is not None and start_line is not None and end_line < start_line:
+                raise ValueError("end_line must be >= start_line")
             if heading and start_line is None and end_line is None:
                 matches = [chunk for chunk in indexer.all_chunks() if chunk.source == source and chunk.metadata.get("heading") == heading]
                 if not matches:
@@ -604,7 +635,19 @@ class VaultMcpServer:
                 start_line = min(chunk.metadata["start_line"] for chunk in matches)
                 end_line = max(chunk.metadata["end_line"] for chunk in matches)
             text = indexer.read(source, start_line, end_line)
-            return _text_content({"source": source, "start_line": start_line, "end_line": end_line, "content": text})
+            # 无范围时整篇塞进单个 text 块会撑爆模型上下文/客户端消息上限，
+            # 给一个保守上限并明确告知被截断，引导调用方用 start_line 续读。
+            truncated = False
+            if len(text) > 20000:
+                text = text[:20000]
+                truncated = True
+            return _text_content({
+                "source": source,
+                "start_line": start_line,
+                "end_line": end_line,
+                "content": text,
+                "truncated": truncated,
+            })
         if name == "kb_stats":
             return _text_content(indexer.stats())
         if name == "kb_exempt":
@@ -653,7 +696,24 @@ class VaultMcpServer:
             try:
                 return _json_result(request_id, self.call_tool(str(params.get("name", "")), params.get("arguments") or {}))
             except (ValueError, TypeError, OSError) as exc:
-                return _json_error(request_id, -32602, str(exc))
+                # MCP 规范：工具执行失败应以 CallToolResult{isError:true} 返回，
+                # 模型看到错误内容可以自我纠正（比如先 kb_init 再重试）。此前
+                # 一律转成协议级 -32602，很多客户端会直接中断整个回合。只有
+                # 意外异常（非 ValueError/OSError）才降级为 -32000。
+                return _json_result(
+                    request_id,
+                    {
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": json.dumps(
+                                    {"error": str(exc)}, ensure_ascii=False
+                                ),
+                            }
+                        ],
+                        "isError": True,
+                    },
+                )
             except Exception as exc:
                 return _json_error(request_id, -32000, str(exc))
         if request_id is None:
@@ -669,7 +729,19 @@ def serve_stdio(config_path: str | Path | None = None) -> int:
             stream.reconfigure(encoding="utf-8")
         except (AttributeError, ValueError, OSError):
             pass
-    server = VaultMcpServer(config_path)
+    try:
+        server = VaultMcpServer(config_path)
+    except Exception as exc:
+        # 配置错误必须给出人类可读的报错而不是裸 traceback 退出：
+        # 客户端只会看到"连接已关闭"，完全不知道是自己 toml 写错了。
+        # PR 新增的 8 个配置键让这个失败面显著变大。
+        sys.stderr.write(f"Configuration error: {exc}\n")
+        sys.stderr.flush()
+        return 2
+    return _serve_stdio(server)
+
+
+def _serve_stdio(server: VaultMcpServer) -> int:
     try:
         for raw_line in sys.stdin:
             line = raw_line.strip()

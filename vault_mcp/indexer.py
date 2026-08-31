@@ -53,6 +53,14 @@ _CACHE_VERSION = 1
 _SNAPSHOT_FORMAT = "vault-mcp-snapshot"
 _SNAPSHOT_VERSION = 1
 _SNAPSHOT_MEMBERS = frozenset({"manifest.json", "chunks.bin", "vectors.bin", "vectors.sqlite", "fts.sqlite"})
+# 各成员解压后的字节上限：正常库的缓存不会超过这些量级，超限 = 恶意构造。
+_SNAPSHOT_MEMBER_LIMITS = {
+    "manifest.json": 1 * 1024 * 1024,
+    "chunks.bin": 4 * 1024 * 1024 * 1024,
+    "vectors.bin": 16 * 1024 * 1024 * 1024,
+    "vectors.sqlite": 16 * 1024 * 1024 * 1024,
+    "fts.sqlite": 16 * 1024 * 1024 * 1024,
+}
 
 # Embeddings are stored as float32 arrays (4 bytes/dim) instead of Python lists
 # to keep memory sane: 6157 chunks x 4096 dims would otherwise cost ~800MB.
@@ -168,8 +176,18 @@ class SearchFilter:
 
     def matches(self, chunk: Chunk) -> bool:
         """chunk 是否满足全部已设置的条件（未设置的条件一律放行）。"""
-        if self.path_prefix and not chunk.source.startswith(self.path_prefix):
-            return False
+        if self.path_prefix:
+            # 归一化后比较：source 恒为 posix 风格（'dir/file.md'），而 Windows
+            # 用户自然会传 '教材\\' 或大小写不同的 'notes/' —— 此前是裸
+            # startswith，两者都静默零召回（FTS 下推的 LIKE 对 ASCII 大小写
+            # 不敏感，比权威后过滤更宽松，掩盖了这个问题）。
+            prefix = self.path_prefix.replace("\\", "/").rstrip("/")
+            source = chunk.source
+            if os.name == "nt":
+                prefix = prefix.casefold()
+                source = source.casefold()
+            if prefix and not source.startswith(prefix):
+                return False
         if self.tags:
             wanted = {str(tag).lower().lstrip("#") for tag in self.tags if str(tag).strip()}
             if wanted:
@@ -503,10 +521,16 @@ class MarkdownIndexer:
         # 防抖定时器到点后做一次全量 sync；事件密集时不断顺延但受
         # _FS_MAX_DEBOUNCE_WAIT 封顶（见 _on_fs_events）。
         self._fs_watcher: WindowsDirectoryWatcher | None = None
+        # 防抖：常驻调度线程 + 条件变量。每事件新建/取消 threading.Timer 在
+        # 编辑器风暴下是每秒数千次线程生灭；单调度线程只在有事件时唤醒。
         self._fs_debounce_lock = threading.Lock()
-        self._fs_debounce_timer: threading.Timer | None = None
+        self._fs_debounce_cv = threading.Condition(self._fs_debounce_lock)
+        self._fs_scheduler_thread: threading.Thread | None = None
+        self._fs_requested = False
         self._fs_pending_since: float | None = None
         self._fs_debounce_seconds: float = 0.5
+        # 连续同步的最小间隔：避免高频事件把 sync 压成紧密循环。
+        self._fs_last_sync_at: float = 0.0
         self._sync_lock = threading.Lock()
         self._cache_lock = threading.Lock()
         # 是否正在 sync（供 kb_stats 报进度）；连续失败次数用于监听线程的退避。
@@ -590,7 +614,13 @@ class MarkdownIndexer:
         self._vectors_cache_path = vectors_dir / f"vault_{key}.{model_hash}.{self.config.embedding.dimension}.vec.bin"
         self._fts_cache_path = fts_dir / f"vault_{key}.fts.sqlite"
         # sqlite-vec backend keeps its own db (never shares the FTS file).
-        self._vectors_db_path = vectors_dir / f"vault_{key}.vec.sqlite"
+        # 文件名必须带上 model 与 dimension：vec0 表的维度在建表时就固化了
+        # （CREATE VIRTUAL TABLE ... vec0(embedding float[N])），改维度后
+        # IF NOT EXISTS 会静默保留旧表，之后所有插入都失败且被 upsert 的
+        # except 吞掉 —— 向量库从此语义检索归零且不可自愈。
+        self._vectors_db_path = (
+            vectors_dir / f"vault_{key}.{model_hash}.{self.config.embedding.dimension}.vec.sqlite"
+        )
         # 失败名单：与 chunks/vectors/fts 平级的纯可观测性文件，进程重启后
         # 让 kb_stats 仍能报出上一轮的失败原因。
         self._failed_cache_path = base / f"vault_{key}.failed.json"
@@ -636,6 +666,11 @@ class MarkdownIndexer:
             "key": self._cache_key(),
             "chunk_size": self.config.chunk_size,
             "chunk_overlap": self.config.chunk_overlap,
+            # 图片注入会改写 chunk.content（继而改写 chunk.id），必须参与失效
+            # 判据。此前漏了它：缓存失效只看文件字节 sha256，翻转这个开关后
+            # 文件字节没变 → 存量库既不重切块也不重嵌，CHANGELOG 承诺的
+            # 「开启会全量重嵌」实际完全没生效。
+            "inject_image_captions": bool(self.config.inject_image_captions),
             "chunker": 4,
         }
 
@@ -645,6 +680,13 @@ class MarkdownIndexer:
             "embedding_mode": self.config.embedding.mode,
             "embedding_model": self.config.embedding.model,
             "dimension": self.config.embedding.dimension,
+            # endpoint / send_dimensions 必须参与失效判据：把 endpoint 从 A 厂
+            # 换到 B 厂（自建同名 bge-m3）会静默复用 A 厂算出的向量；翻转
+            # send_dimensions（MRL）会让新旧两种维度混在同一个缓存文件里，
+            # numpy 侧因 ragged 输入抛错后回退到 _cosine，而 _cosine 用
+            # min(len) 截断再算余弦 —— 出来的是毫无意义的相似度。
+            "endpoint": self.config.embedding.endpoint,
+            "send_dimensions": bool(self.config.embedding.send_dimensions),
         }
 
     def _load_chunks_cache(self) -> None:
@@ -766,10 +808,14 @@ class MarkdownIndexer:
             # to the vectors layer, otherwise a model/dimension change would not
             # invalidate vectors while reusing text.
             payload[source] = (self._signatures[source], [self._strip_embedding(chunk) for chunk in chunks])
-        if not payload:
-            return
         try:
-            _CacheCodec.dump(self._chunks_cache_path, self._chunks_meta(), payload)
+            if payload:
+                _CacheCodec.dump(self._chunks_cache_path, self._chunks_meta(), payload)
+            elif self._chunks_cache_path.exists():
+                # 空也必须写：早退等于"删除无法持久化"。把库里的笔记全删光
+                # （或全部豁免）后，旧 chunks.bin 原封不动留在磁盘上，
+                # 下次启动会把已删除的笔记重新载回索引。
+                self._chunks_cache_path.unlink()
         except OSError:
             pass
 
@@ -789,10 +835,13 @@ class MarkdownIndexer:
             for chunk in chunks:
                 if chunk.embedding is not None and len(chunk.embedding):
                     vectors[chunk.id] = chunk.embedding
-        if not vectors:
-            return
         try:
-            _VectorsCodec.dump(self._vectors_cache_path, self._vectors_meta(), vectors)
+            if vectors:
+                _VectorsCodec.dump(self._vectors_cache_path, self._vectors_meta(), vectors)
+            elif self._vectors_cache_path.exists():
+                # 同上：全库删空后旧 .bin 必须一起清掉，否则重启会把陈旧
+                # 向量重新挂回来（向量 meta 还可能与新配置不符）。
+                self._vectors_cache_path.unlink()
         except OSError:
             pass
 
@@ -918,13 +967,20 @@ class MarkdownIndexer:
         if not vectors:
             return
         try:
-            self._vector_backend.upsert_vectors(vectors)
-            self._disk_vectors.update(vectors)
-            for chunk in self.all_chunks():
-                if chunk.id in vectors:
-                    chunk.embedding = None
+            persisted = self._vector_backend.upsert_vectors(vectors)
         except Exception:
-            pass
+            # 落盘失败就保留在 RAM 里，让下一轮还能重试（不能假装已落盘）。
+            return
+        # 后端返回 None = 未实现成功计数，沿用旧的乐观语义；否则只认真正
+        # 落盘的 id。此前无条件 update(vectors)：upsert 内部吞掉异常后照样
+        # 记账，导致 chunk 被认为"已有向量"而永不重嵌。
+        stored = set(vectors) if persisted is None else {str(item) for item in persisted}
+        if not stored:
+            return
+        self._disk_vectors.update(stored)
+        for chunk in self.all_chunks():
+            if chunk.id in stored:
+                chunk.embedding = None
 
     def _fts_upsert(self, source: str, chunks: list[Chunk]) -> None:
         if self._fts is None:
@@ -1162,16 +1218,34 @@ class MarkdownIndexer:
             return []
         matcher = self._ignore_matcher()
         paths: list[Path] = []
-        for path in self.vault_path.rglob("*"):
-            if not path.is_file() or path.suffix.lower() != ".md":
+        # 手动 scandir 递归并在目录层剪枝：rglob 不做剪枝，只能在事后过滤，
+        # 而排除目录（.git/objects 等）里可能有数十万对象，轮询模式每
+        # 0.25s 全量遍历一次代价巨大。
+        stack = [self.vault_path]
+        while stack:
+            directory = stack.pop()
+            try:
+                entries = list(os.scandir(directory))
+            except OSError:
                 continue
-            if self._ignored_name(path.name):
-                continue
-            source = self._source(path)
-            ignored, _ = matcher.is_ignored(source, is_dir=False)
-            if ignored:
-                continue
-            paths.append(path)
+            for entry in entries:
+                try:
+                    is_dir = entry.is_dir()
+                except OSError:
+                    continue
+                path = Path(entry.path)
+                if is_dir:
+                    rel_dir = self._source(path)
+                    ignored, _ = matcher.is_ignored(rel_dir, is_dir=True)
+                    if ignored or self._ignored_name(entry.name):
+                        continue
+                    stack.append(path)
+                    continue
+                if entry.name.lower().endswith(".md") and not self._ignored_name(entry.name):
+                    source = self._source(path)
+                    ignored, _ = matcher.is_ignored(source, is_dir=False)
+                    if not ignored:
+                        paths.append(path)
         return sorted(paths, key=lambda item: self._source(item))
 
     @staticmethod
@@ -1345,6 +1419,26 @@ class MarkdownIndexer:
             carry: list[str] = []
             carry_length = 0
             for offset, line in enumerate(lines):
+                # 超长行必须按字符硬切：一行 1MB 的 CSV/日志粘贴会原样塞进单个
+                # chunk 直发付费 embedding API（还会 413/400，然后每轮 sync 都
+                # 重试该文件）。chunk_size 是字符数预算，行本身超过它就该切。
+                if len(line) > self.config.chunk_size:
+                    if current:
+                        result.append(self._new_chunk(source, title, heading, current_start, start + offset - 1, chunk_index, tags, current, mtime))
+                        chunk_index += 1
+                        carry, carry_length = self._overlap_tail(current, overlap)
+                        current = list(carry)
+                        current_start = start + offset - len(carry)
+                        current_length = carry_length
+                    for piece_start in range(0, len(line), self.config.chunk_size):
+                        piece = line[piece_start : piece_start + self.config.chunk_size]
+                        if current:
+                            result.append(self._new_chunk(source, title, heading, current_start, start + offset - 1, chunk_index, tags, current, mtime))
+                            chunk_index += 1
+                        current = [piece]
+                        current_length = len(piece) + 1
+                        current_start = start + offset
+                    continue
                 if current and current_length + len(line) + 1 > self.config.chunk_size:
                     result.append(self._new_chunk(source, title, heading, current_start, start + offset - 1, chunk_index, tags, current, mtime))
                     chunk_index += 1
@@ -1458,7 +1552,12 @@ class MarkdownIndexer:
                     query_vector = self.embedding_provider.embed([query])[0]
                 # Rerank candidate cap + per-route RRF width both come from
                 # config so callers can trade recall vs API payload size.
+                # 带过滤条件时放大候选池：过滤发生在候选截断之后，窄过滤条件
+                # （path_prefix/tags）下 top-vec_limit 全局候选可能全被滤掉而
+                # 真匹配在窗口外，返回偏少或空、翻页边界不稳定。
                 vec_limit = max(top_k, self.config.rrf_per_route, self.config.rerank_cap)
+                if filters is not None:
+                    vec_limit = max(vec_limit, min(top_k * 20, vec_limit * 8))
                 pairs = self._vector_backend.query(query_vector, vec_limit)
                 semantic_snapshot = dict(pairs)
                 for chunk in all_chunks:
@@ -1495,13 +1594,14 @@ class MarkdownIndexer:
         if filters is not None:
             ranked = [chunk for chunk in ranked if filters.matches(chunk)]
 
-        if use_rerank and self.reranker_provider and ranked:
-            ranked = rerank_chunks(query, ranked, self.reranker_provider, cap=self.config.rerank_cap)
-
-        # 内容完全相同的 chunk（重复备份）只留排在最前面的那条，否则同一段
-        # 内容会占掉 top_k 里的好几格，把其它库/其它文件的结果挤出去。
+        # 去重同样放在 rerank 之前：付费 rerank 的 cap（默认 60）个名额会被
+        # 同一段内容的 N 份副本占满，实际收益只剩 1/N。行 1468 的 early dedupe
+        # 只覆盖混合模式之前，这里兜底语义路由无词法结果的情况。
         if dedupe:
             ranked = dedupe_by_content_hash(ranked)
+
+        if use_rerank and self.reranker_provider and ranked:
+            ranked = rerank_chunks(query, ranked, self.reranker_provider, cap=self.config.rerank_cap)
 
         if filters is None:
             return ranked[: max(0, top_k)]
@@ -1514,6 +1614,13 @@ class MarkdownIndexer:
         Returns None when no such token survives (e.g. a 2-char CJK query like
         "银狼"), so the caller skips the BM25 route and the bigram lexical route
         covers the query instead. Trigram cannot match <3-char queries.
+
+        中文特判：FTS5 用的是 trigram 分词器（索引的是 3 字滑窗），而查询侧把
+        整段连续 CJK 当一个引号短语的话，必须"原样连续出现"才命中——中文没有
+        分词，一段自然语言就是 8~10 个字，实测「半导体物理」「如何学习半导体
+        物理」这类查询对含相关内容的正文命中 0 条，BM25 路由对中文基本是摆设
+        （不报错，另两路兜住，所以看不出问题）。长度 >= 4 的 CJK 段切成 3 字
+        滑窗、用 OR 连接，让 BM25 按命中滑窗数量给分级召回。
         """
         terms: list[str] = []
         for piece in _WORD_RE.findall(query):
@@ -1521,8 +1628,16 @@ class MarkdownIndexer:
                 if len(word) >= 3:
                     terms.append('"' + word.lower().replace('"', '""') + '"')
             for cjk in _CJK_RE.findall(piece):
-                if len(cjk) >= 3:
+                if len(cjk) == 3:
                     terms.append('"' + cjk.replace('"', '""') + '"')
+                elif len(cjk) >= 4:
+                    shingles = [
+                        cjk[index : index + 3] for index in range(len(cjk) - 2)
+                    ]
+                    joined = " OR ".join(
+                        '"' + shingle.replace('"', '""') + '"' for shingle in shingles
+                    )
+                    terms.append(f"({joined})")
         if not terms:
             return None
         return " AND ".join(terms)
@@ -1623,7 +1738,12 @@ class MarkdownIndexer:
 
     @staticmethod
     def _cosine(left: array, right: array) -> float:
-        size = min(len(left), len(right))
+        # 维度不一致说明数据已损坏（换模型 / 换维度 / 导入了错误维度的快照后
+        # numpy 路径会抛错并被吞，最终落到这里）。截断后算出来的余弦是毫无
+        # 意义的数字，宁可判 0 也不要产出"看起来很像回事"的错误排序。
+        if len(left) != len(right):
+            return 0.0
+        size = len(left)
         if not size:
             return 0.0
         dot = 0.0
@@ -1989,63 +2109,73 @@ class MarkdownIndexer:
         快照是缓存层原样搬运，不含任何机器相关路径；导入端按自己的 cache key
         重命名落地。前提是缓存已启用且做过至少一次 sync（否则没有可导出的东西）。
         """
-        if self._chunks_cache_path is None:
-            raise ValueError("cache is disabled; enable [cache] before exporting a snapshot")
-        if not self._chunks:
-            raise ValueError("index is empty; run a sync (or kb_rebuild) before exporting")
+        # 与 import 对称地持 _sync_lock：否则并发 sync 的 tmp.replace 会让
+        # 快照里 chunks 与 vectors 来自不同时刻（撕裂快照）。
+        with self._sync_lock:
+            return self._export_snapshot_locked(out_path)
 
-        # 把当前内存态刷进缓存文件再打包，保证快照 = 此刻的索引。
-        self._save_cache()
+    def _export_snapshot_locked(self, out_path: str | Path) -> dict[str, Any]:
+        # 必须持 _sync_lock：打包过程逐文件读取缓存，并发的 sync 可能恰好
+        # tmp.replace 其中一个文件 —— Windows 上直接 PermissionError，非失败
+        # 交错则产出「chunks 来自 sync 前、vectors 来自 sync 后」的撕裂快照，
+        # 导入端会把这对不一致数据当作一致状态恢复。
+            if self._chunks_cache_path is None:
+                raise ValueError("cache is disabled; enable [cache] before exporting a snapshot")
+            if not self._chunks:
+                raise ValueError("index is empty; run a sync (or kb_rebuild) before exporting")
 
-        vectors_member: str | None = None
-        if self._vectors_on_disk:
-            if self._vectors_db_path is not None and self._vectors_db_path.exists():
-                vectors_member = "vectors.sqlite"
-        elif self._vectors_cache_path is not None and self._vectors_cache_path.exists():
-            vectors_member = "vectors.bin"
+            # 把当前内存态刷进缓存文件再打包，保证快照 = 此刻的索引。
+            self._save_cache()
 
-        vector_count = sum(
-            1 for chunk in self.all_chunks() if self._chunk_has_vector(chunk)
-        )
-        manifest = {
-            "format": _SNAPSHOT_FORMAT,
-            "format_version": _SNAPSHOT_VERSION,
-            "cache_key": self._cache_key(),
-            "chunks_meta": self._chunks_meta(),
-            "vectors_meta": self._vectors_meta(),
-            "backend": getattr(self._vector_backend, "name", self.config.vector.backend),
-            "stats": {
-                "files": len(self._chunks),
-                "chunks": len(self.all_chunks()),
-                "vectors": vector_count,
-            },
-        }
+            vectors_member: str | None = None
+            if self._vectors_on_disk:
+                if self._vectors_db_path is not None and self._vectors_db_path.exists():
+                    vectors_member = "vectors.sqlite"
+            elif self._vectors_cache_path is not None and self._vectors_cache_path.exists():
+                vectors_member = "vectors.bin"
 
-        out = Path(out_path).expanduser()
-        out.parent.mkdir(parents=True, exist_ok=True)
-        tmp = out.with_suffix(out.suffix + ".tmp")
-        try:
-            with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zf:
-                zf.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
-                zf.write(self._chunks_cache_path, "chunks.bin")
-                if vectors_member is not None:
-                    source = self._vectors_db_path if vectors_member == "vectors.sqlite" else self._vectors_cache_path
-                    zf.write(source, vectors_member)
-                if self._fts is not None and self._fts_cache_path is not None and self._fts_cache_path.exists():
-                    zf.write(self._fts_cache_path, "fts.sqlite")
-            tmp.replace(out)
-        finally:
-            if tmp.exists():
-                try:
-                    tmp.unlink()
-                except OSError:
-                    pass
-        return {
-            "exported": True,
-            "path": str(out),
-            "backend": manifest["backend"],
-            **manifest["stats"],
-        }
+            vector_count = sum(
+                1 for chunk in self.all_chunks() if self._chunk_has_vector(chunk)
+            )
+            manifest = {
+                "format": _SNAPSHOT_FORMAT,
+                "format_version": _SNAPSHOT_VERSION,
+                "cache_key": self._cache_key(),
+                "chunks_meta": self._chunks_meta(),
+                "vectors_meta": self._vectors_meta(),
+                "backend": getattr(self._vector_backend, "name", self.config.vector.backend),
+                "stats": {
+                    "files": len(self._chunks),
+                    "chunks": len(self.all_chunks()),
+                    "vectors": vector_count,
+                },
+            }
+
+            out = Path(out_path).expanduser()
+            out.parent.mkdir(parents=True, exist_ok=True)
+            tmp = out.with_suffix(out.suffix + ".tmp")
+            try:
+                with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zf:
+                    zf.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
+                    zf.write(self._chunks_cache_path, "chunks.bin")
+                    if vectors_member is not None:
+                        source = self._vectors_db_path if vectors_member == "vectors.sqlite" else self._vectors_cache_path
+                        zf.write(source, vectors_member)
+                    if self._fts is not None and self._fts_cache_path is not None and self._fts_cache_path.exists():
+                        zf.write(self._fts_cache_path, "fts.sqlite")
+                tmp.replace(out)
+            finally:
+                if tmp.exists():
+                    try:
+                        tmp.unlink()
+                    except OSError:
+                        pass
+            return {
+                "exported": True,
+                "path": str(out),
+                "backend": manifest["backend"],
+                **manifest["stats"],
+            }
 
     def import_snapshot(self, snapshot: str | Path, force: bool = False) -> dict[str, Any]:
         """从快照恢复索引缓存；随后一次 sync 应当 0 次 embedding API 调用。
@@ -2075,6 +2205,20 @@ class MarkdownIndexer:
                 raise ValueError(f"snapshot contains unexpected members: {sorted(unknown)}")
             if "manifest.json" not in names or "chunks.bin" not in names:
                 raise ValueError("snapshot is missing manifest.json or chunks.bin")
+            # 解压炸弹防护：快照的用途就是从别人机器收文件，任何一个成员都可以
+            # 是恶意构造的。白名单挡得住路径穿越，挡不住"1MB zip 解出几十 GB"。
+            for member in names:
+                info = zf.getinfo(member)
+                if info.file_size > _SNAPSHOT_MEMBER_LIMITS.get(member, 0):
+                    raise ValueError(
+                        f"snapshot member {member} is too large "
+                        f"({info.file_size} bytes > limit {_SNAPSHOT_MEMBER_LIMITS.get(member)})"
+                    )
+                if info.compress_size > 0 and info.file_size / info.compress_size > 1000:
+                    raise ValueError(
+                        f"snapshot member {member} has an implausible compression ratio "
+                        f"({info.file_size}/{info.compress_size}); refusing to decompress"
+                    )
             try:
                 manifest = json.loads(zf.read("manifest.json").decode("utf-8"))
             except (ValueError, UnicodeDecodeError) as exc:
@@ -2093,10 +2237,38 @@ class MarkdownIndexer:
             snapshot_vectors_meta = manifest.get("vectors_meta") or {}
             vectors_member = "vectors.sqlite" if "vectors.sqlite" in names else ("vectors.bin" if "vectors.bin" in names else None)
             skip_vectors = vectors_member is None
-            if vectors_member == "vectors.bin" and (
+            warnings: list[str] = []
+
+            # 分块参数（chunk_size / chunk_overlap / chunker 代际 / 图片注入）不匹配时，
+            # chunk.id（sha1 of source+index+content）对不上，导入的向量一条都挂不上，
+            # 等于白导——而且 vectors.bin 的 meta 导入时会被本机 meta 重写，事后看不出
+            # 原因。此前 manifest 里导出的 chunks_meta 从不比对。
+            # 注意只比切块相关字段，不比 cache_key：cache_key 含 vault 路径，换机迁移
+            # 时必然不同，拿它当判据会把正当的「免重嵌迁移」也拒掉。
+            def _chunking_fingerprint(meta: dict[str, Any]) -> dict[str, Any]:
+                return {key: value for key, value in (meta or {}).items() if key != "key"}
+
+            snapshot_chunks_meta = manifest.get("chunks_meta")
+            # 只在 manifest 确实带 chunks_meta（0.5.0+ 快照）时才做比对：
+            # 老格式快照没有该字段，直接拒掉会给出误导性的"参数不匹配"报错。
+            chunks_mismatch = isinstance(snapshot_chunks_meta, dict) and _chunking_fingerprint(
+                snapshot_chunks_meta
+            ) != _chunking_fingerprint(self._chunks_meta())
+            if chunks_mismatch and not force:
+                raise ValueError(
+                    "snapshot was chunked with different parameters than this machine "
+                    "(chunk_size / chunker / inject_image_captions mismatch); pass force=true "
+                    "to import anyway (next sync will re-chunk and re-embed)"
+                )
+
+            # 模型/维度校验对两个向量成员一视同仁。此前只查 vectors.bin，vectors.sqlite
+            # 整文件替换、零校验——错误维度的向量装进去后 numpy 路径抛错被吞，
+            # 标量 _cosine 用 min(len) 截断，返回"看起来很像回事"的垃圾相似度。
+            model_mismatch = (
                 snapshot_vectors_meta.get("embedding_model") != local_vectors_meta["embedding_model"]
                 or snapshot_vectors_meta.get("dimension") != local_vectors_meta["dimension"]
-            ):
+            )
+            if vectors_member is not None and model_mismatch:
                 if not force:
                     raise ValueError(
                         "snapshot vectors were built with model="
@@ -2106,6 +2278,14 @@ class MarkdownIndexer:
                         "pass force=true to import the text layer only and re-embed"
                     )
                 skip_vectors = True
+                warnings.append(
+                    "vectors skipped: snapshot model/dimension differs from this config"
+                )
+            if chunks_mismatch and force:
+                warnings.append(
+                    "chunking parameters differ from this machine; imported vectors may not "
+                    "match chunk ids and will be re-embedded"
+                )
 
             # 锁序必须与 sync() 一致（_sync_lock → _cache_lock）。此前这里是
             # _cache_lock → _sync_lock 的反向嵌套，kb_import 撞上 watcher 的
@@ -2113,7 +2293,9 @@ class MarkdownIndexer:
             # kb_search / kb_list 排队在 _sync_lock 上，整个 MCP 服务冻结。
             # 导入体本身会在锁内从磁盘重载全部状态，无需外层再持 _cache_lock。
             with self._sync_lock:
-                return self._import_snapshot_locked(src, zf, vectors_member, skip_vectors)
+                return self._import_snapshot_locked(
+                    src, zf, vectors_member, skip_vectors, warnings
+                )
 
     def _import_snapshot_locked(
         self,
@@ -2121,7 +2303,12 @@ class MarkdownIndexer:
         zf: zipfile.ZipFile,
         vectors_member: str | None,
         skip_vectors: bool,
+        warnings: list[str] | None = None,
     ) -> dict[str, Any]:
+        # 磁盘记账集必须清空：否则旧模型的 id 还在集合里，导入后凡是命中的
+        # chunk 都被判为"已嵌入"永不重嵌（而 vec 库里躺的是旧语料的向量）。
+        self._disk_vectors.clear()
+
         # 1) 文本层：解码 -> 按本机 meta 重写 -> 原子落地。
         chunk_count, file_count = self._import_chunks_member(zf)
 
@@ -2136,10 +2323,11 @@ class MarkdownIndexer:
         # 3) FTS：能搬就搬；无论搬没搬，都按导入后的 chunk 集对账一次。
         if "fts.sqlite" in zf.namelist() and self._fts_cache_path is not None:
             self._replace_live_file(self._fts_cache_path, zf.read("fts.sqlite"), close_fts=True)
-        self._recreate_fts()
-        self._fts_ensure_populated()
 
         # 4) 用导入后的缓存文件重建内存态（向量按 id 挂回 chunk）。
+        #    注意 FTS 对账必须放在 _chunks.clear() 与 _load_chunks_cache() 之后：
+        #    此前先执行，用的是导入前的旧 chunk 集，会把旧语料全部 upsert 进
+        #    刚导入的 FTS 库——两套语料混在一起，且后续 sync 因签名未变永不修复。
         self._chunks.clear()
         self._signatures.clear()
         self._pending_vectors.clear()
@@ -2148,6 +2336,8 @@ class MarkdownIndexer:
         self._load_failed_files()
         if not self._vectors_on_disk:
             self._load_vectors_cache()
+        self._recreate_fts()
+        self._fts_ensure_populated()
 
         return {
             "imported": True,
@@ -2158,6 +2348,7 @@ class MarkdownIndexer:
             "vectors": vector_count,
             "vectors_imported": vectors_member is not None and not skip_vectors,
             "backend": getattr(self._vector_backend, "name", self.config.vector.backend),
+            "warnings": warnings or [],
         }
 
     # ---------------------------------------------------------------- snapshot 内部
@@ -2190,10 +2381,27 @@ class MarkdownIndexer:
         closer = getattr(self._vector_backend, "close", None)
         if closer is not None:
             closer()
-        self._replace_live_file(self._vectors_db_path, zf.read("vectors.sqlite"), close_fts=False)
+        # try/finally 是必须的：close 之后 self._vector_backend 就是一个被关闭
+        # 的对象，任何一步失败（磁盘满、文件被占用、sqlite_vec 不可用）都会
+        # 让它永久停在"已关闭"状态 —— query() 恒返回 []、upsert 全部 no-op，
+        # 而 _flush_vectors_to_disk 还在盲记账，语义检索静默归零且不可自愈。
+        try:
+            self._replace_live_file(self._vectors_db_path, zf.read("vectors.sqlite"), close_fts=False)
+            backend = create_vector_backend(self.config.vector, self, self._vectors_db_path)
+            if not getattr(backend, "available", False):
+                raise ValueError("sqlite_vec could not open the imported vector store")
+        except Exception:
+            # 失败即回滚：把旧 backend 重新打开（旧文件可能已被替换，能开成
+            # 什么样算什么样——至少不能留一个"已关闭"的对象给后续所有调用）。
+            try:
+                self._vector_backend = create_vector_backend(self.config.vector, self, self._vectors_db_path)
+                self._vectors_on_disk = bool(getattr(self._vector_backend, "on_disk", False))
+                self._disk_vectors = set()
+            except Exception:
+                pass
+            raise
         # 重开后由导入的数据接管；磁盘记账集在下一次 sync 的
         # _ensure_disk_vectors_migrated 里按库内实际 id 重建。
-        backend = create_vector_backend(self.config.vector, self, self._vectors_db_path)
         self._vector_backend = backend
         self._vectors_on_disk = bool(getattr(backend, "on_disk", False))
         self._disk_vectors = set()
@@ -2285,41 +2493,83 @@ class MarkdownIndexer:
                     target=self._native_watch_loop, args=(interval, debounce), daemon=True, name="vault-watch-native"
                 )
                 self._watch_thread.start()
+                self._start_fs_scheduler()
                 return
             self._fs_watcher = None
         self._watch_thread = threading.Thread(target=self._watch_loop, args=(interval, debounce), daemon=True)
         self._watch_thread.start()
+        self._start_fs_scheduler()
+
+    def _start_fs_scheduler(self) -> None:
+        if self._fs_scheduler_thread is not None and self._fs_scheduler_thread.is_alive():
+            return
+        self._fs_scheduler_thread = threading.Thread(
+            target=self._fs_scheduler_loop, daemon=True, name="vault-fs-debounce"
+        )
+        self._fs_scheduler_thread.start()
+
+    def _fs_scheduler_loop(self) -> None:
+        """防抖调度：事件到达后，安静 debounce 秒才 sync；事件持续到达就顺延，
+        但受 _FS_MAX_DEBOUNCE_WAIT 封顶（到期立即执行）。常驻单线程，
+        替代此前「每事件新建/取消一个 threading.Timer」的线程洪泛。
+        """
+        while not self._watch_stop.is_set():
+            with self._fs_debounce_lock:
+                if not self._fs_requested:
+                    self._fs_debounce_cv.wait(timeout=0.5)
+                    continue
+                now = time.monotonic()
+                elapsed = now - (self._fs_pending_since or now)
+                if elapsed < self._fs_debounce_seconds and elapsed < _FS_MAX_DEBOUNCE_WAIT:
+                    self._fs_debounce_cv.wait(timeout=self._fs_debounce_seconds - elapsed)
+                    continue  # 重新评估：期间又有事件则继续顺延
+                self._fs_requested = False
+                self._fs_pending_since = None
+                due = True
+            if not due:
+                continue
+            if self._watch_stop.is_set():
+                return
+            self._run_sync_quietly()
 
     def _on_fs_events(self, events: list[tuple[int, str]] | None) -> None:
         """原生监听的回调：把「库里有动静」翻译成一次防抖后的全量 sync。
 
-        事件里带哪些路径完全不重要——正确性由 sync() 的全量 sha256 对账兜底，
-        这里不解析、不增量处理。events=None（内核缓冲区溢出，具体改动不可知）
-        也走同一条路，反正 sync 本来就是全量的。
+        正确性由 sync() 的全量 sha256 对账兜底。events=None（内核缓冲区溢出，
+        具体改动不可知）也走同一条路。事件路径在这里做第一层过滤：Obsidian
+        的 .obsidian/、缓存目录、以及被 ignore 规则排除的路径变动不需要唤醒
+        全量 sync——递归监视看不到排除目录，所以必须过滤而不是指望不触发。
         """
+        if events is not None:
+            keep = False
+            for _, rel in events:
+                if self._fs_event_matters(rel):
+                    keep = True
+                    break
+            if not keep:
+                return
         with self._fs_debounce_lock:
             now = time.monotonic()
             if self._fs_pending_since is None:
                 self._fs_pending_since = now
-            # 防抖：事件安静 debounce 秒后才同步；事件持续到达就不断顺延定时器，
-            # 但受 _FS_MAX_DEBOUNCE_WAIT 封顶（延迟归零，尽快同步一次）。
-            delay = self._fs_debounce_seconds
-            if now - self._fs_pending_since >= _FS_MAX_DEBOUNCE_WAIT:
-                delay = 0.0
-            if self._fs_debounce_timer is not None:
-                self._fs_debounce_timer.cancel()
-            timer = threading.Timer(delay, self._fs_fire_sync)
-            timer.daemon = True
-            self._fs_debounce_timer = timer
-        timer.start()
+            self._fs_requested = True
+            self._fs_debounce_cv.notify_all()
 
-    def _fs_fire_sync(self) -> None:
-        with self._fs_debounce_lock:
-            self._fs_debounce_timer = None
-            self._fs_pending_since = None
-        if self._watch_stop.is_set():
-            return
-        self._run_sync_quietly()
+    def _fs_event_matters(self, rel: str) -> bool:
+        """事件路径是否需要触发全量 sync。"""
+        if not rel:
+            return True
+        rel = rel.replace("\\", "/").lstrip("/")
+        # 缓存落在 vault 内时，自己写缓存不能再次触发自己。
+        if self.config.cache.placement == "vault" and self.config.cache.subdir:
+            if rel.startswith(self.config.cache.subdir.rstrip("/") + "/") or rel == self.config.cache.subdir:
+                return False
+        lower = rel.lower()
+        for pattern in self.config.exclude_patterns:
+            stripped = pattern.strip().strip("/").lower()
+            if stripped and (lower == stripped or lower.startswith(stripped + "/")):
+                return False
+        return lower.endswith(".md")
 
     def _run_sync_quietly(self) -> None:
         """sync() 的守护包装：监听线程里的任何异常都不能把线程打死。
@@ -2377,7 +2627,14 @@ class MarkdownIndexer:
         previous = self._quick_signatures()
         self._run_sync_quietly()
         while not self._watch_stop.wait(interval):
-            current = self._quick_signatures()
+            try:
+                current = self._quick_signatures()
+            except OSError:
+                # rglob 与 stat 之间文件被删（Obsidian 的编辑器 churn 下很常见）
+                # 此前会让整个线程死于 FileNotFoundError，监控从此静默关闭、
+                # 服务用旧数据继续答搜索。跳过本轮，下一轮再试。
+                time.sleep(0.05)
+                continue
             if current != previous:
                 pending_since = pending_since or time.monotonic()
                 if time.monotonic() - pending_since >= debounce:
@@ -2388,22 +2645,29 @@ class MarkdownIndexer:
                 pending_since = None
 
     def _quick_signatures(self) -> dict[str, tuple[int, int]]:
-        return {self._source(path): (path.stat().st_mtime_ns, path.stat().st_size) for path in self._markdown_files()}
+        # 同一路径只 stat 一次：此前对每个文件 stat 两次（mtime_ns 一次、
+        # size 一次），0.25s 轮询模式下把开销翻倍。
+        out: dict[str, tuple[int, int]] = {}
+        for path in self._markdown_files():
+            try:
+                stat = path.stat()
+            except OSError:
+                continue  # 文件刚被删：跳过，下一轮自然消失
+            out[self._source(path)] = (stat.st_mtime_ns, stat.st_size)
+        return out
 
     def stop_watching(self) -> None:
         self._watch_stop.set()
         with self._fs_debounce_lock:
-            timer, self._fs_debounce_timer = self._fs_debounce_timer, None
+            self._fs_requested = False
             self._fs_pending_since = None
-        if timer is not None:
-            timer.cancel()
+            self._fs_debounce_cv.notify_all()
+        if self._fs_scheduler_thread is not None:
+            self._fs_scheduler_thread.join(timeout=2)
+            self._fs_scheduler_thread = None
         watcher, self._fs_watcher = self._fs_watcher, None
         if watcher is not None:
             watcher.stop()
-        # 防抖 Timer 也是线程：已触发但还在跑 sync 的实例必须等它结束，
-        # 否则 stop_watching 返回后仍会往正在关闭的缓存里写。
-        if timer is not None and timer.is_alive():
-            timer.join(timeout=2)
         if self._watch_thread is not None:
             self._watch_thread.join(timeout=2)
             if self._watch_thread.is_alive():

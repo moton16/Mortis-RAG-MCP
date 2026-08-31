@@ -1,12 +1,12 @@
 ---
 name: vault-mcp
 description: "调用 Mortis'RAG MCP（vault_mcp）检索知识库（语义搜索/读原文/查索引/注册库）。触发词：搜知识库、查笔记、kb_search、vault 检索、RAG 搜索。"
-version: 3.0.0
+version: 3.1.0
 ---
 
-# vault-mcp（知识库检索，0.4.0 混合检索 + 磁盘向量后端）
+# vault-mcp（知识库检索，0.5.0 检索过滤/去重/权重 + 原生监听 + 快照迁移）
 
-连接器：MCP `mortis-rag-mcp`（stdio），server 0.4.0。**9 个工具**。不绑定任何路径：任意文件夹经 `kb_init` 注册为知识库，注册表持久化在 `~/.vault_mcp/vaults.toml`（跨重启/换设备可用）。
+连接器：MCP `mortis-rag-mcp`（stdio），server 0.5.0。**12 个工具**。不绑定任何路径：任意文件夹经 `kb_init` 注册为知识库，注册表持久化在 `~/.vault_mcp/vaults.toml`（跨重启/换设备可用）。0.5.0：嵌入失败重试+切批、failed_files 跨重启保留、内容哈希去重（相同内容只算一次向量）、`kb_set_weight` 库权重、Windows 原生目录监听、`kb_export`/`kb_import` 换机免重嵌快照。
 
 ## 工具速查
 
@@ -14,13 +14,16 @@ version: 3.0.0
 |---|---|---|
 | `kb_init` | **注册任意文件夹为知识库**（后台建索引+启动监听） | `path`(必, 绝对路径), `name`(可选) |
 | `kb_unregister` | 注销知识库 | `path`(必), `purge_cache`(默认false) |
-| `kb_search` | **核心**：0.4.0 起三路 RRF 混合检索（FTS5 BM25 + 向量余弦 + bigram 词法）；**多库时不传 vault_path = 跨全部注册库 fan-out** | `query`(必), `top_k`(默认10), `use_rerank`(默认true), `vault_path`(可选) |
+| `kb_search` | **核心**：0.5.0 三路 RRF 混合检索（FTS5 BM25 + 向量余弦 + bigram 词法）+ 内容哈希去重；**多库时不传 vault_path = 跨全部注册库 fan-out** | `query`(必), `top_k`(默认10), `use_rerank`(默认true), `path_prefix`/`tags`/`mtime_after`/`mtime_before`(过滤), `offset`/`limit`(分页), `group_by_vault`, `dedupe`, `vault_path`(可选) |
 | `kb_read` | 读原文（不调 LLM）；**fan-out 后的 source 是库内相对路径，必须带 vault_path** | `source`(必), 或 `heading` / `start_line`+`end_line`, `vault_path` |
 | `kb_list` | 列出已索引文件 | `vault_path`(可选) |
 | `kb_stats` | 索引状态：文件/切片数、模型、缓存、**use_hybrid/fts_enabled/vector_backend** | `vault_path`(可选) |
 | `kb_vaults` | 列出**已注册**知识库（含 exists/indexed/files/last_sync） | 无 |
 | `kb_exempt` | RAG 豁免管理（排除私密/草稿/备份副本内容） | `action`(必): list/add_pattern/remove_pattern/exempt_file/unexempt_file/check |
 | `kb_rebuild` | 删缓存强制全量重建 | 无（**高危**，见下方注意） |
+| `kb_set_weight` | 调整单库检索权重（fan-out 时该库分数的放大系数，0-100 默认 1.0） | `vault_path`(必), `weight`(必) |
+| `kb_export` | 导出索引快照 zip（换机迁移免重嵌） | `out_path`(必, 绝对路径+.zip), `vault_path`(可选), `overwrite`(可选) |
+| `kb_import` | 从快照恢复索引（快照向量模型/维度不符时拒绝，force=true 仅导入文本层） | `snapshot`(必), `force`(默认false), `vault_path`(可选) |
 
 ## 调用模式
 

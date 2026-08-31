@@ -83,7 +83,10 @@ NOTIFY_FILTER = (
     | FILE_NOTIFY_CHANGE_DIR_NAME
     | FILE_NOTIFY_CHANGE_LAST_WRITE
     | FILE_NOTIFY_CHANGE_SIZE
-    | FILE_NOTIFY_CHANGE_ATTRIBUTES
+    # 刻意去掉 FILE_NOTIFY_CHANGE_ATTRIBUTES：属性变化在 Windows 上极高频
+    #（Obsidian 写 workspace.json、杀软/备份软件清归档位、同步盘刷元数据），
+    # 而回调不解析路径、任何事件都排一次全量 sync —— 属性抖动等于持续触发
+    # 全库 sha256 扫描。内容变更（增删改/大小/最后写入）由其余四位覆盖。
 )
 
 # 变更太多、内核缓冲区装不下时，ReadDirectoryChangesW 以这个错误失败——具体哪些
@@ -327,6 +330,14 @@ class WindowsDirectoryWatcher:
             return False
         if self._thread is not None and self._thread.is_alive():
             return True
+        if getattr(self, "_stopping", False):
+            # 上一次 stop 还没收干净（线程仍存活），先 join 再决定。
+            self._thread.join(timeout=_JOIN_TIMEOUT)
+            if self._thread is not None and self._thread.is_alive():
+                return False
+            with self._lock:
+                self._thread = None
+                self._stopping = False
 
         handle = self._open_handle(dll)
         if handle is None:
@@ -343,6 +354,7 @@ class WindowsDirectoryWatcher:
             self._dir_handle = handle
             self._stop_event = stop_event
             self._io_event = io_event
+            self._stopping = False
         self._closed.clear()
         self._thread = threading.Thread(
             target=self._run, args=(dll,), name="fsnotify-watcher", daemon=True

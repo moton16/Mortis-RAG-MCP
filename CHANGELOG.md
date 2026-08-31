@@ -24,7 +24,8 @@
   chunk metadata 新增 `mtime`（内容最后一次变化的时间）。过滤在 rerank 之前执行，
   不浪费配额；跨库 fan-out 时过滤逐库生效、分页在全局合并后一次完成。
 - **内容去重（C4）**：chunk metadata 新增 `content_hash`；embedding 阶段逐字重复的
-  段落只请求一次 API，跨文件/跨库的相同内容直接复用已算出的向量；检索结果按
+  段落只请求一次 API，同一库内跨文件的相同内容直接复用已算出的向量（库与库之间
+  各自持有向量，跨库收益体现在结果级去重与 query 只 embed 一次）；检索结果按
   `dedupe = true`（默认）保序去重，重复备份不再占掉 top_k。
 - **库级权重与分组 fan-out（C5）**：注册表 v2 新增 `weight` 字段与 `kb_set_weight`
   工具（0 < w <= 100，老 toml 容错为 1.0）；跨库检索分数乘以库权重后再全局排序；
@@ -53,6 +54,13 @@
   反复触发原生监听的自激循环，也省 IO）。
 - `VaultMcpServer` 新增 `shutdown()` 并注册 atexit，嵌入式调用（测试/脚本）退出时
   释放原生监听的目录句柄。
+
+### Known side effects
+
+- `mtime_after` / `mtime_before` 过滤在首次建库或缓存重建后暂时失真：chunk 的
+  `mtime` 取的是「本次索引重建的时刻」，需等文件再次变更才反映真实修改时间。
+- 从 0.5.0 回退到 0.4.1 会触发一次全量重新 embedding（0.4.1 的 `_load_vectors_cache`
+  没有 0.5.0 新增的 `_pending_vectors` 兜底机制，向量在文本层重建时被丢弃）。
 
 ### Fixed
 

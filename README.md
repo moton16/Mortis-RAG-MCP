@@ -151,13 +151,13 @@ If the console script is on the client process `PATH`, `command = "mortis-rag-mc
 python -m pytest -q
 ```
 
-The tests (137 cases) cover registry round-trips and dedup, fan-out search across vaults, unregister + cache purge, missing-vault tolerance, legacy config auto-migration, exempt management, provider JSON handling, static no-network behavior, reranker fallback, add/modify/delete/rename lifecycle, Windows and Unicode paths, and stdio smoke behavior. Each stdio test uses its own registry via the `VAULT_MCP_REGISTRY` environment variable. 0.5.0 adds coverage for embedding retry/backoff/batching, failed-file persistence, search filters and pagination, content-hash dedup, per-vault weights, native watcher integration (including a no-op-sync convergence test), image caption injection, and snapshot export/import round-trips (zero re-embed acceptance).
+The tests ((`python -m pytest -q` all green)) cover registry round-trips and dedup, fan-out search across vaults, unregister + cache purge, missing-vault tolerance, legacy config auto-migration, exempt management, provider JSON handling, static no-network behavior, reranker fallback, add/modify/delete/rename lifecycle, Windows and Unicode paths, and stdio smoke behavior. Each stdio test uses its own registry via the `VAULT_MCP_REGISTRY` environment variable. 0.5.0 adds coverage for embedding retry/backoff/batching, failed-file persistence, search filters and pagination, content-hash dedup, per-vault weights, native watcher integration (including a no-op-sync convergence test), image caption injection, and snapshot export/import round-trips (zero re-embed acceptance).
 
 ## Known limitations
 
 - Base retrieval uses local token matching. Embeddings are generated and used for external semantic ranking, but there is no vector database or ANN index.
 - Static embedding is a deterministic placeholder, not a semantic model. Configure an external provider for semantic recall.
 - Provider response parsing expects `data[].embedding` for embeddings and `results[]` for reranking; vendor-specific adapters may be needed.
-- The watcher uses standard-library polling rather than native OS events; suitable for personal vaults, not optimized for very large/high-churn ones.
+- The watcher defaults to native `ReadDirectoryChangesW` events on Windows (`[index] watch_method = \"auto\"`); non-Windows, `\"poll\"`, or a native-start failure fall back to the legacy 0.25s polling loop, with a 30s full-reconciliation safety net while the native watcher is active. Very large / high-churn vaults are not yet benchmarked.
 - After a multi-vault fan-out search, `source` values are vault-relative — pass the matching `vault_path` to `kb_read`.
 - The registry assumes a single server process per machine (atomic writes; no cross-process locking).

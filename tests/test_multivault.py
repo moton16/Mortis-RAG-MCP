@@ -89,8 +89,8 @@ def test_stdio_relative_vault_path_returns_error(tmp_path):
         {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "kb_search", "arguments": {"query": "子库独有内容", "vault_path": "子库"}}},
     ])
     r2 = responses[1]
-    assert "error" in r2
-    assert "absolute path" in r2["error"]["message"]
+    assert r2["result"]["isError"] is True
+    assert "absolute path" in r2["result"]["content"][0]["text"]
 
 
 def test_stdio_unknown_vault_path_returns_error(tmp_path):
@@ -107,8 +107,8 @@ def test_stdio_unknown_vault_path_returns_error(tmp_path):
         {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "kb_search", "arguments": {"query": "x", "vault_path": str(tmp_path / "not_registered")}}},
     ])
     r2 = responses[1]
-    assert "error" in r2
-    assert "kb_init" in r2["error"]["message"]
+    assert r2["result"]["isError"] is True
+    assert "kb_init" in r2["result"]["content"][0]["text"]
 
 
 def _register_two_vaults(config: Path, vault_a: Path, vault_b: Path, shared: str) -> None:

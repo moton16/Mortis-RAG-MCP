@@ -26,6 +26,11 @@ from typing import Any, Iterable, Protocol, runtime_checkable
 from .config import VectorConfig
 
 
+# 单条 SQL 里 IN(...) 的占位符上限。sqlite 的现代构建默认是 32766，但旧版只有
+# 999；取一个稳妥的 500，既避开上限又不至于让语句过长。
+_IN_CHUNK = 500
+
+
 @runtime_checkable
 class VectorBackend(Protocol):
     name: str
@@ -37,8 +42,14 @@ class VectorBackend(Protocol):
         limit=None means "all available"."""
         ...
 
-    def upsert_vectors(self, vectors: dict[str, Any]) -> None:
-        """Store/replace vectors keyed by chunk_id. None-safe."""
+    def upsert_vectors(self, vectors: dict[str, Any]) -> set[str] | None:
+        """Store/replace vectors keyed by chunk_id. None-safe.
+
+        返回真正落盘的 chunk_id 集合；返回 None 表示后端不提供成功计数，
+        调用方按"全部成功"的乐观语义处理（仅限内存后端这类不会失败的后端）。
+        磁盘后端必须返回实际落盘集合：此前调用方盲目 update 全部 id，
+        upsert 内部吞掉异常后照样记账，chunk 从此被认为"已有向量"永不重嵌。
+        """
         ...
 
     def get_vectors(self, chunk_ids: Iterable[str]) -> dict[str, Any]:
@@ -198,33 +209,47 @@ class SqliteVecBackend:
             return []
 
     @_serialized
-    def upsert_vectors(self, vectors: dict[str, Any]) -> None:
+    def upsert_vectors(self, vectors: dict[str, Any]) -> set[str] | None:
         if not self.available or self._conn is None or not vectors:
-            return
+            return set()
         try:
             rows = [(chunk_id, self._serialize(vec)) for chunk_id, vec in vectors.items() if vec is not None]
             if not rows:
-                return
+                return set()
+            persisted: set[str] = set()
             with self._conn:
-                # Batch in three statements instead of N round-trips.
-                self._conn.executemany(
-                    "INSERT OR IGNORE INTO vec_ids(chunk_id) VALUES (?)",
-                    [(chunk_id,) for chunk_id, _ in rows],
-                )
-                id_map = {
-                    str(chunk_id): vid
-                    for chunk_id, vid in self._conn.execute(
-                        "SELECT chunk_id, vid FROM vec_ids WHERE chunk_id IN (%s)"
-                        % ",".join("?" * len(rows)),
-                        [chunk_id for chunk_id, _ in rows],
-                    ).fetchall()
-                }
-                self._conn.executemany(
-                    "INSERT OR REPLACE INTO vec0_chunks(rowid, embedding) VALUES (?, ?)",
-                    [(id_map[chunk_id], payload) for chunk_id, payload in rows if chunk_id in id_map],
-                )
+                # 按 SQLITE_MAX_VARIABLE_NUMBER 分块：旧版上限只有 999，
+                # 一整库的 chunk_id 塞进单条 IN(...) 会报 "too many SQL
+                # variables"，整批静默失败。
+                for start in range(0, len(rows), _IN_CHUNK):
+                    batch = rows[start : start + _IN_CHUNK]
+                    self._conn.executemany(
+                        "INSERT OR IGNORE INTO vec_ids(chunk_id) VALUES (?)",
+                        [(chunk_id,) for chunk_id, _ in batch],
+                    )
+                    id_map = {
+                        str(chunk_id): vid
+                        for chunk_id, vid in self._conn.execute(
+                            "SELECT chunk_id, vid FROM vec_ids WHERE chunk_id IN (%s)"
+                            % ",".join("?" * len(batch)),
+                            [chunk_id for chunk_id, _ in batch],
+                        ).fetchall()
+                    }
+                    stored = [
+                        (id_map[chunk_id], payload)
+                        for chunk_id, payload in batch
+                        if chunk_id in id_map
+                    ]
+                    self._conn.executemany(
+                        "INSERT OR REPLACE INTO vec0_chunks(rowid, embedding) VALUES (?, ?)",
+                        stored,
+                    )
+                    persisted.update(chunk_id for chunk_id, _ in batch if chunk_id in id_map)
+            return persisted
         except Exception:
-            pass
+            # 失败时返回已成功落盘的部分（可能为空集），绝不返回 None ——
+            # None 会被调用方当成"全部成功"。
+            return set()
 
     @_serialized
     def get_vectors(self, chunk_ids: Iterable[str]) -> dict[str, Any]:
@@ -237,23 +262,33 @@ class SqliteVecBackend:
         out: dict[str, Any] = {}
         if not self.available or self._conn is None:
             return out
+        # Protocol 声明的是 Iterable[str]，而 indexer 传的是 dict；靠"迭代
+        # dict 得到 key"虽能跑，语义是错的，这里显式取 key 列表。
+        wanted = [str(chunk_id) for chunk_id in chunk_ids]
+        if not wanted:
+            return out
         try:
-            for chunk_id in chunk_ids:
-                vid = self._vid_for(chunk_id)
-                if vid is None:
-                    continue
-                try:
-                    row = self._conn.execute(
-                        "SELECT embedding FROM vec0_chunks WHERE rowid = ?", (vid,)
-                    ).fetchone()
-                    if row is None or row[0] is None:
+            # id → vid 与 embedding 用一条 JOIN 分批取回，替代原先"每个 id
+            # 两次查询"——逐字相同的整目录备份下 donors 可达数万，串行往返
+            # 会把首次同步拖到分钟级。
+            for start in range(0, len(wanted), _IN_CHUNK):
+                batch = wanted[start : start + _IN_CHUNK]
+                rows = self._conn.execute(
+                    "SELECT v.chunk_id, d.embedding FROM vec0_chunks d "
+                    "JOIN vec_ids v ON v.vid = d.rowid WHERE v.chunk_id IN (%s)"
+                    % ",".join("?" * len(batch)),
+                    batch,
+                ).fetchall()
+                for chunk_id, blob in rows:
+                    if blob is None:
                         continue
-                    vector = array("f")
-                    vector.frombytes(row[0])
+                    try:
+                        vector = array("f")
+                        vector.frombytes(blob)
+                    except Exception:
+                        continue
                     if len(vector):
                         out[str(chunk_id)] = vector
-                except Exception:
-                    continue
         except Exception:
             return out
         return out

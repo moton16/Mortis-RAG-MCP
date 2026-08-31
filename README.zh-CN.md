@@ -4,7 +4,7 @@
 > 提供结构化切片检索、原文读取、增量索引、向量语义召回与重排序能力，供 AI Agent（WorkBuddy / Codex / Trae 等）通过 MCP 协议调用。
 
 - 仓库：`Mortis-RAG-MCP`（Python 包名保持 `vault_mcp`，控制台脚本新增 `mortis-rag-mcp`，旧 `vault-mcp` 兼容保留）
-- 当前版本：`mortis-rag-mcp 0.4.1`（混合检索：FTS5 BM25 + RRF 三路融合）
+- 当前版本：`mortis-rag-mcp 0.5.0`（混合检索 + 检索过滤/去重 + 库级权重 + 原生监听 + 索引快照）
 - 知识库：**不绑定任何路径** —— 任意文件夹通过 `kb_init` 注册为知识库，注册表持久化于 `~/.vault_mcp/vaults.toml`（跨重启/跨设备可用）
 
 > **新用户看这里**：下载后如何初始化（装包 → 配 key → 接入 MCP 客户端 → `kb_init` 建库 → 安装配套 Skill），见 [docs/QUICKSTART.md](docs/QUICKSTART.md)。
