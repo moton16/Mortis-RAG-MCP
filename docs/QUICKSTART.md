@@ -105,14 +105,18 @@ Copy-Item .\skills\vault-mcp\SKILL.md "$env:USERPROFILE\.workbuddy\skills\vault-
 | 看有哪些库 | `kb_vaults` |
 | 搜索（跨库） | `kb_search {query}` |
 | 搜索（指定库） | `kb_search {query, vault_path}` |
+| 只搜某目录 / 某标签 / 某时间段 | `kb_search {query, path_prefix? tags? mtime_after? mtime_before?}`（0.5.0） |
+| 翻页 | `kb_search {query, offset, limit}`（0.5.0） |
+| 「这个库更重要」 | `kb_set_weight {vault_path, weight}` + 可选 `kb_search {group_by_vault: true}`（0.5.0） |
 | 读原文 | `kb_read {source, vault_path}` |
 | 排除私密笔记 | `kb_exempt {action: "add_pattern" / "exempt_file"}` |
-| 索引出错了 | 看 `kb_stats` 的 `failed_files`；反复调 `kb_stats` 触发增量补齐 |
+| 索引出错了 | 看 `kb_stats` 的 `failed_files`（0.5.0 起重启也不丢）；反复调 `kb_stats` 触发增量补齐 |
+| 换设备 / 换目录迁移 | 旧机器 `kb_export` → 新机器 `kb_init` + `kb_import`（0.5.0，导入后 0 次重新 embedding） |
 | 换 embedding 模型 | `kb_rebuild`（高危：全量重新 embedding，注意 API 限流，见 SKILL.md） |
 
 ## 7. 常见问题
 
 - **搜索结果为空**：先 `kb_vaults` 确认库已注册且 `exists=true`；再 `kb_stats` 确认 files>0。
-- **failed_files 有值**：多为 embedding API 限流/网络错误，别 rebuild，隔几分钟反复 `kb_stats` 让增量 sync 自动补。
-- **换设备**：clone → 装包 → 配 key → 对自己的笔记文件夹 `kb_init`，完事。旧设备注册表不随仓库走，天然干净。
+- **failed_files 有值**：多为 embedding API 限流/网络错误。0.5.0 起请求自动重试（指数退避、429 遵循 Retry-After）并按批切分，单次限流不再打垮整个索引；仍失败就隔几分钟反复 `kb_stats` 让增量 sync 自动补。
+- **换设备**：简单场景 clone → 装包 → 配 key → 对笔记文件夹 `kb_init`（首次全量建索引，花一次 embedding 钱）；想省这笔钱就先在旧机器 `kb_export` 导出索引快照，新机器 `kb_init` 后 `kb_import` 导入——导入后 0 次重嵌。
 - **Windows 中文乱码**：服务端已强制 stdio UTF-8；确保客户端也以 UTF-8 收发。

@@ -3,6 +3,72 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 与
 [Semantic Versioning](https://semver.org/lang/zh-CN/)。提交信息为 Conventional Commits。
 
+## [0.5.0] - 2026-08-30
+
+> **升级兼容性：默认配置从 0.4.1 升级 = 0 次重新 embedding。** 各项改动只 bump 文本层
+> 缓存代际号（秒级重建，向量按 chunk.id 全部命中）；唯一会触发全量重嵌的操作是手动
+> 开启 `inject_image_captions`（它改变 chunk content → id，属已知的 opt-in 代价）。
+
+### Added
+
+- **embedding 韧性（C1）**：外部 embedding 请求支持重试 + 指数退避（`[embedding]
+  max_retries = 3`、`retry_backoff = 1.0`，429 优先遵循服务端 `Retry-After`，其余
+  4xx 不重试），并按 `batch_size = 32` 把长文件的切片切成多个请求——此前整文件塞
+  单请求 + 零重试，一次限流即整批索引失败。
+- **failed_files 持久化（C2）**：失败名单落盘为 `vault_<key>.failed.json`（原子写），
+  进程重启后 `kb_stats` 仍能报告上一轮的失败原因；补嵌成功 / 文件修复 / purge /
+  rebuild 时自动清理。
+- **检索过滤与分页（C3）**：`kb_search` 新增 `path_prefix`（目录前缀，FTS 层 SQL 下推
+  + 统一后过滤）、`tags`（frontmatter 标签，命中任一即可）、`mtime_after` /
+  `mtime_before`（epoch 秒或 ISO 8601 字符串，闭区间）与 `offset` / `limit` 分页；
+  chunk metadata 新增 `mtime`（内容最后一次变化的时间）。过滤在 rerank 之前执行，
+  不浪费配额；跨库 fan-out 时过滤逐库生效、分页在全局合并后一次完成。
+- **内容去重（C4）**：chunk metadata 新增 `content_hash`；embedding 阶段逐字重复的
+  段落只请求一次 API，同一库内跨文件的相同内容直接复用已算出的向量（库与库之间
+  各自持有向量，跨库收益体现在结果级去重与 query 只 embed 一次）；检索结果按
+  `dedupe = true`（默认）保序去重，重复备份不再占掉 top_k。
+- **库级权重与分组 fan-out（C5）**：注册表 v2 新增 `weight` 字段与 `kb_set_weight`
+  工具（0 < w <= 100，老 toml 容错为 1.0）；跨库检索分数乘以库权重后再全局排序；
+  `kb_search` 新增 `group_by_vault`，按库分组返回（组序按各组最高分降序）。
+- **图片 alt/图注注入（C6，opt-in 默认关）**：`[index] inject_image_captions = true`
+  后，在每张图片（标准 Markdown `![alt](path)` 与 Obsidian `![[path|图注]]`）所在行
+  后插入 `[图片: alt 图注 (文件名)]`，让图片语义可检索；代码块内不注入，豁免内容
+  不会被注入救活。开启会全量重嵌（见上）。
+- **Windows 原生目录监听（C7）**：新模块 `fsnotify.py` 用 ctypes 直调
+  `ReadDirectoryChangesW`（overlapped I/O，`CancelIo` 干净退出），零第三方依赖；
+  `[index] watch_method = "auto"`（默认）时事件驱动替换 0.25s 全量轮询（空闲 0 CPU，
+  毫秒级响应），防抖 5s 封顶防编辑器保存风暴饿死同步，watcher 线程死亡自动降级回
+  轮询，30s 低频全量对账兜底（`watch_fallback_interval`，0 关闭）；`"poll"` 完整保留
+  旧行为。
+- **索引快照迁移（C8）**：`kb_export` 把 chunks + 向量 + FTS 三层缓存打包成 zip
+  （含 manifest：格式版本 / cache key / 模型维度 meta / 统计），`kb_import` 在另一台
+  机器按本机 cache key 落地并重写 meta——**导入后下一次 sync 0 次 embedding 调用**。
+  zip 成员白名单校验（拒绝路径穿越名）、model/dimension 不一致拒绝（`force = true`
+  仅导文本层并本地重嵌）。
+
+### Changed
+
+- RRF 每路候选宽度与 rerank 负载上限从硬编码常量改为配置（C0）：`[index]
+  rrf_per_route = 40`、`rerank_cap = 60`，默认值与旧行为一致。
+- 无变化的 sync 不再重写缓存文件（`[cache] placement = "vault"` 时避免缓存写入
+  反复触发原生监听的自激循环，也省 IO）。
+- `VaultMcpServer` 新增 `shutdown()` 并注册 atexit，嵌入式调用（测试/脚本）退出时
+  释放原生监听的目录句柄。
+
+### Known side effects
+
+- `mtime_after` / `mtime_before` 过滤在首次建库或缓存重建后暂时失真：chunk 的
+  `mtime` 取的是「本次索引重建的时刻」，需等文件再次变更才反映真实修改时间。
+- 从 0.5.0 回退到 0.4.1 会触发一次全量重新 embedding（0.4.1 的 `_load_vectors_cache`
+  没有 0.5.0 新增的 `_pending_vectors` 兜底机制，向量在文本层重建时被丢弃）。
+
+### Fixed
+
+- 轮询 watcher 的启动竞态：签名基线原先取在首次 sync 之后，「sync 完成到取基线
+  之间」落盘的文件会被永久漏掉；基线改为先取、由 sync 补齐窗口期改动。
+- 向量补齐成功后，旧的 failed_files 条目在全部三条分支都会被清除（此前「文件未
+  变更」分支的重试成功不会清名单，持久化文件会永久撒谎）。
+
 ## [0.4.1] - 2026-08-30
 
 ### Fixed

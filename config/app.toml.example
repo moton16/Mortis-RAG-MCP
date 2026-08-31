@@ -19,6 +19,11 @@ send_dimensions = false
 # api_key 为空时会自动回退读取环境变量 VAULT_MCP_API_KEY。
 api_key = "${VAULT_MCP_API_KEY}"
 timeout = 30
+# 0.5.0：失败重试（429/5xx/网络错误）。max_retries 越大，单批请求在端点
+# 不可达时卡得越久（每次尝试吃满一个 timeout），且嵌入是按次计费的。
+max_retries = 3
+batch_size = 32
+retry_backoff = 1.0
 
 [reranker]
 enabled = false
@@ -26,12 +31,29 @@ endpoint = "https://api.siliconflow.cn/v1/rerank"
 model = "BAAI/bge-reranker-v2-m3"
 api_key = "${VAULT_MCP_API_KEY}"
 timeout = 30
+# rerank 走 kb_search 的同步路径：重试次数默认 1，避免端点故障时一次搜索
+# 卡 4×timeout。
+max_retries = 1
+retry_backoff = 1.0
 # When enabled, provider failure must fall back to base retrieval order.
 
 [index]
 chunk_size = 1200
 chunk_overlap = 0
 debounce_seconds = 0.5
+# 0.5.0：注入图片 alt/图注使其可检索。注意这会改写 chunk content → chunk.id，
+# 开启 = 全库重新 embedding（一次付费操作）。
+inject_image_captions = false
+# 混合检索三路 RRF 各自的候选宽度与单次 rerank 上限。
+rrf_per_route = 40
+rerank_cap = 60
+# 单次 kb_search 允许返回的最大条数（top_k / limit 的上限夹取）。
+max_top_k = 200
+# 文件监听方式："auto"（默认，Windows 原生 ReadDirectoryChangesW，失败退轮询）、
+# "native"、"poll"（0.4.1 及以前行为）。
+watch_method = "auto"
+# 原生监听期间的低频全量对账兜底秒数；<=0 关闭兜底。
+watch_fallback_interval = 30.0
 # 混合检索：FTS5 BM25 + 向量余弦 + bigram 词法三路 RRF 融合（默认 true）。
 # 设为 false 完整还原旧「词法软信号 + 余弦」行为。需要 [cache] enabled = true。
 use_hybrid = true

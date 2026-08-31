@@ -17,10 +17,18 @@ change, not a code change.
 
 from __future__ import annotations
 
+import functools
 import sqlite3
+import threading
+from array import array
 from typing import Any, Iterable, Protocol, runtime_checkable
 
 from .config import VectorConfig
+
+
+# 单条 SQL 里 IN(...) 的占位符上限。sqlite 的现代构建默认是 32766，但旧版只有
+# 999；取一个稳妥的 500，既避开上限又不至于让语句过长。
+_IN_CHUNK = 500
 
 
 @runtime_checkable
@@ -34,8 +42,23 @@ class VectorBackend(Protocol):
         limit=None means "all available"."""
         ...
 
-    def upsert_vectors(self, vectors: dict[str, Any]) -> None:
-        """Store/replace vectors keyed by chunk_id. None-safe."""
+    def upsert_vectors(self, vectors: dict[str, Any]) -> set[str] | None:
+        """Store/replace vectors keyed by chunk_id. None-safe.
+
+        返回真正落盘的 chunk_id 集合；返回 None 表示后端不提供成功计数，
+        调用方按"全部成功"的乐观语义处理（仅限内存后端这类不会失败的后端）。
+        磁盘后端必须返回实际落盘集合：此前调用方盲目 update 全部 id，
+        upsert 内部吞掉异常后照样记账，chunk 从此被认为"已有向量"永不重嵌。
+        """
+        ...
+
+    def get_vectors(self, chunk_ids: Iterable[str]) -> dict[str, Any]:
+        """Read back stored vectors: {chunk_id: array('f')}.
+
+        Used by the indexer's content-hash reuse round, which needs the vector of
+        an already-embedded chunk to hand to a duplicate chunk with a different
+        id. Missing/failed ids are simply absent from the result — never raise.
+        """
         ...
 
     def delete_vectors(self, chunk_ids: Iterable[str]) -> None:
@@ -75,6 +98,16 @@ class MemoryVectorBackend:
     def upsert_vectors(self, vectors: dict[str, Any]) -> None:
         return None
 
+    def get_vectors(self, chunk_ids: Iterable[str]) -> dict[str, Any]:
+        wanted = {str(chunk_id) for chunk_id in chunk_ids}
+        out: dict[str, Any] = {}
+        if not wanted:
+            return out
+        for chunk in self._indexer.all_chunks():
+            if chunk.id in wanted and chunk.embedding is not None and len(chunk.embedding):
+                out[chunk.id] = chunk.embedding
+        return out
+
     def delete_vectors(self, chunk_ids: Iterable[str]) -> None:
         return None
 
@@ -103,6 +136,10 @@ class SqliteVecBackend:
         self._conn: sqlite3.Connection | None = None
         self._serialize = None
         self.available = False
+        # 所有数据库操作的串行锁（见 _serialized）；_closed 让"已关闭"与
+        # "不可用"可区分，避免 close() 之后的调用被静默当成零结果。
+        self._lock = threading.RLock()
+        self._closed = False
         try:
             import sqlite_vec  # type: ignore
 
@@ -128,14 +165,33 @@ class SqliteVecBackend:
         except Exception:
             self._conn = None
 
+    @staticmethod
+    def _serialized(func):
+        """把数据库操作串行化。
+
+        连接是 check_same_thread=False 建的（watcher 线程、sync 线程、搜索
+        线程都会访问），但 sqlite3 连接本身不是线程安全的：并发 execute 会抛
+        "Cannot operate on a closed database" 或直接返回错乱结果，而这里所有
+        except 都把它们吞成「零结果」—— 语义路由静默消失。
+        """
+
+        @functools.wraps(func)
+        def wrapper(self, *args, **kwargs):
+            with self._lock:
+                return func(self, *args, **kwargs)
+
+        return wrapper
+
     @property
     def path(self) -> Any:
         return self._db_path
 
+    @_serialized
     def _vid_for(self, chunk_id: str) -> int | None:
         row = self._conn.execute("SELECT vid FROM vec_ids WHERE chunk_id = ?", (chunk_id,)).fetchone()
         return int(row[0]) if row else None
 
+    @_serialized
     def query(self, query_vector: Iterable[float], limit: int | None = None) -> list[tuple[str, float]]:
         if not self.available or self._conn is None:
             return []
@@ -152,34 +208,92 @@ class SqliteVecBackend:
         except Exception:
             return []
 
-    def upsert_vectors(self, vectors: dict[str, Any]) -> None:
+    @_serialized
+    def upsert_vectors(self, vectors: dict[str, Any]) -> set[str] | None:
         if not self.available or self._conn is None or not vectors:
-            return
+            return set()
         try:
             rows = [(chunk_id, self._serialize(vec)) for chunk_id, vec in vectors.items() if vec is not None]
             if not rows:
-                return
+                return set()
+            persisted: set[str] = set()
             with self._conn:
-                # Batch in three statements instead of N round-trips.
-                self._conn.executemany(
-                    "INSERT OR IGNORE INTO vec_ids(chunk_id) VALUES (?)",
-                    [(chunk_id,) for chunk_id, _ in rows],
-                )
-                id_map = {
-                    str(chunk_id): vid
-                    for chunk_id, vid in self._conn.execute(
-                        "SELECT chunk_id, vid FROM vec_ids WHERE chunk_id IN (%s)"
-                        % ",".join("?" * len(rows)),
-                        [chunk_id for chunk_id, _ in rows],
-                    ).fetchall()
-                }
-                self._conn.executemany(
-                    "INSERT OR REPLACE INTO vec0_chunks(rowid, embedding) VALUES (?, ?)",
-                    [(id_map[chunk_id], payload) for chunk_id, payload in rows if chunk_id in id_map],
-                )
+                # 按 SQLITE_MAX_VARIABLE_NUMBER 分块：旧版上限只有 999，
+                # 一整库的 chunk_id 塞进单条 IN(...) 会报 "too many SQL
+                # variables"，整批静默失败。
+                for start in range(0, len(rows), _IN_CHUNK):
+                    batch = rows[start : start + _IN_CHUNK]
+                    self._conn.executemany(
+                        "INSERT OR IGNORE INTO vec_ids(chunk_id) VALUES (?)",
+                        [(chunk_id,) for chunk_id, _ in batch],
+                    )
+                    id_map = {
+                        str(chunk_id): vid
+                        for chunk_id, vid in self._conn.execute(
+                            "SELECT chunk_id, vid FROM vec_ids WHERE chunk_id IN (%s)"
+                            % ",".join("?" * len(batch)),
+                            [chunk_id for chunk_id, _ in batch],
+                        ).fetchall()
+                    }
+                    stored = [
+                        (id_map[chunk_id], payload)
+                        for chunk_id, payload in batch
+                        if chunk_id in id_map
+                    ]
+                    self._conn.executemany(
+                        "INSERT OR REPLACE INTO vec0_chunks(rowid, embedding) VALUES (?, ?)",
+                        stored,
+                    )
+                    persisted.update(chunk_id for chunk_id, _ in batch if chunk_id in id_map)
+            return persisted
         except Exception:
-            pass
+            # 失败时返回已成功落盘的部分（可能为空集），绝不返回 None ——
+            # None 会被调用方当成"全部成功"。
+            return set()
 
+    @_serialized
+    def get_vectors(self, chunk_ids: Iterable[str]) -> dict[str, Any]:
+        """Read back vectors from the vec0 table (content-hash reuse round).
+
+        A vec0 column selected normally comes back as the raw float32 blob it was
+        stored as, so it can be rebuilt with array('f').frombytes. Anything that
+        doesn't decode is skipped: the caller just re-embeds those chunks.
+        """
+        out: dict[str, Any] = {}
+        if not self.available or self._conn is None:
+            return out
+        # Protocol 声明的是 Iterable[str]，而 indexer 传的是 dict；靠"迭代
+        # dict 得到 key"虽能跑，语义是错的，这里显式取 key 列表。
+        wanted = [str(chunk_id) for chunk_id in chunk_ids]
+        if not wanted:
+            return out
+        try:
+            # id → vid 与 embedding 用一条 JOIN 分批取回，替代原先"每个 id
+            # 两次查询"——逐字相同的整目录备份下 donors 可达数万，串行往返
+            # 会把首次同步拖到分钟级。
+            for start in range(0, len(wanted), _IN_CHUNK):
+                batch = wanted[start : start + _IN_CHUNK]
+                rows = self._conn.execute(
+                    "SELECT v.chunk_id, d.embedding FROM vec0_chunks d "
+                    "JOIN vec_ids v ON v.vid = d.rowid WHERE v.chunk_id IN (%s)"
+                    % ",".join("?" * len(batch)),
+                    batch,
+                ).fetchall()
+                for chunk_id, blob in rows:
+                    if blob is None:
+                        continue
+                    try:
+                        vector = array("f")
+                        vector.frombytes(blob)
+                    except Exception:
+                        continue
+                    if len(vector):
+                        out[str(chunk_id)] = vector
+        except Exception:
+            return out
+        return out
+
+    @_serialized
     def delete_vectors(self, chunk_ids: Iterable[str]) -> None:
         if not self.available or self._conn is None:
             return
@@ -194,6 +308,7 @@ class SqliteVecBackend:
         except Exception:
             pass
 
+    @_serialized
     def list_ids(self) -> list[str]:
         if not self.available or self._conn is None:
             return []
@@ -202,6 +317,7 @@ class SqliteVecBackend:
         except Exception:
             return []
 
+    @_serialized
     def count(self) -> int:
         if not self.available or self._conn is None:
             return 0
@@ -210,6 +326,24 @@ class SqliteVecBackend:
         except Exception:
             return 0
 
+    @_serialized
+    def close(self) -> None:
+        """Release the sqlite connection WITHOUT deleting the db file.
+
+        与 purge() 的区别：purge 是「连库一起删」（缓存清理语义），close 只是
+        放开文件句柄——快照导入要把新的 vec.sqlite 落到同一路径，必须先关掉
+        持有旧文件的连接，重开后由导入的数据接管。
+        """
+        if self._conn is not None:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+            self._conn = None
+        self.available = False
+        self._closed = True
+
+    @_serialized
     def purge(self) -> None:
         if self._conn is not None:
             try:

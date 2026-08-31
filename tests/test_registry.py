@@ -92,3 +92,66 @@ def test_registry_save_uses_atomic_replace(tmp_path):
     # No leftover tmp files from the write.
     assert list(tmp_path.glob("*.tmp")) == []
     assert reg.load()[0].path == str(tmp_path / "a")
+
+
+def test_registry_weight_roundtrip(tmp_path):
+    reg = VaultRegistry(tmp_path / "vaults.toml")
+    vault = tmp_path / "notes"
+    vault.mkdir()
+    reg.add(vault, weight=2.5)
+    loaded = VaultRegistry(tmp_path / "vaults.toml").load()
+    assert loaded[0].weight == 2.5
+
+
+def test_registry_load_defaults_weight_for_legacy_toml(tmp_path):
+    reg_path = tmp_path / "vaults.toml"
+    # 0.4.1 及更早写出的注册表没有 weight 字段，必须回退到 1.0 而不是报错。
+    reg_path.write_text("version = 1\n\n[[vaults]]\npath = 'C:/Notes'\nname = \"Notes\"\nregistered_at = 1.0\n", encoding="utf-8")
+    loaded = VaultRegistry(reg_path).load()
+    assert len(loaded) == 1
+    assert loaded[0].weight == 1.0
+
+
+def test_registry_load_tolerates_dirty_weight(tmp_path):
+    reg_path = tmp_path / "vaults.toml"
+    reg_path.write_text("version = 2\n\n[[vaults]]\npath = 'C:/Notes'\nname = \"Notes\"\nregistered_at = 1.0\nweight = \"abc\"\n", encoding="utf-8")
+    loaded = VaultRegistry(reg_path).load()
+    assert loaded[0].weight == 1.0
+
+
+def test_registry_set_weight_updates_entry(tmp_path):
+    reg = VaultRegistry(tmp_path / "vaults.toml")
+    vault = tmp_path / "notes"
+    vault.mkdir()
+    reg.add(vault)
+    entry = reg.set_weight(vault, 3.0)
+    assert entry.weight == 3.0
+    # 必须落盘，换一个实例读也要看到新权重。
+    assert VaultRegistry(tmp_path / "vaults.toml").load()[0].weight == 3.0
+
+
+def test_registry_set_weight_rejects_out_of_range(tmp_path):
+    reg = VaultRegistry(tmp_path / "vaults.toml")
+    vault = tmp_path / "notes"
+    vault.mkdir()
+    reg.add(vault)
+    for bad in (0, -1, 0.0, 101, 100.5):
+        try:
+            reg.set_weight(vault, bad)
+            raised = False
+        except ValueError:
+            raised = True
+        assert raised, bad
+    # 100 是允许的上界。
+    assert reg.set_weight(vault, 100).weight == 100
+
+
+def test_registry_set_weight_unknown_raises(tmp_path):
+    reg = VaultRegistry(tmp_path / "vaults.toml")
+    try:
+        reg.set_weight(tmp_path / "ghost", 2.0)
+        raised = False
+    except ValueError as exc:
+        raised = True
+        assert "not registered" in str(exc)
+    assert raised

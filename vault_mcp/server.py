@@ -1,17 +1,96 @@
 from __future__ import annotations
 
+import atexit
 import json
 import sys
 import threading
 from argparse import ArgumentParser
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from .config import load_config, resolve_config_path
-from .indexer import MarkdownIndexer, Chunk, rerank_chunks
+from .indexer import Chunk, MarkdownIndexer, SearchFilter, dedupe_by_content_hash, rerank_chunks
 from .registry import VaultEntry, VaultRegistry, registry_path
 
-SERVER_INFO = {"name": "mortis-rag-mcp", "version": "0.4.1", "title": "Mortis'RAG MCP"}
+SERVER_INFO = {"name": "mortis-rag-mcp", "version": "0.5.0", "title": "Mortis'RAG MCP"}
+
+
+def _parse_epoch(value: Any) -> float | None:
+    """把 MCP 参数解析成 epoch 秒：接受数字、数字字符串和 ISO 8601 字符串。
+
+    解析不出来就返回 None（该条件不生效），绝不抛异常——参数来自外部客户端，
+    一个拼写错误的时间不该让整个 kb_search 失败。
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        pass
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def _parse_tags(value: Any) -> list[str] | None:
+    """tags 参数归一化：逗号分隔的字符串和字符串数组都接受，空值返回 None。"""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        items: list[Any] = [part for part in value.split(",")]
+    elif isinstance(value, (list, tuple)):
+        items = list(value)
+    else:
+        return None
+    tags = [str(item).strip() for item in items if str(item).strip()]
+    return tags or None
+
+
+def _parse_int(value: Any) -> int | None:
+    """防御式整数解析：解析失败返回 None（该条件不生效）。"""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_top_k(value: Any, maximum: int) -> int:
+    """top_k 解析：非法值退回默认 10，并夹到 [1, config.max_top_k]。
+
+    此前这里是裸 int()，LLM 传个 "10.5" 或 null 就让整次搜索报错；
+    传 10**9 则让 sqlite-vec 去建千万级 KNN 堆。
+    """
+    parsed = _parse_int(value)
+    if parsed is None:
+        return 10
+    return max(1, min(parsed, maximum))
+
+
+def _search_filter(arguments: dict[str, Any], max_limit: int = 200) -> SearchFilter:
+    """从 kb_search 的 arguments 构造 SearchFilter，全部字段都可缺省。"""
+    limit = _parse_int(arguments.get("limit"))
+    if limit is not None and limit < 1:
+        limit = None
+    if limit is not None:
+        limit = min(limit, max_limit)
+    offset = _parse_int(arguments.get("offset"))
+    return SearchFilter(
+        path_prefix=str(arguments.get("path_prefix") or "").strip(),
+        tags=_parse_tags(arguments.get("tags")),
+        mtime_after=_parse_epoch(arguments.get("mtime_after")),
+        mtime_before=_parse_epoch(arguments.get("mtime_before")),
+        offset=max(0, offset) if offset is not None else 0,
+        limit=limit,
+    )
 
 
 def _json_result(request_id: Any, result: Any) -> dict[str, Any]:
@@ -47,6 +126,31 @@ def _tool_definitions() -> list[dict[str, Any]]:
             "inputSchema": {"type": "object", "properties": {}},
         },
         {
+            "name": "kb_set_weight",
+            "description": "设置知识库的检索权重：跨库检索时该库所有 chunk 的分数会乘以该系数，用于表达\"这个库更重要\"（默认 1.0，取值 0 < w <= 100）。",
+            "inputSchema": {"type": "object", "required": ["vault_path", "weight"], "properties": {
+                "vault_path": {"type": "string", "description": "必填，已注册知识库的绝对路径"},
+                "weight": {"type": "number", "exclusiveMinimum": 0, "maximum": 100, "description": "必填，权重系数，取值 0 < weight <= 100；1.0 为默认不放大"},
+            }},
+        },
+        {
+            "name": "kb_export",
+            "description": "把知识库的索引快照（chunks + 向量 + FTS）导出为 zip 文件，用于换机/换目录迁移，导入后无需全量重新 embedding。要求缓存已启用且完成过至少一次索引。",
+            "inputSchema": {"type": "object", "required": ["out_path"], "properties": {
+                "out_path": {"type": "string", "description": "必填，快照输出路径（.zip）"},
+                "vault_path": {"type": "string", "description": vault_path_hint},
+            }},
+        },
+        {
+            "name": "kb_import",
+            "description": "从 kb_export 生成的快照恢复索引缓存（先 kb_init 注册目标目录再调用）。导入后的下一次同步应当 0 次 embedding 调用；快照的向量模型/维度与本机配置不一致时拒绝，除非 force=true（此时只导入文本层并本地重嵌）。",
+            "inputSchema": {"type": "object", "required": ["snapshot"], "properties": {
+                "snapshot": {"type": "string", "description": "必填，快照 zip 文件路径"},
+                "force": {"type": "boolean", "default": False, "description": "模型/维度不一致时强制导入（仅文本层，向量重算）"},
+                "vault_path": {"type": "string", "description": vault_path_hint},
+            }},
+        },
+        {
             "name": "kb_rebuild",
             "description": "删除指定知识库的磁盘缓存并强制全量重建索引（首次建库或内容大改后用）。",
             "inputSchema": {"type": "object", "properties": {
@@ -64,11 +168,19 @@ def _tool_definitions() -> list[dict[str, Any]]:
             "inputSchema": {"type": "object", "required": ["query"], "properties": {
                 "query": {"type": "string"}, "top_k": {"type": "integer", "minimum": 1, "default": 10}, "use_rerank": {"type": "boolean", "default": True},
                 "vault_path": {"type": "string", "description": "可选，已注册知识库的绝对路径；缺省时跨全部注册库检索"},
+                "group_by_vault": {"type": "boolean", "default": False, "description": "可选，仅跨库检索（不传 vault_path）时生效：结果按知识库分组返回 groups，每组取 top_k 条"},
+                "path_prefix": {"type": "string", "description": "可选，只保留 source 以该前缀开头的 chunk（source 是库内相对 posix 路径，如 '教材/'）"},
+                "tags": {"type": "array", "items": {"type": "string"}, "description": "可选，frontmatter 标签过滤：命中任一标签即保留（大小写不敏感，自动去掉 '#' 前缀）"},
+                "mtime_after": {"type": ["number", "string"], "description": "可选，只保留修改时间 >= 该值的文件；epoch 秒或 ISO 8601 字符串（如 '2026-01-01'）"},
+                "mtime_before": {"type": ["number", "string"], "description": "可选，只保留修改时间 <= 该值的文件；epoch 秒或 ISO 8601 字符串"},
+                "offset": {"type": "integer", "minimum": 0, "default": 0, "description": "可选，跳过前 N 条结果（分页用）"},
+                "limit": {"type": "integer", "minimum": 1, "description": "可选，本页最多返回条数；缺省时用 top_k"},
+                "dedupe": {"type": "boolean", "default": True, "description": "可选，默认 true：正文完全相同的 chunk 只保留排在最前面的一条（重复备份/复制段落不再占多格 top_k）"},
             }},
         },
         {
             "name": "kb_read",
-            "description": "读取知识库原文，不调用 LLM。多库环境下建议显式传 vault_path（fan-out 结果中的 source 是库内相对路径）。",
+            "description": "读取知识库原文（不调用 LLM 生成回答；若索引有未同步的变更会先触发一次增量同步，可能调用 embedding API，建议带上 start_line/end_line 限定范围避免一次拉全篇）。多库环境下建议显式传 vault_path（fan-out 结果中的 source 是库内相对路径）。",
             "inputSchema": {"type": "object", "required": ["source"], "properties": {
                 "source": {"type": "string"}, "heading": {"type": "string"}, "start_line": {"type": "integer", "minimum": 1}, "end_line": {"type": "integer", "minimum": 1},
                 "vault_path": {"type": "string", "description": vault_path_hint},
@@ -124,11 +236,23 @@ class VaultMcpServer:
         self.config = load_config(resolve_config_path(config_path))
         self.registry = VaultRegistry()
         self._indexers: dict[str, MarkdownIndexer] = {}
+        self._indexers_lock = threading.Lock()
         self._startup_lock = threading.Lock()
         self._started = False
         self._migrate_legacy()
         # 所有已注册库在后台线程串行预索引，MCP 握手（initialize）永不阻塞。
         self._start_background_index()
+        # 原生监听持有目录句柄；serve_stdio 有 finally 清理，但嵌入式用法
+        # （测试、脚本）没有——注册 atexit 保证句柄在进程退出前释放。
+        atexit.register(self.shutdown)
+
+    def shutdown(self) -> None:
+        """停掉所有知识库的文件监听（幂等，可重复调用）。"""
+        for indexer in list(self._indexers.values()):
+            try:
+                indexer.stop_watching()
+            except Exception:
+                pass
 
     def _migrate_legacy(self) -> None:
         """First run after upgrading: import the legacy [vault].path into the
@@ -210,10 +334,18 @@ class VaultMcpServer:
         vault_path = self._resolve_vault_path(raw)
         key = str(Path(vault_path).expanduser().resolve())
         indexer = self._indexers.get(key)
-        if indexer is None:
-            indexer = MarkdownIndexer(vault_path, self.config)
-            indexer.start_watching()
-            self._indexers[key] = indexer
+        if indexer is not None:
+            return indexer
+        # 双检锁：后台启动线程（_startup_index_all）与 stdio 主线程会同时走到
+        # 这里，此前两者各造一个 MarkdownIndexer、各跑一次全量 sync、各起一个
+        # watcher；败者被字典覆盖后再也拿不到引用，它的 watcher 线程与目录句柄
+        # 永久泄漏（Windows 上句柄还会锁住目录，导致无法重命名/删除）。
+        with self._indexers_lock:
+            indexer = self._indexers.get(key)
+            if indexer is None:
+                indexer = MarkdownIndexer(vault_path, self.config)
+                indexer.start_watching()
+                self._indexers[key] = indexer
         return indexer
 
     def _list_vaults(self) -> dict[str, Any]:
@@ -226,6 +358,7 @@ class VaultMcpServer:
                 "name": entry.name,
                 "path": entry.path,
                 "registered_at": entry.registered_at,
+                "weight": entry.weight,
                 "exists": exists,
                 "indexed": indexer is not None,
                 "files": len(indexer._chunks) if indexer is not None else None,
@@ -256,10 +389,13 @@ class VaultMcpServer:
         }
 
     def _kb_unregister(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        path = str(arguments.get("path", "")).strip()
-        if not path:
+        raw = str(arguments.get("path", "")).strip()
+        if not raw:
             raise ValueError("path is required for kb_unregister")
         purge = bool(arguments.get("purge_cache", False))
+        # 与 kb_set_weight 一致：统一解析为规范化绝对路径再查注册表，
+        # 避免相对路径按服务进程 CWD 解析出不可预测的行为。
+        path = self._resolve_vault_path(raw)
         entry = self.registry.get(path)
         if entry is None:
             raise ValueError(f"vault not registered: {path}")
@@ -281,9 +417,23 @@ class VaultMcpServer:
             "cache_purged": cache_purged,
         }
 
-    def _fanout_search(self, query: str, top_k: int, use_rerank: bool) -> dict[str, Any]:
-        """Search across every registered (existing) vault, merge and rerank once."""
+    def _fanout_search(self, query: str, top_k: int, use_rerank: bool, group_by_vault: bool = False, filters: SearchFilter | None = None, dedupe: bool = True) -> dict[str, Any]:
+        """Search across every registered (existing) vault, merge and rerank once.
+
+        group_by_vault=True 时返回按库分组的结果（每组 top_k 条），否则平铺返回。
+        filters 的过滤条件对每个库分别生效，分页（offset/limit）只在最后合并
+        排序后的全局结果上做一次——否则各库各翻一页，合并出来的顺序没有意义。
+        """
         per_vault_k = max(top_k, 20)
+        # 单库检索只吃过滤条件，不吃分页：分页留到全局合并之后。
+        per_vault_filters: SearchFilter | None = None
+        if filters is not None:
+            per_vault_filters = SearchFilter(
+                path_prefix=filters.path_prefix,
+                tags=filters.tags,
+                mtime_after=filters.mtime_after,
+                mtime_before=filters.mtime_before,
+            )
         entries = [entry for entry in self.registry.load() if Path(entry.path).is_dir()]
         if not entries:
             raise ValueError("no readable registered vaults; call kb_init first")
@@ -304,29 +454,76 @@ class VaultMcpServer:
             try:
                 indexer = self._indexer_for({"vault_path": entry.path})
                 indexer.sync()
-                chunks = indexer.search(query, per_vault_k, False, query_vector=query_vector)
+                chunks = indexer.search(query, per_vault_k, False, query_vector=query_vector, filters=per_vault_filters, dedupe=dedupe)
                 for chunk in chunks:
                     merged.append((entry, chunk))
                 searched.append(entry.path)
             except Exception as exc:
                 errors[entry.path] = str(exc)
 
+        # 库级权重：分数乘以该库 weight 后再参与全局排序。
+        # 直接改 chunk.score 是安全的：每次检索都会由 indexer 的 _hybrid_rank /
+        # lexical 分支整体重算分数（chunk 本身是每次搜索新构造的对象），这里放大
+        # 不会污染后续查询。全部 weight 为默认 1.0 时结果与加权前逐字节一致。
+        for entry, chunk in merged:
+            chunk.score = chunk.score * entry.weight
+
         merged.sort(key=lambda pair: (-pair[1].score, pair[1].source, pair[1].metadata["chunk_index"]))
         pairs = merged
+        # 跨库再去重一次：同一份内容可能躺在两个库里（比如一个库是另一个的备份）。
+        if dedupe:
+            pairs = dedupe_by_content_hash(pairs, chunk_of=lambda pair: pair[1])
         if use_rerank and merged:
             provider = None
-            for indexer in self._indexers.values():
+            for indexer in list(self._indexers.values()):
                 if indexer.reranker_provider is not None:
                     provider = indexer.reranker_provider
                     break
             if provider is not None:
-                pool = [chunk for _, chunk in merged]
-                reranked = rerank_chunks(query, pool, provider)
-                origin = {id(chunk): entry for entry, chunk in merged}
+                # rerank 的候选池必须来自去重+加权后的 pairs，而不是未去重的
+                # merged：否则 449-472 行的去重被这条路径整体撤销（默认
+                # use_rerank=True 时两个卖点在默认路径上互相抵消）。
+                pool = [chunk for _, chunk in pairs]
+                reranked = rerank_chunks(query, pool, provider, cap=self.config.rerank_cap)
+                origin = {id(chunk): entry for entry, chunk in pairs}
                 pairs = [(origin[id(chunk)], chunk) for chunk in reranked]
+                # rerank 覆盖了 chunk.score，把库级权重乘回去，否则 465-466 行
+                # 的加权在这条路径上失效。
+                for entry, chunk in pairs:
+                    chunk.score = chunk.score * entry.weight
+
+        if filters is not None:
+            start, end = filters.page_slice(top_k)
+        else:
+            start, end = 0, max(0, top_k)
+
+        if group_by_vault:
+            # 分组模式：保持融合后的组内顺序，按库切桶；组顺序取各组最高分降序。
+            # 分页在这里是"每组各翻一页"——全局先切一刀会让低分库整组消失，
+            # 那不是分组检索要的语义。offset/limit 缺省时等价于原来的 top_k 截断。
+            buckets: dict[str, dict[str, Any]] = {}
+            for entry, chunk in pairs:
+                group = buckets.get(entry.path)
+                if group is None:
+                    group = {"vault": entry.path, "vault_name": entry.name, "chunks": []}
+                    buckets[entry.path] = group
+                data = chunk.to_dict()
+                data["vault"] = entry.path
+                data["vault_name"] = entry.name
+                group["chunks"].append(data)
+            for group in buckets.values():
+                group["chunks"] = group["chunks"][start:end]
+            # 切片后桶可能空了，直接丢掉（max 不接受空序列）。
+            groups = sorted(
+                (group for group in buckets.values() if group["chunks"]),
+                key=lambda group: -max(chunk["score"] for chunk in group["chunks"]),
+            )
+            return {"groups": groups, "searched": searched, "errors": errors}
+
+        pairs = pairs[start:end]
 
         out_chunks = []
-        for entry, chunk in pairs[: max(0, top_k)]:
+        for entry, chunk in pairs:
             data = chunk.to_dict()
             data["vault"] = entry.path
             data["vault_name"] = entry.name
@@ -344,35 +541,93 @@ class VaultMcpServer:
             return _text_content(self._kb_unregister(arguments))
         if name == "kb_vaults":
             return _text_content(self._list_vaults())
+        if name == "kb_set_weight":
+            # 统一走 _resolve_vault_path：此前直接按原始字符串查注册表，
+            # 相对路径会按 stdio 服务进程的任意 CWD 解析，行为不可预测。
+            vault_path = self._resolve_vault_path(str(arguments.get("vault_path") or "").strip())
+            if "weight" not in arguments:
+                raise ValueError("weight is required for kb_set_weight")
+            try:
+                weight = float(arguments["weight"])
+            except (TypeError, ValueError):
+                raise ValueError(f"weight must be a number in (0, 100]: {arguments['weight']}")
+            entry = self.registry.set_weight(vault_path, weight)
+            return _text_content({"path": entry.path, "name": entry.name, "weight": entry.weight})
         if name == "kb_rebuild":
             indexer = self._indexer_for(arguments)
             indexer.rebuild()
             return _text_content(indexer.stats())
+        if name == "kb_export":
+            indexer = self._indexer_for(arguments)
+            out_path = str(arguments.get("out_path", "")).strip()
+            if not out_path:
+                raise ValueError("out_path is required for kb_export")
+            # 信任边界：out_path 直通 tmp.replace(out)，此前零校验 —— 被提示
+            # 注入或跑偏的 LLM 可以用 zip 字节原子覆盖任意用户可写文件（文档、
+            # 配置、.ssh/authorized_keys）。对比 kb_read 特意做了 _safe_path
+            # 沙箱，这里至少要做到：绝对路径 + .zip 后缀 + 不静默覆盖。
+            out = Path(out_path).expanduser()
+            if not out.is_absolute():
+                raise ValueError("out_path must be an absolute path for kb_export")
+            if out.suffix.lower() != ".zip":
+                raise ValueError("out_path must end with .zip for kb_export")
+            if out.exists():
+                overwrite = str(arguments.get("overwrite", "")).strip().lower()
+                if overwrite not in {"1", "true", "yes", "on"}:
+                    raise ValueError(
+                        f"out_path already exists: {out}; pass overwrite=true to replace it"
+                    )
+            return _text_content(indexer.export_snapshot(out))
+        if name == "kb_import":
+            indexer = self._indexer_for(arguments)
+            snapshot = str(arguments.get("snapshot", "")).strip()
+            if not snapshot:
+                raise ValueError("snapshot is required for kb_import")
+            force = arguments.get("force", False)
+            if isinstance(force, str):
+                force = force.strip().lower() in {"1", "true", "yes", "on"}
+            return _text_content(indexer.import_snapshot(snapshot, force=bool(force)))
         if name == "kb_search":
             explicit = str(arguments.get("vault_path") or "").strip()
             if not explicit and len(self.registry.load()) > 1:
                 query = str(arguments.get("query", ""))
-                top_k = int(arguments.get("top_k", 10))
+                top_k = _parse_top_k(arguments.get("top_k", 10), self.config.max_top_k)
                 use_rerank = arguments.get("use_rerank", True)
                 if isinstance(use_rerank, str):
                     use_rerank = use_rerank.strip().lower() in {"1", "true", "yes", "on"}
-                return _text_content(self._fanout_search(query, top_k, bool(use_rerank)))
+                group_by_vault = arguments.get("group_by_vault", False)
+                if isinstance(group_by_vault, str):
+                    group_by_vault = group_by_vault.strip().lower() in {"1", "true", "yes", "on"}
+                dedupe = arguments.get("dedupe", True)
+                if isinstance(dedupe, str):
+                    dedupe = dedupe.strip().lower() not in {"0", "false", "no", "off"}
+                return _text_content(self._fanout_search(query, top_k, bool(use_rerank), bool(group_by_vault), _search_filter(arguments, self.config.max_top_k), bool(dedupe)))
         indexer = self._indexer_for(arguments)
         indexer.sync()
         if name == "kb_list":
             return _text_content({"files": indexer.list_files()})
         if name == "kb_search":
             query = str(arguments.get("query", ""))
-            top_k = int(arguments.get("top_k", 10))
+            top_k = _parse_top_k(arguments.get("top_k", 10), self.config.max_top_k)
             use_rerank = arguments.get("use_rerank", True)
             if isinstance(use_rerank, str):
                 use_rerank = use_rerank.strip().lower() in {"1", "true", "yes", "on"}
-            return _text_content({"chunks": [chunk.to_dict() for chunk in indexer.search(query, top_k, bool(use_rerank))]})
+            dedupe = arguments.get("dedupe", True)
+            if isinstance(dedupe, str):
+                dedupe = dedupe.strip().lower() not in {"0", "false", "no", "off"}
+            results = indexer.search(query, top_k, bool(use_rerank), filters=_search_filter(arguments, self.config.max_top_k), dedupe=bool(dedupe))
+            return _text_content({"chunks": [chunk.to_dict() for chunk in results]})
         if name == "kb_read":
-            source = str(arguments.get("source", ""))
+            source = str(arguments.get("source", "")).strip()
+            if not source:
+                raise ValueError("source is required for kb_read")
             heading = arguments.get("heading")
-            start_line = arguments.get("start_line")
-            end_line = arguments.get("end_line")
+            start_line = _parse_int(arguments.get("start_line"))
+            end_line = _parse_int(arguments.get("end_line"))
+            if start_line is not None and start_line < 1:
+                raise ValueError("start_line must be >= 1")
+            if end_line is not None and start_line is not None and end_line < start_line:
+                raise ValueError("end_line must be >= start_line")
             if heading and start_line is None and end_line is None:
                 matches = [chunk for chunk in indexer.all_chunks() if chunk.source == source and chunk.metadata.get("heading") == heading]
                 if not matches:
@@ -380,7 +635,19 @@ class VaultMcpServer:
                 start_line = min(chunk.metadata["start_line"] for chunk in matches)
                 end_line = max(chunk.metadata["end_line"] for chunk in matches)
             text = indexer.read(source, start_line, end_line)
-            return _text_content({"source": source, "start_line": start_line, "end_line": end_line, "content": text})
+            # 无范围时整篇塞进单个 text 块会撑爆模型上下文/客户端消息上限，
+            # 给一个保守上限并明确告知被截断，引导调用方用 start_line 续读。
+            truncated = False
+            if len(text) > 20000:
+                text = text[:20000]
+                truncated = True
+            return _text_content({
+                "source": source,
+                "start_line": start_line,
+                "end_line": end_line,
+                "content": text,
+                "truncated": truncated,
+            })
         if name == "kb_stats":
             return _text_content(indexer.stats())
         if name == "kb_exempt":
@@ -429,7 +696,24 @@ class VaultMcpServer:
             try:
                 return _json_result(request_id, self.call_tool(str(params.get("name", "")), params.get("arguments") or {}))
             except (ValueError, TypeError, OSError) as exc:
-                return _json_error(request_id, -32602, str(exc))
+                # MCP 规范：工具执行失败应以 CallToolResult{isError:true} 返回，
+                # 模型看到错误内容可以自我纠正（比如先 kb_init 再重试）。此前
+                # 一律转成协议级 -32602，很多客户端会直接中断整个回合。只有
+                # 意外异常（非 ValueError/OSError）才降级为 -32000。
+                return _json_result(
+                    request_id,
+                    {
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": json.dumps(
+                                    {"error": str(exc)}, ensure_ascii=False
+                                ),
+                            }
+                        ],
+                        "isError": True,
+                    },
+                )
             except Exception as exc:
                 return _json_error(request_id, -32000, str(exc))
         if request_id is None:
@@ -445,7 +729,19 @@ def serve_stdio(config_path: str | Path | None = None) -> int:
             stream.reconfigure(encoding="utf-8")
         except (AttributeError, ValueError, OSError):
             pass
-    server = VaultMcpServer(config_path)
+    try:
+        server = VaultMcpServer(config_path)
+    except Exception as exc:
+        # 配置错误必须给出人类可读的报错而不是裸 traceback 退出：
+        # 客户端只会看到"连接已关闭"，完全不知道是自己 toml 写错了。
+        # PR 新增的 8 个配置键让这个失败面显著变大。
+        sys.stderr.write(f"Configuration error: {exc}\n")
+        sys.stderr.flush()
+        return 2
+    return _serve_stdio(server)
+
+
+def _serve_stdio(server: VaultMcpServer) -> int:
     try:
         for raw_line in sys.stdin:
             line = raw_line.strip()
@@ -461,8 +757,22 @@ def serve_stdio(config_path: str | Path | None = None) -> int:
             except Exception as exc:
                 response = _json_error(None, -32000, str(exc))
             if response is not None:
-                sys.stdout.write(json.dumps(response, ensure_ascii=False, separators=(",", ":")) + "\n")
-                sys.stdout.flush()
+                # 笔记内容里可能夹带孤立代理项（surrogate，来自 os 解码的文件名
+                # 或粘贴内容）。注意：json.dumps(ensure_ascii=False) 对代理项并
+                # 不报错，UnicodeEncodeError 发生在 write() 编码那一刻 —— 只包
+                # dumps 是死代码，write 也必须在 try 内，否则异常逃出循环直接
+                # 杀掉进程。回退到 ensure_ascii=True 会把代理项转成转义序列，
+                # 序列化与写出都能通过。
+                try:
+                    sys.stdout.write(
+                        json.dumps(response, ensure_ascii=False, separators=(",", ":")) + "\n"
+                    )
+                    sys.stdout.flush()
+                except UnicodeEncodeError:
+                    sys.stdout.write(
+                        json.dumps(response, ensure_ascii=True, separators=(",", ":")) + "\n"
+                    )
+                    sys.stdout.flush()
         return 0
     finally:
         for indexer in server._indexers.values():

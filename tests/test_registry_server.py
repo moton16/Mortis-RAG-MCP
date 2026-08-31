@@ -77,8 +77,8 @@ def test_stdio_duplicate_init_errors_and_unregister_removes(tmp_path):
         {"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": "kb_search", "arguments": {"query": "hello", "vault_path": str(vault)}}},
     ])
     dup = responses[2]
-    assert "error" in dup
-    assert "already registered" in dup["error"]["message"]
+    assert dup["result"]["isError"] is True
+    assert "already registered" in dup["result"]["content"][0]["text"]
 
     unreg = _payload(responses[3])
     assert unreg["unregistered"] is True
@@ -87,8 +87,8 @@ def test_stdio_duplicate_init_errors_and_unregister_removes(tmp_path):
 
     # After unregistering, the path is no longer searchable.
     err = responses[4]
-    assert "error" in err
-    assert "kb_init" in err["error"]["message"]
+    assert err["result"]["isError"] is True
+    assert "kb_init" in err["result"]["content"][0]["text"]
 
     # Cache files were purged for that vault.
     cache_dir = tmp_path / "cache"

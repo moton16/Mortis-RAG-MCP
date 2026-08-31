@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 import re
 from dataclasses import dataclass, field
@@ -28,6 +29,13 @@ class EmbeddingConfig:
     # (Qwen3-Embedding series) accept it; fixed-dimension models (bge-m3) reject
     # it with HTTP 400, so set this to false for those.
     send_dimensions: bool = True
+    # Extra attempts after the first failure (0 keeps the old fail-fast behavior).
+    max_retries: int = 3
+    # Max texts per embedding HTTP request. <=0 disables batching and sends
+    # every chunk of a file in one request (old behavior).
+    batch_size: int = 32
+    # Base seconds for the exponential backoff between retries.
+    retry_backoff: float = 1.0
 
 
 @dataclass(slots=True)
@@ -37,6 +45,12 @@ class RerankerConfig:
     model: str = ""
     api_key: str = ""
     timeout: float = 30.0
+    # rerank 走的是 kb_search 的同步交互路径，重试次数必须能单独控制：
+    # 此前 create_reranker_provider 从不透传，永远硬编码 3 次 × timeout，
+    # 端点不可达时一次搜索卡 4×timeout（timeout=30 约 126 秒），且异常被
+    # rerank_chunks 吞成"搜索卡死"。默认 1 次重试是交互路径的合理折中。
+    max_retries: int = 1
+    retry_backoff: float = 1.0
 
 
 @dataclass(slots=True)
@@ -74,7 +88,18 @@ class CacheConfig:
     max_age_days: int = 0
 
 
-DEFAULT_EXCLUDE_PATTERNS = [".obsidian"]
+DEFAULT_EXCLUDE_PATTERNS = [
+    ".obsidian",
+    # Obsidian 的默认回收站：里面的"已删除"笔记不该再被检索（隐私）。
+    ".trash",
+    # git / 同步盘元数据目录：rglob 无法剪枝时只做事后过滤，会在每次
+    # 轮询里遍历 .git/objects 下数十万对象。
+    ".git",
+    ".stversions",
+    ".stfolder",
+    "node_modules",
+    ".DS_Store",
+]
 DEFAULT_EXCLUDE_TAGS = ["no-rag", "private", "draft", "私密", "豁免"]
 DEFAULT_EXCLUDE_FRONTMATTER_KEYS = ["rag_exclude", "rag_ignore", "no_rag"]
 
@@ -93,7 +118,27 @@ class AppConfig:
     use_hybrid: bool = True
     chunk_size: int = 1200
     chunk_overlap: int = 0
+    # 图片 alt/图注注入（opt-in，默认关）：开启后在每张图片所在行后插入一行
+    # `[图片: alt 图注 (文件名)]`，让图片的 alt/图注变得可检索。注意这会改变
+    # chunk content → chunk.id，等价于全库重新 embedding——所以默认必须关闭。
+    inject_image_captions: bool = False
+    # Hybrid search tuning: how many candidates each RRF route (FTS5 BM25 /
+    # vector cosine / bigram lexical) contributes to the fused pool, and the
+    # cap on how many chunks a single rerank API call may carry.
+    rrf_per_route: int = 40
+    rerank_cap: int = 60
+    # 单次 kb_search 允许返回的最大条数。客户端（或被提示注入的 LLM）传来的
+    # top_k / limit 一律夹到这个范围内，避免 10**9 这类值让 sqlite-vec 去建
+    # 千万级 KNN 堆，或让单次响应变成几 MB。
+    max_top_k: int = 200
     debounce_seconds: float = 0.5
+    # 文件监听方式："auto"（默认）= Windows 原生 ReadDirectoryChangesW 可用就用，
+    # 否则退回轮询；"native" = 优先原生，启动失败退回轮询；"poll" = 始终轮询
+    #（0.4.1 及以前的行为）。
+    watch_method: str = "auto"
+    # 原生监听生效期间的低频兜底：每隔这么多秒做一次全量 sha256 对账，覆盖
+    # 原生事件可能丢失的极端情况。<=0 关闭兜底同步（只保留事件驱动）。
+    watch_fallback_interval: float = 30.0
     exclude_patterns: list[str] = field(default_factory=lambda: list(DEFAULT_EXCLUDE_PATTERNS))
     exclude_tags: list[str] = field(default_factory=lambda: list(DEFAULT_EXCLUDE_TAGS))
     exclude_frontmatter_keys: list[str] = field(default_factory=lambda: list(DEFAULT_EXCLUDE_FRONTMATTER_KEYS))
@@ -105,6 +150,16 @@ class AppConfig:
             raise ValueError("embedding.mode must be 'static' or 'external'")
         if self.embedding.dimension < 1:
             raise ValueError("embedding.dimension must be positive")
+        # 重试次数必须封顶：每次尝试都吃满一个 timeout，而调用链一直握着
+        # _sync_lock，max_retries=1000 会把整个服务挂死数小时。
+        if not 0 <= self.embedding.max_retries <= 10:
+            raise ValueError("embedding.max_retries must be in [0, 10]")
+        if self.embedding.batch_size < 0:
+            raise ValueError("embedding.batch_size must be >= 0")
+        if self.embedding.retry_backoff <= 0:
+            raise ValueError("embedding.retry_backoff must be positive")
+        if not 0 < self.embedding.timeout <= 300:
+            raise ValueError("embedding.timeout must be in (0, 300]")
         if self.cache.embedding_max_workers < 1:
             raise ValueError("cache.embedding_max_workers must be positive")
         if self.cache.placement not in {"home", "vault"}:
@@ -121,6 +176,16 @@ class AppConfig:
             raise ValueError("chunk_size must be positive")
         if self.chunk_overlap < 0 or self.chunk_overlap >= self.chunk_size:
             raise ValueError("chunk_overlap must be in [0, chunk_size)")
+        if self.rrf_per_route < 1:
+            raise ValueError("rrf_per_route must be >= 1")
+        if self.rerank_cap < 1:
+            raise ValueError("rerank_cap must be >= 1")
+        if not 1 <= self.max_top_k <= 5000:
+            raise ValueError("max_top_k must be in [1, 5000]")
+        if self.watch_method not in {"auto", "native", "poll"}:
+            raise ValueError("watch_method must be 'auto', 'native' or 'poll'")
+        if self.watch_fallback_interval < 0:
+            raise ValueError("watch_fallback_interval must be >= 0")
 
 
 def _env(value: Any) -> Any:
@@ -206,6 +271,40 @@ def _section(data: Mapping[str, Any], name: str) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
 
 
+def _numeric(
+    section: dict[str, Any],
+    flat: dict[str, Any],
+    key: str,
+    kind: type,
+    default: Any,
+    minimum: float | None = None,
+    maximum: float | None = None,
+) -> Any:
+    """读取数值型配置键（分组优先，其次扁平），类型/范围错误给出可读报错。
+
+    此前一律裸写 int()/float()：TOML 里把 max_retries 写成 "3 次" 会抛一段原始
+    traceback，把 rrf_per_route 写成 40.5 会被静默截断成 40。
+    """
+    raw = section.get(key, flat.get(key, default))
+    # bool 是 int 的子类：int(True) == 1 会让 `timeout = true` 悄悄变成 1 秒。
+    if isinstance(raw, bool):
+        raise ValueError(f"config key '{key}' must be a {kind.__name__}, got a boolean")
+    try:
+        value = kind(raw)
+    except (TypeError, ValueError):
+        raise ValueError(f"config key '{key}' must be a {kind.__name__}, got {raw!r}") from None
+    if kind is int and isinstance(raw, float) and raw != int(raw):
+        raise ValueError(f"config key '{key}' must be an integer, got {raw!r}")
+    # NaN 与任何值的比较都是 False，min/max 校验会全部放行，必须显式挡掉。
+    if kind is float and not math.isfinite(value):
+        raise ValueError(f"config key '{key}' must be a finite number, got {raw!r}")
+    if minimum is not None and value < minimum:
+        raise ValueError(f"config key '{key}' must be >= {minimum}, got {value}")
+    if maximum is not None and value > maximum:
+        raise ValueError(f"config key '{key}' must be <= {maximum}, got {value}")
+    return value
+
+
 def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
     """Load app.toml while accepting both flat and grouped configuration keys."""
     data = _read_toml(Path(path)) if path is not None else {}
@@ -222,26 +321,31 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
         endpoint=str(_env(embedding.get("endpoint", ""))),
         model=str(_env(embedding.get("model", ""))),
         api_key=str(_env(embedding.get("api_key", "")) or os.getenv(API_KEY_ENV_VAR, "")),
-        timeout=float(embedding.get("timeout", 30.0)),
-        dimension=int(embedding.get("dimension", 384)),
+        timeout=_numeric(embedding, data, "timeout", float, 30.0, 0.0, 300.0),
+        dimension=_numeric(embedding, data, "dimension", int, 384, 1),
         send_dimensions=bool(embedding.get("send_dimensions", True)),
+        max_retries=_numeric(embedding, data, "max_retries", int, 3, 0, 10),
+        batch_size=_numeric(embedding, data, "batch_size", int, 32, 0),
+        retry_backoff=_numeric(embedding, data, "retry_backoff", float, 1.0, 0.0, 60.0),
     )
     rer = RerankerConfig(
         enabled=bool(reranker.get("enabled", False)),
         endpoint=str(_env(reranker.get("endpoint", ""))),
         model=str(_env(reranker.get("model", ""))),
         api_key=str(_env(reranker.get("api_key", "")) or os.getenv(API_KEY_ENV_VAR, "")),
-        timeout=float(reranker.get("timeout", 30.0)),
+        timeout=_numeric(reranker, data, "timeout", float, 30.0, 0.0, 300.0),
+        max_retries=_numeric(reranker, data, "max_retries", int, 1, 0, 10),
+        retry_backoff=_numeric(reranker, data, "retry_backoff", float, 1.0, 0.0, 60.0),
     )
     cch = CacheConfig(
         dir=str(_env(cache.get("dir", DEFAULT_CACHE_DIR))),
         enabled=bool(cache.get("enabled", True)),
-        embedding_max_workers=int(cache.get("embedding_max_workers", 6)),
+        embedding_max_workers=_numeric(cache, data, "embedding_max_workers", int, 6, 1, 32),
         placement=str(cache.get("placement", "home")).lower(),
         subdir=str(cache.get("subdir", ".mcp_cache")),
         namespace=str(cache.get("namespace", "default")).lower(),
         id=str(_env(cache.get("id", ""))),
-        max_age_days=int(cache.get("max_age_days", 0)),
+        max_age_days=_numeric(cache, data, "max_age_days", int, 0, 0),
     )
     raw_exclude_patterns = index.get("exclude_patterns", data.get("exclude_patterns", DEFAULT_EXCLUDE_PATTERNS))
     if isinstance(raw_exclude_patterns, str):
@@ -270,9 +374,15 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
         vector=VectorConfig(backend=str(vector.get("backend", "memory")).lower()),
         cache=cch,
         use_hybrid=bool(index.get("use_hybrid", data.get("use_hybrid", True))),
-        chunk_size=int(index.get("chunk_size", data.get("chunk_size", 1200))),
-        chunk_overlap=int(index.get("chunk_overlap", data.get("chunk_overlap", 0))),
-        debounce_seconds=float(index.get("debounce_seconds", data.get("debounce_seconds", 0.5))),
+        chunk_size=_numeric(index, data, "chunk_size", int, 1200, 1),
+        chunk_overlap=_numeric(index, data, "chunk_overlap", int, 0, 0),
+        inject_image_captions=bool(index.get("inject_image_captions", data.get("inject_image_captions", False))),
+        rrf_per_route=_numeric(index, data, "rrf_per_route", int, 40, 1),
+        rerank_cap=_numeric(index, data, "rerank_cap", int, 60, 1),
+        max_top_k=_numeric(index, data, "max_top_k", int, 200, 1, 5000),
+        debounce_seconds=_numeric(index, data, "debounce_seconds", float, 0.5, 0.0, 60.0),
+        watch_method=str(index.get("watch_method", data.get("watch_method", "auto"))).strip().lower(),
+        watch_fallback_interval=_numeric(index, data, "watch_fallback_interval", float, 30.0, 0.0, 3600.0),
         exclude_patterns=exclude_patterns,
         exclude_tags=exclude_tags,
         exclude_frontmatter_keys=exclude_fm,
