@@ -10,7 +10,7 @@ from pathlib import Path
 def _run_stdio(config: Path, requests: list[dict]) -> list[dict]:
     payload = "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in requests)
     proc = subprocess.run(
-        [sys.executable, "-m", "vault_mcp", "--serve-mcp-stdio", "--app-config", str(config)],
+        [sys.executable, "-m", "mortis_rag_mcp", "--serve-mcp-stdio", "--app-config", str(config)],
         input=payload,
         text=True,
         capture_output=True,
@@ -73,17 +73,17 @@ def test_stdio_duplicate_init_errors_and_unregister_removes(tmp_path):
         {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
         {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "kb_init", "arguments": {"path": str(vault)}}},
         {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "kb_init", "arguments": {"path": str(vault)}}},
-        {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "kb_unregister", "arguments": {"path": str(vault), "purge_cache": True}}},
+        {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "kb_remove", "arguments": {"path": str(vault), "purge_cache": True}}},
         {"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": "kb_search", "arguments": {"query": "hello", "vault_path": str(vault)}}},
     ])
     dup = responses[2]
     assert dup["result"]["isError"] is True
     assert "already registered" in dup["result"]["content"][0]["text"]
 
-    unreg = _payload(responses[3])
-    assert unreg["unregistered"] is True
-    assert unreg["watcher_stopped"] is True
-    assert unreg["cache_purged"] is True
+    removed = _payload(responses[3])
+    assert removed["removed"] is True
+    assert removed["watcher_stopped"] is True
+    assert removed["cache_purged"] is True
 
     # After unregistering, the path is no longer searchable.
     err = responses[4]
@@ -113,7 +113,7 @@ def test_stdio_missing_vault_folder_listed_as_not_exists(tmp_path):
 
     responses = _run_stdio(config, [
         {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
-        {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "kb_vaults", "arguments": {}}},
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "kb_list", "arguments": {}}},
         {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "kb_search", "arguments": {"query": "内容"}}},
     ])
     data = _payload(responses[1])
@@ -153,7 +153,7 @@ def test_stdio_legacy_vault_path_auto_migrates(tmp_path):
     # No explicit registry file: legacy [vault].path must be auto-imported.
     responses = _run_stdio(config, [
         {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
-        {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "kb_vaults", "arguments": {}}},
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "kb_list", "arguments": {}}},
         {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "kb_search", "arguments": {"query": "XYZ999"}}},
     ])
     data = _payload(responses[1])

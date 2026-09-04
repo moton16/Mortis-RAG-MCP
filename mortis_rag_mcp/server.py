@@ -5,6 +5,7 @@ import json
 import sys
 import threading
 from argparse import ArgumentParser
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -13,7 +14,7 @@ from .config import load_config, resolve_config_path
 from .indexer import Chunk, MarkdownIndexer, SearchFilter, dedupe_by_content_hash, rerank_chunks
 from .registry import VaultEntry, VaultRegistry, registry_path
 
-SERVER_INFO = {"name": "mortis-rag-mcp", "version": "0.5.0", "title": "Mortis'RAG MCP"}
+SERVER_INFO = {"name": "mortis-rag-mcp", "version": "0.6.0", "title": "Mortis'RAG MCP"}
 
 
 def _parse_epoch(value: Any) -> float | None:
@@ -106,24 +107,32 @@ def _tool_definitions() -> list[dict[str, Any]]:
     return [
         {
             "name": "kb_init",
-            "description": "注册（初始化）一个文件夹为知识库：校验目录、写入用户级注册表（跨重启保留）、后台建立索引并启动文件监听。首次使用或要纳入新文件夹时调用。",
+            "description": "注册（初始化）一个文件夹为知识库：校验目录、写入用户级注册表（跨重启保留）、后台建立索引并启动文件监听。首次使用或要纳入新文件夹时调用；要注册不参与全局检索的独立库用 kb_init_solo。",
             "inputSchema": {"type": "object", "required": ["path"], "properties": {
                 "path": {"type": "string", "description": "必填，要注册为知识库的文件夹绝对路径"},
                 "name": {"type": "string", "description": "可选，显示名，默认取文件夹名"},
             }},
         },
         {
-            "name": "kb_unregister",
-            "description": "注销一个已注册的知识库：停止文件监听并从注册表移除（不影响文件夹本身）。",
+            "name": "kb_remove",
+            "description": "从注册表移除一个已注册的知识库：停止文件监听并移除注册（不影响文件夹本身）。移除后想恢复参与全局检索，重新 kb_init 即可（磁盘缓存保留，秒级恢复、无需重新 embedding）。",
             "inputSchema": {"type": "object", "required": ["path"], "properties": {
                 "path": {"type": "string", "description": "必填，已注册知识库的绝对路径"},
                 "purge_cache": {"type": "boolean", "default": False, "description": "是否同时删除该库的磁盘索引缓存"},
             }},
         },
         {
-            "name": "kb_vaults",
-            "description": "列出所有已注册的知识库（含存活状态与索引进度）。",
+            "name": "kb_list",
+            "description": "列出所有已注册的知识库（含 solo 标记、存活状态与索引进度）。",
             "inputSchema": {"type": "object", "properties": {}},
+        },
+        {
+            "name": "kb_init_solo",
+            "description": "初始化一个 solo（独立）知识库：不参与跨库全局检索（kb_search 不传 vault_path 时跳过它），只有显式传 vault_path 才会被搜索。三种输入：(1) 未注册的文件夹 → 注册为 solo 库并后台建索引；(2) 已注册的普通库 → 原地转为 solo（索引/缓存/监听不动，秒级）；(3) 已是 solo → 幂等确认。取消 solo 用 kb_remove 后重新 kb_init（缓存保留，0 次重新 embedding）。",
+            "inputSchema": {"type": "object", "required": ["path"], "properties": {
+                "path": {"type": "string", "description": "必填，文件夹绝对路径（未注册则注册为 solo 库；已注册则转为 solo）"},
+                "name": {"type": "string", "description": "可选，显示名，默认取文件夹名（仅未注册时生效）"},
+            }},
         },
         {
             "name": "kb_set_weight",
@@ -158,16 +167,16 @@ def _tool_definitions() -> list[dict[str, Any]]:
             }},
         },
         {
-            "name": "kb_list",
+            "name": "kb_list_files",
             "description": "列出已索引的 Markdown 文件。可传 vault_path 指定知识库。",
             "inputSchema": {"type": "object", "properties": {"vault_path": {"type": "string", "description": vault_path_hint}}},
         },
         {
             "name": "kb_search",
-            "description": "搜索知识库并返回结构化原始 chunks。不传 vault_path 时跨全部注册库 fan-out 检索（结果带 vault 字段）。",
+            "description": "搜索知识库并返回结构化原始 chunks。不传 vault_path 时跨全部非 solo 注册库 fan-out 检索（结果带 vault 字段；solo 库被跳过并在 excluded_solo 中列出）；solo 库必须显式传 vault_path 才会被搜索。",
             "inputSchema": {"type": "object", "required": ["query"], "properties": {
                 "query": {"type": "string"}, "top_k": {"type": "integer", "minimum": 1, "default": 10}, "use_rerank": {"type": "boolean", "default": True},
-                "vault_path": {"type": "string", "description": "可选，已注册知识库的绝对路径；缺省时跨全部注册库检索"},
+                "vault_path": {"type": "string", "description": "可选，已注册知识库的绝对路径；缺省时跨全部非 solo 注册库检索"},
                 "group_by_vault": {"type": "boolean", "default": False, "description": "可选，仅跨库检索（不传 vault_path）时生效：结果按知识库分组返回 groups，每组取 top_k 条"},
                 "path_prefix": {"type": "string", "description": "可选，只保留 source 以该前缀开头的 chunk（source 是库内相对 posix 路径，如 '教材/'）"},
                 "tags": {"type": "array", "items": {"type": "string"}, "description": "可选，frontmatter 标签过滤：命中任一标签即保留（大小写不敏感，自动去掉 '#' 前缀）"},
@@ -302,7 +311,7 @@ class VaultMcpServer:
         p = Path(vault_path).expanduser()
         if not p.is_absolute():
             raise ValueError(
-                "vault_path must be an absolute path; call kb_vaults to list registered vaults, or kb_init to register a folder"
+                "vault_path must be an absolute path; call kb_list to list registered vaults, or kb_init to register a folder"
             )
         candidate = str(p.resolve())
         if for_registration:
@@ -311,7 +320,7 @@ class VaultMcpServer:
             return candidate
         if self.registry.get(candidate) is None:
             raise ValueError(
-                f"vault not registered: {candidate}; call kb_init first, or kb_vaults to list registered vaults"
+                f"vault not registered: {candidate}; call kb_init first, or kb_list to list registered vaults"
             )
         return candidate
 
@@ -359,6 +368,7 @@ class VaultMcpServer:
                 "path": entry.path,
                 "registered_at": entry.registered_at,
                 "weight": entry.weight,
+                "solo": entry.solo,
                 "exists": exists,
                 "indexed": indexer is not None,
                 "files": len(indexer._chunks) if indexer is not None else None,
@@ -388,10 +398,51 @@ class VaultMcpServer:
             "md_files": md_files,
         }
 
-    def _kb_unregister(self, arguments: dict[str, Any]) -> dict[str, Any]:
+    def _kb_init_solo(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        """kb_init_solo：初始化/确保一个 solo 库（幂等三态）。
+
+        未注册 → 注册为 solo；已注册普通库 → 原地转 solo（只改注册表布尔位，
+        索引/缓存/watcher 不动）；已是 solo → 幂等确认。刻意不提供"转普通"
+        的隐式路径（kb_init 保持重复注册报错）：避免模型日常重复调 kb_init
+        时悄悄把 solo 库转回普通库、恰好暴露用户想隔离的内容——取消 solo
+        必须显式走 kb_remove + kb_init 两步（缓存保留，零成本周转）。
+        """
+        path = str(arguments.get("path", "")).strip()
+        if not path:
+            raise ValueError("path is required for kb_init_solo")
+        name_arg = str(arguments.get("name", "")).strip() or None
+        resolved = self._resolve_vault_path(path, for_registration=True)
+        existing = self.registry.get(resolved)
+        if existing is None:
+            # Register first (fail fast, no half state), then build the indexer.
+            try:
+                entry = self.registry.add(resolved, name_arg, solo=True)
+            except OSError:
+                entry = self.registry.add(resolved, name_arg, solo=True, persist=False)
+            indexer = self._indexer_for({"vault_path": entry.path})
+            threading.Thread(target=indexer.sync, daemon=True, name="vault-init").start()
+            md_files = sum(1 for _ in Path(entry.path).rglob("*.md") if _.is_file())
+            return {
+                "solo": True,
+                "registered": True,
+                "path": entry.path,
+                "name": entry.name,
+                "indexing": "started in background",
+                "md_files": md_files,
+            }
+        entry = self.registry.set_solo(existing.path, True)
+        return {
+            "solo": True,
+            "registered": False,
+            "switched": not existing.solo,
+            "path": entry.path,
+            "name": entry.name,
+        }
+
+    def _kb_remove(self, arguments: dict[str, Any]) -> dict[str, Any]:
         raw = str(arguments.get("path", "")).strip()
         if not raw:
-            raise ValueError("path is required for kb_unregister")
+            raise ValueError("path is required for kb_remove")
         purge = bool(arguments.get("purge_cache", False))
         # 与 kb_set_weight 一致：统一解析为规范化绝对路径再查注册表，
         # 避免相对路径按服务进程 CWD 解析出不可预测的行为。
@@ -410,7 +461,7 @@ class VaultMcpServer:
         if purge and indexer is not None:
             cache_purged = indexer.purge_cache()
         return {
-            "unregistered": True,
+            "removed": True,
             "path": entry.path,
             "name": entry.name,
             "watcher_stopped": watcher_stopped,
@@ -434,8 +485,19 @@ class VaultMcpServer:
                 mtime_after=filters.mtime_after,
                 mtime_before=filters.mtime_before,
             )
-        entries = [entry for entry in self.registry.load() if Path(entry.path).is_dir()]
+        all_entries = self.registry.load()
+        # solo 库只在显式指定 vault_path 时被检索；fan-out 跳过它们并原样
+        # 报告在 excluded_solo 里，否则"忘了一个库是 solo"会变成检索黑洞。
+        excluded_solo = [entry.path for entry in all_entries if entry.solo]
+        entries = [
+            entry for entry in all_entries
+            if Path(entry.path).is_dir() and not entry.solo
+        ]
         if not entries:
+            if excluded_solo and len(excluded_solo) == len(all_entries):
+                raise ValueError(
+                    "no searchable vaults: all registered vaults are solo (excluded from global search); pass an explicit vault_path to search one"
+                )
             raise ValueError("no readable registered vaults; call kb_init first")
         merged: list[tuple[VaultEntry, Chunk]] = []
         searched: list[str] = []
@@ -462,11 +524,11 @@ class VaultMcpServer:
                 errors[entry.path] = str(exc)
 
         # 库级权重：分数乘以该库 weight 后再参与全局排序。
-        # 直接改 chunk.score 是安全的：每次检索都会由 indexer 的 _hybrid_rank /
-        # lexical 分支整体重算分数（chunk 本身是每次搜索新构造的对象），这里放大
-        # 不会污染后续查询。全部 weight 为默认 1.0 时结果与加权前逐字节一致。
-        for entry, chunk in merged:
-            chunk.score = chunk.score * entry.weight
+        # 使用 replace 生成打分副本，避免污染 indexer 内存常驻对象。
+        merged = [
+            (entry, replace(chunk, score=chunk.score * entry.weight))
+            for entry, chunk in merged
+        ]
 
         merged.sort(key=lambda pair: (-pair[1].score, pair[1].source, pair[1].metadata["chunk_index"]))
         pairs = merged
@@ -485,12 +547,23 @@ class VaultMcpServer:
                 # use_rerank=True 时两个卖点在默认路径上互相抵消）。
                 pool = [chunk for _, chunk in pairs]
                 reranked = rerank_chunks(query, pool, provider, cap=self.config.rerank_cap)
-                origin = {id(chunk): entry for entry, chunk in pairs}
-                pairs = [(origin[id(chunk)], chunk) for chunk in reranked]
+                origin_map: dict[str, list[VaultEntry]] = {}
+                for entry, chunk in pairs:
+                    origin_map.setdefault(chunk.id, []).append(entry)
+                new_pairs = []
+                for chunk in reranked:
+                    entries = origin_map.get(chunk.id)
+                    if entries:
+                        new_pairs.append((entries.pop(0), chunk))
+                    elif pairs:
+                        new_pairs.append((pairs[0][0], chunk))
+                pairs = new_pairs
                 # rerank 覆盖了 chunk.score，把库级权重乘回去，否则 465-466 行
                 # 的加权在这条路径上失效。
-                for entry, chunk in pairs:
-                    chunk.score = chunk.score * entry.weight
+                pairs = [
+                    (entry, replace(chunk, score=chunk.score * entry.weight))
+                    for entry, chunk in pairs
+                ]
 
         if filters is not None:
             start, end = filters.page_slice(top_k)
@@ -518,7 +591,7 @@ class VaultMcpServer:
                 (group for group in buckets.values() if group["chunks"]),
                 key=lambda group: -max(chunk["score"] for chunk in group["chunks"]),
             )
-            return {"groups": groups, "searched": searched, "errors": errors}
+            return {"groups": groups, "searched": searched, "errors": errors, "excluded_solo": excluded_solo}
 
         pairs = pairs[start:end]
 
@@ -528,7 +601,7 @@ class VaultMcpServer:
             data["vault"] = entry.path
             data["vault_name"] = entry.name
             out_chunks.append(data)
-        return {"chunks": out_chunks, "searched": searched, "errors": errors}
+        return {"chunks": out_chunks, "searched": searched, "errors": errors, "excluded_solo": excluded_solo}
 
     def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         # 防御：某些客户端会把工具名/畸形数据当 arguments 透传（如逐字符拆分的 dict），
@@ -537,9 +610,11 @@ class VaultMcpServer:
             arguments = {}
         if name == "kb_init":
             return _text_content(self._kb_init(arguments))
-        if name == "kb_unregister":
-            return _text_content(self._kb_unregister(arguments))
-        if name == "kb_vaults":
+        if name == "kb_init_solo":
+            return _text_content(self._kb_init_solo(arguments))
+        if name == "kb_remove":
+            return _text_content(self._kb_remove(arguments))
+        if name == "kb_list":
             return _text_content(self._list_vaults())
         if name == "kb_set_weight":
             # 统一走 _resolve_vault_path：此前直接按原始字符串查注册表，
@@ -589,22 +664,33 @@ class VaultMcpServer:
             return _text_content(indexer.import_snapshot(snapshot, force=bool(force)))
         if name == "kb_search":
             explicit = str(arguments.get("vault_path") or "").strip()
-            if not explicit and len(self.registry.load()) > 1:
-                query = str(arguments.get("query", ""))
-                top_k = _parse_top_k(arguments.get("top_k", 10), self.config.max_top_k)
-                use_rerank = arguments.get("use_rerank", True)
-                if isinstance(use_rerank, str):
-                    use_rerank = use_rerank.strip().lower() in {"1", "true", "yes", "on"}
-                group_by_vault = arguments.get("group_by_vault", False)
-                if isinstance(group_by_vault, str):
-                    group_by_vault = group_by_vault.strip().lower() in {"1", "true", "yes", "on"}
-                dedupe = arguments.get("dedupe", True)
-                if isinstance(dedupe, str):
-                    dedupe = dedupe.strip().lower() not in {"0", "false", "no", "off"}
-                return _text_content(self._fanout_search(query, top_k, bool(use_rerank), bool(group_by_vault), _search_filter(arguments, self.config.max_top_k), bool(dedupe)))
+            if not explicit:
+                entries = self.registry.load()
+                # 唯一的注册库是 solo 库时，不传 vault_path 的检索同样算"全局
+                # 检索"，必须拒绝而不是悄悄搜它——否则单库用户的 solo 等于没设。
+                # （检查放在这里而不是 _default_vault_path：后者被 kb_read/
+                # kb_stats 等管理类工具共用，单库默认它们是合理的。）
+                if len(entries) == 1 and entries[0].solo:
+                    raise ValueError(
+                        f"vault '{entries[0].name}' is solo (excluded from global search); "
+                        "pass an explicit vault_path to search it"
+                    )
+                if len(entries) > 1:
+                    query = str(arguments.get("query", ""))
+                    top_k = _parse_top_k(arguments.get("top_k", 10), self.config.max_top_k)
+                    use_rerank = arguments.get("use_rerank", True)
+                    if isinstance(use_rerank, str):
+                        use_rerank = use_rerank.strip().lower() in {"1", "true", "yes", "on"}
+                    group_by_vault = arguments.get("group_by_vault", False)
+                    if isinstance(group_by_vault, str):
+                        group_by_vault = group_by_vault.strip().lower() in {"1", "true", "yes", "on"}
+                    dedupe = arguments.get("dedupe", True)
+                    if isinstance(dedupe, str):
+                        dedupe = dedupe.strip().lower() not in {"0", "false", "no", "off"}
+                    return _text_content(self._fanout_search(query, top_k, bool(use_rerank), bool(group_by_vault), _search_filter(arguments, self.config.max_top_k), bool(dedupe)))
         indexer = self._indexer_for(arguments)
         indexer.sync()
-        if name == "kb_list":
+        if name == "kb_list_files":
             return _text_content({"files": indexer.list_files()})
         if name == "kb_search":
             query = str(arguments.get("query", ""))

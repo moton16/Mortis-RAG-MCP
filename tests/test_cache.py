@@ -2,8 +2,8 @@
 
 from pathlib import Path
 
-from vault_mcp.config import AppConfig, CacheConfig, EmbeddingConfig
-from vault_mcp.indexer import MarkdownIndexer
+from mortis_rag_mcp.config import AppConfig, CacheConfig, EmbeddingConfig
+from mortis_rag_mcp.indexer import MarkdownIndexer
 
 
 class CountingProvider:

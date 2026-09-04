@@ -4,7 +4,7 @@
 > 提供结构化切片检索、原文读取、增量索引、向量语义召回与重排序能力，供 AI Agent（WorkBuddy / Codex / Trae 等）通过 MCP 协议调用。
 
 - 仓库：`Mortis-RAG-MCP`（Python 包名保持 `vault_mcp`，控制台脚本新增 `mortis-rag-mcp`，旧 `vault-mcp` 兼容保留）
-- 当前版本：`mortis-rag-mcp 0.5.0`（混合检索 + 检索过滤/去重 + 库级权重 + 原生监听 + 索引快照）
+- 当前版本：`mortis-rag-mcp 0.6.0`（solo 独立库 + 工具更名 + 混合检索 + 检索过滤/去重 + 库级权重 + 原生监听 + 索引快照）
 - 知识库：**不绑定任何路径** —— 任意文件夹通过 `kb_init` 注册为知识库，注册表持久化于 `~/.vault_mcp/vaults.toml`（跨重启/跨设备可用）
 
 > **新用户看这里**：下载后如何初始化（装包 → 配 key → 接入 MCP 客户端 → `kb_init` 建库 → 安装配套 Skill），见 [docs/QUICKSTART.md](docs/QUICKSTART.md)。
@@ -202,7 +202,10 @@ python -m vault_mcp --serve-mcp-stdio --app-config .\config\app.toml
 
 ### 3.4 功能模块 / API 调用方式
 
-共 12 个工具，均为 `tools/call` 的 JSON-RPC 请求：
+共 13 个工具，均为 `tools/call` 的 JSON-RPC 请求：
+
+> **0.6.0 工具更名（Breaking）**：`kb_unregister` → `kb_remove`、`kb_vaults` → `kb_list`、
+> 原 `kb_list`（列文件）→ `kb_list_files`，旧名不再保留。
 
 #### `kb_init` — 注册知识库（0.3.0 新增，首次使用必调）
 
@@ -214,13 +217,25 @@ python -m vault_mcp --serve-mcp-stdio --app-config .\config\app.toml
 - `name` 可选，默认取文件夹名。重复注册同一目录（Windows 大小写不敏感）会报 `already registered`。
 - 注册表跨重启保留；换设备/分发给他人时，对方只需对新文件夹跑一次 `kb_init` + 配好自己的 `VAULT_MCP_API_KEY`。
 
-#### `kb_unregister` — 注销知识库（0.3.0 新增）
+#### `kb_remove` — 从注册表移除知识库（0.6.0 更名，原 `kb_unregister`）
 
 ```json
-{"name": "kb_unregister", "arguments": {"path": "D:\\我的笔记", "purge_cache": true}}
+{"name": "kb_remove", "arguments": {"path": "D:\\我的笔记", "purge_cache": true}}
 ```
 
 - 停止文件监听并从注册表移除（不动文件夹本身）。`purge_cache=true` 时同时删除该库的磁盘索引缓存。
+- 移除后重新 `kb_init` 即可恢复（磁盘缓存默认保留，秒级、无需重新 embedding）——这也是取消 solo 独立库的正道。
+
+#### `kb_init_solo` — 注册/转为独立库（0.6.0 新增）
+
+```json
+{"name": "kb_init_solo", "arguments": {"path": "D:\\私密笔记", "name": "私密库"}}
+```
+
+- 独立库（solo）**不参与全局检索**：`kb_search` 不传 `vault_path` 时跳过它（并在结果的 `excluded_solo` 字段点名）；只有显式传 `vault_path` 才会被搜索。索引、文件监听、快照迁移等能力与普通库完全一致。
+- 三种输入：未注册文件夹 → 注册为独立库；已注册普通库 → 原地转为独立库（秒级，不动索引与缓存）；已是独立库 → 幂等确认。
+- 唯一注册库是独立库、或全部库都是独立库时，不传 `vault_path` 的检索会明确报错并提示显式传 `vault_path`，不会悄悄搜索。
+- 取消独立库：`kb_remove` 后重新 `kb_init`（磁盘缓存保留，0 次重新 embedding）。
 
 #### `kb_search` — 语义+词法混合检索（核心）
 
@@ -239,7 +254,7 @@ python -m vault_mcp --serve-mcp-stdio --app-config .\config\app.toml
 - `query`：必填检索词。
 - `top_k`：返回条数，默认 10。
 - `use_rerank`：默认 `true`，调用免费 bge-reranker-v2-m3 对 top-60 精排。
-- `vault_path`：可选，**已注册**知识库的绝对路径；**缺省时跨全部注册库 fan-out 检索**（每库取候选 → 合并 → query 只 embed 一次 → 统一 rerank 一次），结果每项带 `vault`（注册路径）与 `vault_name` 字段，另有 `searched`/`errors` 汇总。
+- `vault_path`：可选，**已注册**知识库的绝对路径；**缺省时跨全部非 solo 注册库 fan-out 检索**（每库取候选 → 合并 → query 只 embed 一次 → 统一 rerank 一次），结果每项带 `vault`（注册路径）与 `vault_name` 字段，另有 `searched`/`errors` 汇总与 `excluded_solo`（本次被跳过的独立库）。solo 库必须显式传 `vault_path` 才会被搜索。
 - **0.5.0 过滤与分页**（过滤在 rerank 之前执行，不浪费配额；fan-out 时过滤逐库生效、分页在全局合并后一次完成）：
   - `path_prefix`：只保留 `source` 以该前缀开头的 chunk（如 `"教材/"`）；
   - `tags`：frontmatter 标签过滤，命中任一即可（大小写不敏感，自动去 `#`）；
@@ -267,10 +282,10 @@ python -m vault_mcp --serve-mcp-stdio --app-config .\config\app.toml
 
 支持按 `source`、`heading` 或 1-based 行区间读取。
 
-#### `kb_list` — 列出已索引文件
+#### `kb_list_files` — 列出已索引文件（0.6.0 更名，原 `kb_list`）
 
 ```json
-{"name": "kb_list", "arguments": {}}
+{"name": "kb_list_files", "arguments": {}}
 ```
 返回 `[{source, title, chunks}]`。
 
@@ -281,12 +296,12 @@ python -m vault_mcp --serve-mcp-stdio --app-config .\config\app.toml
 ```
 返回文件数、切片数、失败文件、最后同步时间、embedding 模型/维度、reranker/cache 是否启用。
 
-#### `kb_vaults` — 列出根目录下的子知识库
+#### `kb_list` — 列出已注册知识库（0.6.0 更名，原 `kb_vaults`）
 
 ```json
-{"name": "kb_vaults", "arguments": {"root": "C:\\Users\\you\\1\\Obsidian Vault"}}
+{"name": "kb_list", "arguments": {}}
 ```
-返回每个一级子文件夹的 `{name, path, md_files}`。
+返回每个注册条目的 `{name, path, registered_at, weight, solo, exists, indexed, files, last_sync}`。
 
 #### `kb_rebuild` — 删除缓存并强制全量重建
 

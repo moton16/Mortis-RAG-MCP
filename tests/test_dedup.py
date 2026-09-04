@@ -11,8 +11,8 @@ from pathlib import Path
 
 import pytest
 
-from vault_mcp.config import AppConfig, CacheConfig, EmbeddingConfig, VectorConfig
-from vault_mcp.indexer import MarkdownIndexer
+from mortis_rag_mcp.config import AppConfig, CacheConfig, EmbeddingConfig, VectorConfig
+from mortis_rag_mcp.indexer import MarkdownIndexer
 
 # 两段正文都带这个 token，保证一次查询能命中全部 chunk。
 SHARED = "SHARED123"

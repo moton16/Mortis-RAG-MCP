@@ -6,14 +6,14 @@ import subprocess
 import sys
 from pathlib import Path
 
-from vault_mcp.config import AppConfig, CacheConfig, EmbeddingConfig
-from vault_mcp.indexer import MarkdownIndexer
+from mortis_rag_mcp.config import AppConfig, CacheConfig, EmbeddingConfig
+from mortis_rag_mcp.indexer import MarkdownIndexer
 
 
 def _run_stdio(config: Path, requests: list[dict]) -> list[dict]:
     payload = "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in requests)
     proc = subprocess.run(
-        [sys.executable, "-m", "vault_mcp", "--serve-mcp-stdio", "--app-config", str(config)],
+        [sys.executable, "-m", "mortis_rag_mcp", "--serve-mcp-stdio", "--app-config", str(config)],
         input=payload,
         text=True,
         capture_output=True,
@@ -83,8 +83,9 @@ def test_rebuild_recreates_index_from_scratch(tmp_path):
     assert indexer.stats()["files"] == 1
 
 
-def test_stdio_kb_vaults_lists_registered_vaults(tmp_path):
-    # 0.3.0：kb_vaults 列出注册表条目（而非根库子文件夹）。
+def test_stdio_kb_list_lists_registered_vaults(tmp_path):
+    # 0.3.0：列库工具（0.6.0 起叫 kb_list，旧名 kb_vaults）列出注册表条目
+    # （而非根库子文件夹）。
     vault_one = tmp_path / "安华帝国"
     vault_two = tmp_path / "工作"
     vault_one.mkdir()
@@ -101,7 +102,7 @@ def test_stdio_kb_vaults_lists_registered_vaults(tmp_path):
         {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
         {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "kb_init", "arguments": {"path": str(vault_one)}}},
         {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "kb_init", "arguments": {"path": str(vault_two)}}},
-        {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "kb_vaults", "arguments": {}}},
+        {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "kb_list", "arguments": {}}},
     ])
     data = json.loads(responses[3]["result"]["content"][0]["text"])
     names = {item["name"]: item for item in data["vaults"]}
@@ -110,6 +111,8 @@ def test_stdio_kb_vaults_lists_registered_vaults(tmp_path):
     assert "未注册" not in names
     assert names["安华帝国"]["files"] == 1
     assert names["安华帝国"]["exists"] is True
+    # 普通注册默认不是 solo 库。
+    assert all(item["solo"] is False for item in data["vaults"])
 
 
 def test_stdio_kb_rebuild_returns_stats(tmp_path):

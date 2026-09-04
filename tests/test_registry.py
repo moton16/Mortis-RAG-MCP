@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 
-from vault_mcp.registry import VaultEntry, VaultRegistry, normalize_vault_key
+from mortis_rag_mcp.registry import VaultEntry, VaultRegistry, normalize_vault_key
 
 
 def _entry(path, name=None, at=None):
@@ -150,6 +150,55 @@ def test_registry_set_weight_unknown_raises(tmp_path):
     reg = VaultRegistry(tmp_path / "vaults.toml")
     try:
         reg.set_weight(tmp_path / "ghost", 2.0)
+        raised = False
+    except ValueError as exc:
+        raised = True
+        assert "not registered" in str(exc)
+    assert raised
+
+
+def test_registry_solo_roundtrip(tmp_path):
+    reg = VaultRegistry(tmp_path / "vaults.toml")
+    vault = tmp_path / "notes"
+    vault.mkdir()
+    reg.add(vault, solo=True)
+    loaded = VaultRegistry(tmp_path / "vaults.toml").load()
+    assert loaded[0].solo is True
+
+
+def test_registry_load_defaults_solo_false_for_legacy_toml(tmp_path):
+    reg_path = tmp_path / "vaults.toml"
+    # v2 及更早写出的注册表没有 solo 字段，必须回退 False（正常参与全局检索）。
+    reg_path.write_text("version = 2\n\n[[vaults]]\npath = 'C:/Notes'\nname = \"Notes\"\nregistered_at = 1.0\nweight = 1.0\n", encoding="utf-8")
+    loaded = VaultRegistry(reg_path).load()
+    assert len(loaded) == 1
+    assert loaded[0].solo is False
+
+
+def test_registry_load_tolerates_dirty_solo(tmp_path):
+    reg_path = tmp_path / "vaults.toml"
+    reg_path.write_text("version = 3\n\n[[vaults]]\npath = 'C:/Notes'\nname = \"Notes\"\nregistered_at = 1.0\nsolo = \"abc\"\n", encoding="utf-8")
+    loaded = VaultRegistry(reg_path).load()
+    assert loaded[0].solo is False
+
+
+def test_registry_set_solo_updates_entry(tmp_path):
+    reg = VaultRegistry(tmp_path / "vaults.toml")
+    vault = tmp_path / "notes"
+    vault.mkdir()
+    reg.add(vault)
+    entry = reg.set_solo(vault, True)
+    assert entry.solo is True
+    # 必须落盘，换一个实例读也要看到 solo 状态。
+    assert VaultRegistry(tmp_path / "vaults.toml").load()[0].solo is True
+    assert reg.set_solo(vault, False).solo is False
+    assert VaultRegistry(tmp_path / "vaults.toml").load()[0].solo is False
+
+
+def test_registry_set_solo_unknown_raises(tmp_path):
+    reg = VaultRegistry(tmp_path / "vaults.toml")
+    try:
+        reg.set_solo(tmp_path / "ghost", True)
         raised = False
     except ValueError as exc:
         raised = True

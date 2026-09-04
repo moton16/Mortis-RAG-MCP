@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from vault_mcp.config import AppConfig, CacheConfig, EmbeddingConfig
-from vault_mcp.indexer import MarkdownIndexer
+from mortis_rag_mcp.config import AppConfig, CacheConfig, EmbeddingConfig
+from mortis_rag_mcp.indexer import MarkdownIndexer
 
 
 def _static_config(tmp_path: Path, **cache_kwargs) -> AppConfig:
@@ -171,7 +171,7 @@ def test_warm_cache_upgrade_populates_fts(tmp_path):
 
 
 def test_rrf_per_route_config_roundtrip(tmp_path):
-    from vault_mcp.config import load_config
+    from mortis_rag_mcp.config import load_config
 
     path = tmp_path / "app.toml"
     path.write_text(
@@ -190,7 +190,7 @@ def test_rrf_per_route_config_roundtrip(tmp_path):
     assert config.rerank_cap == 11
 
     import pytest
-    from vault_mcp.config import AppConfig
+    from mortis_rag_mcp.config import AppConfig
 
     with pytest.raises(ValueError):
         AppConfig(rrf_per_route=0)
@@ -231,7 +231,7 @@ def test_rrf_per_route_limits_fusion_pool(tmp_path):
 
 
 def test_rrf_per_route_config_roundtrip(tmp_path):
-    from vault_mcp.config import load_config
+    from mortis_rag_mcp.config import load_config
 
     path = tmp_path / "app.toml"
     path.write_text(
@@ -250,7 +250,7 @@ def test_rrf_per_route_config_roundtrip(tmp_path):
     assert config.rerank_cap == 11
 
     import pytest
-    from vault_mcp.config import AppConfig
+    from mortis_rag_mcp.config import AppConfig
 
     with pytest.raises(ValueError):
         AppConfig(rrf_per_route=0)

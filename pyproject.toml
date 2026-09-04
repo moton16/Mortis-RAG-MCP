@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mortis-rag-mcp"
-version = "0.5.0"
+version = "0.6.0"
 description = "Mortis'RAG MCP - registry-based Markdown knowledge base RAG server (MCP over stdio, zero runtime dependencies)"
 requires-python = ">=3.10"
 dependencies = []
@@ -15,11 +15,11 @@ dependencies = []
 vec = ["sqlite-vec>=0.1.9"]
 
 [project.scripts]
-mortis-rag-mcp = "vault_mcp.__main__:main"
-vault-mcp = "vault_mcp.__main__:main"  # legacy alias kept for existing connectors
+mortis-rag-mcp = "mortis_rag_mcp.__main__:main"
+vault-mcp = "mortis_rag_mcp.__main__:main"  # legacy alias kept for existing connectors
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
 [tool.setuptools.packages.find]
-include = ["vault_mcp*"]
+include = ["mortis_rag_mcp*"]

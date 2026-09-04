@@ -12,7 +12,7 @@ import zlib
 import zipfile
 from array import array
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -40,7 +40,12 @@ _BLOCK_IGNORE_END = re.compile(r"^\s*<!--\s*(?:/rag-ignore|/rag:ignore|/no-rag|/
 # 图片注入（inject_image_captions）：标准 Markdown 图片与 Obsidian wiki 图片嵌入。
 _MD_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\(\s*([^)\s]+)(?:\s+\"([^\"]*)\")?\s*\)")
 _WIKI_IMAGE_RE = re.compile(r"!\[\[([^\]|]+)(?:\|([^\]]*))?\]\]")
-_FENCE_RE = re.compile(r"^\s*(?:```|~~~)")
+_FENCE_START_RE = re.compile(r"^\s*(`{3,}|~{3,})")
+_FENCE_RE = _FENCE_START_RE
+_SHORT_STOPWORDS = frozenset({
+    "a", "an", "at", "be", "by", "do", "go", "he", "if", "in", "is", "it",
+    "me", "my", "no", "of", "on", "or", "so", "to", "up", "we", "us", "am"
+})
 # wiki 嵌入只有在图片扩展名时才当图片处理：![[另一篇笔记]] 不是图片。
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp", ".avif"}
 
@@ -284,13 +289,23 @@ def _inject_image_notes(lines: list[str]) -> list[str]:
     里的图片语法只是示例文本，不注入。
     """
     result: list[str] = []
-    in_fence = False
+    fence_char: str | None = None
+    fence_len: int = 0
     for line in lines:
         result.append(line)
-        if _FENCE_RE.match(line):
-            in_fence = not in_fence
-            continue
-        if in_fence:
+        m = _FENCE_START_RE.match(line)
+        if m:
+            token = m.group(1)
+            char, length = token[0], len(token)
+            if fence_char is None:
+                fence_char = char
+                fence_len = length
+                continue
+            elif char == fence_char and length >= fence_len:
+                fence_char = None
+                fence_len = 0
+                continue
+        if fence_char is not None:
             continue
         result.extend(_image_notes_for_line(line))
     return result
@@ -479,16 +494,22 @@ def rerank_chunks(query: str, ranked: list[Chunk], reranker_provider: Any, cap: 
         else:
             reranked = reranker_provider.rerank(query, [chunk.content for chunk in candidates])
     except Exception:
-        return ranked
+        return [replace(c) for c in ranked]
     if not reranked:
-        return ranked
+        return [replace(c) for c in ranked]
     positions = {int(item["index"]): item for item in reranked if "index" in item}
-    ordered = [candidates[index] for index in positions if 0 <= index < len(candidates)]
-    ordered += [chunk for index, chunk in enumerate(candidates) if index not in positions]
+    scored_candidates = list(candidates)
     for index, item in positions.items():
-        if 0 <= index < len(candidates) and "relevance_score" in item:
-            candidates[index].score = float(item["relevance_score"])
-    return ordered + ranked[len(candidates):]
+        if 0 <= index < len(scored_candidates) and "relevance_score" in item:
+            scored_candidates[index] = replace(scored_candidates[index], score=float(item["relevance_score"]))
+        elif 0 <= index < len(scored_candidates):
+            scored_candidates[index] = replace(scored_candidates[index])
+    for index in range(len(scored_candidates)):
+        if index not in positions:
+            scored_candidates[index] = replace(scored_candidates[index])
+    ordered = [scored_candidates[index] for index in positions if 0 <= index < len(scored_candidates)]
+    ordered += [chunk for index, chunk in enumerate(scored_candidates) if index not in positions]
+    return ordered + [replace(c) for c in ranked[len(candidates):]]
 
 
 class MarkdownIndexer:
@@ -510,6 +531,7 @@ class MarkdownIndexer:
                 self.reranker_provider = None
         self._chunks: dict[str, list[Chunk]] = {}
         self._signatures: dict[str, str] = {}
+        self._stat_cache: dict[str, tuple[int, int]] = {}
         # 文本层缓存失效时，初始化阶段读出来的向量暂存到这里，等 sync 重建
         # 文本后再按 chunk.id 补挂（见 _load_vectors_cache / _attach_pending_vectors）。
         self._pending_vectors: dict[str, Any] = {}
@@ -855,38 +877,42 @@ class MarkdownIndexer:
         self.vault_path.mkdir(parents=True, exist_ok=True)
         failed_before = dict(self.failed_files)
         found: set[str] = set()
-        changed: list[tuple[str, str, list[Chunk]]] = []
+        changed: list[tuple[str, str, list[Chunk], tuple[int, int]]] = []
         for path in self._markdown_files():
             source = self._source(path)
             found.add(source)
             try:
+                stat = path.stat()
+                fast_sig = (int(stat.st_mtime_ns), int(stat.st_size))
+                if source in self._signatures and self._stat_cache.get(source) == fast_sig:
+                    continue
+
                 raw = path.read_bytes()
                 signature = hashlib.sha256(raw).hexdigest()
                 if self._signatures.get(source) == signature:
+                    self._stat_cache[source] = fast_sig
                     continue
                 text = raw.decode("utf-8-sig")
                 # 顺手复用上面 read_bytes 已经打开的目录项做一次 stat，记录文件
                 # 修改时间供 mtime 过滤用：签名未变的文件不会走到这里，所以这个
                 # mtime 语义上是"内容最后一次变化的时间"，而不是每次 touch 都更新。
-                mtime: float | None = None
-                try:
-                    mtime = path.stat().st_mtime
-                except OSError:
-                    mtime = None
+                mtime = float(stat.st_mtime)
                 chunks = self._chunk_file(source, text, mtime)
-                changed.append((source, signature, chunks))
+                changed.append((source, signature, chunks, fast_sig))
             except Exception as exc:
                 self.failed_files[source] = str(exc)
                 self._chunks.pop(source, None)
                 self._signatures.pop(source, None)
+                self._stat_cache.pop(source, None)
                 self._fts_delete(source)
 
         # Text layer: changed files update the index even if embedding fails
         # afterwards, so lexical search still works without vectors.
-        for source, signature, chunks in changed:
+        for source, signature, chunks, fast_sig in changed:
             old_chunks = self._chunks.get(source)
             self._chunks[source] = chunks
             self._signatures[source] = signature
+            self._stat_cache[source] = fast_sig
             self.failed_files.pop(source, None)
             self._fts_upsert(source, chunks)
             # Disk-backed mode: re-chunking a file orphans its old vector ids.
@@ -918,6 +944,7 @@ class MarkdownIndexer:
             removed_ids = [chunk.id for chunk in self._chunks.get(source, [])]
             self._chunks.pop(source, None)
             self._signatures.pop(source, None)
+            self._stat_cache.pop(source, None)
             self.failed_files.pop(source, None)
             self._fts_delete(source)
             if removed_ids:
@@ -1272,9 +1299,22 @@ class MarkdownIndexer:
         current_heading = title
         current_start = body_start + 1
         current_lines: list[str] = []
+        fence_char: str | None = None
+        fence_len: int = 0
         for offset, line in enumerate(body):
             line_number = body_start + offset + 1
-            match = _HEADING_RE.match(line)
+            m = _FENCE_START_RE.match(line)
+            if m:
+                token = m.group(1)
+                char, length = token[0], len(token)
+                if fence_char is None:
+                    fence_char = char
+                    fence_len = length
+                elif char == fence_char and length >= fence_len:
+                    fence_char = None
+                    fence_len = 0
+            in_fence = fence_char is not None
+            match = _HEADING_RE.match(line) if not in_fence else None
             if match:
                 if any(l.strip() for l in current_lines):
                     sections.append((current_heading, current_start, current_lines))
@@ -1391,11 +1431,44 @@ class MarkdownIndexer:
         return re.sub(r"\s+#*$", "", heading).strip()
 
     def _title(self, source: str, body: list[str]) -> str:
+        fence_char: str | None = None
+        fence_len: int = 0
         for line in body:
+            m = _FENCE_START_RE.match(line)
+            if m:
+                token = m.group(1)
+                char, length = token[0], len(token)
+                if fence_char is None:
+                    fence_char = char
+                    fence_len = length
+                    continue
+                elif char == fence_char and length >= fence_len:
+                    fence_char = None
+                    fence_len = 0
+                    continue
+            if fence_char is not None:
+                continue
             match = _HEADING_RE.match(line)
             if match and len(match.group(1)) == 1:
                 return self._clean_heading(match.group(2))
+
+        fence_char = None
+        fence_len = 0
         for line in body:
+            m = _FENCE_START_RE.match(line)
+            if m:
+                token = m.group(1)
+                char, length = token[0], len(token)
+                if fence_char is None:
+                    fence_char = char
+                    fence_len = length
+                    continue
+                elif char == fence_char and length >= fence_len:
+                    fence_char = None
+                    fence_len = 0
+                    continue
+            if fence_char is not None:
+                continue
             match = _HEADING_RE.match(line)
             if match:
                 return self._clean_heading(match.group(2))
@@ -1518,7 +1591,7 @@ class MarkdownIndexer:
         query = query.strip()
         all_chunks = self.all_chunks()
         if not query:
-            ranked = list(all_chunks)
+            ranked = [replace(c, score=0.0) for c in all_chunks]
             if dedupe:
                 ranked = dedupe_by_content_hash(ranked)
             if filters is None:
@@ -1529,14 +1602,45 @@ class MarkdownIndexer:
 
         query_tokens = self._query_tokens(query)
 
+        # 针对 SQLite FTS5 Trigram 分词器丢弃 < 3 字符短英文词（如 RC、AI、OS、IP、Go）的补偿机制：
+        # 1. 过滤英文常用停用词（如 to, in, at, is 等），当查询中含有实质词汇时排除纯虚词，避免频次倒挂
+        # 2. 将所有待加权短词合并为一个预编译正则，将 O(N_chunks * N_tokens) 降为 O(N_chunks) 单次扫描
+        short_acronym_tokens: list[str] = []
+        regular_tokens: list[str] = []
+        raw_words = _WORD_RE.findall(query)
+        has_substantive_tokens = any(
+            t not in _SHORT_STOPWORDS or (t.isascii() and any(w.isupper() and w.lower() == t for w in raw_words))
+            for t in query_tokens
+        )
+        for token in query_tokens:
+            if token.isascii() and token.isalnum() and len(token) < 3:
+                is_raw_upper = any(w.isupper() and w.lower() == token for w in raw_words)
+                if token not in _SHORT_STOPWORDS or is_raw_upper:
+                    short_acronym_tokens.append(token)
+                elif not has_substantive_tokens:
+                    regular_tokens.append(token)
+            else:
+                regular_tokens.append(token)
+
+        acronym_regex: re.Pattern | None = None
+        if short_acronym_tokens:
+            try:
+                acronym_regex = re.compile(
+                    r"\b(?:" + "|".join(re.escape(t) for t in set(short_acronym_tokens)) + r")\b",
+                    re.IGNORECASE,
+                )
+            except Exception:
+                acronym_regex = None
+
         # Lexical scores are a soft signal, never a hard gate: every chunk gets a
         # score so semantic recall always has the full corpus to work with.
         lexical: dict[str, float] = {}
         for chunk in all_chunks:
             haystack = chunk.content.lower()
-            token_hits = sum(haystack.count(token) for token in query_tokens)
+            token_hits = sum(haystack.count(token) for token in regular_tokens)
+            acronym_hits = len(acronym_regex.findall(chunk.content)) if acronym_regex is not None else 0
             exact_boost = 1 if query.lower() in haystack else 0
-            lexical[chunk.id] = float(token_hits + exact_boost * 10)
+            lexical[chunk.id] = float(token_hits + acronym_hits * 5.0 + exact_boost * 10)
 
         # Semantic route: raw cosine, snapshotted BEFORE any lexical fusion so
         # both the hybrid (RRF) and legacy paths can use it independently.
@@ -1562,8 +1666,7 @@ class MarkdownIndexer:
                 semantic_snapshot = dict(pairs)
                 for chunk in all_chunks:
                     if chunk.id in semantic_snapshot:
-                        chunk.score = semantic_snapshot[chunk.id]
-                        semantic_chunks.append(chunk)
+                        semantic_chunks.append(replace(chunk, score=semantic_snapshot[chunk.id]))
             except Exception:
                 pass
 
@@ -1579,13 +1682,16 @@ class MarkdownIndexer:
             # Legacy path, unchanged: cosine dominates, lexical breaks ties.
             if semantic_chunks:
                 lex_max = max(lexical[chunk.id] for chunk in semantic_chunks) or 1.0
-                for chunk in semantic_chunks:
-                    chunk.score = chunk.score + (lexical[chunk.id] / lex_max) * 0.2
-                ranked = semantic_chunks
+                ranked = [
+                    replace(chunk, score=chunk.score + (lexical[chunk.id] / lex_max) * 0.2)
+                    for chunk in semantic_chunks
+                ]
             else:
-                ranked = [chunk for chunk in all_chunks if lexical[chunk.id] > 0]
-                for chunk in ranked:
-                    chunk.score = lexical[chunk.id]
+                ranked = [
+                    replace(chunk, score=lexical[chunk.id])
+                    for chunk in all_chunks
+                    if lexical[chunk.id] > 0
+                ]
 
         ranked.sort(key=lambda chunk: (-chunk.score, chunk.source, chunk.metadata["chunk_index"]))
 
@@ -1688,9 +1794,7 @@ class MarkdownIndexer:
             for rank, chunk_id in enumerate(route, start=1):
                 fused[chunk_id] = fused.get(chunk_id, 0.0) + 1.0 / (_RRF_K + rank)
 
-        ranked = [by_id[chunk_id] for chunk_id in fused if chunk_id in by_id]
-        for chunk in ranked:
-            chunk.score = fused[chunk.id]
+        ranked = [replace(by_id[chunk_id], score=fused[chunk_id]) for chunk_id in fused if chunk_id in by_id]
         ranked.sort(key=lambda chunk: (-chunk.score, chunk.source, chunk.metadata["chunk_index"]))
         return ranked
 
@@ -2014,7 +2118,7 @@ class MarkdownIndexer:
         }
 
     def purge_cache(self) -> bool:
-        """Delete this vault's on-disk cache files (used by kb_unregister).
+        """Delete this vault's on-disk cache files (used by kb_remove).
 
         Returns True when both cache files are gone afterwards. Safe to call
         when caching is disabled (returns False, nothing to purge).
@@ -2034,6 +2138,7 @@ class MarkdownIndexer:
             self._failed_cache_path = None
             # 缓存整体丢弃，失败名单也随之作废（它只是缓存的附属观测数据）。
             self.failed_files.clear()
+            self._stat_cache.clear()
         # FTS index + optional sqlite-vec backend share the cache lifecycle.
         if self._fts is not None:
             try:
@@ -2077,6 +2182,7 @@ class MarkdownIndexer:
         with self._sync_lock:
             self._chunks.clear()
             self._signatures.clear()
+            self._stat_cache.clear()
             self.failed_files.clear()
             self._disk_vectors.clear()
             if self._vectors_on_disk:
@@ -2290,7 +2396,7 @@ class MarkdownIndexer:
             # 锁序必须与 sync() 一致（_sync_lock → _cache_lock）。此前这里是
             # _cache_lock → _sync_lock 的反向嵌套，kb_import 撞上 watcher 的
             # 30s 对账 sync 就是 ABBA 死锁：两个线程永久互等，之后所有
-            # kb_search / kb_list 排队在 _sync_lock 上，整个 MCP 服务冻结。
+            # kb_search / kb_list_files 排队在 _sync_lock 上，整个 MCP 服务冻结。
             # 导入体本身会在锁内从磁盘重载全部状态，无需外层再持 _cache_lock。
             with self._sync_lock:
                 return self._import_snapshot_locked(
@@ -2673,7 +2779,7 @@ class MarkdownIndexer:
             if self._watch_thread.is_alive():
                 # 线程没停就别把引用丢掉：持引用才能让下一次 stop_watching
                 # 继续 join，也让 is_alive() 对外如实反映"还在跑"。
-                # 丢掉引用会导致 kb_unregister→kb_init 同一目录时新旧两个
+                # 丢掉引用会导致 kb_remove→kb_init 同一目录时新旧两个
                 # watcher 并存，各自写同一批缓存文件（cache key 相同）。
                 self._stopping = True
             else:

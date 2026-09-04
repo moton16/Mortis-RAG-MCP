@@ -16,10 +16,10 @@ from pathlib import Path
 from typing import Any
 
 
-from vault_mcp.config import AppConfig, CacheConfig, EmbeddingConfig
-from vault_mcp.indexer import MarkdownIndexer
-from vault_mcp.providers import ProviderError
-from vault_mcp.server import VaultMcpServer
+from mortis_rag_mcp.config import AppConfig, CacheConfig, EmbeddingConfig
+from mortis_rag_mcp.indexer import MarkdownIndexer
+from mortis_rag_mcp.providers import ProviderError
+from mortis_rag_mcp.server import VaultMcpServer
 
 
 class ExplodingProvider:

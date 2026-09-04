@@ -10,7 +10,7 @@ from pathlib import Path
 def _run_stdio(config: Path, requests: list[dict]) -> list[dict]:
     payload = "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in requests)
     proc = subprocess.run(
-        [sys.executable, "-m", "vault_mcp", "--serve-mcp-stdio", "--app-config", str(config)],
+        [sys.executable, "-m", "mortis_rag_mcp", "--serve-mcp-stdio", "--app-config", str(config)],
         input=payload,
         text=True,
         capture_output=True,
@@ -199,7 +199,7 @@ def test_fanout_group_by_vault_returns_grouped_results(tmp_path):
 
 
 def test_kb_set_weight_updates_registry_and_vault_listing(tmp_path, monkeypatch):
-    from vault_mcp.server import VaultMcpServer
+    from mortis_rag_mcp.server import VaultMcpServer
 
     vault = tmp_path / "库"
     vault.mkdir()
@@ -215,7 +215,7 @@ def test_kb_set_weight_updates_registry_and_vault_listing(tmp_path, monkeypatch)
     assert set_result["weight"] == 2.5
     assert set_result["path"] == str(vault)
 
-    listing = json.loads(server.call_tool("kb_vaults", {})["content"][0]["text"])
+    listing = json.loads(server.call_tool("kb_list", {})["content"][0]["text"])
     assert listing["vaults"][0]["weight"] == 2.5
 
     # 越界权重必须走 ValueError（call_tool 不吞异常，MCP 层会转成 -32602）。
@@ -228,7 +228,7 @@ def test_kb_set_weight_updates_registry_and_vault_listing(tmp_path, monkeypatch)
         assert raised
 
 
-def test_kb_vaults_lists_registered_entries(tmp_path):
+def test_kb_list_lists_registered_entries(tmp_path):
     vault_one = tmp_path / "库一"
     vault_two = tmp_path / "库二"
     (vault_one / "子目录").mkdir(parents=True)
@@ -243,7 +243,7 @@ def test_kb_vaults_lists_registered_entries(tmp_path):
         {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
         {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "kb_init", "arguments": {"path": str(vault_one), "name": "库一"}}},
         {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "kb_init", "arguments": {"path": str(vault_two)}}},
-        {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "kb_vaults", "arguments": {}}},
+        {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "kb_list", "arguments": {}}},
     ])
     data = json.loads(responses[3]["result"]["content"][0]["text"])
     by_name = {item["name"]: item for item in data["vaults"]}

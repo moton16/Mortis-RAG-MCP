@@ -7,7 +7,7 @@ import time
 
 import pytest
 
-from vault_mcp.fsnotify import (
+from mortis_rag_mcp.fsnotify import (
     FILE_ACTION_ADDED,
     FILE_ACTION_MODIFIED,
     WindowsDirectoryWatcher,

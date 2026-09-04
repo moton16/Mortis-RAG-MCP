@@ -3,6 +3,39 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 与
 [Semantic Versioning](https://semver.org/lang/zh-CN/)。提交信息为 Conventional Commits。
 
+## [0.6.0] - 2026-09-02
+
+> **升级须知（Breaking）：三个工具更名。** `kb_unregister` → `kb_remove`、
+> `kb_vaults` → `kb_list`、原 `kb_list`（列出已索引文件）→ `kb_list_files`。
+> 旧名不再保留，客户端配置/提示词里引用旧名处需同步修改。
+
+### Added
+
+- **独立库（solo vault）**：新增 `kb_init_solo` 工具，可把任意文件夹注册为「独立库」。
+  独立库不参与全局检索——`kb_search` 不传 `vault_path` 时自动跳过它，只有显式指定
+  `vault_path` 才会被搜索。适合私密笔记、临时试验库等不想混入全局搜索结果的文件夹。
+  - 已注册的普通库调用 `kb_init_solo` 即原地转为独立库，重复调用无副作用。
+  - 取消独立库：`kb_remove` 后重新 `kb_init`，索引缓存保留、无需重新 embedding。
+  - 全局检索结果新增 `excluded_solo` 字段，列出本次被跳过的独立库；当唯一注册库
+    （或全部注册库）都是独立库时，全局检索会明确报错并提示显式指定 `vault_path`，
+    而不是悄悄搜索或返回莫名空结果。
+  - 列库结果（`kb_list`）新增 `solo` 字段标识独立库。
+- **Fast-Stat 轻量级文件对账**：`sync()` 时优先比对 `(st_mtime_ns, st_size)`，未变动文件彻底跳过磁盘读取与 SHA256 计算，海量笔记库周期性对账扫描 I/O 降为近零。
+- **代码块围栏保护**：文档切片与标题提取跟踪代码块围栏（` ``` ` 与 `~~~`），代码块内部的 `#` 注释不再误当作 Markdown 章节分块或覆盖文档标题。
+- **检索打分只读纯洁性**：使用 `dataclasses.replace` 产生只读打分副本，避免在共享的常驻 Chunk 对象上原地修改 `score`，彻底根除并发脏读与缓存污染。
+- **注册表跨进程排他锁**：`vaults.toml` 的读写修改序列（`add`、`remove`、`set_weight`、`set_solo`）增加平台原生跨进程建议锁（Windows `msvcrt.locking` / POSIX `fcntl.flock`），防止多客户端并发操作造成配置损坏。
+- **短英文缩写精准词法提权**：针对 SQLite FTS5 Trigram 分词器丢弃 `< 3` 字符短英文词（如 `RC`、`AI`、`OS`）的问题，在词法打分路由引入单词边界正则（`\b`）精准匹配与权重提升，既消除了 `rc` 误匹配 `source` 的假阳性，又确保了短缩写专业词汇的强召回。
+
+### Changed
+
+- **工具更名（Breaking）**：`kb_unregister` → `kb_remove`（从注册表移除知识库）；
+  `kb_vaults` → `kb_list`（列出已注册知识库）；原 `kb_list`（列出已索引文件）→
+  `kb_list_files`。工具总数 12 → 13。
+- **配套 Skill 更名**：`skills/vault-mcp/` → `skills/mortis-rag-mcp/`（skill 名同步
+  改为 `mortis-rag-mcp`，内容为 0.6.0 工具速查与 solo 路由指引）。已安装旧版 skill
+  的用户请删除旧目录后按 QUICKSTART 重新复制，否则旧 skill 会继续教 AI 使用已更名
+  的工具。
+
 ## [0.5.0] - 2026-08-30
 
 > **升级兼容性：默认配置从 0.4.1 升级 = 0 次重新 embedding。** 各项改动只 bump 文本层

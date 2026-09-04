@@ -9,9 +9,9 @@ from typing import Any
 
 import pytest
 
-from vault_mcp.config import AppConfig, CacheConfig, EmbeddingConfig
-from vault_mcp.indexer import MarkdownIndexer
-from vault_mcp.providers import StaticEmbeddingProvider
+from mortis_rag_mcp.config import AppConfig, CacheConfig, EmbeddingConfig
+from mortis_rag_mcp.indexer import MarkdownIndexer
+from mortis_rag_mcp.providers import StaticEmbeddingProvider
 
 
 class CountingProvider(StaticEmbeddingProvider):
@@ -107,7 +107,7 @@ def test_deleting_all_notes_persists_empty_cache(tmp_path):
 
 
 def test_kb_export_rejects_relative_path_and_clobber(tmp_path, monkeypatch):
-    from vault_mcp.server import VaultMcpServer
+    from mortis_rag_mcp.server import VaultMcpServer
 
     vault = _vault(tmp_path)
     config = tmp_path / "app.toml"

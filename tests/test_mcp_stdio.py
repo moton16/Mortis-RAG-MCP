@@ -10,7 +10,7 @@ from pathlib import Path
 def _run_stdio(config: Path, requests: list[dict]) -> list[dict]:
     payload = "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in requests)
     proc = subprocess.run(
-        [sys.executable, "-m", "vault_mcp", "--serve-mcp-stdio", "--app-config", str(config)],
+        [sys.executable, "-m", "mortis_rag_mcp", "--serve-mcp-stdio", "--app-config", str(config)],
         input=payload,
         text=True,
         capture_output=True,
@@ -30,13 +30,13 @@ def test_stdio_initialize_tools_and_list_search(tmp_path):
     responses = _run_stdio(config, [
         {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
         {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
-        {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "kb_list", "arguments": {}}},
+        {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "kb_list_files", "arguments": {}}},
         {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "kb_search", "arguments": {"query": "MCP stdio", "top_k": 5, "use_rerank": False}}},
     ])
 
     assert responses[0]["result"]["serverInfo"]["name"] == "mortis-rag-mcp"
     names = {tool["name"] for tool in responses[1]["result"]["tools"]}
-    assert {"kb_list", "kb_search", "kb_read", "kb_stats"} <= names
+    assert {"kb_list", "kb_list_files", "kb_search", "kb_read", "kb_stats"} <= names
 
     listed = json.loads(responses[2]["result"]["content"][0]["text"])
     assert listed["files"][0]["source"] == "知识库.md"

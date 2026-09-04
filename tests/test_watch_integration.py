@@ -12,10 +12,10 @@ from pathlib import Path
 
 import pytest
 
-from vault_mcp.config import AppConfig, CacheConfig, EmbeddingConfig, load_config
-from vault_mcp.fsnotify import watcher_available
-from vault_mcp.indexer import MarkdownIndexer
-from vault_mcp.providers import StaticEmbeddingProvider
+from mortis_rag_mcp.config import AppConfig, CacheConfig, EmbeddingConfig, load_config
+from mortis_rag_mcp.fsnotify import watcher_available
+from mortis_rag_mcp.indexer import MarkdownIndexer
+from mortis_rag_mcp.providers import StaticEmbeddingProvider
 
 
 def _config(tmp_path: Path, **kwargs) -> AppConfig:

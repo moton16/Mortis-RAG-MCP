@@ -7,9 +7,10 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
-
 import os
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -18,7 +19,75 @@ from typing import Any
 
 from .config import read_toml_file
 
-REGISTRY_VERSION = 2
+_thread_local = threading.local()
+
+
+@contextlib.contextmanager
+def _process_file_lock(lock_path: Path):
+    """Advisory cross-process file lock using msvcrt (Windows) or fcntl (POSIX).
+    Supports reentrancy within the same thread.
+    """
+    depth = getattr(_thread_local, "lock_depth", 0)
+    if depth > 0:
+        _thread_local.lock_depth = depth + 1
+        try:
+            yield
+        finally:
+            _thread_local.lock_depth = depth
+        return
+
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        f = open(lock_path, "a+b")
+    except OSError:
+        yield
+        return
+
+    locked = False
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+            try:
+                f.seek(0)
+                msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+                locked = True
+            except OSError:
+                pass
+        else:
+            import fcntl
+            try:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                locked = True
+            except OSError:
+                pass
+
+        _thread_local.lock_depth = 1
+        try:
+            yield
+        finally:
+            _thread_local.lock_depth = 0
+            if locked:
+                if sys.platform == "win32":
+                    import msvcrt
+                    try:
+                        f.seek(0)
+                        msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+                    except OSError:
+                        pass
+                else:
+                    import fcntl
+                    try:
+                        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                    except OSError:
+                        pass
+    finally:
+        try:
+            f.close()
+        except OSError:
+            pass
+
+# v3（0.6.0）：vaults 条目新增 solo 布尔字段（老文件没有该键 → False）。
+REGISTRY_VERSION = 3
 
 
 def user_config_dir() -> Path:
@@ -51,6 +120,7 @@ class VaultEntry:
     name: str            # display name, defaults to the folder name
     registered_at: float  # time.time()
     weight: float = 1.0  # 跨库检索时该库分数的放大系数：>1 表示更偏好这个库
+    solo: bool = False   # solo 库不参与跨库 fan-out，仅在显式指定 vault_path 时被检索
 
 
 class VaultRegistry:
@@ -64,6 +134,7 @@ class VaultRegistry:
         # add/remove/set_weight 都是 load→改→save 的读改写序列，而后台启动线程
         # 会并发 load()。锁只保证进程内一致（跨进程文件锁不在本轮范围）。
         self._lock = threading.RLock()
+        self._lock_path = self.path.with_suffix(".lock")
 
     # ------------------------------------------------------------------ io
 
@@ -72,8 +143,18 @@ class VaultRegistry:
         Session-only (memory) entries are appended at the end."""
         file_entries: list[VaultEntry] = []
         if self.path.is_file():
-            try:
-                data: dict[str, Any] = read_toml_file(self.path)
+            data: dict[str, Any] | None = None
+            for attempt in range(4):
+                try:
+                    data = read_toml_file(self.path)
+                    break
+                except OSError:
+                    if attempt == 3:
+                        break
+                    time.sleep(0.015 * (attempt + 1))
+                except Exception:
+                    break
+            if data is not None and isinstance(data, dict):
                 for raw in data.get("vaults", []):
                     if not isinstance(raw, dict):
                         continue
@@ -89,16 +170,22 @@ class VaultRegistry:
                         weight = float(raw.get("weight", 1.0))
                     except (TypeError, ValueError):
                         weight = 1.0
+                    # solo 是 v3 新增字段：老 toml 里没有 → False；脏值（字符串）
+                    # 按 server 层同款布尔容错解析，解析不出一律 False。
+                    solo_raw = raw.get("solo", False)
+                    if isinstance(solo_raw, str):
+                        solo = solo_raw.strip().lower() in {"1", "true", "yes", "on"}
+                    else:
+                        solo = bool(solo_raw)
                     file_entries.append(
                         VaultEntry(
                             path=path_value,
                             name=str(raw.get("name", "")) or Path(path_value).name,
                             registered_at=registered_at,
                             weight=weight,
+                            solo=solo,
                         )
                     )
-            except Exception:
-                file_entries = []
         known = {normalize_vault_key(entry.path) for entry in file_entries}
         for entry in self._memory_entries:
             if normalize_vault_key(entry.path) not in known:
@@ -120,15 +207,32 @@ class VaultRegistry:
             lines.append(f"name = {json.dumps(entry.name, ensure_ascii=False)}")
             lines.append(f"registered_at = {entry.registered_at!r}")
             lines.append(f"weight = {entry.weight}")
+            # TOML 布尔字面量必须小写。
+            lines.append(f"solo = {str(entry.solo).lower()}")
             lines.append("")
-        tmp = self.path.with_suffix(".toml.tmp")
-        tmp.write_text("\n".join(lines), encoding="utf-8")
-        tmp.replace(self.path)
+        tmp = self.path.with_name(f"{self.path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+        try:
+            tmp.write_text("\n".join(lines), encoding="utf-8")
+            tmp.replace(self.path)
+        finally:
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except OSError:
+                pass
 
     # ------------------------------------------------------------ mutation
 
-    def add(self, path: str | os.PathLike[str], name: str | None = None, *, persist: bool = True, weight: float = 1.0) -> VaultEntry:
-        with self._lock:
+    def add(
+        self,
+        path: str | os.PathLike[str],
+        name: str | None = None,
+        *,
+        persist: bool = True,
+        weight: float = 1.0,
+        solo: bool = False,
+    ) -> VaultEntry:
+        with self._lock, _process_file_lock(self._lock_path):
             resolved = str(Path(path).expanduser().resolve())
             entries = self.load()
             for entry in entries:
@@ -139,6 +243,7 @@ class VaultRegistry:
                 name=name or Path(resolved).name,
                 registered_at=time.time(),
                 weight=float(weight),
+                solo=bool(solo),
             )
             entries.append(entry)
             if persist:
@@ -148,7 +253,7 @@ class VaultRegistry:
             return entry
 
     def remove(self, path: str | os.PathLike[str]) -> VaultEntry:
-        with self._lock:
+        with self._lock, _process_file_lock(self._lock_path):
             target = normalize_vault_key(path)
             entries = self.load()
             for index, entry in enumerate(entries):
@@ -166,12 +271,27 @@ class VaultRegistry:
             raise ValueError(f"invalid weight: {weight}")
         if not 0 < weight <= 100:
             raise ValueError(f"weight must be in (0, 100]: {weight}")
-        with self._lock:
+        with self._lock, _process_file_lock(self._lock_path):
             target = normalize_vault_key(path)
             entries = self.load()
             for entry in entries:
                 if normalize_vault_key(entry.path) == target:
                     entry.weight = weight
+                    self.save(entries)
+                    return entry
+            raise ValueError(f"vault not registered: {path}")
+
+    def set_solo(self, path: str | os.PathLike[str], solo: bool) -> VaultEntry:
+        """设置/取消单个库的 solo 标志（不参与跨库 fan-out，仅显式检索）。
+
+        只改注册表布尔位：索引、缓存、watcher 全部不动，调用方无需重建任何东西。
+        """
+        with self._lock, _process_file_lock(self._lock_path):
+            target = normalize_vault_key(path)
+            entries = self.load()
+            for entry in entries:
+                if normalize_vault_key(entry.path) == target:
+                    entry.solo = bool(solo)
                     self.save(entries)
                     return entry
             raise ValueError(f"vault not registered: {path}")

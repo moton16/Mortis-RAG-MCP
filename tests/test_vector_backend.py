@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import pytest
 
-from vault_mcp.config import AppConfig, CacheConfig, EmbeddingConfig, VectorConfig
-from vault_mcp.indexer import MarkdownIndexer
+from mortis_rag_mcp.config import AppConfig, CacheConfig, EmbeddingConfig, VectorConfig
+from mortis_rag_mcp.indexer import MarkdownIndexer
 
 pytest.importorskip("sqlite_vec", reason="pip install sqlite-vec to test the disk backend")
 

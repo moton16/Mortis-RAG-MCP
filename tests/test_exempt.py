@@ -6,14 +6,14 @@ import subprocess
 import sys
 from pathlib import Path
 
-from vault_mcp.config import AppConfig
-from vault_mcp.indexer import IgnoreMatcher, MarkdownIndexer
+from mortis_rag_mcp.config import AppConfig
+from mortis_rag_mcp.indexer import IgnoreMatcher, MarkdownIndexer
 
 
 def _run_stdio(config: Path, requests: list[dict]) -> list[dict]:
     payload = "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in requests)
     proc = subprocess.run(
-        [sys.executable, "-m", "vault_mcp", "--serve-mcp-stdio", "--app-config", str(config)],
+        [sys.executable, "-m", "mortis_rag_mcp", "--serve-mcp-stdio", "--app-config", str(config)],
         input=payload,
         text=True,
         capture_output=True,

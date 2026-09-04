@@ -3,8 +3,8 @@
 import time
 from pathlib import Path
 
-from vault_mcp.config import AppConfig, EmbeddingConfig
-from vault_mcp.indexer import MarkdownIndexer
+from mortis_rag_mcp.config import AppConfig, EmbeddingConfig
+from mortis_rag_mcp.indexer import MarkdownIndexer
 
 
 def test_markdown_chunks_include_heading_lines_index_and_tags(tmp_path):

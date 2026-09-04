@@ -6,9 +6,9 @@ from urllib.request import Request
 
 import pytest
 
-from vault_mcp.config import AppConfig, EmbeddingConfig, RerankerConfig, load_config
-from vault_mcp import providers
-from vault_mcp.providers import ExternalEmbeddingProvider, ExternalRerankerProvider, ProviderError, StaticEmbeddingProvider
+from mortis_rag_mcp.config import AppConfig, EmbeddingConfig, RerankerConfig, load_config
+from mortis_rag_mcp import providers
+from mortis_rag_mcp.providers import ExternalEmbeddingProvider, ExternalRerankerProvider, ProviderError, StaticEmbeddingProvider
 
 
 def test_load_config_supports_static_embedding_and_optional_reranker(tmp_path):
@@ -45,7 +45,7 @@ def test_external_embedding_request_has_expected_json(monkeypatch):
             {"data": [{"index": 0, "embedding": [0.1, 0.2]}, {"index": 1, "embedding": [0.3, 0.4]}]}
         )
 
-    monkeypatch.setattr("vault_mcp.providers.urlopen", fake_urlopen)
+    monkeypatch.setattr("mortis_rag_mcp.providers.urlopen", fake_urlopen)
     provider = ExternalEmbeddingProvider(
         endpoint="https://embedding.test/v1/embeddings",
         model="embed-model",
@@ -72,7 +72,7 @@ def test_external_reranker_request_has_expected_json(monkeypatch):
         captured["request"] = request
         return _JsonResponse({"results": [{"index": 1, "relevance_score": 0.8}]})
 
-    monkeypatch.setattr("vault_mcp.providers.urlopen", fake_urlopen)
+    monkeypatch.setattr("mortis_rag_mcp.providers.urlopen", fake_urlopen)
     provider = ExternalRerankerProvider(
         endpoint="https://rerank.test/v1/rerank",
         model="rerank-model",
@@ -96,9 +96,9 @@ def test_reranker_failure_degrades_to_original_order(monkeypatch):
     def fail(*args, **kwargs):
         raise OSError("offline")
 
-    monkeypatch.setattr("vault_mcp.providers.urlopen", fail)
+    monkeypatch.setattr("mortis_rag_mcp.providers.urlopen", fail)
     # 重试会退避等待，这里只记录不真睡，保持测试秒级完成。
-    monkeypatch.setattr("vault_mcp.providers._sleep", sleeps.append)
+    monkeypatch.setattr("mortis_rag_mcp.providers._sleep", sleeps.append)
     provider = ExternalRerankerProvider(endpoint="https://rerank.test")
 
     assert provider.rerank_or_none("q", ["a", "b"]) is None
@@ -107,7 +107,7 @@ def test_reranker_failure_degrades_to_original_order(monkeypatch):
 
 def test_static_embedding_does_not_call_llm(monkeypatch):
     monkeypatch.setattr(
-        "vault_mcp.providers.urlopen",
+        "mortis_rag_mcp.providers.urlopen",
         lambda *args, **kwargs: pytest.fail("static mode called an external model"),
     )
     provider = StaticEmbeddingProvider(dimension=4)
@@ -150,8 +150,8 @@ def test_embedding_retries_after_429_then_succeeds(monkeypatch):
             raise _http_error(429)
         return _JsonResponse({"data": [{"embedding": [0.3, 0.4]}]})
 
-    monkeypatch.setattr("vault_mcp.providers.urlopen", fake_urlopen)
-    monkeypatch.setattr("vault_mcp.providers._sleep", sleeps.append)
+    monkeypatch.setattr("mortis_rag_mcp.providers.urlopen", fake_urlopen)
+    monkeypatch.setattr("mortis_rag_mcp.providers._sleep", sleeps.append)
     provider = ExternalEmbeddingProvider(endpoint=ENDPOINT, model="embed-model")
 
     assert provider.embed(["hello"]) == [[0.3, 0.4]]
@@ -170,8 +170,8 @@ def test_embedding_retries_after_500_then_succeeds(monkeypatch):
             raise _http_error(500)
         return _JsonResponse({"data": [{"embedding": [1.0]}]})
 
-    monkeypatch.setattr("vault_mcp.providers.urlopen", fake_urlopen)
-    monkeypatch.setattr("vault_mcp.providers._sleep", sleeps.append)
+    monkeypatch.setattr("mortis_rag_mcp.providers.urlopen", fake_urlopen)
+    monkeypatch.setattr("mortis_rag_mcp.providers._sleep", sleeps.append)
     provider = ExternalEmbeddingProvider(endpoint=ENDPOINT, model="embed-model")
 
     assert provider.embed(["hello"]) == [[1.0]]
@@ -187,7 +187,7 @@ def test_embedding_does_not_retry_on_404(monkeypatch):
         calls.append(request)
         raise _http_error(404)
 
-    monkeypatch.setattr("vault_mcp.providers.urlopen", fake_urlopen)
+    monkeypatch.setattr("mortis_rag_mcp.providers.urlopen", fake_urlopen)
     provider = ExternalEmbeddingProvider(endpoint=ENDPOINT, model="embed-model")
 
     with pytest.raises(ProviderError):
@@ -203,8 +203,8 @@ def test_embedding_gives_up_after_max_retries(monkeypatch):
         calls.append(request)
         raise _http_error(429)
 
-    monkeypatch.setattr("vault_mcp.providers.urlopen", fake_urlopen)
-    monkeypatch.setattr("vault_mcp.providers._sleep", sleeps.append)
+    monkeypatch.setattr("mortis_rag_mcp.providers.urlopen", fake_urlopen)
+    monkeypatch.setattr("mortis_rag_mcp.providers._sleep", sleeps.append)
     provider = ExternalEmbeddingProvider(endpoint=ENDPOINT, model="embed-model", max_retries=2)
 
     with pytest.raises(ProviderError) as excinfo:
@@ -222,8 +222,8 @@ def test_embedding_backoff_grows_exponentially(monkeypatch):
     def fake_urlopen(request, timeout):
         raise _http_error(500)
 
-    monkeypatch.setattr("vault_mcp.providers.urlopen", fake_urlopen)
-    monkeypatch.setattr("vault_mcp.providers._sleep", sleeps.append)
+    monkeypatch.setattr("mortis_rag_mcp.providers.urlopen", fake_urlopen)
+    monkeypatch.setattr("mortis_rag_mcp.providers._sleep", sleeps.append)
     provider = ExternalEmbeddingProvider(
         endpoint=ENDPOINT, model="embed-model", max_retries=3, retry_backoff=1.0
     )
@@ -244,8 +244,8 @@ def test_embedding_honors_retry_after_header(monkeypatch):
     def fake_urlopen(request, timeout):
         raise _http_error(429, {"Retry-After": "5"})
 
-    monkeypatch.setattr("vault_mcp.providers.urlopen", fake_urlopen)
-    monkeypatch.setattr("vault_mcp.providers._sleep", sleeps.append)
+    monkeypatch.setattr("mortis_rag_mcp.providers.urlopen", fake_urlopen)
+    monkeypatch.setattr("mortis_rag_mcp.providers._sleep", sleeps.append)
     provider = ExternalEmbeddingProvider(endpoint=ENDPOINT, model="embed-model", max_retries=2)
 
     with pytest.raises(ProviderError):
@@ -260,8 +260,8 @@ def test_embedding_ignores_non_numeric_retry_after_header(monkeypatch):
     def fake_urlopen(request, timeout):
         raise _http_error(429, {"Retry-After": "Wed, 21 Oct 2015 07:28:00 GMT"})
 
-    monkeypatch.setattr("vault_mcp.providers.urlopen", fake_urlopen)
-    monkeypatch.setattr("vault_mcp.providers._sleep", sleeps.append)
+    monkeypatch.setattr("mortis_rag_mcp.providers.urlopen", fake_urlopen)
+    monkeypatch.setattr("mortis_rag_mcp.providers._sleep", sleeps.append)
     provider = ExternalEmbeddingProvider(endpoint=ENDPOINT, model="embed-model", max_retries=2)
 
     with pytest.raises(ProviderError):
@@ -280,7 +280,7 @@ def test_embedding_splits_requests_by_batch_size(monkeypatch):
         batches.append(payload["input"])
         return _JsonResponse({"data": [{"embedding": [float(len(text))]} for text in payload["input"]]})
 
-    monkeypatch.setattr("vault_mcp.providers.urlopen", fake_urlopen)
+    monkeypatch.setattr("mortis_rag_mcp.providers.urlopen", fake_urlopen)
     provider = ExternalEmbeddingProvider(endpoint=ENDPOINT, model="embed-model", batch_size=2)
 
     vectors = provider.embed(["a", "bb", "ccc", "dddd", "eeeee"])
@@ -297,7 +297,7 @@ def test_embedding_batch_size_zero_keeps_single_request(monkeypatch):
         batches.append(payload["input"])
         return _JsonResponse({"data": [{"embedding": [0.0]} for _ in payload["input"]]})
 
-    monkeypatch.setattr("vault_mcp.providers.urlopen", fake_urlopen)
+    monkeypatch.setattr("mortis_rag_mcp.providers.urlopen", fake_urlopen)
     provider = ExternalEmbeddingProvider(endpoint=ENDPOINT, model="embed-model", batch_size=0)
 
     assert len(provider.embed(["a", "b", "c"])) == 3
@@ -308,7 +308,7 @@ def test_embedding_batch_rejects_short_response(monkeypatch):
     def fake_urlopen(request, timeout):
         return _JsonResponse({"data": [{"embedding": [0.1]}]})
 
-    monkeypatch.setattr("vault_mcp.providers.urlopen", fake_urlopen)
+    monkeypatch.setattr("mortis_rag_mcp.providers.urlopen", fake_urlopen)
     provider = ExternalEmbeddingProvider(endpoint=ENDPOINT, model="embed-model", batch_size=2)
 
     with pytest.raises(ProviderError, match="returned 1 vectors for 2 inputs"):
@@ -368,8 +368,8 @@ def test_retry_after_non_finite_values_are_ignored(monkeypatch, raw):
     def fake_urlopen(request, timeout):
         raise _http_error(429, {"Retry-After": raw})
 
-    monkeypatch.setattr("vault_mcp.providers.urlopen", fake_urlopen)
-    monkeypatch.setattr("vault_mcp.providers._sleep", sleeps.append)
+    monkeypatch.setattr("mortis_rag_mcp.providers.urlopen", fake_urlopen)
+    monkeypatch.setattr("mortis_rag_mcp.providers._sleep", sleeps.append)
     provider = ExternalEmbeddingProvider(endpoint=ENDPOINT, model="m", max_retries=1)
 
     with pytest.raises(ProviderError):
@@ -386,8 +386,8 @@ def test_retry_after_is_capped_by_max_backoff(monkeypatch):
     def fake_urlopen(request, timeout):
         raise _http_error(429, {"Retry-After": "86400"})
 
-    monkeypatch.setattr("vault_mcp.providers.urlopen", fake_urlopen)
-    monkeypatch.setattr("vault_mcp.providers._sleep", sleeps.append)
+    monkeypatch.setattr("mortis_rag_mcp.providers.urlopen", fake_urlopen)
+    monkeypatch.setattr("mortis_rag_mcp.providers._sleep", sleeps.append)
     provider = ExternalEmbeddingProvider(endpoint=ENDPOINT, model="m", max_retries=2)
 
     with pytest.raises(ProviderError):
@@ -402,8 +402,8 @@ def test_backoff_jitters_to_avoid_thundering_herd(monkeypatch):
     def fake_urlopen(request, timeout):
         raise _http_error(429, {"Retry-After": "10"})
 
-    monkeypatch.setattr("vault_mcp.providers.urlopen", fake_urlopen)
-    monkeypatch.setattr("vault_mcp.providers._sleep", sleeps.append)
+    monkeypatch.setattr("mortis_rag_mcp.providers.urlopen", fake_urlopen)
+    monkeypatch.setattr("mortis_rag_mcp.providers._sleep", sleeps.append)
     provider = ExternalEmbeddingProvider(endpoint=ENDPOINT, model="m", max_retries=4)
 
     with pytest.raises(ProviderError):
@@ -421,7 +421,7 @@ def test_single_batch_short_response_is_rejected(monkeypatch):
         # 上游少返回一个向量：回填时 zip() 会静默截断并让后续 chunk 错位。
         return _JsonResponse({"data": [{"embedding": [1.0]} for _ in payload["input"][:-1]]})
 
-    monkeypatch.setattr("vault_mcp.providers.urlopen", fake_urlopen)
+    monkeypatch.setattr("mortis_rag_mcp.providers.urlopen", fake_urlopen)
     provider = ExternalEmbeddingProvider(endpoint=ENDPOINT, model="m")
 
     with pytest.raises(ProviderError, match="vectors for"):
@@ -437,7 +437,7 @@ def test_multi_batch_short_response_is_rejected(monkeypatch):
         calls.append(len(payload["input"]))
         return _JsonResponse({"data": [{"embedding": [1.0]}]})
 
-    monkeypatch.setattr("vault_mcp.providers.urlopen", fake_urlopen)
+    monkeypatch.setattr("mortis_rag_mcp.providers.urlopen", fake_urlopen)
     provider = ExternalEmbeddingProvider(endpoint=ENDPOINT, model="m", batch_size=2)
 
     with pytest.raises(ProviderError, match="vectors for"):
@@ -459,7 +459,7 @@ def test_embedding_reorders_response_by_index(monkeypatch):
             }
         )
 
-    monkeypatch.setattr("vault_mcp.providers.urlopen", fake_urlopen)
+    monkeypatch.setattr("mortis_rag_mcp.providers.urlopen", fake_urlopen)
     provider = ExternalEmbeddingProvider(endpoint=ENDPOINT, model="m")
 
     assert provider.embed(["a", "b", "c"]) == [[1.0], [2.0], [3.0]]
@@ -476,7 +476,7 @@ def test_embedding_rejects_duplicate_response_index(monkeypatch):
             }
         )
 
-    monkeypatch.setattr("vault_mcp.providers.urlopen", fake_urlopen)
+    monkeypatch.setattr("mortis_rag_mcp.providers.urlopen", fake_urlopen)
     provider = ExternalEmbeddingProvider(endpoint=ENDPOINT, model="m")
 
     with pytest.raises(ProviderError, match="indexes"):

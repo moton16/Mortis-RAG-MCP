@@ -81,18 +81,18 @@ MCP 连上后，对 AI 说一句（或手动发 tools/call）：
 
 - 这一步会把文件夹**注册进 `~/.vault_mcp/vaults.toml`**（持久化，重启不丢），后台建立索引并开始监听文件变化。
 - 想分库管理（比如"工作"、"世界观"分开搜）：每个文件夹各 `kb_init` 一次。
-- 验证：`kb_vaults` 列注册表，`kb_stats` 看 files/chunks/failed_files。
-- 搜索：不传 `vault_path` 时自动跨全部注册库检索；结果里的 `vault` 字段标明命中哪个库。
+- 验证：`kb_list` 列注册库，`kb_stats` 看 files/chunks/failed_files。
+- 搜索：不传 `vault_path` 时自动跨全部非 solo 注册库检索；结果里的 `vault` 字段标明命中哪个库。想让某个库不参与全局检索（私密库等）：用 `kb_init_solo` 注册或转换，显式传 `vault_path` 才能搜它。
 
 ## 5. 安装配套 Skill（可选，推荐 AI 助手用户）
 
-仓库 `skills/vault-mcp/SKILL.md` 是配套的调用技能（教 AI 正确路由、避坑 rebuild 限流等）。按你的助手平台的 skills 目录放置：
+仓库 `skills/mortis-rag-mcp/SKILL.md` 是配套的调用技能（教 AI 正确路由、避坑 rebuild 限流等）。按你的助手平台的 skills 目录放置：
 
-- **WorkBuddy**：复制到 `~/.workbuddy/skills/vault-mcp/SKILL.md`（Windows 即 `C:\Users\<你>\.workbuddy\skills\`）
+- **WorkBuddy**：复制到 `~/.workbuddy/skills/mortis-rag-mcp/SKILL.md`（Windows 即 `C:\Users\<你>\.workbuddy\skills\`）
 - 其他支持 SKILL.md 规范的 agent（Claude Code / OpenCode 等）：复制到对应 skills 目录
 
 ```powershell
-Copy-Item .\skills\vault-mcp\SKILL.md "$env:USERPROFILE\.workbuddy\skills\vault-mcp\SKILL.md"
+Copy-Item .\skills\mortis-rag-mcp\SKILL.md "$env:USERPROFILE\.workbuddy\skills\mortis-rag-mcp\SKILL.md"
 ```
 
 装好后，对 AI 说"搜知识库 / 查笔记 / kb_search xxx"即可自动触发。
@@ -102,7 +102,8 @@ Copy-Item .\skills\vault-mcp\SKILL.md "$env:USERPROFILE\.workbuddy\skills\vault-
 | 动作 | 工具 |
 |---|---|
 | 注册新知识库 | `kb_init {path, name?}` |
-| 看有哪些库 | `kb_vaults` |
+| 注册独立库（不参与全局检索） | `kb_init_solo {path, name?}`（0.6.0） |
+| 看有哪些库 | `kb_list` |
 | 搜索（跨库） | `kb_search {query}` |
 | 搜索（指定库） | `kb_search {query, vault_path}` |
 | 只搜某目录 / 某标签 / 某时间段 | `kb_search {query, path_prefix? tags? mtime_after? mtime_before?}`（0.5.0） |
@@ -116,7 +117,7 @@ Copy-Item .\skills\vault-mcp\SKILL.md "$env:USERPROFILE\.workbuddy\skills\vault-
 
 ## 7. 常见问题
 
-- **搜索结果为空**：先 `kb_vaults` 确认库已注册且 `exists=true`；再 `kb_stats` 确认 files>0。
+- **搜索结果为空**：先 `kb_list` 确认库已注册且 `exists=true`（solo 库不参与全局检索，需显式传 `vault_path`）；再 `kb_stats` 确认 files>0。
 - **failed_files 有值**：多为 embedding API 限流/网络错误。0.5.0 起请求自动重试（指数退避、429 遵循 Retry-After）并按批切分，单次限流不再打垮整个索引；仍失败就隔几分钟反复 `kb_stats` 让增量 sync 自动补。
 - **换设备**：简单场景 clone → 装包 → 配 key → 对笔记文件夹 `kb_init`（首次全量建索引，花一次 embedding 钱）；想省这笔钱就先在旧机器 `kb_export` 导出索引快照，新机器 `kb_init` 后 `kb_import` 导入——导入后 0 次重嵌。
 - **Windows 中文乱码**：服务端已强制 stdio UTF-8；确保客户端也以 UTF-8 收发。

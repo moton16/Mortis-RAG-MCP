@@ -2,18 +2,19 @@
 
 A standard-library-only MCP server for Obsidian-style Markdown knowledge bases (formerly `vault-mcp` / Obsidian RAG MCP). It provides structured chunk search, raw source reads, incremental indexing, and a user-level vault registry that binds to **no hardcoded folder** — register any directory with a single `kb_init` call.
 
-> **New here?** Follow [docs/QUICKSTART.md](docs/QUICKSTART.md): clone → install → configure your API key → wire up your MCP client → `kb_init` your notes folder → optionally install the companion skill from [`skills/vault-mcp/`](skills/vault-mcp/SKILL.md).
+> **New here?** Follow [docs/QUICKSTART.md](docs/QUICKSTART.md): clone → install → configure your API key → wire up your MCP client → `kb_init` your notes folder → optionally install the companion skill from [`skills/mortis-rag-mcp/`](skills/mortis-rag-mcp/SKILL.md).
 
 > **Release notes:** see [CHANGELOG.md](CHANGELOG.md) for per-version changes (0.5.0 = embedding resilience, search filters/dedup, per-vault weights, native watcher, index snapshots).
 
 ## Implemented
 
-- `kb_init` / `kb_unregister`: register / unregister any folder as a knowledge base (persistent registry, per-vault file watcher, optional cache purge).
-- `kb_search`: return raw chunks with `id`, `content`, `score`, `source`, `title`, and metadata. Without `vault_path`, searches across **all registered vaults** (fan-out, query embedded once, merged + reranked in one pass) and tags each result with `vault` / `vault_name`.
+- `kb_init` / `kb_remove`: register / remove any folder as a knowledge base (persistent registry, per-vault file watcher, optional cache purge). Renamed in 0.6.0 (`kb_init` / `kb_unregister`).
+- `kb_init_solo` (0.6.0): register a folder as a **solo vault** — excluded from global fan-out search; it is only searched when you pass its `vault_path` explicitly. Calling it on an already-registered vault flips that vault to solo in place. To un-solo: `kb_remove` then `kb_init` again (cache preserved, zero re-embedding).
+- `kb_search`: return raw chunks with `id`, `content`, `score`, `source`, `title`, and metadata. Without `vault_path`, searches across **all registered non-solo vaults** (fan-out, query embedded once, merged + reranked in one pass), tags each result with `vault` / `vault_name`, and lists skipped solo vaults in `excluded_solo`.
   - **Filters & pagination (0.5.0)**: `path_prefix` (per-directory), `tags` (frontmatter), `mtime_after` / `mtime_before` (epoch seconds or ISO 8601), `offset` / `limit` paging, and `group_by_vault` for grouped fan-out results. Filtering runs before rerank so quota is never spent on filtered-out chunks.
   - **Dedup (0.5.0)**: `dedupe = true` (default) keeps only the first chunk of byte-identical content — duplicate backups no longer fill up top_k, and identical paragraphs are embedded once and share vectors.
 - `kb_read`: read raw text by `source`, `heading`, or 1-based line range; it never calls an LLM.
-- `kb_list` / `kb_stats` / `kb_vaults` / `kb_rebuild`: inspect and manage registered vaults.
+- `kb_list_files` / `kb_stats` / `kb_list` / `kb_rebuild`: inspect and manage registered vaults. Renamed in 0.6.0 (old `kb_list` → `kb_list_files`, old `kb_vaults` → `kb_list`).
 - `kb_set_weight` (0.5.0): per-vault retrieval weight (0 < w <= 100); fan-out scores are scaled by the vault weight before the global sort.
 - `kb_export` / `kb_import` (0.5.0): pack the chunks + vector + FTS cache layers into a zip snapshot and restore them on another machine — the next sync after an import performs **zero embedding API calls**. Members are whitelist-validated and model/dimension mismatches are refused unless `force = true`.
 - `kb_exempt`: exclude private/draft notes from retrieval (`.vaultignore` patterns or per-file frontmatter `rag: false`).

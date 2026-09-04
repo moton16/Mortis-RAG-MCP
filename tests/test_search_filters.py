@@ -11,10 +11,10 @@ import os
 from datetime import datetime
 from pathlib import Path
 
-from vault_mcp.config import AppConfig, CacheConfig, EmbeddingConfig
-from vault_mcp.indexer import MarkdownIndexer, SearchFilter
-from vault_mcp.providers import StaticEmbeddingProvider
-from vault_mcp.server import VaultMcpServer
+from mortis_rag_mcp.config import AppConfig, CacheConfig, EmbeddingConfig
+from mortis_rag_mcp.indexer import MarkdownIndexer, SearchFilter
+from mortis_rag_mcp.providers import StaticEmbeddingProvider
+from mortis_rag_mcp.server import VaultMcpServer
 
 # 两个可辨识的 mtime（整数秒，NTFS 上能精确存回）。
 OLD_MTIME = 1_600_000_000.0  # 2020-09-13
