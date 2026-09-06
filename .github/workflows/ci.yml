@@ -17,6 +17,12 @@ jobs:
   test:
     name: pytest (${{ matrix.os }}, py${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
+    # Force UTF-8 for the runner and every child process: the test suite pipes
+    # Chinese content through stdio, which dies on the default cp1252 locale
+    # of Windows runners (and on POSIX runners with a C locale).
+    env:
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: utf-8
     strategy:
       fail-fast: false
       matrix:

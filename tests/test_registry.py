@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import sys
 import time
+
+import pytest
 
 from mortis_rag_mcp.registry import VaultEntry, VaultRegistry, normalize_vault_key
 
@@ -9,6 +12,10 @@ def _entry(path, name=None, at=None):
     return VaultEntry(path=str(path), name=name or "x", registered_at=at if at is not None else time.time())
 
 
+@pytest.mark.skipif(
+    sys.platform != "win32",
+    reason="Windows drive-letter / backslash path semantics only",
+)
 def test_registry_roundtrip_keeps_windows_backslashes(tmp_path):
     reg = VaultRegistry(tmp_path / "vaults.toml")
     reg.add("C:\\Users\\somebody\\Notes\\Work", "Work")
@@ -69,6 +76,10 @@ def test_registry_remove_unknown_raises(tmp_path):
     assert raised
 
 
+@pytest.mark.skipif(
+    sys.platform != "win32",
+    reason="normcase only folds case on Windows; POSIX filesystems are case-sensitive",
+)
 def test_registry_get_uses_normcase(tmp_path):
     reg = VaultRegistry(tmp_path / "vaults.toml")
     vault = tmp_path / "MixedCase"

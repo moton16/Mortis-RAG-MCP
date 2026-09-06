@@ -15,6 +15,7 @@ def _run_stdio(config: Path, requests: list[dict]) -> list[dict]:
         text=True,
         capture_output=True,
         check=False,
+        encoding="utf-8",
         env={**os.environ, "VAULT_MCP_REGISTRY": str(config.parent / "vaults.toml")},
     )
     assert proc.returncode == 0, proc.stderr
