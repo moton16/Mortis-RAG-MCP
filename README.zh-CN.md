@@ -1,5 +1,8 @@
 # Mortis'RAG MCP（原名 vault-mcp / Obsidian RAG MCP）项目文档
 
+[![CI](https://github.com/moton16/Mortis-RAG-MCP/actions/workflows/ci.yml/badge.svg)](https://github.com/moton16/Mortis-RAG-MCP/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 > 面向 Obsidian Markdown 知识库的本地 RAG（检索增强生成）MCP 服务。
 > 提供结构化切片检索、原文读取、增量索引、向量语义召回与重排序能力，供 AI Agent（WorkBuddy / Codex / Trae 等）通过 MCP 协议调用。
 

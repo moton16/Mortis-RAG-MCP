@@ -1,5 +1,8 @@
 # Mortis'RAG MCP
 
+[![CI](https://github.com/moton16/Mortis-RAG-MCP/actions/workflows/ci.yml/badge.svg)](https://github.com/moton16/Mortis-RAG-MCP/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 A standard-library-only MCP server for Obsidian-style Markdown knowledge bases (formerly `vault-mcp` / Obsidian RAG MCP). It provides structured chunk search, raw source reads, incremental indexing, and a user-level vault registry that binds to **no hardcoded folder** — register any directory with a single `kb_init` call.
 
 > **New here?** Follow [docs/QUICKSTART.md](docs/QUICKSTART.md): clone → install → configure your API key → wire up your MCP client → `kb_init` your notes folder → optionally install the companion skill from [`skills/mortis-rag-mcp/`](skills/mortis-rag-mcp/SKILL.md).
