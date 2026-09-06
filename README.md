@@ -152,7 +152,7 @@ If the console script is on the client process `PATH`, `command = "mortis-rag-mc
 python -m pytest -q
 ```
 
-The tests ((`python -m pytest -q` all green)) cover registry round-trips and dedup, fan-out search across vaults, unregister + cache purge, missing-vault tolerance, legacy config auto-migration, exempt management, provider JSON handling, static no-network behavior, reranker fallback, add/modify/delete/rename lifecycle, Windows and Unicode paths, and stdio smoke behavior. Each stdio test uses its own registry via the `VAULT_MCP_REGISTRY` environment variable. 0.5.0 adds coverage for embedding retry/backoff/batching, failed-file persistence, search filters and pagination, content-hash dedup, per-vault weights, native watcher integration (including a no-op-sync convergence test), image caption injection, and snapshot export/import round-trips (zero re-embed acceptance).
+The tests (`python -m pytest -q` all green) cover registry round-trips and dedup, fan-out search across vaults, unregister + cache purge, missing-vault tolerance, legacy config auto-migration, exempt management, provider JSON handling, static no-network behavior, reranker fallback, add/modify/delete/rename lifecycle, Windows and Unicode paths, and stdio smoke behavior. Each stdio test uses its own registry via the `VAULT_MCP_REGISTRY` environment variable. 0.5.0 adds coverage for embedding retry/backoff/batching, failed-file persistence, search filters and pagination, content-hash dedup, per-vault weights, native watcher integration (including a no-op-sync convergence test), image caption injection, and snapshot export/import round-trips (zero re-embed acceptance).
 
 ## Known limitations
 
