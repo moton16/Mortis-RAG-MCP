@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: pytest (${{ matrix.os }}, py${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+        include:
+          # Windows-only coverage: the native watcher (ReadDirectoryChangesW)
+          # and its integration tests are skipped on every other platform.
+          - os: windows-latest
+            python-version: "3.12"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install package (zero runtime deps)
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install pytest
+          python -m pip install -e .
+
+      - name: Install optional [vec] extra (best effort)
+        # Enables the sqlite-vec disk backend tests; skipped automatically if
+        # the extra is unavailable, so a missing wheel must not fail the build.
+        continue-on-error: true
+        run: python -m pip install -e ".[vec]"
+
+      - name: Show environment
+        run: |
+          python -c "import sys, sqlite3; print(sys.version); print('sqlite', sqlite3.sqlite_version)"
+          python -m pip list
+
+      - name: Run tests
+        run: python -m pytest -q --durations=15
