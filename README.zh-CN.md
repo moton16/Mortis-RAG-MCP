@@ -140,7 +140,8 @@ python -m pip install -e .
 # 仍失败（离线/构建隔离异常）再退而求其次：
 # python -m pip install -e . --no-build-isolation
 # 注："零依赖"指运行时依赖（dependencies=[]）；从源码安装需要 setuptools 作为
-# PEP 517 构建后端，健康环境下 pip 会自动提供。
+# PEP 517 构建后端，健康环境下 pip 会自动提供。走 --no-build-isolation 时用的是
+# 本地 setuptools，需 >= 77（本项目用 PEP 639 的 SPDX 字段声明许可证）。
 
 # 可选：numpy 加速语义检索
 python -m pip install numpy

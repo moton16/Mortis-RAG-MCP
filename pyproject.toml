@@ -1,10 +1,13 @@
 [build-system]
-requires = ["setuptools>=68"]
+# setuptools>=77 is required for the PEP 639 SPDX license fields below.
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "mortis-rag-mcp"
 version = "0.6.0"
+license = "MIT"
+license-files = ["LICENSE"]
 description = "Mortis'RAG MCP - registry-based Markdown knowledge base RAG server (MCP over stdio, zero runtime dependencies)"
 requires-python = ">=3.10"
 dependencies = []

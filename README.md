@@ -59,7 +59,7 @@ Only if that still fails (e.g. offline / broken isolation) fall back to:
 python -m pip install -e . --no-build-isolation
 ```
 
-Note: "zero dependencies" refers to **runtime** dependencies (`dependencies = []`); building from source requires setuptools as the PEP 517 build backend, which pip provides automatically in a healthy environment.
+Note: "zero dependencies" refers to **runtime** dependencies (`dependencies = []`); building from source requires setuptools as the PEP 517 build backend, which pip provides automatically in a healthy environment. The `--no-build-isolation` path uses your local setuptools, which must be **77+** (the project declares its license with the PEP 639 SPDX fields).
 
 ## Configuration
 
