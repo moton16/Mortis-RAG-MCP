@@ -94,3 +94,8 @@
 - 将英文版独立收敛为 `README_EN.md`，两份文档顶部互设 `[English](README_EN.md) | 简体中文` 双向语言切换链接。
 - 移除多余的 `README.zh-CN.md`，同步更新 `docs/Quick-start_developer.md` 与 `docs/PROJECT_GUIDE.md` 中的文档索引。
 
+### C12 — moton16,2026-9-13,Antigravity,Gemini 3.8 Flash — docs: add MinerU configuration guides to READMEs and QUICKSTART
+- 在 `README.md`、`README_EN.md` 与 `QUICKSTART_user.md` 的配置章节中，明确拆分基础配置（Embedding API Key）与进阶可选配置（MinerU 文档解析摄取）。
+- 详细说明 MinerU Token 获取地址（mineru.net）、环境变量设置（`MINERU_API_TOKEN`）与免登轻量试用通道的区别。
+- 在客户端连接配置 JSON 示例中补充展示 `MINERU_API_TOKEN` 环境变量注入项。
+

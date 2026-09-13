@@ -43,9 +43,13 @@ Copy-Item .\config\app.toml.example .\config\app.toml
 3. `[reranker]`：要精排就 `enabled = true`（bge-reranker-v2-m3 免费）
 4. `[vector]`：默认 `backend = "memory"`（向量驻内存）；想省内存改成 `"sqlite_vec"`（需先装 `mortis-rag-mcp[vec]`，首次切换自动迁移旧缓存，零重嵌）
 5. 分发给别人的库文件夹想连缓存一起带走：`[cache]` 里 `placement = "vault"`
-6. （可选）PDF/Office 摄取：**默认关闭，初次部署不用管**。需要检索 PDF 时再
-   把 `[ingest] enabled` 改 `true` 并重启，然后让 AI 跑 `kb_ingest`。
-   解析产物在 `.mortis-parsed/`，不会弄乱你的原目录。
+6. （可选）PDF/Office 文档摄取（MinerU）：
+   - **默认关闭**，若仅检索 Markdown 笔记无需配置。
+   - 如需检索 PDF/Office 文档，在 `config/app.toml` 中将 `[ingest] enabled = true`。
+   - **配置 MinerU Token**：
+     - **推荐（v4 高精度通道）**：前往 [mineru.net](https://mineru.net) 免费获取 API Token，设置系统环境变量 `MINERU_API_TOKEN=<你的Token>`（或在 `[ingest]` 中填写 `api_key = "你的Token"`），享受每日 1000 页额度与大文件支持。
+     - **免登测试**：不填 `api_key` 自动走轻量免登通道（适合单次 20 页内的小文件体验）。
+   - 解析产物自动存放于 `.mortis-parsed/` 独立目录，不会修改或污染原笔记。
 
 ## 3. 接入 MCP 客户端
 
@@ -58,7 +62,11 @@ Copy-Item .\config\app.toml.example .\config\app.toml
   "mortis-rag-mcp": {
     "command": "C:\\path\\to\\Mortis-RAG-MCP\\.venv\\Scripts\\python.exe",
     "args": ["-m", "mortis_rag_mcp", "--serve-mcp-stdio", "--app-config", "C:\\path\\to\\Mortis-RAG-MCP\\config\\app.toml"],
-    "env": { "PYTHONPATH": "C:\\path\\to\\Mortis-RAG-MCP", "VAULT_MCP_API_KEY": "你的key" }
+    "env": {
+      "PYTHONPATH": "C:\\path\\to\\Mortis-RAG-MCP",
+      "VAULT_MCP_API_KEY": "你的key",
+      "MINERU_API_TOKEN": "可选，用于PDF解析的MinerU密钥"
+    }
   }
 }
 ```

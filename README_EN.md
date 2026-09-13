@@ -46,9 +46,17 @@ Copy the example configuration:
 Copy-Item .\config\app.toml.example .\config\app.toml
 ```
 
-Set your Embedding API key (e.g. SiliconFlow `BAAI/bge-m3` free tier):
+#### (1) Basic: Embedding API Key (for semantic note retrieval)
+Recommended: SiliconFlow `BAAI/bge-m3` free tier:
 - **Option 1 (Recommended)**: Set environment variable `VAULT_MCP_API_KEY=your_api_key`.
 - **Option 2**: Configure your endpoint and key directly in `config/app.toml`.
+
+#### (2) Optional: MinerU Setup (0.7.0, for PDF & Office document ingestion)
+If you want to search PDFs, Word, PPT, Excel, or images in your knowledge base:
+1. Open `config/app.toml` and set `enabled = true` under `[ingest]`.
+2. Configure your MinerU Token (two options):
+   - **High-Precision Channel (Recommended)**: Get a free API token at [mineru.net](https://mineru.net), set environment variable `MINERU_API_TOKEN=your_token` (or set `api_key = "your_token"` under `[ingest]` in `config/app.toml`) for 1,000 free pages/day and large document support.
+   - **Zero-Config Trial**: Leave `api_key` blank to use the public guest channel (best for quick tests under 20 pages).
 
 ### 3. Wire Up Your MCP Client
 
@@ -60,7 +68,10 @@ The server runs over standard stdio:
   "mortis-rag-mcp": {
     "command": "python",
     "args": ["-m", "mortis_rag_mcp", "--serve-mcp-stdio", "--app-config", "C:\\path\\to\\config\\app.toml"],
-    "env": { "VAULT_MCP_API_KEY": "your_api_key" }
+    "env": {
+      "VAULT_MCP_API_KEY": "your_api_key",
+      "MINERU_API_TOKEN": "optional_mineru_token_for_pdf_ingestion"
+    }
   }
 }
 ```

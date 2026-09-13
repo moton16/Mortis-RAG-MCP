@@ -46,9 +46,17 @@ python -m pip install -e .
 Copy-Item .\config\app.toml.example .\config\app.toml
 ```
 
-设置你的 Embedding API Key（推荐免费档硅基流动 `BAAI/bge-m3`）：
+#### (1) 基础配置：Embedding API Key（用于笔记语义检索）
+推荐使用免费档硅基流动 `BAAI/bge-m3`：
 - **方式一（推荐）**：设置系统环境变量 `VAULT_MCP_API_KEY=你的API密钥`。
 - **方式二**：直接在 `config/app.toml` 中配置你的服务商地址与密钥。
+
+#### (2) 可选配置：MinerU 接入（0.7.0，用于 PDF / Office 文档解析摄取）
+如果需要检索知识库内的 PDF、Word、PPT、Excel 或图片文件：
+1. 打开 `config/app.toml`，在 `[ingest]` 小节将 `enabled = true`。
+2. 配置 MinerU Token（两种方式）：
+   - **高精度通道（推荐）**：前往 [mineru.net](https://mineru.net) 免费获取 API Token，设置系统环境变量 `MINERU_API_TOKEN=你的Token`（或在 `config/app.toml` 的 `[ingest]` 中填写 `api_key = "你的Token"`），享受每日 1000 页额度与大文件支持。
+   - **免登试用通道**：留空 `api_key` 即可直接使用（适合 20 页以内的日常小文档体验）。
 
 ### 3. 接入 AI 客户端
 
@@ -60,7 +68,10 @@ Copy-Item .\config\app.toml.example .\config\app.toml
   "mortis-rag-mcp": {
     "command": "python",
     "args": ["-m", "mortis_rag_mcp", "--serve-mcp-stdio", "--app-config", "C:\\你的路径\\config\\app.toml"],
-    "env": { "VAULT_MCP_API_KEY": "你的API密钥" }
+    "env": {
+      "VAULT_MCP_API_KEY": "你的API密钥",
+      "MINERU_API_TOKEN": "可选，用于PDF解析的MinerU密钥"
+    }
   }
 }
 ```
