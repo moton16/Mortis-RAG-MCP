@@ -1,0 +1,22 @@
+fix(indexer): Fast-Stat 的 racily clean 判据与真正有鉴别力的回归测试
+
+上一版 148a395 的判据方向正确，但回归测试毫无鉴别力：把判据临时改成恒真的
+`return True` 后测试依然通过，等于没有覆盖这个 bug。根因是测试构造顺序错误
+——先 sync 再钉 mtime，导致 _stat_cache 里留的是首页真实 mtime，签名判据
+(mtime_ns, size) 先短路为假，文件直接走 sha256 被正确检出，可信度判据根本没
+被调用。
+
+本次改动：
+- 测试改为「先 sync，再把索引缓存与笔记 mtime 钉到同一时刻 T，并把 (T, size)
+  写进 _stat_cache」，精确复现 Git 定义的 racily clean 条目（mtime 与索引文件
+  时间戳相同），使可信度判据成为唯一决定因素。
+- 反向验证已通过：禁用判据 -> 测试 FAIL；启用判据 -> 测试 PASS。
+- 判据注释对齐 git-scm.com/docs/racy-git 原文：索引在采集完所有 stat 信息之后
+  才落盘，其时间戳通常不早于其中任何条目，故可疑条目限定为「mtime 与索引时间
+  戳相同」，判据取 mtime 严格早于锚点才信任签名相等。
+- 锚点优先取索引缓存文件 st_mtime_ns（单调、跨进程有效、与文件 mtime 同时基），
+  缓存未启用时退化为进程内扫描完成时刻。
+
+验证：tests/test_indexer.py + tests/test_improvements.py 共 15 passed，含
+test_fast_stat_skips_disk_read_when_unmodified 的零读盘契约；并额外确认
+cache.enabled=False 时 anchor 退化为 _scan_completed_ns 仍保持零读盘。
