@@ -57,7 +57,7 @@ Copy-Item .\config\app.toml.example .\config\app.toml
 {
   "mortis-rag-mcp": {
     "command": "C:\\path\\to\\Mortis-RAG-MCP\\.venv\\Scripts\\python.exe",
-    "args": ["-m", "vault_mcp", "--serve-mcp-stdio", "--app-config", "C:\\path\\to\\Mortis-RAG-MCP\\config\\app.toml"],
+    "args": ["-m", "mortis_rag_mcp", "--serve-mcp-stdio", "--app-config", "C:\\path\\to\\Mortis-RAG-MCP\\config\\app.toml"],
     "env": { "PYTHONPATH": "C:\\path\\to\\Mortis-RAG-MCP", "VAULT_MCP_API_KEY": "你的key" }
   }
 }
@@ -107,12 +107,14 @@ Copy-Item .\skills\mortis-rag-mcp\SKILL.md "$env:USERPROFILE\.workbuddy\skills\m
 | 注册新知识库 | `kb_init {path, name?}` |
 | 注册独立库（不参与全局检索） | `kb_init_solo {path, name?}`（0.6.0） |
 | 看有哪些库 | `kb_list` |
+| 设置库描述（引导定向选库） | `kb_describe {vault_path, description}`（0.7.0） |
 | 搜索（跨库） | `kb_search {query}` |
 | 搜索（指定库） | `kb_search {query, vault_path}` |
 | 只搜某目录 / 某标签 / 某时间段 | `kb_search {query, path_prefix? tags? mtime_after? mtime_before?}`（0.5.0） |
 | 翻页 | `kb_search {query, offset, limit}`（0.5.0） |
 | 「这个库更重要」 | `kb_set_weight {vault_path, weight}` + 可选 `kb_search {group_by_vault: true}`（0.5.0） |
 | 读原文 | `kb_read {source, vault_path}` |
+| 摄取 PDF / Office 文档 | `kb_ingest {action: "pending" / "submit" / "status", vault_path?}`（0.7.0，需配置开启） |
 | 排除私密笔记 | `kb_exempt {action: "add_pattern" / "exempt_file"}` |
 | 索引出错了 | 看 `kb_stats` 的 `failed_files`（0.5.0 起重启也不丢）；反复调 `kb_stats` 触发增量补齐 |
 | 换设备 / 换目录迁移 | 旧机器 `kb_export` → 新机器 `kb_init` + `kb_import`（0.5.0，导入后 0 次重新 embedding） |

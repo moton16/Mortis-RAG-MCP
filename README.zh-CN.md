@@ -6,7 +6,7 @@
 > 面向 Obsidian Markdown 知识库的本地 RAG（检索增强生成）MCP 服务。
 > 提供结构化切片检索、原文读取、增量索引、向量语义召回与重排序能力，供 AI Agent（WorkBuddy / Codex / Trae 等）通过 MCP 协议调用。
 
-- 仓库：`Mortis-RAG-MCP`（Python 包名保持 `vault_mcp`，控制台脚本新增 `mortis-rag-mcp`，旧 `vault-mcp` 兼容保留）
+- 仓库：`Mortis-RAG-MCP`（Python 包名 `mortis_rag_mcp`，控制台脚本新增 `mortis-rag-mcp`，旧 `vault-mcp` 兼容保留）
 - 当前版本：`mortis-rag-mcp 0.7.0`（PDF/Office 摄取 + 定向路由 + 表格保护 + solo 独立库 + 混合检索 + 检索过滤/去重 + 库级权重 + 原生监听 + 索引快照）
 - 知识库：**不绑定任何路径** —— 任意文件夹通过 `kb_init` 注册为知识库，注册表持久化于 `~/.vault_mcp/vaults.toml`（跨重启/跨设备可用）
 
@@ -214,10 +214,10 @@ subdir = ".mcp_cache"
 
 ```powershell
 # 方式一：安装后的控制台脚本
-vault-mcp --serve-mcp-stdio --app-config .\config\app.toml
+mortis-rag-mcp --serve-mcp-stdio --app-config .\config\app.toml
 
 # 方式二：python -m 直接运行
-python -m vault_mcp --serve-mcp-stdio --app-config .\config\app.toml
+python -m mortis_rag_mcp --serve-mcp-stdio --app-config .\config\app.toml
 ```
 
 服务为 **stdio 模式**：stdout 只输出 JSON-RPC 响应，通过 stdin 接收 newline-delimited JSON 请求。正常情况由 Agent（WorkBuddy/Codex）拉起，无需手动运行。

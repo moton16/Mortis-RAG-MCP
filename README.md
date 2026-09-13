@@ -135,7 +135,7 @@ mortis-rag-mcp --serve-mcp-stdio --app-config .\config\app.toml
 Without installing the console script:
 
 ```powershell
-python -m vault_mcp --serve-mcp-stdio --app-config .\config\app.toml
+python -m mortis_rag_mcp --serve-mcp-stdio --app-config .\config\app.toml
 ```
 
 stdout contains only JSON-RPC responses. The server supports `initialize`, `tools/list`, `tools/call`, and `ping` over newline-delimited JSON input.
