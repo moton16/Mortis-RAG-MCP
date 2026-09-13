@@ -6,7 +6,7 @@
 
 ---
 
-### D0 — WorkBuddy(工作区改动，未commit),2026-9-13,WorkBuddy,kimi-k3-1 — docs: 开发者文档体系建立
+### D0 — Vodyanitsaaa,2026-9-13,WorkBuddy(工作区改动，未commit),WorkBuddy,kimi-k3-1 — docs: 开发者文档体系建立
 - **新增 `docs/Execution-plan_developer.md`**：v0.7.0 代码级执行方案。P0 检索评测 harness（scripts/eval_search.py + 金标准查询集）→ P1 定向检索路由（registry 加 description 字段 + kb_describe 工具 + MCP initialize instructions + kb_search 描述路由纪律 + fan-out hint + SKILL.md 5.0 判定表化重写）→ P2 PDF/Office 摄取层（**默认关闭**、按需异步 kb_ingest、内嵌 MinerU 双通道客户端 v4/Agent免登、产物收 `.mortis-parsed/`、HTML 表格原子块保护 + 小表转 pipe、pymupdf 兜底）→ P3 可选增强（title/alias boost、per-source 限流，eval 数据决定是否做）。每步含可直接粘贴的代码、测试清单、commit 切分与验收标准。
 - **补全 `docs/Quick-start_developer.md`**（原为空胚）：项目概况、架构分层图、索引/检索/tools-call 三条数据流、8 个模块职责与改动坑位表、缓存布局、测试约定、开发约定（文档分工/原子写/fail-closed/Breaking 流程）、常见任务食谱（加工具/改检索/加配置）、上手 checklist。
 - 方案依据：MinerU 官方 API 文档（mineru.net/apiManage/docs）已核实全量端点/参数/错误码（v4 精准 + Agent 轻量免登双通道）；同类项目调研（proofsh/obsidian-notes-rag 链接图谱、gbrain per-page max-pool/title boost/CRAG、parent-document retrieval 业界数据）。
@@ -54,11 +54,11 @@
 - README.zh-CN.md：增补"PDF / Office 文档摄取（默认关闭）"小节，阐明两步开启方式与 .mortis-parsed/ 落盘设计
 - QUICKSTART_user.md：配置段末尾追加第 6 条摄取说明
 
-### D1 — moton16,2026-9-13,Antigravity,Gemini 3.8 Flash — docs: 新增 v0.7.0 本地提交对抗审查报告
+### D1 — Vodyanitsaaa,2026-9-13,Kimi Code,Kimi-K3 — docs: 新增 v0.7.0 本地提交对抗审查报告
 - 新增 `docs/v0.7.0/Adversarial-review-merged_developer.md`：针对 C0-C7 8 轮 commit 进行全量对抗审查（Adversarial Review / Red Team Review），整合两轮（静态代码审查 + 实测探针深挖），按根因去重、统一为 `D1–D20` 编号。
 - 梳理出 3 项 P0（`kb_ingest` 路径逃逸外发、未闭合 `<table>` 三条故障分支、已闭合大表超预算 chunk）、5 项 P1、6 项 P2、6 项 P3，其中 8 条附实测复现数据，并提供代码级修复指引与 14 条验收门禁。
 
-### C8 — moton16,2026-9-13,Antigravity,Gemini — fix(ingest,indexer,server): 全面修复对抗审查 20 项缺陷并达成 14 项门禁
+### C8 — moton16,2026-9-13,ZCode,GLM-5.3 — fix(ingest,indexer,server): 全面修复对抗审查 20 项缺陷并达成 14 项门禁
 - **P0 缺陷彻底清零**：
   - D1: `_validate_safe_source` 纵深校验前移至 `submit` 与 `_run_job` 双重防御，严防路径穿越与任意文件上传。
   - D2: `iter_table_blocks` 排除围栏代码块，对未闭合表格设行数与字符双重界限；`convert_small_tables` 严格要求已闭合 `</table>`，根除正文被删隐患。
@@ -76,7 +76,7 @@
   - D15 / D16: 移除全局盲替换，优化 status 汇总可观测性 (`done_full` / `done_fallback`)。
   - D17 / D18 / D19 / D20: 统一版本号 0.7.0 与 15 个工具计数，eval_search 支持 MRR 与无外网模式，fanout hint 采用 VaultEntry.name，231 项全真测试 100% 通过。
 
-### C9 — moton16,2026-9-13,Antigravity,Gemini 3.8 Flash — chore: bump version to 0.7.0 and sync CHANGELOG/docs
+### C9 — moton16,2026-9-13,ZCode,GLM-5.3-Flash — chore: bump version to 0.7.0 and sync CHANGELOG/docs
 - pyproject.toml：版本号由 0.6.0 bump 至 0.7.0
 - CHANGELOG_user.md：全量重写为纯大白话用户体验更新日志，顶部增设醒目红线警告栏（严禁技术术语）
 - 新增 AGENTS.md & CLAUDE.md：根目录确立开发者与 AI Agent 协作法则，将“用户日志禁止堆砌技术细节”设为项目级强制红线
@@ -84,17 +84,17 @@
 - README.zh-CN.md & docs/PROJECT_GUIDE.md：更新版本标头为 v0.7.0 并同步新特性
 - 验证：全量测试 231 passed，Hit@5 100%，准备合入与推流
 
-### C10 — moton16,2026-9-13,Antigravity,Gemini 3.8 Flash — docs: purge root AGENTS/CLAUDE files and streamline READMEs to user perspective
+### C10 — moton16,2026-9-13,ZCode,GLM-5.3-Flash — docs: purge root AGENTS/CLAUDE files and streamline READMEs to user perspective
 - 移除根目录冗余的 `AGENTS.md` 与 `CLAUDE.md`，开发者协作与文档分工准则统一收敛于 `docs/Quick-start_developer.md` 与 `docs/PROJECT_GUIDE.md`。
 - 大幅精简重写 `README.md` 与 `README.zh-CN.md`，彻底移除数百行历史故障复盘、内存基准分析与底层结构排查等技术黑话。
 - 主页文档全面对齐 `QUICKSTART_user.md` 与 `CHANGELOG_user.md` 简化版，聚焦产品特性、5 分钟极简上手、核心工具速查与文档导航，打造清爽优雅的项目主页。
 
-### C11 — moton16,2026-9-13,Antigravity,Gemini 3.8 Flash — docs: make Chinese README default and add README_EN with bilingual switcher
+### C11 — moton16,2026-9-13,ZCode,GLM-5.3-Flash — docs: make Chinese README default and add README_EN with bilingual switcher
 - 将 `README.md`（GitHub 默认渲染入口）设为中文主页，直接匹配主力用户与仓库母语使用习惯。
 - 将英文版独立收敛为 `README_EN.md`，两份文档顶部互设 `[English](README_EN.md) | 简体中文` 双向语言切换链接。
 - 移除多余的 `README.zh-CN.md`，同步更新 `docs/Quick-start_developer.md` 与 `docs/PROJECT_GUIDE.md` 中的文档索引。
 
-### C12 — moton16,2026-9-13,Antigravity,Gemini 3.8 Flash — docs: add MinerU configuration guides to READMEs and QUICKSTART
+### C12 — moton16,2026-9-13,ZCode,GLM-5.3-Flash — docs: add MinerU configuration guides to READMEs and QUICKSTART
 - 在 `README.md`、`README_EN.md` 与 `QUICKSTART_user.md` 的配置章节中，明确拆分基础配置（Embedding API Key）与进阶可选配置（MinerU 文档解析摄取）。
 - 详细说明 MinerU Token 获取地址（mineru.net）、环境变量设置（`MINERU_API_TOKEN`）与免登轻量试用通道的区别。
 - 在客户端连接配置 JSON 示例中补充展示 `MINERU_API_TOKEN` 环境变量注入项。
@@ -120,3 +120,12 @@
   - `run()`：`quiet=True` 场景禁止触碰 `sys.stdout.reconfigure`，规避后台刷新与 stdio JSON-RPC 主线程竞争；去重沿用探测提示后缀。
 - **单测宿主环境隔离**：`conftest.py` 检测隔离环境变量，在隔离测试与 CI 下跳过改写真实宿主 `STATUS.md`；`record_test_run()` 使用 `setdefault` 保持信任锚原始过期时间戳。
 - **测试补充**：在 `tests/test_doctor.py` 与 `tests/test_path_migration.py` 中新增 8 个回归测试（测试全绿：257 passed, 2 skipped）。
+
+### C15 — Vodyanitsaaa,2026-9-13,Antigravity,Gemini 3.8 Flash — fix(doctor,migration): 修复预置目录注册表失联、外部门禁防假、URL伪本地绕过与并发排他锁缺陷
+- **注册表无损迁移守护**：`registry.py`（`registry_path`）增加文件级检测，当新目录预先存在（如提前放置 config.toml）但无 `vaults.toml`，而旧目录存在 `vaults.toml` 时，执行单文件原子迁移；遇锁失败安全回退读取旧文件，杜绝老知识库注册丢失归零。
+- **外部模型门禁严加把关**：`doctor.py`（`run`）优化判定逻辑，`mode="external"` 时 `embedding_api` 必须在场且通过探测才能判定 `overall = True`；增量轻量刷新保留原 `generated_at` 时间戳并增加过期校验，杜绝无限续期与虚假标绿。
+- **URL Hostname 严格解析**：`_is_local_endpoint()` 改用 `urllib.parse.urlsplit` 严格提取 hostname 进行环回与本地判定，杜绝路径或 query 携带 `localhost` 绕过免密检查；对 `mode="external"` 补全 endpoint/model 非空校验。
+- **doctor 跨进程排他锁**：`doctor.run()` 与 `record_test_run()` 引入 `_process_file_lock("status.lock")`，杜绝后台刷新与 CLI 诊断并发时的 Lost Update。
+- **单测宿主环境防污染**：`tests/conftest.py` 增加前置文件存在检测，宿主未初始化时单测运行禁止无中生有落盘 `STATUS.md`。
+- **测试补充**：在 `tests/test_doctor.py` 与 `tests/test_path_migration.py` 中新增 7 个对抗回归测试（全量 264 passed, 2 skipped 全部通过）。
+

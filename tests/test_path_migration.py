@@ -185,3 +185,35 @@ def test_resolve_default_cache_dir_rename_race_fallback_to_new_if_exists(tmp_pat
         assert res == str(new_cache)
         assert new_cache.exists()
 
+
+def test_registry_path_migrates_old_file_when_new_dir_already_exists(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    old_dir = tmp_path / ".vault_mcp"
+    new_dir = tmp_path / ".mortis_rag_mcp"
+    old_dir.mkdir()
+    new_dir.mkdir()
+    (old_dir / "vaults.toml").write_text("version = 4\n[[vaults]]\npath = 'test'\nname = 'v1'\n", encoding="utf-8")
+
+    # When new_dir already exists without vaults.toml, registry_path() must migrate old vaults.toml
+    target = registry_path()
+    assert target == (new_dir / "vaults.toml")
+    assert target.exists()
+    assert not (old_dir / "vaults.toml").exists()
+    assert "name = 'v1'" in target.read_text(encoding="utf-8")
+
+
+def test_registry_path_rename_error_fallback_to_old_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    old_dir = tmp_path / ".vault_mcp"
+    new_dir = tmp_path / ".mortis_rag_mcp"
+    old_dir.mkdir()
+    new_dir.mkdir()
+    old_file = old_dir / "vaults.toml"
+    old_file.write_text("version = 4\n", encoding="utf-8")
+
+    with patch.object(Path, "rename", side_effect=OSError("locked")):
+        target = registry_path()
+        assert target == old_file
+        assert target.exists()
+
+

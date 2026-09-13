@@ -115,7 +115,18 @@ def registry_path() -> Path:
                 or os.getenv("VAULT_MCP_REGISTRY", "").strip())
     if override:
         return Path(override).expanduser()
-    return user_config_dir() / "vaults.toml"
+    new_reg = user_config_dir() / "vaults.toml"
+    old_reg = Path.home() / ".vault_mcp" / "vaults.toml"
+    if not new_reg.exists() and old_reg.is_file():
+        try:
+            new_reg.parent.mkdir(parents=True, exist_ok=True)
+            old_reg.rename(new_reg)
+            return new_reg
+        except OSError:
+            if new_reg.exists():
+                return new_reg
+            return old_reg
+    return new_reg
 
 
 def user_config_path() -> Path:

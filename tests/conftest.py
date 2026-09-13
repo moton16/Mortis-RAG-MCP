@@ -21,6 +21,9 @@ def pytest_sessionfinish(session, exitstatus):
         skipped = len(stats.get("skipped", []))
         total_collected = getattr(session, "testscollected", passed + failed + skipped)
         from mortis_rag_mcp import doctor
+        # 仅在宿主环境已有 status.json 时才更新观测测试成绩，严禁凭空在干净宿主目录造文件
+        if not doctor._status_json_path().is_file():
+            return
         doctor.record_test_run(passed=passed, failed=failed, skipped=skipped, total_collected=total_collected)
     except Exception:
         pass

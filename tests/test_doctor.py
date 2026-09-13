@@ -154,3 +154,76 @@ def test_doctor_record_test_run_preserves_generated_at(tmp_path, monkeypatch):
     data = doctor._read_json()
     assert data["generated_at"] == "2026-09-01T00:00:00+08:00"
 
+
+def test_doctor_is_local_endpoint_strict_hostname():
+    # Valid locals
+    assert doctor._is_local_endpoint("http://localhost:11434") is True
+    assert doctor._is_local_endpoint("http://127.0.0.1:11434") is True
+    assert doctor._is_local_endpoint("http://127.0.0.2:11434") is True
+    assert doctor._is_local_endpoint("http://[::1]:11434") is True
+    assert doctor._is_local_endpoint("http://host.docker.internal:11434") is True
+
+    # Hostname substring attacks / remote hosts with localhost in path or query
+    assert doctor._is_local_endpoint("https://api.openai.com/v1?tag=localhost") is False
+    assert doctor._is_local_endpoint("https://localhost.attacker.com/v1") is False
+    assert doctor._is_local_endpoint("https://proxy.internal/127.0.0.1/rerank") is False
+    assert doctor._is_local_endpoint("") is False
+
+
+def test_doctor_external_mode_requires_endpoint_and_model():
+    mock_cfg = MagicMock()
+    mock_cfg.embedding.mode = "external"
+    mock_cfg.embedding.endpoint = ""
+    mock_cfg.embedding.model = ""
+    mock_cfg.embedding.api_key = "sk-valid-key"
+    mock_cfg.reranker.enabled = False
+
+    with patch("mortis_rag_mcp.config.load_config", return_value=mock_cfg):
+        res, _ = doctor.check_config(None)
+        assert res["ok"] is False
+        assert "endpoint缺失" in res["detail"]
+        assert "model缺失" in res["detail"]
+
+
+def test_doctor_external_mode_unprobed_cannot_be_valid(tmp_path, monkeypatch):
+    monkeypatch.setattr(doctor, "_status_dir", lambda: tmp_path)
+    mock_cfg = MagicMock()
+    mock_cfg.embedding.mode = "external"
+    mock_cfg.embedding.endpoint = "https://api.remote.com"
+    mock_cfg.embedding.model = "text-embed"
+    mock_cfg.embedding.api_key = "sk-valid"
+    mock_cfg.reranker.enabled = False
+
+    with patch("mortis_rag_mcp.config.load_config", return_value=mock_cfg):
+        # When full=False and no previous probe exists, external mode MUST NOT evaluate to True
+        exit_code = doctor.run(full=False, quiet=True)
+        assert exit_code == 1
+        data = doctor._read_json()
+        assert data["overall"] is False
+
+
+def test_doctor_run_preserves_generated_at_on_incremental(tmp_path, monkeypatch):
+    monkeypatch.setattr(doctor, "_status_dir", lambda: tmp_path)
+    status_json = tmp_path / "status.json"
+    status_json.write_text(
+        '{"generated_at": "2026-09-10T12:00:00+08:00", "sections": {"embedding_api": {"ok": true, "detail": "ok"}}}',
+        encoding="utf-8"
+    )
+    doctor.run(full=False, quiet=True)
+    data = doctor._read_json()
+    assert data["generated_at"] == "2026-09-10T12:00:00+08:00"
+
+
+def test_doctor_run_marks_expired_if_past_freshness_days(tmp_path, monkeypatch):
+    monkeypatch.setattr(doctor, "_status_dir", lambda: tmp_path)
+    status_json = tmp_path / "status.json"
+    # 20 days ago
+    status_json.write_text(
+        '{"generated_at": "2026-08-01T12:00:00+08:00", "sections": {"embedding_api": {"ok": true, "detail": "ok"}}}',
+        encoding="utf-8"
+    )
+    exit_code = doctor.run(full=False, quiet=True)
+    assert exit_code == 1
+    data = doctor._read_json()
+    assert data["overall"] is False
+

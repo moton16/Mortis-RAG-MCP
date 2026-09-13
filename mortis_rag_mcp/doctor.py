@@ -140,6 +140,21 @@ def check_optional_deps() -> dict:
     return _section(True, detail)
 
 
+def _is_local_endpoint(endpoint: str) -> bool:
+    if not endpoint:
+        return False
+    try:
+        from urllib.parse import urlsplit
+        ep = endpoint if "://" in endpoint else f"http://{endpoint}"
+        host = (urlsplit(ep).hostname or "").lower()
+        return (
+            host in ("localhost", "127.0.0.1", "0.0.0.0", "::1", "host.docker.internal")
+            or host.startswith("127.")
+        )
+    except Exception:
+        return False
+
+
 def check_config(app_config: str | None) -> tuple[dict, object | None]:
     try:
         from .config import load_config, resolve_config_path, resolve_api_key
@@ -148,9 +163,9 @@ def check_config(app_config: str | None) -> tuple[dict, object | None]:
         emb = getattr(cfg, "embedding", None)
         mode = getattr(emb, "mode", "?")
         model = getattr(emb, "model", "?")
-        endpoint = str(getattr(emb, "endpoint", "")).lower()
+        endpoint = str(getattr(emb, "endpoint", "")).strip()
         key = resolve_api_key(getattr(emb, "api_key", "") or "")
-        is_local = any(h in endpoint for h in ("localhost", "127.0.0.1", "0.0.0.0", "::1", "host.docker.internal"))
+        is_local = _is_local_endpoint(endpoint)
         key_configured = bool(key) or mode == "static" or is_local
 
         # 消除 static 模式下自相矛盾的"缺失"提示
@@ -163,17 +178,34 @@ def check_config(app_config: str | None) -> tuple[dict, object | None]:
         else:
             status_text = "缺失"
 
+        missing_fields = []
+        if mode == "external":
+            if not endpoint:
+                key_configured = False
+                missing_fields.append("endpoint缺失")
+            if not model:
+                key_configured = False
+                missing_fields.append("model缺失")
+
         rr = getattr(cfg, "reranker", None)
         rr_detail = ""
         if getattr(rr, "enabled", False):
             rr_key = resolve_api_key(getattr(rr, "api_key", "") or "")
-            rr_ep = str(getattr(rr, "endpoint", "")).lower()
-            rr_local = any(h in rr_ep for h in ("localhost", "127.0.0.1", "0.0.0.0", "::1", "host.docker.internal"))
+            rr_ep = str(getattr(rr, "endpoint", "")).strip()
+            rr_model = str(getattr(rr, "model", "")).strip()
+            rr_local = _is_local_endpoint(rr_ep)
+            if not rr_ep:
+                key_configured = False
+                rr_detail += "，reranker endpoint 缺失"
+            if not rr_model:
+                key_configured = False
+                rr_detail += "，reranker model 缺失"
             if not (rr_key or rr_local):
                 key_configured = False
-                rr_detail = "，reranker api_key 缺失"
+                rr_detail += "，reranker api_key 缺失"
 
-        detail = f"{Path(str(path)).name if path else '内置默认'}：embedding={mode}/{model}，api_key {status_text}{rr_detail}"
+        missing_str = f"（{'/'.join(missing_fields)}）" if missing_fields else ""
+        detail = f"{Path(str(path)).name if path else '内置默认'}：embedding={mode}/{model}，api_key {status_text}{missing_str}{rr_detail}"
         return _section(key_configured, detail), cfg
     except Exception as exc:
         return _section(False, f"配置加载失败：{exc}"), None
@@ -298,69 +330,105 @@ def run(full: bool = True, app_config: str | None = None, quiet: bool = False) -
                 stream.reconfigure(encoding="utf-8", errors="replace")
             except (AttributeError, ValueError, OSError):
                 pass
-    prev = _read_json()
-    sections: dict = {}
-    sections["python"] = check_python()
-    sections["package"] = check_package()
-    cfg_sec, cfg = check_config(app_config)
-    sections["config"] = cfg_sec
-    sections["registry"] = check_registry()
-    sections["optional_deps"] = check_optional_deps()
-    sections["cache"] = check_cache_dir(cfg)
-    if full and cfg is not None:
-        sections["embedding_api"] = probe_embedding(cfg)
-        sections["reranker_api"] = probe_reranker(cfg)
-    else:
-        suffix = "（沿用上次全量探测）"
-        for name in ("embedding_api", "reranker_api"):
-            old = prev.get("sections", {}).get(name)
-            if old:
-                old = dict(old)
-                raw_detail = str(old.get("detail", ""))
-                if not raw_detail.endswith(suffix):
-                    old["detail"] = raw_detail + suffix
-                sections[name] = old
-    merged = {**prev.get("sections", {}), **sections}
-    # 门禁加固：核心项至少 4 项（python, package, config, registry）全部在场且 ok
-    core_keys = ["python", "package", "config", "registry", "embedding_api", "reranker_api"]
-    core_present = [k for k in core_keys if k in merged]
-    overall = (len(core_present) >= 4) and all(merged[k].get("ok") for k in core_present)
-    data = {
-        "generated_at": _now_iso(),
-        "freshness_days": FRESHNESS_DAYS,
-        "overall": overall,
-        "version": _repo_version(),
-        "commit": _git_commit(),
-        "machine": platform.node(),
-        "sections": merged,
-    }
-    _atomic_write(_status_json_path(), json.dumps(data, ensure_ascii=False, indent=2))
-    _atomic_write(_status_md_path(), render_md(data))
-    if not quiet:
-        print(render_md(data))
-        print(f"overall={'VALID' if overall else 'BROKEN'}，已写入 {_status_md_path()}")
-    return 0 if overall else 1
+    from .registry import _process_file_lock
+    with _process_file_lock(_status_dir() / "status.lock"):
+        prev = _read_json()
+        sections: dict = {}
+        sections["python"] = check_python()
+        sections["package"] = check_package()
+        cfg_sec, cfg = check_config(app_config)
+        sections["config"] = cfg_sec
+        sections["registry"] = check_registry()
+        sections["optional_deps"] = check_optional_deps()
+        sections["cache"] = check_cache_dir(cfg)
+        if full and cfg is not None:
+            sections["embedding_api"] = probe_embedding(cfg)
+            sections["reranker_api"] = probe_reranker(cfg)
+        else:
+            suffix = "（沿用上次全量探测）"
+            for name in ("embedding_api", "reranker_api"):
+                old = prev.get("sections", {}).get(name)
+                if old:
+                    old = dict(old)
+                    raw_detail = str(old.get("detail", ""))
+                    if not raw_detail.endswith(suffix):
+                        old["detail"] = raw_detail + suffix
+                    sections[name] = old
+        merged = {**prev.get("sections", {}), **sections}
+
+        # 门禁加固：
+        # 1. 核心项 python, package, config, registry 全部在场且 ok
+        # 2. 若 embedding 模式为 external，embedding_api 必须在场且 ok，杜绝未探测外部网络即放行
+        # 3. 若 reranker 启用，reranker_api 必须在场且 ok
+        core_keys = ["python", "package", "config", "registry"]
+        emb_mode = getattr(getattr(cfg, "embedding", None), "mode", "static") if cfg else "static"
+        if emb_mode == "external":
+            core_keys.append("embedding_api")
+        if cfg and getattr(getattr(cfg, "reranker", None), "enabled", False):
+            core_keys.append("reranker_api")
+
+        prev_gen = prev.get("generated_at")
+        is_fresh = True
+        if full or not prev_gen:
+            gen_at = _now_iso()
+        else:
+            gen_at = prev_gen
+            try:
+                gen_dt = datetime.fromisoformat(prev_gen)
+                age_days = (datetime.now(timezone.utc).astimezone() - gen_dt).total_seconds() / 86400.0
+                if age_days > FRESHNESS_DAYS:
+                    is_fresh = False
+            except Exception:
+                is_fresh = True
+
+        all_core_ok = all(k in merged and merged[k].get("ok") for k in core_keys)
+        overall = all_core_ok and is_fresh
+        data = {
+            "generated_at": gen_at,
+            "freshness_days": FRESHNESS_DAYS,
+            "overall": overall,
+            "version": _repo_version(),
+            "commit": _git_commit(),
+            "machine": platform.node(),
+            "sections": merged,
+        }
+        _atomic_write(_status_json_path(), json.dumps(data, ensure_ascii=False, indent=2))
+        _atomic_write(_status_md_path(), render_md(data))
+        if not quiet:
+            print(render_md(data))
+            print(f"overall={'VALID' if overall else 'BROKEN'}，已写入 {_status_md_path()}")
+        return 0 if overall else 1
 
 
 def record_test_run(passed: int, failed: int, skipped: int, total_collected: int = 0) -> None:
     """供 tests/conftest.py 调用：仅记录成绩，绝不污染 overall 运行时判定，杜绝空跑伪阳性。"""
     try:
-        data = _read_json()
-        sections = data.get("sections", {})
-        is_full_run = (total_collected >= 150) or (total_collected > 0 and (passed + failed + skipped) == total_collected and total_collected >= 100)
-        detail_suffix = "" if is_full_run else "（局部测试）"
-        sections["tests"] = _section(failed == 0, f"{passed} passed, {failed} failed, {skipped} skipped（commit {_git_commit()}）{detail_suffix}")
-        data["sections"] = sections
-        data.setdefault("generated_at", _now_iso())
-        data.setdefault("freshness_days", FRESHNESS_DAYS)
-        data.setdefault("version", _repo_version())
-        data.setdefault("commit", _git_commit())
-        data.setdefault("machine", platform.node())
-        # 门禁约束：只有核心项真实存在且过半时才核算 overall，防止空文件被测试跑出伪 VALID
-        core_keys = ["python", "package", "config", "registry", "embedding_api", "reranker_api"]
-        core_present = [k for k in core_keys if k in sections]
-        data["overall"] = (len(core_present) >= 4) and all(sections[k].get("ok") for k in core_present)
-        _atomic_write(_status_json_path(), json.dumps(data, ensure_ascii=False, indent=2))
-        _atomic_write(_status_md_path(), render_md(data))
+        from .registry import _process_file_lock
+        with _process_file_lock(_status_dir() / "status.lock"):
+            data = _read_json()
+            sections = data.get("sections", {})
+            is_full_run = (total_collected >= 150) or (total_collected > 0 and (passed + failed + skipped) == total_collected and total_collected >= 100)
+            detail_suffix = "" if is_full_run else "（局部测试）"
+            sections["tests"] = _section(failed == 0, f"{passed} passed, {failed} failed, {skipped} skipped（commit {_git_commit()}）{detail_suffix}")
+            data["sections"] = sections
+            data.setdefault("generated_at", _now_iso())
+            data.setdefault("freshness_days", FRESHNESS_DAYS)
+            data.setdefault("version", _repo_version())
+            data.setdefault("commit", _git_commit())
+            data.setdefault("machine", platform.node())
+            # 门禁约束：只有核心项真实存在且有效，且原有 data 中已有 overall 时才核算，防止空文件被测试跑出伪 VALID
+            core_keys = ["python", "package", "config", "registry"]
+            if "embedding_api" in sections:
+                core_keys.append("embedding_api")
+            if "reranker_api" in sections:
+                core_keys.append("reranker_api")
+            core_present = [k for k in core_keys if k in sections]
+            if len(core_present) >= 4 and all(sections[k].get("ok") for k in core_present):
+                data["overall"] = bool(data.get("overall", False))
+            else:
+                data["overall"] = False
+            _atomic_write(_status_json_path(), json.dumps(data, ensure_ascii=False, indent=2))
+            _atomic_write(_status_md_path(), render_md(data))
     except Exception:
         pass
+
