@@ -86,8 +86,9 @@ def _process_file_lock(lock_path: Path):
         except OSError:
             pass
 
+# v4（0.7.0）：vaults 条目新增 description 字段（老文件没有该键 → ""）。
 # v3（0.6.0）：vaults 条目新增 solo 布尔字段（老文件没有该键 → False）。
-REGISTRY_VERSION = 3
+REGISTRY_VERSION = 4
 
 
 def user_config_dir() -> Path:
@@ -121,6 +122,7 @@ class VaultEntry:
     registered_at: float  # time.time()
     weight: float = 1.0  # 跨库检索时该库分数的放大系数：>1 表示更偏好这个库
     solo: bool = False   # solo 库不参与跨库 fan-out，仅在显式指定 vault_path 时被检索
+    description: str = ""  # v4（0.7.0）：库的语义说明（如"数电教材+课件"），供模型定向选库
 
 
 class VaultRegistry:
@@ -177,6 +179,8 @@ class VaultRegistry:
                         solo = solo_raw.strip().lower() in {"1", "true", "yes", "on"}
                     else:
                         solo = bool(solo_raw)
+                    # description 是 v4 新增字段：老 toml 里没有 → ""（不参与任何旧逻辑，纯元数据）。
+                    description = str(raw.get("description", "") or "")
                     file_entries.append(
                         VaultEntry(
                             path=path_value,
@@ -184,6 +188,7 @@ class VaultRegistry:
                             registered_at=registered_at,
                             weight=weight,
                             solo=solo,
+                            description=description,
                         )
                     )
         known = {normalize_vault_key(entry.path) for entry in file_entries}
@@ -209,6 +214,9 @@ class VaultRegistry:
             lines.append(f"weight = {entry.weight}")
             # TOML 布尔字面量必须小写。
             lines.append(f"solo = {str(entry.solo).lower()}")
+            # 空串不写入，保持老文件干净；序列化与 path/name 同款 json.dumps 防注入。
+            if entry.description:
+                lines.append(f"description = {json.dumps(entry.description, ensure_ascii=False)}")
             lines.append("")
         tmp = self.path.with_name(f"{self.path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
         try:
@@ -231,6 +239,7 @@ class VaultRegistry:
         persist: bool = True,
         weight: float = 1.0,
         solo: bool = False,
+        description: str = "",
     ) -> VaultEntry:
         with self._lock, _process_file_lock(self._lock_path):
             resolved = str(Path(path).expanduser().resolve())
@@ -244,6 +253,7 @@ class VaultRegistry:
                 registered_at=time.time(),
                 weight=float(weight),
                 solo=bool(solo),
+                description=str(description or "").strip(),
             )
             entries.append(entry)
             if persist:
@@ -295,6 +305,18 @@ class VaultRegistry:
                     self.save(entries)
                     return entry
             raise ValueError(f"vault not registered: {path}")
+
+    def set_description(self, path: str | os.PathLike[str], description: str) -> VaultEntry:
+        """更新库描述。与 set_weight 同款：load→改→save，进程锁+跨进程文件锁。"""
+        with self._lock, _process_file_lock(self._lock_path):
+            resolved = str(Path(path).expanduser().resolve())
+            entries = self.load()
+            for entry in entries:
+                if normalize_vault_key(entry.path) == normalize_vault_key(resolved):
+                    entry.description = description.strip()
+                    self.save(entries)
+                    return entry
+            raise ValueError(f"vault not registered: {resolved}")
 
     def get(self, path: str | os.PathLike[str]) -> VaultEntry | None:
         target = normalize_vault_key(path)

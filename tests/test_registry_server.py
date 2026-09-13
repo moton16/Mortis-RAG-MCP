@@ -161,3 +161,39 @@ def test_stdio_legacy_vault_path_auto_migrates(tmp_path):
     assert data["vaults"][0]["path"] == str(vault.resolve())
     search = _payload(responses[2])
     assert any("XYZ999" in chunk["content"] for chunk in search["chunks"])
+
+
+def test_vault_description_roundtrip(tmp_path):
+    """description 注册写入→load 还原→set_description 更新→老 toml（无该键）回退 ''。"""
+    from mortis_rag_mcp.registry import VaultRegistry
+
+    reg_path = tmp_path / "vaults.toml"
+    reg = VaultRegistry(reg_path)
+    vault = tmp_path / "数电库"
+    vault.mkdir()
+
+    # a. registry.add 写入 description 后 load 还原正确
+    entry = reg.add(vault, "数电库", description="数电教材")
+    assert entry.description == "数电教材"
+    loaded = VaultRegistry(reg_path).load()
+    assert len(loaded) == 1
+    assert loaded[0].description == "数电教材"
+
+    # b. registry.set_description 更新后 load 还原正确
+    updated = reg.set_description(vault, "数电教材+课件")
+    assert updated.description == "数电教材+课件"
+    loaded_after_update = VaultRegistry(reg_path).load()
+    assert len(loaded_after_update) == 1
+    assert loaded_after_update[0].description == "数电教材+课件"
+
+    # c. 手工写入不含 description 的老 vaults.toml 后 load 得到 description == ""
+    legacy_path = tmp_path / "legacy_vaults.toml"
+    legacy_path.write_text(
+        'version = 3\n\n[[vaults]]\npath = "C:/LegacyVault"\nname = "Legacy"\nregistered_at = 1.0\nweight = 1.0\nsolo = false\n',
+        encoding="utf-8",
+    )
+    legacy_reg = VaultRegistry(legacy_path)
+    legacy_loaded = legacy_reg.load()
+    assert len(legacy_loaded) == 1
+    assert legacy_loaded[0].description == ""
+

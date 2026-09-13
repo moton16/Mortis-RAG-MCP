@@ -16,6 +16,14 @@ from .registry import VaultEntry, VaultRegistry, registry_path
 
 SERVER_INFO = {"name": "mortis-rag-mcp", "version": "0.6.0", "title": "Mortis'RAG MCP"}
 
+SERVER_INSTRUCTIONS = (
+    "本服务器提供本地 Markdown 知识库检索。路由纪律："
+    "1) 用户问题或上下文已明确目标库/目录时，kb_search 必须传 vault_path 或 path_prefix 定向检索；"
+    "仅在目标模糊或确需跨库时省略 vault_path。"
+    "2) 不确定有哪些库时先 kb_list 查看各库 description 再选库。"
+    "3) kb_read 尽量带 start_line/end_line 限定范围，避免一次拉全篇。"
+)
+
 
 def _parse_epoch(value: Any) -> float | None:
     """把 MCP 参数解析成 epoch 秒：接受数字、数字字符串和 ISO 8601 字符串。
@@ -111,6 +119,7 @@ def _tool_definitions() -> list[dict[str, Any]]:
             "inputSchema": {"type": "object", "required": ["path"], "properties": {
                 "path": {"type": "string", "description": "必填，要注册为知识库的文件夹绝对路径"},
                 "name": {"type": "string", "description": "可选，显示名，默认取文件夹名"},
+                "description": {"type": "string", "description": "可选，一句话说明这个库装什么（如 '数电教材+课件'）。写给未来的检索路由看：模型靠它判断该不该定向选库，务必具体。"},
             }},
         },
         {
@@ -140,6 +149,14 @@ def _tool_definitions() -> list[dict[str, Any]]:
             "inputSchema": {"type": "object", "required": ["vault_path", "weight"], "properties": {
                 "vault_path": {"type": "string", "description": "必填，已注册知识库的绝对路径"},
                 "weight": {"type": "number", "exclusiveMinimum": 0, "maximum": 100, "description": "必填，权重系数，取值 0 < weight <= 100；1.0 为默认不放大"},
+            }},
+        },
+        {
+            "name": "kb_describe",
+            "description": "设置/更新知识库的描述（一句话说明这个库装什么，供检索路由定向选库用）。与 kb_set_weight 平行的元数据工具。",
+            "inputSchema": {"type": "object", "required": ["vault_path", "description"], "properties": {
+                "vault_path": {"type": "string", "description": "必填，已注册知识库的绝对路径"},
+                "description": {"type": "string", "description": "必填，库内容的一句话描述，要具体（差：'笔记'；好：'数字电路教材解析稿+课件'）"},
             }},
         },
         {
@@ -173,12 +190,12 @@ def _tool_definitions() -> list[dict[str, Any]]:
         },
         {
             "name": "kb_search",
-            "description": "搜索知识库并返回结构化原始 chunks。不传 vault_path 时跨全部非 solo 注册库 fan-out 检索（结果带 vault 字段；solo 库被跳过并在 excluded_solo 中列出）；solo 库必须显式传 vault_path 才会被搜索。",
+            "description": "搜索知识库并返回结构化 chunks。路由纪律：用户问题或上下文已明确指向特定库/目录时，必须传 vault_path 或 path_prefix 定向检索（精度更高、噪音更少）；仅在目标模糊或确需跨库时才省略 vault_path 做跨库 fan-out（结果带 vault 字段；solo 库被跳过并在 excluded_solo 中列出）。不确定有哪些库时先 kb_list 看各库 description 再决定。",
             "inputSchema": {"type": "object", "required": ["query"], "properties": {
                 "query": {"type": "string"}, "top_k": {"type": "integer", "minimum": 1, "default": 10}, "use_rerank": {"type": "boolean", "default": True},
                 "vault_path": {"type": "string", "description": "可选，已注册知识库的绝对路径；缺省时跨全部非 solo 注册库检索"},
                 "group_by_vault": {"type": "boolean", "default": False, "description": "可选，仅跨库检索（不传 vault_path）时生效：结果按知识库分组返回 groups，每组取 top_k 条"},
-                "path_prefix": {"type": "string", "description": "可选，只保留 source 以该前缀开头的 chunk（source 是库内相对 posix 路径，如 '教材/'）"},
+                "path_prefix": {"type": "string", "description": "可选，只保留 source 以该前缀开头的 chunk（source 是库内相对 posix 路径）。用户提到具体课程名/文件夹名/主题目录时，用它把检索限定在该子树，如 '教材/'、'数字电路/'"},
                 "tags": {"type": "array", "items": {"type": "string"}, "description": "可选，frontmatter 标签过滤：命中任一标签即保留（大小写不敏感，自动去掉 '#' 前缀）"},
                 "mtime_after": {"type": ["number", "string"], "description": "可选，只保留修改时间 >= 该值的文件；epoch 秒或 ISO 8601 字符串（如 '2026-01-01'）"},
                 "mtime_before": {"type": ["number", "string"], "description": "可选，只保留修改时间 <= 该值的文件；epoch 秒或 ISO 8601 字符串"},
@@ -366,6 +383,7 @@ class VaultMcpServer:
             items.append({
                 "name": entry.name,
                 "path": entry.path,
+                "description": entry.description,
                 "registered_at": entry.registered_at,
                 "weight": entry.weight,
                 "solo": entry.solo,
@@ -381,12 +399,13 @@ class VaultMcpServer:
         if not path:
             raise ValueError("path is required for kb_init")
         name_arg = str(arguments.get("name", "")).strip() or None
+        desc = str(arguments.get("description", "")).strip()
         resolved = self._resolve_vault_path(path, for_registration=True)
         # Register first (fail fast, no half state), then build the indexer.
         try:
-            entry = self.registry.add(resolved, name_arg)
+            entry = self.registry.add(resolved, name_arg, description=desc)
         except OSError:
-            entry = self.registry.add(resolved, name_arg, persist=False)
+            entry = self.registry.add(resolved, name_arg, description=desc, persist=False)
         indexer = self._indexer_for({"vault_path": entry.path})
         threading.Thread(target=indexer.sync, daemon=True, name="vault-init").start()
         md_files = sum(1 for _ in Path(entry.path).rglob("*.md") if _.is_file())
@@ -394,6 +413,7 @@ class VaultMcpServer:
             "registered": True,
             "path": entry.path,
             "name": entry.name,
+            "description": entry.description,
             "indexing": "started in background",
             "md_files": md_files,
         }
@@ -467,6 +487,15 @@ class VaultMcpServer:
             "watcher_stopped": watcher_stopped,
             "cache_purged": cache_purged,
         }
+
+    def _kb_describe(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        raw = str(arguments.get("vault_path", "")).strip()
+        desc = str(arguments.get("description", "")).strip()
+        if not raw or not desc:
+            raise ValueError("vault_path and description are required for kb_describe")
+        path = self._resolve_vault_path(raw)
+        entry = self.registry.set_description(path, desc)
+        return {"path": entry.path, "name": entry.name, "description": entry.description}
 
     def _fanout_search(self, query: str, top_k: int, use_rerank: bool, group_by_vault: bool = False, filters: SearchFilter | None = None, dedupe: bool = True) -> dict[str, Any]:
         """Search across every registered (existing) vault, merge and rerank once.
@@ -614,6 +643,8 @@ class VaultMcpServer:
             return _text_content(self._kb_init_solo(arguments))
         if name == "kb_remove":
             return _text_content(self._kb_remove(arguments))
+        if name == "kb_describe":
+            return _text_content(self._kb_describe(arguments))
         if name == "kb_list":
             return _text_content(self._list_vaults())
         if name == "kb_set_weight":
@@ -772,7 +803,12 @@ class VaultMcpServer:
         if method in {"notifications/initialized", "notifications/cancelled"}:
             return None
         if method == "initialize":
-            return _json_result(request_id, {"protocolVersion": "2025-06-18", "capabilities": {"tools": {"listChanged": False}}, "serverInfo": SERVER_INFO})
+            return _json_result(request_id, {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {"tools": {"listChanged": False}},
+                "serverInfo": SERVER_INFO,
+                "instructions": SERVER_INSTRUCTIONS,
+            })
         if method == "ping":
             return _json_result(request_id, {})
         if method == "tools/list":

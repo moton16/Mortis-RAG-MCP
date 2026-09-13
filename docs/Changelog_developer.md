@@ -17,3 +17,9 @@
 - 动机：P1-P3 都会动检索行为，先立度量尺
 - 验证：占位查询跑通（MISS 正常捕获，耗时 0.00s）；真实 vault 抽测跑通（0.09s）；Hit@5 基线 = 0.0%
 
+### C1 — moton16,2026-9-13,Antigravity,Gemini 3.8 Flash — feat(registry,server): vault description + kb_describe + instructions + 路由纪律
+- registry.py：VaultEntry.description / set_description（load/save 兼容老 toml）
+- server.py：kb_init 收 description；_list_vaults 返回 description；新增 kb_describe 工具；kb_search 与 path_prefix 描述加入路由纪律；initialize 响应加 instructions
+- 测试：tests/test_registry_server.py（roundtrip/老 toml 回退）、tests/test_mcp_stdio.py（instructions/kb_describe schema 与调用）
+- 验证：pytest 9 passed (1.92s)；eval Hit@5 = 0.0%（基线维持）
+
