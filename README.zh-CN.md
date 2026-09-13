@@ -23,7 +23,7 @@
 | Python | `>= 3.10`（实际运行 `3.13.12`） | `pyproject.toml` 声明，MCP 服务运行于 managed 3.13.12 |
 | 构建后端 | `setuptools >= 68` | `pyproject.toml` build-system |
 | MCP 协议 | `2025-06-18` | `server.py` 中 `initialize` 声明的协议版本 |
-| 项目包名 | `vault-mcp` | 控制台入口：`vault-mcp --serve-mcp-stdio` |
+| 项目包名 | `mortis-rag-mcp` | 控制台入口：`mortis-rag-mcp --serve-mcp-stdio`（旧 `vault-mcp` 兼容保留） |
 
 ### 1.2 运行时依赖
 
@@ -77,11 +77,13 @@ API Key 通过环境变量注入（`EMBEDDING_API_KEY` / `RERANKER_API_KEY`）�
 | **Qwen3-Embedding 系列 / BGE-reranker-v2-m3** | 开源模型 | 通过硅基流动托管 API 调用，模型名直接写死在 `config/app.toml` |
 | **Obsidian vault 目录约定** | 数据格式 | 识别 `---frontmatter---` 与 `tags:`、`# 标题` 层级、`.obsidian` 隐藏目录忽略 |
 
-### 2.2 模块继承结构（自研包 `vault_mcp/`）
+### 2.2 模块继承结构（自研包 `mortis_rag_mcp/`）
 
-| 模块 | 职责 | 对外接口 |
+各模块单职责：
+
+| 模块 | 职责 | 核心暴露 |
 |---|---|---|
-| `config.py` | TOML 配置加载、环境变量插值、参数校验 | `load_config(path)` → `AppConfig` |
+| `config.py` | TOML 配置加载、环境变量覆盖、默认值合并、单例获取 | `load_config` / `get_config` |
 | `providers.py` | 外部 HTTP 封装（embedding / reranker）、静态哈希 embedding 兜底 | `create_embedding_provider` / `create_reranker_provider` |
 | `indexer.py` | 文件扫描、切块、增量同步、磁盘缓存、检索（词法+语义+rerank） | `MarkdownIndexer` 类 |
 | `server.py` | MCP 协议层：工具定义、请求分发、stdio 服务 | `serve_stdio(config_path)` |
@@ -91,10 +93,10 @@ API Key 通过环境变量注入（`EMBEDDING_API_KEY` / `RERANKER_API_KEY`）�
 MCP 服务注册在 `~/.workbuddy/mcp.json`（stdio 模式）：
 
 ```json
-"vault-mcp": {
+"mortis-rag-mcp": {
   "type": "stdio",
   "command": "python",
-  "args": ["-m", "vault_mcp", "--serve-mcp-stdio", "--app-config", "<项目目录>/config/app.toml"],
+  "args": ["-m", "mortis_rag_mcp", "--serve-mcp-stdio", "--app-config", "<项目目录>/config/app.toml"],
   "env": {
     "PYTHONPATH": "<项目目录>",
     "EMBEDDING_API_KEY": "...",
@@ -103,7 +105,7 @@ MCP 服务注册在 `~/.workbuddy/mcp.json`（stdio 模式）：
 }
 ```
 
-也可在 Codex / Trae 中注册为 `mcp_servers.vault_mcp`（详见英文版 README）。
+也可在 Codex / Trae 中注册为 `mcp_servers.mortis_rag_mcp`（详见英文版 README）。
 
 ### 2.4 本会话（2026-08-08）新增的优化项
 
