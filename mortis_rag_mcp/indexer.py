@@ -953,12 +953,27 @@ class MarkdownIndexer:
 
                 raw = path.read_bytes()
                 signature = hashlib.sha256(raw).hexdigest()
+                # 读盘/哈希完成后重新观测一次，作为该签名的登记时刻。用“读完之后”
+                # 的观测点有两个好处：一是它与刚读到的那份内容严格对应（读期间若
+                # 有写入，重取会看到新的 mtime，下一轮自然会被判不可信）；二是此时
+                # 文件已写完关闭，其 mtime 不会再被这次写入改动，不容易落进
+                # “写入与观测同处一个时间戳刻度”的窗口。实测 Windows 上写入紧接
+                # 同步时约有 3% 概率踩中该窗口（本地 NTFS 300 次 0 次），这正是
+                # 零读盘契约在 Windows CI 上偶发失败的来源。
+                try:
+                    restat = path.stat()
+                    settled_ns = int(restat.st_mtime_ns)
+                    settled_sig = (settled_ns, int(restat.st_size))
+                    recorded_at_ns = time.time_ns()
+                except OSError:
+                    settled_sig = fast_sig
+                    recorded_at_ns = seen_ns
                 if self._signatures.get(source) == signature:
                     # 内容实测未变（可能是被 racily clean 判据逼下来复核的，也可能
-                    # 只是 mtime 被 touch 过）。按本次观测时刻重新登记，使该条目在
-                    # 下一轮恢复可信、重新走零读盘快速路径。
-                    self._stat_cache[source] = fast_sig
-                    self._stat_seen_ns[source] = seen_ns
+                    # 只是 mtime 被 touch 过）。按重新观测到的签名与时刻登记，使该
+                    # 条目在下一轮恢复可信、重新走零读盘快速路径。
+                    self._stat_cache[source] = settled_sig
+                    self._stat_seen_ns[source] = recorded_at_ns
                     continue
                 text = raw.decode("utf-8-sig")
                 # 顺手复用上面 read_bytes 已经打开的目录项做一次 stat，记录文件
@@ -966,7 +981,9 @@ class MarkdownIndexer:
                 # mtime 语义上是"内容最后一次变化的时间"，而不是每次 touch 都更新。
                 mtime = float(stat.st_mtime)
                 chunks = self._chunk_file(source, text, mtime)
-                changed.append((source, signature, chunks, fast_sig, seen_ns))
+                changed.append(
+                    (source, signature, chunks, settled_sig, recorded_at_ns)
+                )
             except Exception as exc:
                 self.failed_files[source] = str(exc)
                 self._chunks.pop(source, None)

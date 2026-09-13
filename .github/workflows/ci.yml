@@ -61,4 +61,4 @@ jobs:
           python -m pip list
 
       - name: Run tests
-        run: python -m pytest -q -s --durations=15
+        run: python -m pytest -q --durations=15
