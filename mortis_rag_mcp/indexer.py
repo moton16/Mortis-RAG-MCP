@@ -548,10 +548,9 @@ class MarkdownIndexer:
         self._chunks: dict[str, list[Chunk]] = {}
         self._signatures: dict[str, str] = {}
         self._stat_cache: dict[str, tuple[int, int]] = {}
-        # 上一次扫描完成的时刻（纳秒），Fast-Stat 锚点的退化选项：仅当索引缓存
-        # 未启用（cache.enabled=False）或尚未落盘时使用。此时无法借索引文件的
-        # mtime 做跨进程单调锚点，只能退化为进程内时钟。见
-        # _fast_path_is_trustworthy / _index_written_ns。
+        # 本轮扫描的结束时刻（纳秒），仅供观测/诊断；快速路径判据已改用
+        # _index_written_ns()，兜底锚点改为扫描起点 scan_started_ns（见
+        # _sync_locked / _fast_path_is_trustworthy）。
         self._scan_completed_ns: int = 0
         # 文本层缓存失效时，初始化阶段读出来的向量暂存到这里，等 sync 重建
         # 文本后再按 chunk.id 补挂（见 _load_vectors_cache / _attach_pending_vectors）。
@@ -895,37 +894,41 @@ class MarkdownIndexer:
         with self._sync_lock:
             return self._sync_locked()
 
-    def _fast_path_is_trustworthy(self, mtime_ns: int) -> bool:
+    def _fast_path_is_trustworthy(self, mtime_ns: int, scan_started_ns: int) -> bool:
         """(mtime_ns, size) 快速短路是否可信 —— Git “racily clean” 判据。
 
         快速路径靠 (mtime_ns, size) 相等跳过 sha256，但该判据只在“内容变化必然
         推动 mtime 前进”时成立，以下场景会击穿它：
 
-        1. 时间戳粒度：文件时间戳并非真纳秒（NTFS 实测刻度约 3ms，FAT32 达 2s，
+        1. 时间戳粒度：文件时间戳并非真纳秒（NTFS 刻度约 3ms，FAT32 达 2s，
            网络卷更粗）。等长内容替换（"old content" -> "new content"，均 18
-           字节）若与前一次写入落在同一刻度内，mtime_ns 与 size 双双不变，文件
+           字节）若与索引落盘落在同一刻度内，mtime_ns 与 size 双双不变，文件
            被误判为未修改，旧 chunk 静默残留并继续被召回。Git 把这种条目称为
-           *racily clean*（见 git-scm.com/docs/racy-git），其处理同样是“回退读
-           内容比对”；Borg 的 files cache 亦逐出“时间戳等于归档最新时间戳”的
-           文件，理由与此完全一致。
+           *racily clean*（git-scm.com/docs/racy-git），其处理同样是“回退读内容
+           比对”；Borg 的 files cache 亦逐出“时间戳等于归档最新时间戳”的文件。
         2. 显式回拨 mtime：os.utime / touch -d / 部分同步与备份工具会把 mtime
            恢复成旧值，内容已变而签名不变。
 
-        判据对齐 Git 的 *racily clean* 检查（git-scm.com/docs/racy-git）：当缓存
-        签名说“文件未修改”，而文件 st_mtime **不早于**索引自身的时间戳时，必须
-        回退读内容精确比对。Git 原文：“When the cached stat information says the
-        file has not been modified, and the st_mtime is the same as (or newer
-        than) the timestamp of the index file itself ... it also compares the
-        contents”。因为索引总是在采集完所有 stat 信息之后才落盘，其时间戳通常
-        不早于其中任何条目，所以真正可疑的只有“mtime 与索引时间戳相同”的条目。
-        因此判据取反向：仅 mtime 严格早于锚点时允许信任签名相等。锚点优先取索引
-        缓存文件的 st_mtime_ns（文件系统时间戳单调、跨进程重启有效，且与待比较
-        的文件 mtime 同处一个时基）；缓存未启用时退化为进程内扫描完成时刻。无任
-        何可用锚点时返回 False（全量精算）。
+        Git 原文（racy-git）：“When the cached stat information says the file has
+        not been modified, and the st_mtime is the same as (or newer than) the
+        timestamp of the index file itself ... it also compares the contents”，
+        且“index entries that can be racily clean are limited to the ones that
+        have the same timestamp as the index file itself”。因为索引总是在采集完
+        所有 stat 信息之后才落盘，其时间戳通常不早于其中任何条目，所以真正可疑
+        的只有“mtime 与锚点相同或更晚”的条目。判据因此取反向：只有 mtime 严格
+        早于锚点才信任签名相等。
+
+        锚点优先取索引缓存文件的 st_mtime_ns（一次 write-then-close 的定局时间，
+        单调、跨进程重启有效，且与待比较的文件 mtime 同处一个时基）；缓存未启用
+        时退化为本次扫描的起点时刻 scan_started_ns。把兜底锚点放在扫描“开始”
+        而非“结束”是关键：不变文件上一轮就已存在，其 mtime 必然早于本轮起点，
+        不会因粒度碰撞被反复误判为可疑，零读盘快速路径得以稳定成立；而扫描期间
+        被写过的文件 mtime >= 起点，会被强制 sha256 复核。无锚点时返回 False
+        （退化为全量精算，宁可慢不可错）。
         """
         anchor_ns = self._index_written_ns()
         if anchor_ns <= 0:
-            anchor_ns = self._scan_completed_ns
+            anchor_ns = scan_started_ns
         if anchor_ns <= 0:
             return False
         return mtime_ns < anchor_ns
@@ -946,6 +949,11 @@ class MarkdownIndexer:
 
     def _sync_locked(self) -> list[Chunk]:
         self.vault_path.mkdir(parents=True, exist_ok=True)
+        # 本次扫描的起点时刻（纳秒），缓存未启用时的退化锚点。必须在本轮任何
+        # stat 之前取：这样“上一轮就已存在且此后没被动过”的文件其 mtime 严格早
+        # 于该值，能被判定可信、继续享受零读盘快速路径；而扫描期间被写过的文件
+        # mtime >= 该值，会被强制走 sha256 复核。
+        scan_started_ns = time.time_ns()
         failed_before = dict(self.failed_files)
         found: set[str] = set()
         changed: list[tuple[str, str, list[Chunk], tuple[int, int]]] = []
@@ -958,7 +966,9 @@ class MarkdownIndexer:
                 if (
                     source in self._signatures
                     and self._stat_cache.get(source) == fast_sig
-                    and self._fast_path_is_trustworthy(int(stat.st_mtime_ns))
+                    and self._fast_path_is_trustworthy(
+                        int(stat.st_mtime_ns), scan_started_ns
+                    )
                 ):
                     continue
 
@@ -1029,9 +1039,8 @@ class MarkdownIndexer:
                 except Exception:
                     pass
         self.last_sync = time.time()
-        # 扫描完成时刻，供 _fast_path_is_trustworthy 在无索引缓存时退化使用。
-        # 必须在所有 stat/read 之后取：这样扫描期间被写过的文件其 mtime 都
-        # >= 该时刻，下次扫描会被强制走 sha256 精确校验。
+        # 本轮扫描的结束时刻（纳秒），仅供观测/诊断；快速路径判据已改用
+        # _index_written_ns()，兜底锚点改为扫描起点（见 _sync_locked）。
         self._scan_completed_ns = time.time_ns()
         # 什么都没变时跳过缓存重写：原生监听（[cache] placement = "vault"）下，
         # 每次写缓存都会再次触发文件事件，无变化也重写等于自激的同步死循环。
