@@ -84,7 +84,7 @@
 - README.zh-CN.md & docs/PROJECT_GUIDE.md：更新版本标头为 v0.7.0 并同步新特性
 - 验证：全量测试 231 passed，Hit@5 100%，准备合入与推流
 
-
-
-
-
+### C10 — moton16,2026-9-13,Antigravity,Gemini 3.8 Flash — docs: purge root AGENTS/CLAUDE files and streamline READMEs to user perspective
+- 移除根目录冗余的 `AGENTS.md` 与 `CLAUDE.md`，开发者协作与文档分工准则统一收敛于 `docs/Quick-start_developer.md` 与 `docs/PROJECT_GUIDE.md`。
+- 大幅精简重写 `README.md` 与 `README.zh-CN.md`，彻底移除数百行历史故障复盘、内存基准分析与底层结构排查等技术黑话。
+- 主页文档全面对齐 `QUICKSTART_user.md` 与 `CHANGELOG_user.md` 简化版，聚焦产品特性、5 分钟极简上手、核心工具速查与文档导航，打造清爽优雅的项目主页。
