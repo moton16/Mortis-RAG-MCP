@@ -6,7 +6,7 @@
 
 ## 在这里，你才需要详细描述每次commit的代码逻辑、技术框架的更改，请标明提交commit人员的GitHub账户名，如果是agent执行的，请一并标出是什么agent处理的。如editor:moton16,codex.
 
-> \\\\\\\*\\\\\\\*版本\\\\\\\*\\\\\\\*：对应 v0.6.0（2026-09-04，本地工作副本）。0.6.0 变更：新增 solo 独立库（`kb\\\\\\\_init\\\\\\\_solo` / fan-out 排除 / `excluded\\\\\\\_solo` 返回），三个工具更名（`kb\\\\\\\_unregister`→`kb\\\\\\\_remove`、`kb\\\\\\\_vaults`→`kb\\\\\\\_list`、`kb\\\\\\\_list`→`kb\\\\\\\_list\\\\\\\_files`），注册表 REGISTRY\\\\\\\_VERSION 2→3，以及 Fast-Stat 轻量对账、代码块围栏保护、只读打分纯洁性、注册表跨进程排他锁与短英文专业词汇精准提权。逐项代码逻辑见\[第十五节：版本变更详录](#十五版本变更详录)。
+> \\\\\\\*\\\\\\\*版本\\\\\\\*\\\\\\\*：对应 v0.7.0（2026-09-13，本地工作副本）。0.7.0 变更：新增 PDF/Office 文档摄取层（`kb_ingest` / MinerU 双通道 / `.mortis-parsed/` 隔离）、定向检索路由（`kb_describe` / `VaultEntry.description` / initialize instructions / fan-out hint / 判定表化 SKILL.md 5.0）、HTML 表格原子块保护与大表分片、检索回归评测 harness（Hit@K / MRR），以及对抗审查 20 项缺陷清零加固。逐项代码逻辑见\[第十五节：版本变更详录](#十五版本变更详录)。
 >
 > ⚠️ \\\\\\\*\\\\\\\*本机本地改动（2026-09-01）\\\\\\\*\\\\\\\*：此工作副本把 Python 包目录 `vault\\\\\\\_mcp/` 改名为
 > `mortis\\\\\\\_rag\\\\\\\_mcp/`（pyproject 入口、tests 已同步），仓库目录也从 `E:\\\\\\\\coding\\\\\\\\moton's RAG MCP`
@@ -803,6 +803,52 @@ python -m pytest -q                       # 应全绿
 ## 十五、版本变更详录
 
 > 本节按版本记录每次 commit 的代码逻辑与技术框架更改（用户可感知的功能增减见外部 CHANGELOG.md，按项目规范两者详略互补）。新版本倒序追加在顶部，每条必须标注 editor：提交人 GitHub 账户名 + 执行 agent（无 agent 则省略）。
+
+### v0.7.0（2026-09-13）—— 文档摄取层 + 定向检索路由 + 表格保护与分片 + 评测 Harness
+
+#### editor:moton16,antigravity
+
+**背景与动机**：
+随着知识库规模扩大与多源知识混合沉淀，用户在实际使用中面临三大核心痛点：
+1. **多库盲目 fan-out 与路由噪音**：知识库数量增多后，通用 query 会横跨全部库并发广播，不仅浪费 token 与算力，还导致跨领域无关笔记稀释检索精度。需要显式元数据让 AI 能理解各个库的职责并定向选库。
+2. **非 Markdown 文档（PDF/Docx/PPT/Excel）无法直接检索**：大量高校教材、课件、技术手册以 PDF/Office 格式存放于笔记目录，原系统仅支持 `.md`。需要在零第三方运行时依赖前提下，提供高可用、异步、容错的外部 MinerU 与本地兜底摄取链路，将非 Markdown 文档转化为标准结构化 Markdown。
+3. **复杂 HTML 表格切块碎裂**：MinerU 解析产物富含复杂 HTML 表格，原有切块逻辑遇到表格内部 `#` 标题或换行时会切碎表格，丢失行号、表头上下文与语义闭合。
+为此实施了 v0.7.0 架构升级，包含 P0 评测 harness、P1 定向路由、P2 文档摄取、表格保护，并通过 20 项红队对抗审查全量缺陷清零。
+
+**代码逻辑与技术框架变更**：
+
+* `mortis_rag_mcp/registry.py`（REGISTRY_VERSION 3→4）：
+  * `VaultEntry` 新增 `description: str = ""` 字段，存储单库的自然语言业务说明。
+  * `set_description(path, description)`：遵循跨进程建议锁与原子覆写模式，安全更新并落盘。
+  * 向后兼容：老 v3 格式 toml 缺省该字段时自动回退 `""`。
+* `mortis_rag_mcp/server.py`：
+  * **工具扩充至 15 个**：
+    * 新增 `kb_describe`：允许模型或用户显式更新知识库描述元数据。
+    * 新增 `kb_ingest`：异步摄取文档，支持 `submit`（入队解析）、`status`（任务与进度查询）、`pending`（待处理文档扫描）三态。
+  * **定向路由引导纪律**：
+    * MCP `initialize` 响应协议注入 `instructions`，从握手层约束 AI 在上下文明确时必须传 `vault_path` 或 `path_prefix`。
+    * `kb_search` 跨库 fan-out 时在结果中动态注入 `hint`，引导调用方收敛检索范围。
+    * `kb_init` / `kb_init_solo` 在扫描到存在 PDF/Office 时给出配置开启引导 hint。
+  * 版本号统一 bump 至 `0.7.0`。
+* `mortis_rag_mcp/ingest/`（新模块体系）：
+  * `mineru.py`：纯标准库 `urllib` 实现 MinerU API 双通道客户端（v4 精准 + Agent 轻量免登通道），含 429 Retry-After 重试、致命错误码熔断与 zip 解包。
+  * `tables.py`：`iter_table_blocks` 表格识别与闭合防护、`convert_small_tables` 小表管道化、`split_large_table` 大表分片与表头上下文保留。
+  * `worker.py`：`IngestManager` 任务状态机、跨进程 `.ingest.lock` 文件锁、`.mortis-parsed/` 隔离落盘、双检锁与增量哈希幂等跳过、PyMuPDF 本地兜底。
+* `mortis_rag_mcp/indexer.py`：
+  * 切块集成表格原子块保护与动态字符预算装箱，避免超出 `chunk_size`。
+  * 缓存元数据引入 `table_guard` 机制。
+* `scripts/eval_search.py`：
+  * 引入 Hit@K、MRR 评测度量回归套件，支持真实知识库的金标准测试。
+* `skills/mortis-rag-mcp/SKILL.md`：
+  * 5.0.0 重构为 5 级判定表，全面覆盖 15 个工具的调用决策树与路由约束。
+
+**红队对抗审计闭环（D1–D20 清零）**：
+* 修复路径穿越安全风险（D1）、未闭合表格解析边界（D2/D5）、大表超预算切分（D3/D4）、跨进程写竞争（D6）、PyMuPDF 句柄泄漏与错误重试分类（D7）、大量文件扫描假死剪枝（D8）、僵尸任务自愈（D10/D11）、前缀定向穿透（D13/D14）等全部 20 项缺陷。
+
+**测试**（179→231 passed，100% 通过）：
+* 新增 52 项单元与集成测试（涵盖 `test_ingest_mineru.py`、`test_ingest_worker.py`、`test_ingest_tables.py`、`test_ingest_server.py`、`test_adversarial_v070.py`）。
+
+---
 
 ### v0.6.0 深度加固与性能优化（2026-09-04）—— Fast-Stat 轻量对账、代码围栏保护、只读打分纯洁性、跨进程锁与短缩写提权
 

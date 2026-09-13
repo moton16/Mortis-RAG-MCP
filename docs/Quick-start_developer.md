@@ -189,10 +189,10 @@ stdin 一行 JSON → handle() → method=="tools/call"
 1. **commit 即记账**：每次 commit 后把技术变更追加到 `docs/Changelog_developer.md`
    （格式见该文件开头：GitHub 用户名、日期、agent、模型）。
 2. **文档分工**（不许串味）：
-   - `CHANGELOG_user.md`：只在发 release 时改；只讲功能与体验，**不许出现**技术细节
-     （"改了哪行代码"这种话出现在这里 = 事故）。
+   - `CHANGELOG_user.md`：**面向终端用户**。只在发 release 时改；只讲功能增减与体验改善，**严禁出现任何技术术语或底层代码细节**（函数名、变量名、私有类、底层锁、内部脚本名出现在这里 = 事故）。
    - `QUICKSTART_user.md`：用户初次部署指南，保持"5 分钟跑通"的颗粒度。
-   - `docs/Changelog_developer.md`：commit 级技术流水，可以随便技术。
+   - `docs/Changelog_developer.md`：commit 级技术流水，必须记录操作者与技术细节。
+   - `docs/PROJECT_GUIDE.md`：全系统架构指南，代码级架构变动写在第十五节。
    - `docs/Quick-start_developer.md`：本文件，架构/约定变了就同步。
    - `docs/Execution-plan_developer.md`：待执行功能方案，做完一个划掉一个。
 3. **Breaking 变更**：工具更名/删工具 = 大版本，README + CHANGELOG_user 顶部必须写

@@ -2,6 +2,7 @@
 ### 如有commit变更，请同步在此说明更新。非必要可以**不读**该文件，阅读"Quick-start_developer.md"即可。只在你需要补充内容以及遇到困难要溯源时进行查证使用。否则就太占上下文了。
 ### 请在每次commit的开头标注commit提交的用户名（GitHub用户名），时间，若commit为ai直接提交的，请一并输出agent与模型底模（如你的系统提示词有明确告诉你你是什么模型，没有则不需要）的名字。
 #### 如：moton16,2026-9-13,Codex,GPT-6-Astra
+### ⚠️ 必须注意文档分工：面向普通用户的日常更新在根目录 CHANGELOG_user.md，必须用大白话只讲功能增减与体验，绝不允许写技术细节；所有的代码逻辑、实现细节与技术变更流水必须且只能写在本文档（Changelog_developer.md）与 PROJECT_GUIDE.md！
 
 ---
 
@@ -74,6 +75,15 @@
   - D13 / D14: 配置防御与告警，SearchFilter 与 FTS 支持原目录前缀定向召回 `.mortis-parsed` 产物。
   - D15 / D16: 移除全局盲替换，优化 status 汇总可观测性 (`done_full` / `done_fallback`)。
   - D17 / D18 / D19 / D20: 统一版本号 0.7.0 与 15 个工具计数，eval_search 支持 MRR 与无外网模式，fanout hint 采用 VaultEntry.name，231 项全真测试 100% 通过。
+
+### C9 — moton16,2026-9-13,Antigravity,Gemini 3.8 Flash — chore: bump version to 0.7.0 and sync CHANGELOG/docs
+- pyproject.toml：版本号由 0.6.0 bump 至 0.7.0
+- CHANGELOG_user.md：全量重写为纯大白话用户体验更新日志，顶部增设醒目红线警告栏（严禁技术术语）
+- 新增 AGENTS.md & CLAUDE.md：根目录确立开发者与 AI Agent 协作法则，将“用户日志禁止堆砌技术细节”设为项目级强制红线
+- docs/Quick-start_developer.md & Changelog_developer.md：强化文档分工说明
+- README.zh-CN.md & docs/PROJECT_GUIDE.md：更新版本标头为 v0.7.0 并同步新特性
+- 验证：全量测试 231 passed，Hit@5 100%，准备合入与推流
+
 
 
 
