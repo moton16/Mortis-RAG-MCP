@@ -54,6 +54,36 @@ def test_incremental_add_modify_delete_and_rename(tmp_path):
     assert not indexer.all_chunks()
 
 
+def test_incremental_evicts_stale_when_mtime_does_not_advance(tmp_path):
+    """等长内容替换 + mtime 未推进时，增量同步必须仍然淘汰旧 chunk。
+
+    回归测试：快速路径曾用 (mtime_ns, size) 相等短路 sha256，而 Windows 文件
+    时间戳粒度受系统时钟中断（约 15.6ms）限制，等长替换（"old content" →
+    "new content"）可能落在同一刻度内，使 mtime_ns 与 size 双双不变，导致旧
+    chunk 静默残留、继续被召回（Windows CI 稳定复现，ext4 纳秒精度掩盖了它）。
+    os.utime 把 mtime 精确回拨到变换前的值，可确定性复现同一失效模式。
+    """
+    import os
+
+    note = tmp_path / "old.md"
+    note.write_text("# Old\nold content", encoding="utf-8")
+    indexer = MarkdownIndexer(tmp_path, AppConfig(embedding=EmbeddingConfig(mode="static", dimension=4)))
+    indexer.sync()
+    assert any("old content" in chunk.content for chunk in indexer.all_chunks())
+
+    before = note.stat()
+    note.write_text("# New\nnew content", encoding="utf-8")
+    # size 保持不变，并把 mtime 回拨到变换前：快速路径签名完全不变。
+    os.utime(note, ns=(before.st_atime_ns, before.st_mtime_ns))
+    after = note.stat()
+    assert after.st_size == before.st_size
+    assert after.st_mtime_ns == before.st_mtime_ns
+
+    indexer.sync()
+    assert not any("old content" in chunk.content for chunk in indexer.all_chunks())
+    assert any("new content" in chunk.content for chunk in indexer.all_chunks())
+
+
 def test_search_returns_structured_chunk_fields_and_read_returns_raw_lines(tmp_path):
     note = tmp_path / "note.md"
     note.write_text("# Heading\nline one\nline two\nline three\n", encoding="utf-8")

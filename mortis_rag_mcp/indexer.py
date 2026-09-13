@@ -548,6 +548,12 @@ class MarkdownIndexer:
         self._chunks: dict[str, list[Chunk]] = {}
         self._signatures: dict[str, str] = {}
         self._stat_cache: dict[str, tuple[int, int]] = {}
+        # 上次扫描完成的时刻（纳秒）。快速路径靠 (mtime_ns, size) 短路 sha256，
+        # 但 Windows 文件时间戳粒度受系统时钟中断（约 15.6ms）限制：等长内容
+        # 替换若落在同一刻度内，mtime_ns 与 size 双双不变，会误判为“未修改”。
+        # 因此只有 mtime 明确早于该时刻的文件才允许走快速路径（见
+        # _fast_path_is_trustworthy）。
+        self._scan_completed_ns: int = 0
         # 文本层缓存失效时，初始化阶段读出来的向量暂存到这里，等 sync 重建
         # 文本后再按 chunk.id 补挂（见 _load_vectors_cache / _attach_pending_vectors）。
         self._pending_vectors: dict[str, Any] = {}
@@ -890,6 +896,23 @@ class MarkdownIndexer:
         with self._sync_lock:
             return self._sync_locked()
 
+    def _fast_path_is_trustworthy(self, mtime_ns: int) -> bool:
+        """(mtime_ns, size) 快速短路是否可信。
+
+        快速路径靠 (mtime_ns, size) 相等跳过 sha256，但该判据只在“内容变化必然
+        推动 mtime 前进”时成立，以下两种真实场景会击穿它：
+
+        1. Windows 文件时间戳粒度受系统时钟中断（约 15.6ms）限制，等长内容替换
+           若落在同一刻度内，mtime_ns 与 size 双双不变（Windows CI 上稳定复现）。
+        2. 显式回拨 mtime：os.utime / touch -d / 部分同步与备份工具会把 mtime
+           恢复成旧值，内容已变而签名不变。
+
+        这两种情况下 mtime 都表现为“没有前进”，因此判据取反向：只有 mtime
+        严格晚于上次扫描完成时刻（即文件确实在此之后被写过）时才允许信任签名
+        相等。首次同步（无上次完成时刻）一律走全量 sha256。
+        """
+        return self._scan_completed_ns > 0 and mtime_ns > self._scan_completed_ns
+
     def _sync_locked(self) -> list[Chunk]:
         self.vault_path.mkdir(parents=True, exist_ok=True)
         failed_before = dict(self.failed_files)
@@ -901,7 +924,11 @@ class MarkdownIndexer:
             try:
                 stat = path.stat()
                 fast_sig = (int(stat.st_mtime_ns), int(stat.st_size))
-                if source in self._signatures and self._stat_cache.get(source) == fast_sig:
+                if (
+                    source in self._signatures
+                    and self._stat_cache.get(source) == fast_sig
+                    and self._fast_path_is_trustworthy(int(stat.st_mtime_ns))
+                ):
                     continue
 
                 raw = path.read_bytes()
@@ -971,6 +998,10 @@ class MarkdownIndexer:
                 except Exception:
                     pass
         self.last_sync = time.time()
+        # 记录扫描完成时刻，供下次扫描的快速路径判据使用（见
+        # _fast_path_is_trustworthy）。必须在本轮所有 stat/read 之后取，确保
+        # 扫描期间被写过的文件其 mtime 都 ≥ 该时刻，下次扫描时被强制走 sha256。
+        self._scan_completed_ns = time.time_ns()
         # 什么都没变时跳过缓存重写：原生监听（[cache] placement = "vault"）下，
         # 每次写缓存都会再次触发文件事件，无变化也重写等于自激的同步死循环。
         if changed or removed or embed_did_work or self.failed_files != failed_before:
