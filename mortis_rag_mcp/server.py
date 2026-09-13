@@ -16,7 +16,7 @@ from .indexer import Chunk, MarkdownIndexer, SearchFilter, dedupe_by_content_has
 from .ingest import IngestManager, INGEST_EXTS
 from .registry import VaultEntry, VaultRegistry, registry_path
 
-SERVER_INFO = {"name": "mortis-rag-mcp", "version": "0.7.0", "title": "Mortis'RAG MCP"}
+SERVER_INFO = {"name": "mortis-rag-mcp", "version": "0.7.1", "title": "Mortis'RAG MCP"}
 
 SERVER_INSTRUCTIONS = (
     "本服务器提供本地 Markdown 知识库检索。路由纪律："
@@ -24,6 +24,8 @@ SERVER_INSTRUCTIONS = (
     "仅在目标模糊或确需跨库时省略 vault_path。"
     "2) 不确定有哪些库时先 kb_list 查看各库 description 再选库。"
     "3) kb_read 尽量带 start_line/end_line 限定范围，避免一次拉全篇。"
+    "4) 环境状态以 ~/.mortis_rag_mcp/STATUS.md 为准：标注有效且未过期时，禁止做环境/依赖/key 预检，"
+    "直接调用工具；若状态为 ❌，仅允许运行一次 python -m mortis_rag_mcp --doctor 重测，仍为 ❌ 则严禁重试，直接报错向用户求助。"
 )
 
 
@@ -972,6 +974,17 @@ class VaultMcpServer:
         return _json_error(request_id, -32601, f"method not found: {method}")
 
 
+def _refresh_status_async(config_path: str | Path | None) -> None:
+    """启动后后台轻量刷新 STATUS.md。派生数据失败完全吞掉，静默模式严防污染 stdio。"""
+    def _worker() -> None:
+        try:
+            from . import doctor
+            doctor.run(full=False, app_config=str(config_path) if config_path else None, quiet=True)
+        except Exception:
+            pass
+    threading.Thread(target=_worker, name="status-refresh", daemon=True).start()
+
+
 def serve_stdio(config_path: str | Path | None = None) -> int:
     # Windows 下 Python stdio 默认 GBK，MCP 协议要求 UTF-8。
     # 不强制的话：中文 query 进进程变乱码（检索全灭）、中文结果输出变乱码。
@@ -989,6 +1002,7 @@ def serve_stdio(config_path: str | Path | None = None) -> int:
         sys.stderr.write(f"Configuration error: {exc}\n")
         sys.stderr.flush()
         return 2
+    _refresh_status_async(config_path)
     return _serve_stdio(server)
 
 
@@ -1031,10 +1045,16 @@ def _serve_stdio(server: VaultMcpServer) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = ArgumentParser(prog="vault-mcp")
+    parser = ArgumentParser(prog="mortis-rag-mcp")
     parser.add_argument("--serve-mcp-stdio", action="store_true")
     parser.add_argument("--app-config", default=None)
+    parser.add_argument("--doctor", action="store_true",
+                        help="全量探测本机环境（含 API 真实调用）并重写 ~/.mortis_rag_mcp/STATUS.md 与 status.json")
+    parser.add_argument("--quiet", action="store_true", help="静默模式，禁止输出到 stdout")
     args = parser.parse_args(argv)
+    if args.doctor:
+        from . import doctor
+        return doctor.run(full=True, app_config=args.app_config, quiet=args.quiet)
     if not args.serve_mcp_stdio:
         parser.error("--serve-mcp-stdio is required")
     return serve_stdio(args.app_config)

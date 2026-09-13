@@ -13,8 +13,17 @@ except ImportError:  # Python 3.10 without the optional tomli backport.
     tomllib = None
 
 
-# 规范 API key 环境变量：config 里 api_key 为空时回退读取（${ENV} 插值仍优先）。
-API_KEY_ENV_VAR = "VAULT_MCP_API_KEY"
+API_KEY_ENV_VARS = ("MORTIS_RAG_API_KEY", "VAULT_MCP_API_KEY")  # 新名优先，旧名永久回退
+
+
+def resolve_api_key(explicit: str = "") -> str:
+    if explicit:
+        return explicit
+    for var in API_KEY_ENV_VARS:
+        value = os.environ.get(var, "")
+        if value:
+            return value
+    return ""
 
 
 @dataclass(slots=True)
@@ -60,7 +69,20 @@ class VectorConfig:
     backend: str = "memory"
 
 
-DEFAULT_CACHE_DIR = os.path.join(os.path.expanduser("~"), ".vault_mcp_cache")
+def resolve_default_cache_dir() -> str:
+    """新名 ~/.mortis_rag_mcp_cache 优先；旧名独占时原子搬迁。
+    延迟至运行时调用，严禁在模块顶层 import 时产生文件系统副作用。"""
+    new = Path.home() / ".mortis_rag_mcp_cache"
+    old = Path.home() / ".vault_mcp_cache"
+    if not new.exists() and old.exists():
+        try:
+            old.rename(new)
+        except OSError:
+            return str(old)
+    return str(new)
+
+
+DEFAULT_CACHE_DIR = os.path.join(os.path.expanduser("~"), ".mortis_rag_mcp_cache")
 
 
 @dataclass(slots=True)
@@ -278,22 +300,26 @@ def read_toml_file(path: str | os.PathLike[str]) -> dict[str, Any]:
 
 
 def resolve_config_path(explicit: str | os.PathLike[str] | None = None) -> Path | None:
-    """Configuration resolution chain: --app-config > VAULT_MCP_CONFIG env
-    > ~/.vault_mcp/config.toml > None (built-in defaults).
-
-    This keeps vault-mcp portable: no path is ever baked into the source tree,
-    and every user/device anchors its own settings under the home directory.
+    """Configuration resolution chain: --app-config > MORTIS_RAG_CONFIG > VAULT_MCP_CONFIG
+    > ~/.mortis_rag_mcp/config.toml > ~/.vault_mcp/config.toml > None (built-in defaults).
     """
     if explicit is not None:
         candidate = Path(explicit).expanduser()
         return candidate if candidate.is_file() else None
-    env_path = os.getenv("VAULT_MCP_CONFIG", "").strip()
+    env_path = (os.getenv("MORTIS_RAG_CONFIG", "").strip()
+                or os.getenv("VAULT_MCP_CONFIG", "").strip())
     if env_path:
         candidate = Path(env_path).expanduser()
         if candidate.is_file():
             return candidate
-    home_candidate = Path.home() / ".vault_mcp" / "config.toml"
-    return home_candidate if home_candidate.is_file() else None
+    candidates = [
+        Path.home() / ".mortis_rag_mcp" / "config.toml",
+        Path.home() / ".vault_mcp" / "config.toml",
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return None
 
 
 def _section(data: Mapping[str, Any], name: str) -> Mapping[str, Any]:
@@ -350,7 +376,7 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
         mode=str(embedding.get("mode", "static")).lower(),
         endpoint=str(_env(embedding.get("endpoint", ""))),
         model=str(_env(embedding.get("model", ""))),
-        api_key=str(_env(embedding.get("api_key", "")) or os.getenv(API_KEY_ENV_VAR, "")),
+        api_key=resolve_api_key(str(_env(embedding.get("api_key", "")))),
         timeout=_numeric(embedding, data, "timeout", float, 30.0, 0.0, 300.0),
         dimension=_numeric(embedding, data, "dimension", int, 384, 1),
         send_dimensions=bool(embedding.get("send_dimensions", True)),
@@ -362,13 +388,13 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
         enabled=bool(reranker.get("enabled", False)),
         endpoint=str(_env(reranker.get("endpoint", ""))),
         model=str(_env(reranker.get("model", ""))),
-        api_key=str(_env(reranker.get("api_key", "")) or os.getenv(API_KEY_ENV_VAR, "")),
+        api_key=resolve_api_key(str(_env(reranker.get("api_key", "")))),
         timeout=_numeric(reranker, data, "timeout", float, 30.0, 0.0, 300.0),
         max_retries=_numeric(reranker, data, "max_retries", int, 1, 0, 10),
         retry_backoff=_numeric(reranker, data, "retry_backoff", float, 1.0, 0.0, 60.0),
     )
     cch = CacheConfig(
-        dir=str(_env(cache.get("dir", DEFAULT_CACHE_DIR))),
+        dir=str(_env(cache.get("dir", "")) or resolve_default_cache_dir()),
         enabled=bool(cache.get("enabled", True)),
         embedding_max_workers=_numeric(cache, data, "embedding_max_workers", int, 6, 1, 32),
         placement=str(cache.get("placement", "home")).lower(),

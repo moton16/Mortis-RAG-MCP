@@ -99,3 +99,16 @@
 - 详细说明 MinerU Token 获取地址（mineru.net）、环境变量设置（`MINERU_API_TOKEN`）与免登轻量试用通道的区别。
 - 在客户端连接配置 JSON 示例中补充展示 `MINERU_API_TOKEN` 环境变量注入项。
 
+### C13 — moton16,2026-9-13,Antigravity,Gemini 3.8 Flash — feat(doctor,migration): Agent 信任锚（STATUS.md / doctor.py）+ 用户数据无损原子迁移
+- **路径与配置无损原子迁移（~/.vault_mcp* -> ~/.mortis_rag_mcp*）**：
+  - `registry.py`：保持 `user_config_dir()` 函数名，对 `~/.vault_mcp` 纯原子 `os.rename` 迁移至 `~/.mortis_rag_mcp`，遇 `OSError` 严格安全回退读旧目录，绝不使用 `shutil.move`；`registry_path()` 支持 `MORTIS_RAG_REGISTRY` 优先回退 `VAULT_MCP_REGISTRY`。
+  - `config.py`：新增 `API_KEY_ENV_VARS = ("MORTIS_RAG_API_KEY", "VAULT_MCP_API_KEY")` 及 `resolve_api_key()`；`resolve_default_cache_dir()` 延迟至运行时调用并安全原子搬迁 `~/.mortis_rag_mcp_cache`；`resolve_config_path()` 支持 `MORTIS_RAG_CONFIG` > `VAULT_MCP_CONFIG` > `~/.mortis_rag_mcp/config.toml` > `~/.vault_mcp/config.toml` 回退链。
+  - 新增 `tests/test_path_migration.py`（6 个全覆盖单测）。
+- **Agent 信任锚（STATUS.md / doctor.py）**：
+  - 新增 `mortis_rag_mcp/doctor.py`：实现本机环境自检与 `STATUS.md`（给 Agent 的硬约束规范：7 天内 VALID 禁止环境预检；失效只跑一次 `--doctor`；仍失败熔断报错用户）与 `status.json`；复用 `providers.py`（`provider.rerank` 签名适配）；核心项至少 4 项在场防假 VALID；单库离线警告不锁死；Windows 冲突 4 次退避原子写。
+  - `server.py`：`SERVER_INSTRUCTIONS` 注入信任锚与熔断条款；`main()` 支持 `--doctor` 与 `--quiet`；`serve_stdio` 启动后台异步轻量刷新。
+  - 新增 `tests/conftest.py`（`pytest_sessionfinish` 成绩记录钩子，解耦整体可用性）与 `tests/test_doctor.py`（6 个单测）。
+- **Skill 与规范升级**：
+  - `skills/mortis-rag-mcp/SKILL.md`：bump 至 5.1.0，插入信任锚硬约束条款，更新配置链。
+  - `pyproject.toml` 及全量文档 bump 至 0.7.1。
+

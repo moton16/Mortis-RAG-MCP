@@ -48,7 +48,7 @@ Copy-Item .\config\app.toml.example .\config\app.toml
 
 #### (1) Basic: Embedding API Key (for semantic note retrieval)
 Recommended: SiliconFlow `BAAI/bge-m3` free tier:
-- **Option 1 (Recommended)**: Set environment variable `VAULT_MCP_API_KEY=your_api_key`.
+- **Option 1 (Recommended)**: Set environment variable `MORTIS_RAG_API_KEY=your_api_key` (also backwards-compatible with `VAULT_MCP_API_KEY`).
 - **Option 2**: Configure your endpoint and key directly in `config/app.toml`.
 
 #### (2) Optional: MinerU Setup (0.7.0, for PDF & Office document ingestion)
@@ -69,7 +69,7 @@ The server runs over standard stdio:
     "command": "python",
     "args": ["-m", "mortis_rag_mcp", "--serve-mcp-stdio", "--app-config", "C:\\path\\to\\config\\app.toml"],
     "env": {
-      "VAULT_MCP_API_KEY": "your_api_key",
+      "MORTIS_RAG_API_KEY": "your_api_key",
       "MINERU_API_TOKEN": "optional_mineru_token_for_pdf_ingestion"
     }
   }

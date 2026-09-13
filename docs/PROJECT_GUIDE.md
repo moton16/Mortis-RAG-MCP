@@ -6,15 +6,9 @@
 
 ## 在这里，你才需要详细描述每次commit的代码逻辑、技术框架的更改，请标明提交commit人员的GitHub账户名，如果是agent执行的，请一并标出是什么agent处理的。如editor:moton16,codex.
 
-> \\\\\\\*\\\\\\\*版本\\\\\\\*\\\\\\\*：对应 v0.7.0（2026-09-13，本地工作副本）。0.7.0 变更：新增 PDF/Office 文档摄取层（`kb_ingest` / MinerU 双通道 / `.mortis-parsed/` 隔离）、定向检索路由（`kb_describe` / `VaultEntry.description` / initialize instructions / fan-out hint / 判定表化 SKILL.md 5.0）、HTML 表格原子块保护与大表分片、检索回归评测 harness（Hit@K / MRR），以及对抗审查 20 项缺陷清零加固。逐项代码逻辑见\[第十五节：版本变更详录](#十五版本变更详录)。
+> \\\\\\\*\\\\\\\*版本\\\\\\\*\\\\\\\*：对应 v0.7.1（2026-09-13，本地工作副本）。0.7.1 变更：Agent 信任锚（STATUS.md / doctor.py）+ 用户数据目录无损原子迁移（`~/.vault_mcp*` → `~/.mortis_rag_mcp*`，新名优先、旧名独占原子迁移、永久回退）。
 >
-> ⚠️ \\\\\\\*\\\\\\\*本机本地改动（2026-09-01）\\\\\\\*\\\\\\\*：此工作副本把 Python 包目录 `vault\\\\\\\_mcp/` 改名为
-> `mortis\\\\\\\_rag\\\\\\\_mcp/`（pyproject 入口、tests 已同步），仓库目录也从 `E:\\\\\\\\coding\\\\\\\\moton's RAG MCP`
-> 改名为 `E:\\\\\\\\coding\\\\\\\\Mortis-RAG-MCP`，四个 agent 的 MCP 注册名统一为 `mortis-rag-mcp`。
-> \\\\\\\*\\\\\\\*上游仍使用包名 `vault\\\\\\\_mcp`\\\\\\\*\\\\\\\*——下文凡出现 `vault\\\\\\\_mcp` 模块路径处，本机对应
-> `mortis\\\\\\\_rag\\\\\\\_mcp`；环境变量 `VAULT\\\\\\\_MCP\\\\\\\_\\\\\\\*` 与数据目录 `\\\\\\\~/.vault\\\\\\\_mcp`、`\\\\\\\~/.vault\\\\\\\_mcp\\\\\\\_cache`
-> 两边一致、未改名（改了会让注册表和全部 embedding 缓存作废）。这是一处有意的本地分叉，
-> `git pull` 上游对 `vault\\\\\\\_mcp/` 的改动时需注意。
+> ⚠️ \\\\\\\*\\\\\\\*数据目录与包名迁移说明（v0.7.1）\\\\\\\*\\\\\\\*：Python 包目录已完成换名 `mortis_rag_mcp`，v0.7.1 同步完成了用户数据根目录更名 `~/.mortis_rag_mcp`（缓存 `~/.mortis_rag_mcp_cache`）与环境变量 `MORTIS_RAG_*`，同时保持对旧路径 `~/.vault_mcp*` 与 `VAULT_MCP_*` 的零破坏原子迁移与只读回退支持。
 > \\\\\\\*\\\\\\\*读者\\\\\\\*\\\\\\\*：任何要查阅、二次开发或改进本项目的开发者。读完本文应能：理解项目全貌与每个模块的职责、独立搭建开发环境、按本文的 how-to 完成常见改动、知道改动会牵动哪些缓存/测试/文档。
 > \\\\\\\*\\\\\\\*相关文档\\\\\\\*\\\\\\\*：用户向导见 \\\\\\\[README.md](../README.md)（中文主页） / \\\\\\\[README_EN.md](../README_EN.md)；快速开始见 \\\\\\\[QUICKSTART_user.md](../QUICKSTART_user.md)；版本变更见 \\\\\\\[CHANGELOG_user.md](../CHANGELOG_user.md)；AI 调用技巧见 \\\\\\\[skills/mortis-rag-mcp/SKILL.md](../skills/mortis-rag-mcp/SKILL.md)。
 
@@ -447,6 +441,16 @@ query 为空 → 直接返回（过滤+分页后）的 chunk 列表
 
 `\\\\\\\_\\\\\\\_init\\\\\\\_\\\\\\\_` 导出 `AppConfig / Chunk / MarkdownIndexer / load\\\\\\\_config` 等公共 API（可编程嵌入使用）；`\\\\\\\_\\\\\\\_main\\\\\\\_\\\\\\\_` 仅转发 `server.main`，`python -m vault\\\\\\\_mcp --serve-mcp-stdio` 即服务。
 
+### 4.10 `doctor.py`（约 150 行）—— 本机环境自检与 Agent 信任锚生成器
+
+**职责**：提供一键环境体检与 agent 信任锚（`STATUS.md` / `status.json`）。
+* **零第三方依赖**：探活直接复用 `providers.py`，不引入外部 HTTP 库。
+* **分级探测**：
+  * 全量模式（`--doctor`）：运行 Python、包导入、配置加载、注册表在线性、可选依赖、缓存目录，并实际向 embedding/reranker 发起单次探活 ping 请求；
+  * 轻量模式（MCP 启动后台异步触发）：不发网络探活，复用上次全量探活结果并追加标记。
+* **双向信任锚**：落盘 `~/.mortis_rag_mcp/STATUS.md`（给 Agent 的硬约束规范：7 天内 VALID 禁止任何形式的环境预检；失败/过期只跑一次 `--doctor`；仍失败触发熔断直接报错用户）与 `status.json`（机器可读）。
+* **健壮性保障**：核心项门禁（至少 4 项核心存在且通过才允许 VALID，杜绝空跑伪阳性）；单库离线警告不锁死全局；Windows 访问冲突带 4 阶退避原子写重试；测试成绩记录解耦。
+
 \---
 
 ## 五、核心流程
@@ -577,26 +581,34 @@ query 为空 → 直接返回（过滤+分页后）的 chunk 列表
 ## 八、磁盘数据布局
 
 ```
-\\\\\\\~/.vault\\\\\\\_mcp/                       # 用户级配置目录
-├── vaults.toml                     # 知识库注册表（v3：path/name/registered\\\\\\\_at/weight/solo）
-└── config.toml                     # 可选的全局配置（配置链第 3 优先级）
+~/.mortis_rag_mcp/                       # 用户级配置与信任锚目录（旧名 ~/.vault_mcp 独占时原子迁移）
+├── vaults.toml                     # 知识库注册表（v4：path/name/registered_at/weight/solo/description）
+├── config.toml                     # 可选的全局配置（配置链第 4 优先级）
+├── STATUS.md                       # Agent 信任锚（doctor 自动生成，禁止手改）
+└── status.json                     # 机器可读全量状态报告
 
-\\\\\\\~/.vault\\\\\\\_mcp\\\\\\\_cache/                 # 默认缓存根（placement=home）
+~/.mortis_rag_mcp_cache/                 # 默认缓存根（旧名 ~/.vault_mcp_cache 独占时原子迁移）
 └── <namespace>/                    # 默认 "default"
     ├── chunks/
-    │   └── vault\\\\\\\_<key>.chunks.bin          # 文本层：签名 + 无向量 chunk（VMCPC v1, zlib）
+    │   └── vault_<key>.chunks.bin          # 文本层：签名 + 无向量 chunk（VMCPC v1, zlib）
     ├── vectors/
-    │   ├── vault\\\\\\\_<key>.<model8>.<dim>.vec.bin     # 向量层（memory 后端，VMCPV v1, zlib）
-    │   └── vault\\\\\\\_<key>.<model8>.<dim>.vec.sqlite  # 向量层（sqlite\\\\\\\_vec 后端）
+    │   ├── vault_<key>.<model8>.<dim>.vec.bin     # 向量层（memory 后端，VMCPV v1, zlib）
+    │   └── vault_<key>.<model8>.<dim>.vec.sqlite  # 向量层（sqlite_vec 后端）
     ├── fts/
-    │   └── vault\\\\\\\_<key>.fts.sqlite          # FTS5 trigram 全文索引
-    └── vault\\\\\\\_<key>.failed.json             # 失败文件名单（可观测性）
+    │   └── vault_<key>.fts.sqlite          # FTS5 trigram 全文索引
+    └── vault_<key>.failed.json             # 失败文件名单（可观测性）
 
-<vault>/.mcp\\\\\\\_cache/                 # placement=vault 时的缓存根（同样按 namespace 分层）
+<vault>/.mcp_cache/                 # placement=vault 时的缓存根（同样按 namespace 分层）
 <vault>/.vaultignore                # vault 级豁免规则（gitignore 风格）
 ```
 
-`<key>` = sha256(normcase(realpath(vault)))\[:16]，或 sha256(cache.id)\[:16]。所有 `.bin`/`.json`/`.sqlite` 写入都是 tmp+replace 原子替换。
+`<key>` = sha256(normcase(realpath(vault)))[:16]，或 sha256(cache.id)[:16]。所有 `.bin`/`.json`/`.sqlite` 写入都是 tmp+replace 原子替换。
+
+**0.7.1 路径迁移保障**：
+- 新目录名 `~/.mortis_rag_mcp/` / `~/.mortis_rag_mcp_cache/` 优先；
+- 仅当旧目录独占存在时尝试原子的 `os.rename` 迁移；
+- 遇到任何 `OSError`（如文件锁占用、跨卷），严格原地安全回退读旧目录，绝不使用 `shutil.move`，严防目录分裂与数据丢失；
+- 环境变量优先级：`MORTIS_RAG_API_KEY` > `VAULT_MCP_API_KEY`；`MORTIS_RAG_CONFIG` > `VAULT_MCP_CONFIG`；`MORTIS_RAG_REGISTRY` > `VAULT_MCP_REGISTRY`。
 
 \---
 
@@ -649,27 +661,30 @@ MCP 工具的参数可能被提示注入的 LLM 操控，项目按「零信任�
 ## 十一、测试体系
 
 ```
-tests/（22 个文件，约 4500 行；python -m pytest -q 全绿：179 passed, 4 skipped）
-├── test\\\\\\\_indexer.py          # 切块/frontmatter/豁免/增删改/重命名/Unicode 路径
-├── test\\\\\\\_cache.py            # 双层缓存：失效、复用、换模型只重算向量
-├── test\\\\\\\_improvements.py     # Fast-Stat 对账、围栏保护、只读打分、跨进程锁、短缩写词法提权
-├── test\\\\\\\_providers.py        # 重试退避序列、批切分、响应校验、Retry-After
-├── test\\\\\\\_mcp\\\\\\\_stdio.py        # stdio 协议集成（经 VAULT\\\\\\\_MCP\\\\\\\_REGISTRY 隔离）
-├── test\\\\\\\_multivault.py       # 多库 fan-out、权重、分组
-├── test\\\\\\\_solo\\\\\\\_vault.py       # 0.6.0：solo 三态、fan-out 排除+excluded\\\\\\\_solo、单库拒绝、remove+init 取消
-├── test\\\\\\\_registry\\\\\\\*.py        # 注册表单元 + stdio 集成（solo 字段 roundtrip/容错/set\\\\\\\_solo）
-├── test\\\\\\\_hybrid.py           # 三路 RRF、2 字中文兜底、降级
-├── test\\\\\\\_vector\\\\\\\_backend.py   # memory/sqlite\\\\\\\_vec 后端、迁移、RAM 释放
-├── test\\\\\\\_search\\\\\\\_filters.py   # path\\\\\\\_prefix/tags/mtime/分页
-├── test\\\\\\\_dedup.py            # 内容哈希去重（embedding 与结果级）
-├── test\\\\\\\_failed\\\\\\\_files.py     # 失败名单持久化与清除
-├── test\\\\\\\_fsnotify.py         # parse\\\\\\\_notify\\\\\\\_buffer 纯函数 + watcher 生命周期
-├── test\\\\\\\_watch\\\\\\\_integration.py# 监听→防抖→sync 集成
-├── test\\\\\\\_snapshot.py         # 快照导出/导入/校验/force
-├── test\\\\\\\_image\\\\\\\_notes.py      # 图片注入
-├── test\\\\\\\_concurrency\\\\\\\_hardening.py / test\\\\\\\_hardening\\\\\\\_regressions.py
+tests/（24 个文件，约 5000 行；python -m pytest -q 全绿：243+ passed, 2 skipped）
+├── conftest.py               # pytest 全局钩子：sessionfinish 记录测试成绩入 STATUS.md（解耦 overall）
+├── test_doctor.py            # doctor 模块探活、离线容错、状态防假、静默生成单测
+├── test_path_migration.py    # 路径与配置无损原子迁移（~/.vault_mcp* -> ~/.mortis_rag_mcp*）
+├── test_indexer.py          # 切块/frontmatter/豁免/增删改/重命名/Unicode 路径
+├── test_cache.py            # 双层缓存：失效、复用、换模型只重算向量
+├── test_improvements.py     # Fast-Stat 对账、围栏保护、只读打分、跨进程锁、短缩写词法提权
+├── test_providers.py        # 重试退避序列、批切分、响应校验、Retry-After
+├── test_mcp_stdio.py        # stdio 协议集成（经 VAULT_MCP_REGISTRY 隔离）
+├── test_multivault.py       # 多库 fan-out、权重、分组
+├── test_solo_vault.py       # 0.6.0：solo 三态、fan-out 排除+excluded_solo、单库拒绝、remove+init 取消
+├── test_registry*.py        # 注册表单元 + stdio 集成（solo 字段 roundtrip/容错/set_solo）
+├── test_hybrid.py           # 三路 RRF、2 字中文兜底、降级
+├── test_vector_backend.py   # memory/sqlite_vec 后端、迁移、RAM 释放
+├── test_search_filters.py   # path_prefix/tags/mtime/分页
+├── test_dedup.py            # 内容哈希去重（embedding 与结果级）
+├── test_failed_files.py     # 失败名单持久化与清除
+├── test_fsnotify.py         # parse_notify_buffer 纯函数 + watcher 生命周期
+├── test_watch_integration.py# 监听→防抖→sync 集成
+├── test_snapshot.py         # 快照导出/导入/校验/force
+├── test_image_notes.py      # 图片注入
+├── test_concurrency_hardening.py / test_hardening_regressions.py
 │                            # 0.5.0 硬化的回归测试（死锁、双检锁、无界输入等）
-├── test\\\\\\\_exempt.py / test\\\\\\\_subvaults.py
+├── test_exempt.py / test_subvaults.py
 ```
 
 约定与技巧：

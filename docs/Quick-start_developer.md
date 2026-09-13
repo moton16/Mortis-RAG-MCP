@@ -19,7 +19,7 @@ Mortis'RAG MCP 是一个**本地 Markdown 知识库 RAG 服务器**，通过 MCP
 1. **零第三方运行时依赖**：`pyproject.toml` 里 `dependencies = []`。HTTP 用 `urllib`，
    TOML 用 `tomllib`（3.10 有内置 fallback 解析器），向量存储自己写二进制编解码。
    唯一的可选加速依赖是 numpy（缺失时自动回退标量余弦）和 sqlite_vec（可选磁盘向量后端）。
-2. **不绑定任何路径**：知识库关系存用户级注册表 `~/.vault_mcp/vaults.toml`，仓库零个人配置。
+2. **不绑定任何路径**：知识库关系存用户级注册表 `~/.mortis_rag_mcp/vaults.toml`（兼容旧名 `~/.vault_mcp/vaults.toml`），仓库零个人配置。
 3. **检索永不报错**：FTS 缺失、向量后端加载失败、reranker 挂掉——全部自动降级，不抛给用户。
 4. **注释解释"为什么"**：代码里大量注释记录的是"曾经踩过的坑"，删注释等于拆地雷标识。
 
@@ -146,9 +146,10 @@ stdin 一行 JSON → handle() → method=="tools/call"
 
 | 模块 | 职责 | 关键入口 | 改动时的坑 |
 |---|---|---|---|
-| `config.py` | TOML 加载、`${ENV_VAR}` 插值、配置链 `--app-config` > `VAULT_MCP_CONFIG` > `~/.vault_mcp/config.toml` > 默认 | `load_config()` | 新配置项必须给默认值 + example 文件同步加注释；`AppConfig.vault_path` 会被 `__post_init__` 特殊处理 |
+| `config.py` | TOML 加载、`${ENV_VAR}` 插值、配置链 `--app-config` > `MORTIS_RAG_CONFIG` > `VAULT_MCP_CONFIG` > `~/.mortis_rag_mcp/config.toml` > `~/.vault_mcp/config.toml` > 默认 | `load_config()` | 新配置项必须给默认值 + example 文件同步加注释；`AppConfig.vault_path` 会被 `__post_init__` 特殊处理 |
 | `registry.py` | vaults.toml 读写（**原子写 tmp+replace**，跨进程排他锁 Windows `msvcrt.locking`/POSIX `fcntl.flock`） | `VaultRegistry.add/remove/set_weight/set_solo` | 字符串字段序列化必须 `json.dumps`（曾有 LLM 传入的引号毁掉整个注册表的 bug）；新字段要在 `load()` 里给老文件回退值 |
-| `server.py` | 协议层 + 工具分发 + fan-out | `call_tool()` | 新工具 = schema + 分发 + handler 三处；fan-out 的分页只能在全局合并后做一次（逐库分页再合并顺序无意义） |
+| `doctor.py` | 环境自检与 Agent 信任锚（`STATUS.md` / `status.json`）生成器 | `doctor.run()` | 零第三方依赖，探活复用 `providers.py`；核心项门禁防假 VALID；Windows 冲突 4 次退避原子写 |
+| `server.py` | 协议层 + 工具分发 + fan-out + CLI --doctor | `call_tool()` / `main()` | 新工具 = schema + 分发 + handler 三处；fan-out 的分页只能在全局合并后做一次（逐库分页再合并顺序无意义） |
 | `indexer.py` | 切块、缓存、增量、检索、豁免、快照、watcher | `sync()` / `search()` | ① 改切块逻辑必须同步 `_cache_meta()` 加代际键，否则旧缓存不失效；② 常驻 `Chunk` 对象不许原地改 `score`（用 `dataclasses.replace` 产副本，曾有并发脏读 bug）；③ `_safe_path()` 防路径逃逸，读文件必经它 |
 | `providers.py` | embedding/reranker HTTP（重试、退避、batch 切分、static 兜底） | `create_*_provider()` | 429 必须尊重 `Retry-After`；其余 4xx 不重试 |
 | `fts.py` | FTS5 trigram 索引 | `FtsIndex.search()` | trigram 对 <3 字符天然跳过（短词由 indexer 的 bigram 词法路兜底）；`source` 列是 UNINDEXED，`path_prefix` 下推只减候选 |
@@ -158,10 +159,12 @@ stdin 一行 JSON → handle() → method=="tools/call"
 ## 6. 缓存与状态文件布局
 
 ```
-~/.vault_mcp/
+~/.mortis_rag_mcp/                         # 用户级数据目录（旧名 ~/.vault_mcp 独占时原子迁移）
 ├── vaults.toml            # 注册表（原子写 + 跨进程锁）
 ├── config.toml            # 用户级配置（可选）
-└── (缓存默认在) ~/.vault_mcp_cache/<profile>/
+├── STATUS.md              # Agent 信任锚（doctor 自动生成，禁止手改）
+├── status.json            # 机器可读全量状态报告
+└── (缓存默认在) ~/.mortis_rag_mcp_cache/<profile>/
     ├── vault_<key>.chunks.bin      # 文本层缓存（_CacheCodec，zlib 压缩）
     ├── vault_<key>.vectors.bin     # 向量缓存（float32 + zlib）
     ├── vault_<key>.failed.json     # 失败文件名单（原子写）

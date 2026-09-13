@@ -1,12 +1,21 @@
 ---
 name: mortis-rag-mcp
 description: "调用 Mortis'RAG MCP 检索本地知识库。触发词：搜知识库、查笔记、kb_search、vault 检索、RAG 搜索、mortis rag。"
-version: 5.0.0
+version: 5.1.0
 ---
 
-# mortis-rag-mcp 检索路由（0.7.0）
+# mortis-rag-mcp 检索路由（0.7.1）
 
 连接即读 server 的 `instructions`（路由纪律已内嵌）。本文件只补判定表与反模式。
+
+## 信任锚（开工前必读，优先级最高）
+
+本机环境状态由 `~/.mortis_rag_mcp/STATUS.md` 权威记录（`python -m mortis_rag_mcp --doctor` 自动生成）。
+
+- STATUS.md 标注 ✅ 且生成时间在 7 天内：**禁止任何预检**——不查 venv、不点依赖、不验证 key、不跑 kb_stats/kb_list 探活。直接按下方判定表调用工具干活。
+- STATUS.md 缺失/过期/标注 ❌：**不要逐项手查**。运行（或请用户运行）`python -m mortis_rag_mcp --doctor`，一条命令重新探测并重写 STATUS.md。
+- **熔断保护**：若运行一次 `--doctor` 后状态依然为 ❌，**禁止反复重试**，直接停止预检并向用户汇报失败项。
+- kb_* 工具实际报错时：报错 > STATUS.md。进入排障，第一步仍是 `--doctor`。
 
 ## 检索路由判定表（按序匹配，命中即执行）
 
@@ -34,5 +43,5 @@ kb_set_weight / kb_exempt（豁免私密）/ kb_rebuild（高危，见上）/ kb
 ## 管理机制
 
 混合检索 = FTS5 BM25 + 向量余弦 + bigram 词法三路 RRF + rerank。2 字中文与短英文缩写有兜底，正常搜即可。
-配置链：`--app-config` > `VAULT_MCP_CONFIG` > `~/.vault_mcp/config.toml` > 内置默认。
+配置链：`--app-config` > `MORTIS_RAG_CONFIG` > `VAULT_MCP_CONFIG` > `~/.mortis_rag_mcp/config.toml` > `~/.vault_mcp/config.toml` > 内置默认。
 PDF 摄取层默认关闭：`kb_ingest` 报 disabled 时，引导用户在 config/app.toml 设 `[ingest] enabled=true` 重启后用。

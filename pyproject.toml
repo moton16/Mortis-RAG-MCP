@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mortis-rag-mcp"
-version = "0.7.0"
+version = "0.7.1"
 license = "MIT"
 license-files = ["LICENSE"]
 description = "Mortis'RAG MCP - registry-based Markdown knowledge base RAG server (MCP over stdio, zero runtime dependencies)"

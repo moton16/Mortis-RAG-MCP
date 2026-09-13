@@ -6,7 +6,7 @@
 ## 0. 前置说明
 
 - 你的笔记目录、注册表、API key **全部在你自己的机器上**，仓库里不含任何个人配置（`config/app.toml` 已被 .gitignore 排除）。
-- 首次启动后，所有知识库关系由**用户级注册表** `~/.vault_mcp/vaults.toml` 管理，不写在代码或仓库里。
+- 首次启动后，所有知识库关系由**用户级注册表** `~/.mortis_rag_mcp/vaults.toml`（兼容旧路径 `~/.vault_mcp/vaults.toml`）管理，不写在代码或仓库里。
 
 ## 1. 安装
 
@@ -38,7 +38,7 @@ Copy-Item .\config\app.toml.example .\config\app.toml
 
 1. `[embedding]`：`mode` 改 `"external"`、填 endpoint/model/dimension（硅基流动 bge-m3 为 `BAAI/bge-m3`、1024 维、`send_dimensions = false`）
 2. API key 二选一：
-   - 环境变量（推荐）：设置 `VAULT_MCP_API_KEY=<你的key>`，配置里保持 `${VAULT_MCP_API_KEY}` 即可
+   - 环境变量（推荐）：设置 `MORTIS_RAG_API_KEY=<你的key>`（亦兼容旧名 `VAULT_MCP_API_KEY`），配置里保持 `${MORTIS_RAG_API_KEY}` 即可
    - 或直接在配置里写死 `${别的环境变量名}`（支持 `${ENV_VAR}` 插值）
 3. `[reranker]`：要精排就 `enabled = true`（bge-reranker-v2-m3 免费）
 4. `[vector]`：默认 `backend = "memory"`（向量驻内存）；想省内存改成 `"sqlite_vec"`（需先装 `mortis-rag-mcp[vec]`，首次切换自动迁移旧缓存，零重嵌）
@@ -64,7 +64,7 @@ Copy-Item .\config\app.toml.example .\config\app.toml
     "args": ["-m", "mortis_rag_mcp", "--serve-mcp-stdio", "--app-config", "C:\\path\\to\\Mortis-RAG-MCP\\config\\app.toml"],
     "env": {
       "PYTHONPATH": "C:\\path\\to\\Mortis-RAG-MCP",
-      "VAULT_MCP_API_KEY": "你的key",
+      "MORTIS_RAG_API_KEY": "你的key",
       "MINERU_API_TOKEN": "可选，用于PDF解析的MinerU密钥"
     }
   }
@@ -90,7 +90,7 @@ MCP 连上后，对 AI 说一句（或手动发 tools/call）：
 {"name": "kb_init", "arguments": {"path": "D:\\我的笔记", "name": "我的笔记"}}
 ```
 
-- 这一步会把文件夹**注册进 `~/.vault_mcp/vaults.toml`**（持久化，重启不丢），后台建立索引并开始监听文件变化。
+- 这一步会把文件夹**注册进 `~/.mortis_rag_mcp/vaults.toml`**（持久化，重启不丢），后台建立索引并开始监听文件变化。
 - 想分库管理（比如"工作"、"世界观"分开搜）：每个文件夹各 `kb_init` 一次。
 - 验证：`kb_list` 列注册库，`kb_stats` 看 files/chunks/failed_files。
 - 搜索：不传 `vault_path` 时自动跨全部非 solo 注册库检索；结果里的 `vault` 字段标明命中哪个库。想让某个库不参与全局检索（私密库等）：用 `kb_init_solo` 注册或转换，显式传 `vault_path` 才能搜它。

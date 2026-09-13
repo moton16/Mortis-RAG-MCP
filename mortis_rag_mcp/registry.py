@@ -92,13 +92,25 @@ REGISTRY_VERSION = 4
 
 
 def user_config_dir() -> Path:
-    return Path.home() / ".vault_mcp"
+    """配置与注册表根目录：新名 ~/.mortis_rag_mcp 优先；旧名 ~/.vault_mcp 独占时原子迁移。
+
+    仅做原子 os.rename，遇 OSError（被占用、跨卷、权限）直接回退读旧目录，
+    绝不调用 shutil.move，严防目录分裂。
+    """
+    new = Path.home() / ".mortis_rag_mcp"
+    old = Path.home() / ".vault_mcp"
+    if not new.exists() and old.exists():
+        try:
+            old.rename(new)
+        except OSError:
+            return old
+    return new
 
 
 def registry_path() -> Path:
-    # VAULT_MCP_REGISTRY lets tests (and multi-instance setups) redirect the
-    # registry without touching the user's real one.
-    override = os.getenv("VAULT_MCP_REGISTRY", "").strip()
+    """注册表路径：环境变量覆盖（指向完整 toml 文件）> 用户目录/vaults.toml。"""
+    override = (os.getenv("MORTIS_RAG_REGISTRY", "").strip()
+                or os.getenv("VAULT_MCP_REGISTRY", "").strip())
     if override:
         return Path(override).expanduser()
     return user_config_dir() / "vaults.toml"

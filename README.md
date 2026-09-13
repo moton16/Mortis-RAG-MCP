@@ -48,7 +48,7 @@ Copy-Item .\config\app.toml.example .\config\app.toml
 
 #### (1) 基础配置：Embedding API Key（用于笔记语义检索）
 推荐使用免费档硅基流动 `BAAI/bge-m3`：
-- **方式一（推荐）**：设置系统环境变量 `VAULT_MCP_API_KEY=你的API密钥`。
+- **方式一（推荐）**：设置系统环境变量 `MORTIS_RAG_API_KEY=你的API密钥`（同时兼容旧名 `VAULT_MCP_API_KEY`）。
 - **方式二**：直接在 `config/app.toml` 中配置你的服务商地址与密钥。
 
 #### (2) 可选配置：MinerU 接入（0.7.0，用于 PDF / Office 文档解析摄取）
@@ -69,7 +69,7 @@ Copy-Item .\config\app.toml.example .\config\app.toml
     "command": "python",
     "args": ["-m", "mortis_rag_mcp", "--serve-mcp-stdio", "--app-config", "C:\\你的路径\\config\\app.toml"],
     "env": {
-      "VAULT_MCP_API_KEY": "你的API密钥",
+      "MORTIS_RAG_API_KEY": "你的API密钥",
       "MINERU_API_TOKEN": "可选，用于PDF解析的MinerU密钥"
     }
   }
