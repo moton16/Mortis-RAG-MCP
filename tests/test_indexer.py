@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import time
 from pathlib import Path
@@ -101,3 +101,33 @@ def test_search_reranker_failure_keeps_lexical_results(tmp_path):
     indexer.sync()
 
     assert indexer.search("needle", use_rerank=True)[0].source == "note.md"
+
+
+def test_table_atomic_guard_in_chunker(tmp_path):
+    note = tmp_path / "table_note.md"
+    note.write_text(
+        "# Real Heading\n"
+        "Introduction\n"
+        "<table>\n"
+        "<tr><td># Fake Heading In Table</td></tr>\n"
+        "<tr><td>data row 1</td></tr>\n"
+        "<tr><td>data row 2</td></tr>\n"
+        "</table>\n"
+        "After table text\n",
+        encoding="utf-8",
+    )
+    indexer = MarkdownIndexer(tmp_path, AppConfig(embedding=EmbeddingConfig(mode="static", dimension=4)))
+    chunks = indexer.sync()
+
+    # The fake heading inside table must NOT become a chunk's heading or title
+    headings = {c.metadata.get("heading") for c in chunks}
+    assert "# Fake Heading In Table" not in headings
+    assert "Fake Heading In Table" not in headings
+    assert "Real Heading" in headings
+
+    # The entire table block is preserved intact in chunk content
+    table_chunks = [c for c in chunks if "<table>" in c.content]
+    assert len(table_chunks) == 1
+    assert "</table>" in table_chunks[0].content
+    assert "data row 1" in table_chunks[0].content
+

@@ -20,6 +20,7 @@ from .config import AppConfig
 from . import fsnotify
 from .fsnotify import WindowsDirectoryWatcher, watcher_available
 from .fts import FtsIndex
+from .ingest.tables import iter_table_blocks, split_large_table
 from .providers import EmbeddingProvider, ProviderError, RerankerProvider, create_embedding_provider, create_reranker_provider
 from .vector import create_vector_backend
 
@@ -693,6 +694,7 @@ class MarkdownIndexer:
             # 文件字节没变 → 存量库既不重切块也不重嵌，CHANGELOG 承诺的
             # 「开启会全量重嵌」实际完全没生效。
             "inject_image_captions": bool(self.config.inject_image_captions),
+            "table_guard": True,
             "chunker": 4,
         }
 
@@ -1301,6 +1303,8 @@ class MarkdownIndexer:
         current_lines: list[str] = []
         fence_char: str | None = None
         fence_len: int = 0
+        body_table_blocks = iter_table_blocks(body)
+        in_table_lines = {i for s, e in body_table_blocks for i in range(s, e + 1)}
         for offset, line in enumerate(body):
             line_number = body_start + offset + 1
             m = _FENCE_START_RE.match(line)
@@ -1314,7 +1318,8 @@ class MarkdownIndexer:
                     fence_char = None
                     fence_len = 0
             in_fence = fence_char is not None
-            match = _HEADING_RE.match(line) if not in_fence else None
+            in_table = offset in in_table_lines
+            match = _HEADING_RE.match(line) if (not in_fence and not in_table) else None
             if match:
                 if any(l.strip() for l in current_lines):
                     sections.append((current_heading, current_start, current_lines))
@@ -1486,16 +1491,46 @@ class MarkdownIndexer:
         chunk_index = 0
         overlap = self.config.chunk_overlap
         for heading, start, lines in sections:
+            table_blocks = iter_table_blocks(lines)
+            if any((sum(len(l) + 1 for l in lines[s:e+1]) > 2 * self.config.chunk_size) for s, e in table_blocks):
+                new_lines: list[str] = []
+                idx = 0
+                for s, e in table_blocks:
+                    new_lines.extend(lines[idx:s])
+                    tbl_chunk = lines[s:e+1]
+                    tbl_chars = sum(len(l) + 1 for l in tbl_chunk)
+                    if tbl_chars > 2 * self.config.chunk_size:
+                        avg_line = max(1, tbl_chars // max(1, len(tbl_chunk)))
+                        max_lines = max(5, self.config.chunk_size // avg_line)
+                        parts = split_large_table(tbl_chunk, max_lines)
+                        for part in parts:
+                            new_lines.extend(part)
+                    else:
+                        new_lines.extend(tbl_chunk)
+                    idx = e + 1
+                new_lines.extend(lines[idx:])
+                lines = new_lines
+                table_blocks = iter_table_blocks(lines)
+
+            cannot_cut = {i for s, e in table_blocks for i in range(s + 1, e + 1)}
+            table_starts = {s: sum(len(l) + 1 for l in lines[s:e+1]) for s, e in table_blocks}
+
             current: list[str] = []
             current_start = start
             current_length = 0
             carry: list[str] = []
             carry_length = 0
             for offset, line in enumerate(lines):
-                # 超长行必须按字符硬切：一行 1MB 的 CSV/日志粘贴会原样塞进单个
-                # chunk 直发付费 embedding API（还会 413/400，然后每轮 sync 都
-                # 重试该文件）。chunk_size 是字符数预算，行本身超过它就该切。
-                if len(line) > self.config.chunk_size:
+                if current and offset in table_starts and (current_length + table_starts[offset] > self.config.chunk_size):
+                    result.append(self._new_chunk(source, title, heading, current_start, start + offset - 1, chunk_index, tags, current, mtime))
+                    chunk_index += 1
+                    carry, carry_length = self._overlap_tail(current, overlap)
+                    current = list(carry)
+                    current_start = start + offset - len(carry)
+                    current_length = carry_length
+
+                # 超长行必须按字符硬切：仅在非表格内部时硬切
+                if len(line) > self.config.chunk_size and offset not in cannot_cut:
                     if current:
                         result.append(self._new_chunk(source, title, heading, current_start, start + offset - 1, chunk_index, tags, current, mtime))
                         chunk_index += 1
@@ -1512,7 +1547,7 @@ class MarkdownIndexer:
                         current_length = len(piece) + 1
                         current_start = start + offset
                     continue
-                if current and current_length + len(line) + 1 > self.config.chunk_size:
+                if current and current_length + len(line) + 1 > self.config.chunk_size and offset not in cannot_cut:
                     result.append(self._new_chunk(source, title, heading, current_start, start + offset - 1, chunk_index, tags, current, mtime))
                     chunk_index += 1
                     carry, carry_length = self._overlap_tail(current, overlap)

@@ -12,6 +12,7 @@ from typing import Any
 
 from .config import load_config, resolve_config_path
 from .indexer import Chunk, MarkdownIndexer, SearchFilter, dedupe_by_content_hash, rerank_chunks
+from .ingest import IngestManager, INGEST_EXTS
 from .registry import VaultEntry, VaultRegistry, registry_path
 
 SERVER_INFO = {"name": "mortis-rag-mcp", "version": "0.6.0", "title": "Mortis'RAG MCP"}
@@ -248,6 +249,18 @@ def _tool_definitions() -> list[dict[str, Any]]:
                 },
             },
         },
+        {
+            "name": "kb_ingest",
+            "description": "PDF/Office 文档摄取（默认关闭，需 [ingest] enabled=true）。action=submit：解析指定文档（sources 为库内相对路径列表；省略则扫描全库未解析/已变更文档），后台异步执行并立即返回任务列表；action=status：查进度（可带 job_id）；action=pending：只列待解析文档不启动。产物写入库内 .mortis-parsed/ 子目录，完成后自动进索引。",
+            "inputSchema": {"type": "object", "required": ["action"], "properties": {
+                "action": {"type": "string", "enum": ["submit", "status", "pending"],
+                           "description": "submit=启动解析（异步）；status=查进度；pending=只列待解析"},
+                "sources": {"type": "array", "items": {"type": "string"},
+                            "description": "可选，库内相对路径列表（如 ['教材/数电.pdf']）；仅 submit 有效，省略=扫描全库待解析"},
+                "job_id": {"type": "string", "description": "可选，仅 status：查单个任务"},
+                "vault_path": {"type": "string", "description": "可选，已注册知识库的绝对路径；仅注册了一个库时可省略"},
+            }},
+        },
     ]
 
 
@@ -262,6 +275,7 @@ class VaultMcpServer:
         self.config = load_config(resolve_config_path(config_path))
         self.registry = VaultRegistry()
         self._indexers: dict[str, MarkdownIndexer] = {}
+        self._ingest_managers: dict[str, IngestManager] = {}
         self._indexers_lock = threading.Lock()
         self._startup_lock = threading.Lock()
         self._started = False
@@ -409,14 +423,32 @@ class VaultMcpServer:
         indexer = self._indexer_for({"vault_path": entry.path})
         threading.Thread(target=indexer.sync, daemon=True, name="vault-init").start()
         md_files = sum(1 for _ in Path(entry.path).rglob("*.md") if _.is_file())
-        return {
+        doc_files = sum(
+            1 for p in Path(entry.path).rglob("*")
+            if p.is_file() and p.suffix.lower() in INGEST_EXTS
+        )
+        res = {
             "registered": True,
             "path": entry.path,
             "name": entry.name,
             "description": entry.description,
             "indexing": "started in background",
             "md_files": md_files,
+            "ingestible_docs": doc_files,
         }
+        if doc_files and not self.config.ingest.enabled:
+            res["hint"] = (
+                f"检测到 {doc_files} 个 PDF/Office 文档。PDF 摄取层默认未启用；"
+                "若用户需要检索这些文档，请先向用户确认，然后在 config/app.toml 设置 "
+                "[ingest] enabled = true 并重启服务，再调用 kb_ingest(action='submit')。"
+                "未确认前不要自作主张开启。"
+            )
+        elif doc_files:
+            res["hint"] = (
+                f"检测到 {doc_files} 个 PDF/Office 文档，可调用 "
+                "kb_ingest(action='pending') 查看待解析列表。"
+            )
+        return res
 
     def _kb_init_solo(self, arguments: dict[str, Any]) -> dict[str, Any]:
         """kb_init_solo：初始化/确保一个 solo 库（幂等三态）。
@@ -442,14 +474,32 @@ class VaultMcpServer:
             indexer = self._indexer_for({"vault_path": entry.path})
             threading.Thread(target=indexer.sync, daemon=True, name="vault-init").start()
             md_files = sum(1 for _ in Path(entry.path).rglob("*.md") if _.is_file())
-            return {
+            doc_files = sum(
+                1 for p in Path(entry.path).rglob("*")
+                if p.is_file() and p.suffix.lower() in INGEST_EXTS
+            )
+            res = {
                 "solo": True,
                 "registered": True,
                 "path": entry.path,
                 "name": entry.name,
                 "indexing": "started in background",
                 "md_files": md_files,
+                "ingestible_docs": doc_files,
             }
+            if doc_files and not self.config.ingest.enabled:
+                res["hint"] = (
+                    f"检测到 {doc_files} 个 PDF/Office 文档。PDF 摄取层默认未启用；"
+                    "若用户需要检索这些文档，请先向用户确认，然后在 config/app.toml 设置 "
+                    "[ingest] enabled = true 并重启服务，再调用 kb_ingest(action='submit')。"
+                    "未确认前不要自作主张开启。"
+                )
+            elif doc_files:
+                res["hint"] = (
+                    f"检测到 {doc_files} 个 PDF/Office 文档，可调用 "
+                    "kb_ingest(action='pending') 查看待解析列表。"
+                )
+            return res
         entry = self.registry.set_solo(existing.path, True)
         return {
             "solo": True,
@@ -496,6 +546,34 @@ class VaultMcpServer:
         path = self._resolve_vault_path(raw)
         entry = self.registry.set_description(path, desc)
         return {"path": entry.path, "name": entry.name, "description": entry.description}
+
+    def _ingest_manager_for(self, vault_path: str) -> IngestManager:
+        key = str(Path(vault_path).resolve())
+        manager = self._ingest_managers.get(key)
+        if manager is None:
+            manager = IngestManager(vault_path, self.config.ingest)
+            self._ingest_managers[key] = manager
+        return manager
+
+    def _kb_ingest(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        action = str(arguments.get("action", "")).strip()
+        if action not in {"submit", "status", "pending"}:
+            raise ValueError("action must be one of: submit, status, pending")
+        vault = self._resolve_vault_path(str(arguments.get("vault_path", "")).strip()
+                                         or self._default_vault_path())
+        manager = self._ingest_manager_for(vault)
+        if action == "pending":
+            return {"pending": manager.scan_pending()}
+        if action == "status":
+            return manager.status(str(arguments.get("job_id", "")).strip() or None)
+        result = manager.submit(arguments.get("sources") or None)
+        result["hint"] = ("解析在后台进行，用 kb_ingest(action='status') 查进度；"
+                          "done 的文档已写入 .mortis-parsed/ 并可被 kb_search 检索。")
+        # 触发一次增量同步，把已落盘产物立即纳入索引（watcher 也会捕获，双保险）
+        indexer = self._indexers.get(str(Path(vault).resolve()))
+        if indexer is not None:
+            threading.Thread(target=indexer.sync, daemon=True, name="ingest-sync").start()
+        return result
 
     def _fanout_search(self, query: str, top_k: int, use_rerank: bool, group_by_vault: bool = False, filters: SearchFilter | None = None, dedupe: bool = True) -> dict[str, Any]:
         """Search across every registered (existing) vault, merge and rerank once.
@@ -661,6 +739,8 @@ class VaultMcpServer:
             return _text_content(self._kb_describe(arguments))
         if name == "kb_list":
             return _text_content(self._list_vaults())
+        if name == "kb_ingest":
+            return _text_content(self._kb_ingest(arguments))
         if name == "kb_set_weight":
             # 统一走 _resolve_vault_path：此前直接按原始字符串查注册表，
             # 相对路径会按 stdio 服务进程的任意 CWD 解析，行为不可预测。

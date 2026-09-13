@@ -42,3 +42,10 @@
 - mortis_rag_mcp/ingest/worker.py：IngestManager 异步任务队列、.mortis-parsed/ 镜像落盘、sha256 增量与幂等、原子写状态、pymupdf 本地兜底
 - tests/test_ingest_tables.py、tests/test_ingest_worker.py：表格识别/转换单测、worker 异步生命周期与幂等单测
 - 验证：pytest 13 passed (0.14s)
+
+### C6 — moton16,2026-9-13,Antigravity,Gemini 3.8 Flash — feat(server,indexer): kb_ingest + hint + 表格保护
+- server.py：新增 kb_ingest 工具（submit/status/pending 三态）；kb_init / kb_init_solo 增加 PDF/Office 文档探测与启用提醒 hint；异步触发索引同步
+- indexer.py：iter_table_blocks 表格原子块保护，表格内部不触发标题切分、不截断 chunk；超 2*chunk_size 巨型表分片保护；_cache_meta 增加 table_guard 缓存代际
+- tests/test_ingest_server.py、tests/test_indexer.py：工具分发、三态行为、未开启拦截、原子表格保护单测
+- 验证：pytest 50 passed (2.47s)
+
