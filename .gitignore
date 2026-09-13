@@ -13,8 +13,13 @@ build/
 dist/
 .venv/
 venv/
-# Docs
-docs/
+# Docs — 默认忽略 docs/ 下的临时/本地草稿，仅白名单放行要随仓库分发的开发者文档。
+# 注意：必须用 docs/*（而非 docs/）——目录级排除会让 Git 不再进入该目录，
+# 后续的 ! 白名单将永远无法生效（gitignore 只对"未被排除目录内的文件"生效）。
+docs/*
+!docs/Changelog_developer.md
+!docs/Quick-start_developer.md
+!docs/Execution-plan_developer.md
 # Tooling / test artifacts
 .pytest_cache/
 .smoke_vaults.toml
