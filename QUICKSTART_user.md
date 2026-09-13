@@ -43,6 +43,9 @@ Copy-Item .\config\app.toml.example .\config\app.toml
 3. `[reranker]`：要精排就 `enabled = true`（bge-reranker-v2-m3 免费）
 4. `[vector]`：默认 `backend = "memory"`（向量驻内存）；想省内存改成 `"sqlite_vec"`（需先装 `mortis-rag-mcp[vec]`，首次切换自动迁移旧缓存，零重嵌）
 5. 分发给别人的库文件夹想连缓存一起带走：`[cache]` 里 `placement = "vault"`
+6. （可选）PDF/Office 摄取：**默认关闭，初次部署不用管**。需要检索 PDF 时再
+   把 `[ingest] enabled` 改 `true` 并重启，然后让 AI 跑 `kb_ingest`。
+   解析产物在 `.mortis-parsed/`，不会弄乱你的原目录。
 
 ## 3. 接入 MCP 客户端
 

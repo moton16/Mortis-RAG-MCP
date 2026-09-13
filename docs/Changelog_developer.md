@@ -49,3 +49,8 @@
 - tests/test_ingest_server.py、tests/test_indexer.py：工具分发、三态行为、未开启拦截、原子表格保护单测
 - 验证：pytest 50 passed (2.47s)
 
+### C7 — moton16,2026-9-13,Antigravity,Gemini 3.8 Flash — docs: README/QUICKSTART_user 增补摄取章节
+- README.zh-CN.md：增补"PDF / Office 文档摄取（默认关闭）"小节，阐明两步开启方式与 .mortis-parsed/ 落盘设计
+- QUICKSTART_user.md：配置段末尾追加第 6 条摄取说明
+
+

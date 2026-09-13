@@ -117,6 +117,24 @@ MCP 服务注册在 `~/.workbuddy/mcp.json`（stdio 模式）：
 6. `server.py`：`kb_search` 的 `use_rerank` 默认值从 `False` 改为 `True`，免费 reranker 默认启用。
 7. `config/app.toml`：向量维度 `4096 → 1024`（Qwen3-8B 原生 MRL 裁剪），`chunk_overlap 0 → 150`。
 
+## PDF / Office 文档摄取（默认关闭）
+
+知识库索引只覆盖 Markdown。**初次部署时 PDF 摄取层是不启用的**——你的 PDF、
+课件、表格文档不会自动进入检索，也不会产生任何云端 API 调用。
+
+需要检索这些文档时，两步开启：
+
+1. 编辑 `config/app.toml`，把 `[ingest]` 下 `enabled` 改为 `true`，重启 MCP 服务。
+   解析走 MinerU 云端：配了 `api_key` 用精准接口（≤200MB/200页，每天 1000 页
+   高优先级额度）；没配也能用免登轻量接口（≤10MB/20页）。云端都失败且本地装了
+   `pymupdf` 时自动降级为纯文本兜底。
+2. 让 AI 调用 `kb_ingest(action='submit')`（或指定单个文件）。
+   解析产物统一收进库内 `.mortis-parsed/` 子目录（原文件夹不会多出任何文件），
+   完成后立即可被 `kb_search` 检索。想只搜解析稿：`path_prefix='.mortis-parsed/'`。
+
+如果你是通过 AI agent 部署的：agent 在 `kb_init` 时会收到文档数量提示并询问你
+是否开启，你确认后它会替你完成上面两步。
+
 ---
 
 ## 三、调用方法
