@@ -21,7 +21,7 @@ def test_fast_stat_skips_disk_read_when_unmodified(tmp_path, monkeypatch):
     assert len(chunks1) >= 1
     assert "fast_stat_test.md" in indexer._stat_cache
 
-    # Intercept Path.read_bytes to verify it is NOT called on second sync
+    # Intercept Path.read_bytes to count calls on subsequent syncs
     read_bytes_calls = []
     original_read_bytes = Path.read_bytes
 
@@ -31,17 +31,35 @@ def test_fast_stat_skips_disk_read_when_unmodified(tmp_path, monkeypatch):
 
     monkeypatch.setattr(Path, "read_bytes", intercepted_read_bytes)
 
-    # Second sync without touching file: Fast-Stat must hit
+    # 让笔记 mtime 相对「首页登记时刻」老化超过可信余量（50ms，见
+    # _MTIME_TRUST_MARGIN_NS），使条目在本轮复核后即固化为准可信。
+    time.sleep(0.06)
+
+    # Second sync without touching the file: 条目登记时 mtime 与验证时刻间隔
+    # 小于可信余量（racily clean 疑似，Windows CI 实测约 3% 概率自然出现），
+    # 判据会强制读盘复核一次；复核确认内容未变后按本轮时刻重新登记。允许至多
+    # 一次复核读盘（若 CI 上首页 sync 慢到已满足余量，则为 0）。
     chunks2 = indexer.sync()
     assert len(chunks2) == len(chunks1)
-    assert len(read_bytes_calls) == 0, "read_bytes was called despite file being unmodified!"
+    assert len(read_bytes_calls) <= 1, (
+        "unmodified file was read more than once: racily-clean 复核只允许一次"
+    )
+
+    # Third sync: 条目已按第二轮验证时刻重新登记，mtime 相对它已老化超过余量，
+    # 必须完全零读盘——这是固化的零读盘契约。
+    read_bytes_calls.clear()
+    chunks3 = indexer.sync()
+    assert len(chunks3) == len(chunks1)
+    assert len(read_bytes_calls) == 0, (
+        "read_bytes was called despite the entry being settled and unmodified!"
+    )
 
     # Now modify the file: Fast-Stat must detect change and read_bytes must be called
     time.sleep(0.01)
     note.write_text("# Fast Stat\nUpdated content with modifications.", encoding="utf-8")
-    chunks3 = indexer.sync()
+    chunks4 = indexer.sync()
     assert len(read_bytes_calls) == 1
-    assert any("Updated content" in c.content for c in chunks3)
+    assert any("Updated content" in c.content for c in chunks4)
 
 
 def test_code_block_fence_heading_and_title_protection(tmp_path):

@@ -26,6 +26,13 @@ from .vector import create_vector_backend
 
 _RRF_K = 60
 
+# Fast-Stat 可信判据的安全余量（纳秒）。文件时间戳并非真纳秒：Windows 系统定时器
+# 最坏 15.6ms 才更新一次（实测 NTFS 刻度约 3ms，FAT32 达 2s），且时间戳可能因
+# 取整而超前于进程时钟（Windows CI 实测约 3% 概率，见 CI 诊断 racycount=1/30）。
+# 余量取 50ms > 2 倍最坏刻度，保证「登记之后发生的写入必然推动 mtime 前进」，
+# 论证见 _fast_path_is_trustworthy。
+_MTIME_TRUST_MARGIN_NS = 50_000_000
+
 # native 监听回调的防抖延迟上限：编辑器保存风暴（事件持续不断）会让防抖定时器
 # 一直顺延，超过这个窗口就必须同步一次，不能让事件流饿死同步。
 _FS_MAX_DEBOUNCE_WAIT = 5.0
@@ -548,11 +555,10 @@ class MarkdownIndexer:
         self._chunks: dict[str, list[Chunk]] = {}
         self._signatures: dict[str, str] = {}
         self._stat_cache: dict[str, tuple[int, int]] = {}
-        # 记录每个 source 的 (mtime_ns, size) 签名是在哪个进程时钟时刻被观测到的。
-        # 快速路径判据只比较同源的进程时钟：仅当文件 mtime 严格早于“上次观测到它
-        # 的时刻”才信任签名相等。这样既避开跨时基比较（前两版实现失败的根源），
-        # 又能识别出“改动落在时间戳粒度同一刻度内”的 racily clean 条目。详见
-        # _fast_path_is_trustworthy。
+        # 记录每个 source 的 (mtime_ns, size) 签名是在哪个进程时钟时刻通过内容级
+        # 验证（read + sha256）的。快速路径判据要求文件 mtime 严格早于该时刻减去
+        # 安全余量 _MTIME_TRUST_MARGIN_NS 才信任签名相等，以识别「改动落在时间戳
+        # 粒度同一刻度内」的 racily clean 条目。论证见 _fast_path_is_trustworthy。
         self._stat_seen_ns: dict[str, int] = {}
         # 本轮扫描的结束时刻（纳秒），仅供观测/诊断。
         self._scan_completed_ns: int = 0
@@ -904,30 +910,43 @@ class MarkdownIndexer:
         这正是 Git 的 *racily clean* 问题（git-scm.com/docs/racy-git）：若内容
         变化发生在时间戳粒度的一个刻度之内，`(mtime_ns, size)` 会双双不变，签名
         相等就成了假证据。等长替换（"old content" -> "new content"，均 18 字节）
-        配上 NTFS（刻度约 3ms）或 FAT32（达 2s）就会命中，旧 chunk 静默残留并
-        继续被召回——这正是 Windows CI 上稳定复现、ext4 纳秒精度掩盖掉的 bug。
+        配上 NTFS/FAT32 就会命中，旧 chunk 静默残留并继续被召回——Windows CI
+        上稳定复现、ext4 纳秒精度掩盖掉的正是它。
 
-        判据不去比较“文件 mtime”与“进程时钟”。这两个量属于不同时基，直接比大小在
-        粒度较粗的平台上会因取整而失真：未改动文件也会被判为可疑、被迫读盘，破坏
-        docs/PROJECT_GUIDE.md 记载的“未改变则彻底跳过读取内容”契约。此前两版实现
-        都栽在这里。
+        判据：仅当文件 mtime 严格早于「该签名被内容级验证的时刻」减去一个安全
+        余量时，才信任签名相等：
 
-        改为比较**同源的进程时钟**：记录签名时把“读到该文件的时刻”一并存下
-        （_stat_seen_ns）。下次扫描时，只有当文件 mtime 严格早于那个观测时刻，才
-        认为签名可信。理由：签名是在观测时刻采集的，若此后内容再变，其 mtime 必然
-        被推到观测时刻之后；反过来，mtime 早于观测时刻的条目，其 mtime 已“定局”，
-        不会被后续写入复用，签名相等才真正等价于内容未变。
+            mtime_ns < seen_ns - _MTIME_TRUST_MARGIN_NS
 
-        粒度碰撞发生时（mtime 与观测时刻落入同一刻度），
-        `mtime_ns < seen_ns` 为假，条目被判不可信、强制回退 sha256 复核——方向
-        安全：取整只会更保守。复核确认内容未变后，该条目会按复核时刻重新登记；此时
-        mtime 已明确早于新观测时刻，于是恢复可信、重新享受零读盘快速路径。因此
-        “不可信”只让一个条目多付**一次**读盘代价，而非永久失去快速路径。
+        其中 seen_ns 是上一轮 read + sha256 完成后取的进程时钟读数（与所哈希的
+        内容严格对应）。余量必须显著大于文件时间戳的最大刻度（Windows 系统定时
+        器最坏 15.6ms，故取 50ms），理由是一条可靠的归纳：
+
+        设条目登记时已满足 seen_ns - mtime > MARGIN。此后任何一次真实写入都发生
+        在 seen_ns 之后，其落盘时间戳 T2 满足 T2 >= 写入时刻 - 刻度（时间戳只会
+        因取整而滞后至多一个刻度）。于是
+
+            T2 >= seen_ns - tick > mtime + MARGIN - tick > mtime + tick > mtime
+
+        即**任何登记之后的写入都必然推动 mtime 前进**，签名必然失配、走正常
+        sha256 路径检出——不存在漏检窗口。反过来，登记时刻与 mtime 靠得太近
+        （< MARGIN，包括 Windows 实测约 3% 的「时间戳超前于进程时钟」取整碰撞，
+        见 CI 诊断 racycount=1/30）的条目一律不信任，下一轮强制读盘复核；复核会
+        把 seen_ns 推到更晚，随着真实时间流逝终能满足余量、固化为准可信条目。
+
+        代价：刚被写过的文件在其 mtime 变旧到 50ms 之前，每轮 sync 都会多付一次
+        读盘复核。对「写完立刻连续 sync」的测试与热文件这是可感知的，但方向是
+        安全的（宁可多读不可漏检），且一旦超过余量即恢复零读盘——这也是本判据
+        与“签名相等即跳过”的原始实现的全部行为差异。
+
+        与 Git 的差异说明：Git 用「索引文件自身的 mtime」当锚点（同为文件系统
+        时间戳，天然同时基），本实现用进程时钟 + 余量，因为 cache.enabled=False
+        （AppConfig 默认值）时不落任何盘上锚点，而正确性修复必须覆盖默认配置。
         """
         seen_ns = self._stat_seen_ns.get(source)
         if seen_ns is None:
             return False
-        return mtime_ns < seen_ns
+        return mtime_ns < seen_ns - _MTIME_TRUST_MARGIN_NS
 
     def _sync_locked(self) -> list[Chunk]:
         self.vault_path.mkdir(parents=True, exist_ok=True)
@@ -939,10 +958,6 @@ class MarkdownIndexer:
             found.add(source)
             try:
                 stat = path.stat()
-                # 观测时刻：与文件 mtime 配对存入 _stat_seen_ns，供下一轮
-                # _fast_path_is_trustworthy 用同源进程时钟做判定。必须尽量贴近
-                # 上面这次 stat，否则会把观测期间真实发生的改动误算成“可信”。
-                seen_ns = time.time_ns()
                 fast_sig = (int(stat.st_mtime_ns), int(stat.st_size))
                 if (
                     source in self._signatures
@@ -953,27 +968,21 @@ class MarkdownIndexer:
 
                 raw = path.read_bytes()
                 signature = hashlib.sha256(raw).hexdigest()
-                # 读盘/哈希完成后重新观测一次，作为该签名的登记时刻。用“读完之后”
-                # 的观测点有两个好处：一是它与刚读到的那份内容严格对应（读期间若
-                # 有写入，重取会看到新的 mtime，下一轮自然会被判不可信）；二是此时
-                # 文件已写完关闭，其 mtime 不会再被这次写入改动，不容易落进
-                # “写入与观测同处一个时间戳刻度”的窗口。实测 Windows 上写入紧接
-                # 同步时约有 3% 概率踩中该窗口（本地 NTFS 300 次 0 次），这正是
-                # 零读盘契约在 Windows CI 上偶发失败的来源。
-                try:
-                    restat = path.stat()
-                    settled_ns = int(restat.st_mtime_ns)
-                    settled_sig = (settled_ns, int(restat.st_size))
-                    recorded_at_ns = time.time_ns()
-                except OSError:
-                    settled_sig = fast_sig
-                    recorded_at_ns = seen_ns
+                # 可信时刻：在 read + sha256 完成之后取。它与刚哈希的那份内容严格
+                # 对应——若登记之后文件再被写入，新 mtime 必然晚于该时刻，签名
+                # 随之变化，快速路径自然失效。注意登记进 _stat_cache 的签名用
+                # 读盘前的 fast_sig 而非重新 stat：若读盘期间文件恰好被写入，
+                # fast_sig 与磁盘新状态不一致，下一轮签名比对会失配并自动重读
+                # （自愈）；重新 stat 反而可能把「新 mtime + 旧哈希」这对错误
+                # 组合固化进缓存。
+                verified_at_ns = time.time_ns()
                 if self._signatures.get(source) == signature:
                     # 内容实测未变（可能是被 racily clean 判据逼下来复核的，也可能
-                    # 只是 mtime 被 touch 过）。按重新观测到的签名与时刻登记，使该
-                    # 条目在下一轮恢复可信、重新走零读盘快速路径。
-                    self._stat_cache[source] = settled_sig
-                    self._stat_seen_ns[source] = recorded_at_ns
+                    # 只是 mtime 被 touch 过）。按本轮验证时刻重新登记；只要
+                    # verified_at 与 mtime 拉开了足够余量，该条目即恢复可信、
+                    # 重新走零读盘快速路径。
+                    self._stat_cache[source] = fast_sig
+                    self._stat_seen_ns[source] = verified_at_ns
                     continue
                 text = raw.decode("utf-8-sig")
                 # 顺手复用上面 read_bytes 已经打开的目录项做一次 stat，记录文件
@@ -982,7 +991,7 @@ class MarkdownIndexer:
                 mtime = float(stat.st_mtime)
                 chunks = self._chunk_file(source, text, mtime)
                 changed.append(
-                    (source, signature, chunks, settled_sig, recorded_at_ns)
+                    (source, signature, chunks, fast_sig, verified_at_ns)
                 )
             except Exception as exc:
                 self.failed_files[source] = str(exc)
@@ -994,12 +1003,12 @@ class MarkdownIndexer:
 
         # Text layer: changed files update the index even if embedding fails
         # afterwards, so lexical search still works without vectors.
-        for source, signature, chunks, fast_sig, seen_ns in changed:
+        for source, signature, chunks, fast_sig, verified_at_ns in changed:
             old_chunks = self._chunks.get(source)
             self._chunks[source] = chunks
             self._signatures[source] = signature
             self._stat_cache[source] = fast_sig
-            self._stat_seen_ns[source] = seen_ns
+            self._stat_seen_ns[source] = verified_at_ns
             self.failed_files.pop(source, None)
             self._fts_upsert(source, chunks)
             # Disk-backed mode: re-chunking a file orphans its old vector ids.

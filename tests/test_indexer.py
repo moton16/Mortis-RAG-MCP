@@ -59,23 +59,25 @@ def test_incremental_evicts_stale_when_mtime_does_not_advance(tmp_path):
 
     回归测试：快速路径曾用 (mtime_ns, size) 相等短路 sha256，但文件时间戳并非
     真纳秒（NTFS 实测刻度约 3ms，FAT32 达 2s）。等长替换（"old content" ->
-    "new content"，均 18 字节）若与索引落盘落在同一刻度内，mtime_ns 与 size
-    双双不变，文件被误判为未修改，旧 chunk 静默残留并继续被召回（Windows CI
-    稳定复现；ext4 纳秒精度掩盖了它）。
+    "new content"，均 18 字节）若落在同一刻度内，mtime_ns 与 size 双双不变，
+    文件被误判为未修改，旧 chunk 静默残留并继续被召回（Windows CI 稳定复现；
+    ext4 纳秒精度掩盖了它）。
 
-    构造方式：先完成一次正常 sync，再把笔记的 mtime 钉到与“该条目的观测时刻
-    _stat_seen_ns 完全相等”，并把 _stat_cache 的签名同步成该 (mtime, size)。此时
-    新一轮读到的 (mtime_ns, size) 与缓存逐位相同——签名判据为真；但 mtime 并不
-    严格早于观测时刻，构成 racily clean 条目，可信度判据成为唯一决定因素：禁用
-    判据时本用例必然失败（已验证），启用时回退 sha256 精确检出内容变化。
+    可信判据（_fast_path_is_trustworthy）要求 mtime 严格早于「内容级验证时刻
+    seen_ns 减去安全余量 _MTIME_TRUST_MARGIN_NS」才信任签名。真实场景里，
+    racily clean 状态就是「签名匹配，但 mtime 距 seen_ns 不足余量」——等长
+    替换发生在时间戳同一刻度内时，磁盘读到的 (mtime_ns, size) 与登记签名逐位
+    相同，唯有可信度判据能拦截。
 
-    这里刻意不依赖 cache 是否启用：判据基于 _stat_seen_ns（进程时钟内部自比），
-    在 AppConfig 默认的 cache.enabled=False 下同样生效——这一点很关键，上游的
-    test_incremental_add_modify_delete_and_rename 正是在默认配置下暴露该 bug 的。
+    构造方式：先完成一次正常 sync，把 _stat_seen_ns["old.md"] 压到与笔记 mtime
+    相同（模拟「验证时刻与写入时刻落在同一刻度」的 racily clean 状态，即余量
+    条件不成立），再执行等长内容替换并把 mtime 恢复原值。此时签名判据为真，
+    可信度判据成为唯一决定因素：判据启用时强制回退 sha256、检出变化；判据被
+    禁用（恒 True）时旧 chunk 残留、本用例失败——已做反向验证，确有鉴别力。
 
-    易踩的坑：若只在 sync 之后改文件、不把签名对齐进 _stat_cache，缓存里留的是
-    上一轮真实 mtime，签名判据会先短路为假，文件直接走 sha256 被正确检出，用例
-    恒绿而毫无鉴别力——这正是本用例初版失效的原因。
+    本用例刻意使用 AppConfig 默认配置（cache.enabled=False）：上游的
+    test_incremental_add_modify_delete_and_rename 正是在默认配置下暴露该 bug
+    的，判据必须不依赖索引缓存才覆盖得到它。
     """
     import os
 
@@ -88,15 +90,17 @@ def test_incremental_evicts_stale_when_mtime_does_not_advance(tmp_path):
     assert any("old content" in chunk.content for chunk in indexer.all_chunks())
     assert "old.md" in indexer._stat_seen_ns
 
-    # 把笔记 mtime 钉到“该条目的观测时刻”，复现时间戳粒度碰撞下的 racily clean：
-    # mtime 与 seen 相等 => mtime < seen 为假 => 判据必须拒绝信任签名。
-    seen = indexer._stat_seen_ns["old.md"]
-    os.utime(note, ns=(seen, seen))
-    indexer._stat_cache["old.md"] = (seen, note.stat().st_size)
+    # 把可信时刻压到与 mtime 相同：mtime < seen - MARGIN 显然为假，复现
+    # 「时间戳粒度碰撞导致签名不可信」的 racily clean 状态。
+    mtime_ns = int(note.stat().st_mtime_ns)
+    indexer._stat_seen_ns["old.md"] = mtime_ns
+    assert indexer._fast_path_is_trustworthy("old.md", mtime_ns) is False, (
+        "本用例前提：该条目必须被判定为不可信（racily clean），才具备鉴别力"
+    )
 
     before = note.stat()
     note.write_text("# New\nnew content", encoding="utf-8")
-    # 等长内容 + mtime 恢复成同一时刻：新一轮 (mtime_ns, size) 与缓存逐位相同。
+    # 等长内容 + mtime 回拨：新一轮 (mtime_ns, size) 与登记签名逐位相同。
     os.utime(note, ns=(before.st_atime_ns, before.st_mtime_ns))
     after = note.stat()
     assert after.st_size == before.st_size, "本用例前提：内容等长"
@@ -105,13 +109,18 @@ def test_incremental_evicts_stale_when_mtime_does_not_advance(tmp_path):
         int(after.st_mtime_ns),
         int(after.st_size),
     ), "本用例前提：快速路径签名判据为真，可信度判据才是决定因素"
-    assert indexer._fast_path_is_trustworthy("old.md", int(after.st_mtime_ns)) is False, (
-        "本用例前提：该条目必须被判定为不可信（racily clean），才具备鉴别力"
-    )
 
     indexer.sync()
     assert not any("old content" in chunk.content for chunk in indexer.all_chunks())
     assert any("new content" in chunk.content for chunk in indexer.all_chunks())
+
+    # 复核检出后，条目按本轮验证时刻重新登记；等它老化超过余量后应恢复可信
+    # （零读盘快速路径），验证「不可信」只是临时状态而非永久惩罚。
+    seen_now = indexer._stat_seen_ns["old.md"]
+    indexer._stat_seen_ns["old.md"] = seen_now + 2 * 50_000_000
+    assert indexer._fast_path_is_trustworthy(
+        "old.md", int(note.stat().st_mtime_ns)
+    ) is True, "老化超过余量后条目应恢复可信"
 
 
 def test_search_returns_structured_chunk_fields_and_read_returns_raw_lines(tmp_path):

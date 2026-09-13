@@ -883,7 +883,8 @@ python -m pytest -q                       # 应全绿
 * `mortis_rag_mcp/indexer.py`：
   * **Fast-Stat 轻量级文件对账**：
     * 引入 `_stat_cache: dict[str, tuple[int, int]]` 维护 `rel_path -> (st_mtime_ns, st_size)` 快速签名。
-    * 在 `sync()` 扫描过程中，先调用 `os.stat` 比较纳秒级 mtime 与文件大小。若未发生改变且已在 `_signatures` 与 `_chunks` 中，彻底跳过读取文件内容与计算 SHA256。
+    * 在 `sync()` 扫描过程中，先调用 `os.stat` 比较纳秒级 mtime 与文件大小。若未发生改变且已在 `_signatures` 与 `_chunks` 中，且通过 racily clean 可信判据，则跳过读取文件内容与计算 SHA256。
+    * **racily clean 可信判据**（`_fast_path_is_trustworthy`，对齐 git-scm.com/docs/racy-git）：文件时间戳并非真纳秒（NTFS 实测刻度约 3ms，FAT32 达 2s，Windows 系统定时器最坏 15.6ms），等长内容替换若落在同一刻度内，`(mtime_ns, size)` 双双不变，签名相等成为假证据，旧 chunk 会静默残留。判据要求文件 mtime 严格早于「该签名最近一次通过内容级验证（read+sha256）的时刻 `_stat_seen_ns[source]`」减去安全余量 `_MTIME_TRUST_MARGIN_NS`（50ms > 2 倍最坏刻度）才信任；由于登记之后发生的写入必然推动 mtime 前进（`T2 >= seen - tick > mtime + MARGIN - tick > mtime`），该判据不存在漏检窗口。代价是刚写过的文件在其 mtime 老化超过 50ms 前，每轮 sync 会被复核读盘一次，随后固化恢复零读盘。判据不依赖索引缓存是否启用（覆盖 `cache.enabled=False` 的默认配置），`_stat_seen_ns` 与 `_stat_cache` 同为进程内存活、不持久化。
     * 状态原子提交：单批更新在完成全量切块与 embedding 后才原子合并入 `_stat_cache`，若中间被中断或异常退出不会残留脏缓存。
   * **代码块围栏保护（CommonMark 规范）**：
     * 在 `_chunk_file()` 与 `_title()` 中实现代码围栏状态机：跟踪开围栏字符（反引号 `` ` `` 或波浪号 `~`）及围栏符号长度（`len >= 3`）。
