@@ -23,3 +23,8 @@
 - 测试：tests/test_registry_server.py（roundtrip/老 toml 回退）、tests/test_mcp_stdio.py（instructions/kb_describe schema 与调用）
 - 验证：pytest 9 passed (1.92s)；eval Hit@5 = 0.0%（基线维持）
 
+### C2 — moton16,2026-9-13,Antigravity,Gemini 3.8 Flash — feat(server): fan-out hint
+- server.py：_fanout_search 在横跨多个库（len(searched) > 1）时，在返回 dict 中注入 hint，提示调用方下次携带 vault_path 或 path_prefix 做定向检索
+- 测试：tests/test_registry_server.py 追加跨库 fan-out 结果包含 hint 验证
+- 验证：pytest 6 passed (1.24s)
+

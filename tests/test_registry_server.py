@@ -58,6 +58,8 @@ def test_stdio_init_and_fanout_search_across_vaults(tmp_path):
     data = _payload(responses[3])
     assert len(data["searched"]) == 2
     assert data["errors"] == {}
+    assert "hint" in data
+    assert "本次检索横跨 2 个库" in data["hint"]
     hits = [chunk for chunk in data["chunks"] if "ALPHA123" in chunk["content"]]
     assert hits and hits[0]["vault"] == str(vault_a)
     assert hits[0]["vault_name"] == "库A"

@@ -620,7 +620,14 @@ class VaultMcpServer:
                 (group for group in buckets.values() if group["chunks"]),
                 key=lambda group: -max(chunk["score"] for chunk in group["chunks"]),
             )
-            return {"groups": groups, "searched": searched, "errors": errors, "excluded_solo": excluded_solo}
+            res: dict[str, Any] = {"groups": groups, "searched": searched, "errors": errors, "excluded_solo": excluded_solo}
+            if len(searched) > 1:
+                names = [Path(s).name for s in searched]
+                res["hint"] = (
+                    f"本次检索横跨 {len(searched)} 个库：{names}。若用户问题指向特定库或目录，"
+                    "下次请传 vault_path 或 path_prefix 定向检索，精度更高、噪音更少。"
+                )
+            return res
 
         pairs = pairs[start:end]
 
@@ -630,7 +637,14 @@ class VaultMcpServer:
             data["vault"] = entry.path
             data["vault_name"] = entry.name
             out_chunks.append(data)
-        return {"chunks": out_chunks, "searched": searched, "errors": errors, "excluded_solo": excluded_solo}
+        res = {"chunks": out_chunks, "searched": searched, "errors": errors, "excluded_solo": excluded_solo}
+        if len(searched) > 1:
+            names = [Path(s).name for s in searched]
+            res["hint"] = (
+                f"本次检索横跨 {len(searched)} 个库：{names}。若用户问题指向特定库或目录，"
+                "下次请传 vault_path 或 path_prefix 定向检索，精度更高、噪音更少。"
+            )
+        return res
 
     def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         # 防御：某些客户端会把工具名/畸形数据当 arguments 透传（如逐字符拆分的 dict），
