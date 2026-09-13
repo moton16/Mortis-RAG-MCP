@@ -36,3 +36,9 @@
 - mortis_rag_mcp/ingest/mineru.py：纯标准库 urllib 实现 MinerU v4 精准与 Agent 免登双通道客户端，含 429 Retry-After 重试、致命错误码不重试、zip 提取
 - tests/test_ingest_mineru.py：通道路由、错误重试判定、解包、轮询状态机测试（全部 mock 网络层）
 - 验证：pytest tests/test_ingest_mineru.py 15 passed (0.23s)
+
+### C5 — moton16,2026-9-13,Antigravity,Gemini 3.8 Flash — feat(ingest): 任务管理器 + 表格处理
+- mortis_rag_mcp/ingest/tables.py：iter_table_blocks 块识别与未闭合兜底、convert_small_tables 规整小表转 pipe、split_large_table 巨型表分片包裹
+- mortis_rag_mcp/ingest/worker.py：IngestManager 异步任务队列、.mortis-parsed/ 镜像落盘、sha256 增量与幂等、原子写状态、pymupdf 本地兜底
+- tests/test_ingest_tables.py、tests/test_ingest_worker.py：表格识别/转换单测、worker 异步生命周期与幂等单测
+- 验证：pytest 13 passed (0.14s)
