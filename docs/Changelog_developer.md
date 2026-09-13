@@ -99,3 +99,7 @@
 - 详细说明 MinerU Token 获取地址（mineru.net）、环境变量设置（`MINERU_API_TOKEN`）与免登轻量试用通道的区别。
 - 在客户端连接配置 JSON 示例中补充展示 `MINERU_API_TOKEN` 环境变量注入项。
 
+### C13 — moton16,2026-9-13,Antigravity,Gemini 3.8 Flash — fix(tests): eliminate Windows NTFS mtime collision in test_indexer
+- 根因：`test_indexer.py::test_incremental_add_modify_delete_and_rename` 中连续写入 `# Old\nold content` 与 `# New\nnew content`（两者均为 17 字节）。在云端高速 Windows CI 虚拟机（Azure VM）上，因时钟中断分辨率（15.6ms），两次写入的 `st_mtime_ns` 发生碰撞；结合字节大小完全相同，触发 Fast-Stat 判定为文件未修改而跳过增量更新。
+- 修复：对齐 `test_improvements.py` 与 `test_watch_integration.py` 的处理规范，在连续覆写前增加 `time.sleep(0.02)` 跨越 NTFS 时间戳分辨率窗口，并使用不同长度的更新内容。
+- 验证：本地全量 231 项测试 100% 通过。

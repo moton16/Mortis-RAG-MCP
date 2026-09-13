@@ -37,11 +37,12 @@ def test_incremental_add_modify_delete_and_rename(tmp_path):
     indexer.sync()
     assert any(chunk.source == "old.md" and "old content" in chunk.content for chunk in indexer.search("old"))
 
-    old.write_text("# New\nnew content", encoding="utf-8")
+    time.sleep(0.02)  # 保证在 Windows NTFS mtime 精度内产生可区分的时间戳变动
+    old.write_text("# New\nnew content updated", encoding="utf-8")
     indexer.sync()
     # 修改后旧内容必须从索引移除（增量更新），而非仍然可召回。
     assert not any("old content" in chunk.content for chunk in indexer.all_chunks())
-    assert any("new content" in chunk.content for chunk in indexer.search("new"))
+    assert any("new content updated" in chunk.content for chunk in indexer.search("new"))
 
     renamed = tmp_path / "重命名.md"
     old.rename(renamed)
