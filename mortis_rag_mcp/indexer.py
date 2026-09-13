@@ -548,9 +548,13 @@ class MarkdownIndexer:
         self._chunks: dict[str, list[Chunk]] = {}
         self._signatures: dict[str, str] = {}
         self._stat_cache: dict[str, tuple[int, int]] = {}
-        # 本轮扫描的结束时刻（纳秒），仅供观测/诊断；快速路径判据已改用
-        # _index_written_ns()，兜底锚点改为扫描起点 scan_started_ns（见
-        # _sync_locked / _fast_path_is_trustworthy）。
+        # 记录每个 source 的 (mtime_ns, size) 签名是在哪个进程时钟时刻被观测到的。
+        # 快速路径判据只比较同源的进程时钟：仅当文件 mtime 严格早于“上次观测到它
+        # 的时刻”才信任签名相等。这样既避开跨时基比较（前两版实现失败的根源），
+        # 又能识别出“改动落在时间戳粒度同一刻度内”的 racily clean 条目。详见
+        # _fast_path_is_trustworthy。
+        self._stat_seen_ns: dict[str, int] = {}
+        # 本轮扫描的结束时刻（纳秒），仅供观测/诊断。
         self._scan_completed_ns: int = 0
         # 文本层缓存失效时，初始化阶段读出来的向量暂存到这里，等 sync 重建
         # 文本后再按 chunk.id 补挂（见 _load_vectors_cache / _attach_pending_vectors）。
@@ -894,89 +898,67 @@ class MarkdownIndexer:
         with self._sync_lock:
             return self._sync_locked()
 
-    def _fast_path_is_trustworthy(self, mtime_ns: int) -> bool:
-        """(mtime_ns, size) 快速短路是否可信 —— Git “racily clean” 判据。
+    def _fast_path_is_trustworthy(self, source: str, mtime_ns: int) -> bool:
+        """(mtime_ns, size) 签名相等是否足以断定“文件未修改”。
 
-        快速路径靠 (mtime_ns, size) 相等跳过 sha256，但该判据只在“内容变化必然
-        推动 mtime 前进”时成立，以下场景会击穿它：
+        这正是 Git 的 *racily clean* 问题（git-scm.com/docs/racy-git）：若内容
+        变化发生在时间戳粒度的一个刻度之内，`(mtime_ns, size)` 会双双不变，签名
+        相等就成了假证据。等长替换（"old content" -> "new content"，均 18 字节）
+        配上 NTFS（刻度约 3ms）或 FAT32（达 2s）就会命中，旧 chunk 静默残留并
+        继续被召回——这正是 Windows CI 上稳定复现、ext4 纳秒精度掩盖掉的 bug。
 
-        1. 时间戳粒度：文件时间戳并非真纳秒（NTFS 刻度约 3ms，FAT32 达 2s，
-           网络卷更粗）。等长内容替换（"old content" -> "new content"，均 18
-           字节）若与索引落盘落在同一刻度内，mtime_ns 与 size 双双不变，文件
-           被误判为未修改，旧 chunk 静默残留并继续被召回。Git 把这种条目称为
-           *racily clean*（git-scm.com/docs/racy-git），其处理同样是“回退读内容
-           比对”；Borg 的 files cache 亦逐出“时间戳等于归档最新时间戳”的文件。
-        2. 显式回拨 mtime：os.utime / touch -d / 部分同步与备份工具会把 mtime
-           恢复成旧值，内容已变而签名不变。
+        判据不去比较“文件 mtime”与“进程时钟”。这两个量属于不同时基，直接比大小在
+        粒度较粗的平台上会因取整而失真：未改动文件也会被判为可疑、被迫读盘，破坏
+        docs/PROJECT_GUIDE.md 记载的“未改变则彻底跳过读取内容”契约。此前两版实现
+        都栽在这里。
 
-        Git 原文（racy-git）：“When the cached stat information says the file has
-        not been modified, and the st_mtime is the same as (or newer than) the
-        timestamp of the index file itself ... it also compares the contents”，
-        且“index entries that can be racily clean are limited to the ones that
-        have the same timestamp as the index file itself”。因为索引总是在采集完
-        所有 stat 信息之后才落盘，其时间戳通常不早于其中任何条目，所以真正可疑
-        的只有“mtime 与锚点相同或更晚”的条目。判据因此取反向：只有 mtime 严格
-        早于锚点才信任签名相等。
+        改为比较**同源的进程时钟**：记录签名时把“读到该文件的时刻”一并存下
+        （_stat_seen_ns）。下次扫描时，只有当文件 mtime 严格早于那个观测时刻，才
+        认为签名可信。理由：签名是在观测时刻采集的，若此后内容再变，其 mtime 必然
+        被推到观测时刻之后；反过来，mtime 早于观测时刻的条目，其 mtime 已“定局”，
+        不会被后续写入复用，签名相等才真正等价于内容未变。
 
-        锚点必须是**索引文件自身的时间戳**：它是文件系统里的一个定局时间，与待
-        比较的文件 mtime 同处一个时基，且由“写索引”这一动作一次性确定（先关闭
-        文件再取值，之后不再变动），因此能稳定区分“索引落盘之前就存在的旧内容”
-        与“索引落盘之后才写入的新内容”。
-
-        缓存未启用（cache.enabled=False，也是 AppConfig 的默认值）时不存在这样的
-        锚点，此时**不做判断、直接返回 True**，继续信任 (mtime_ns, size) 签名。
-        理由：进程内时钟（time.time_ns）与文件系统时间戳是两个不同的时基，跨时基
-        比较在时间戳粒度较粗的平台上（NTFS / FAT32）会因取整而失真——本地实测
-        不变文件的 mtime 仅比扫描起点早约 3ms，一旦两者落入同一刻度，
-        `mtime < scan_start` 即为假，未改动文件被反复误判为可疑、被迫读盘，
-        直接破坏 docs/PROJECT_GUIDE.md 记载的“未改变则彻底跳过读取内容”契约
-        （tests/test_improvements.py::test_fast_stat_skips_disk_read_when_unmodified
-        的断言正是读盘次数必须为 0）。宁可在此退化也不引入确定的回归：无缓存
-        模式下没有可比的锚点，就不虚构一个不可靠的比较。
+        粒度碰撞发生时（mtime 与观测时刻落入同一刻度），
+        `mtime_ns < seen_ns` 为假，条目被判不可信、强制回退 sha256 复核——方向
+        安全：取整只会更保守。复核确认内容未变后，该条目会按复核时刻重新登记；此时
+        mtime 已明确早于新观测时刻，于是恢复可信、重新享受零读盘快速路径。因此
+        “不可信”只让一个条目多付**一次**读盘代价，而非永久失去快速路径。
         """
-        anchor_ns = self._index_written_ns()
-        if anchor_ns <= 0:
-            # 无索引文件锚点：不引入跨时基比较，信任签名以保住零读盘契约。
-            return True
-        return mtime_ns < anchor_ns
-
-    def _index_written_ns(self) -> int:
-        """索引缓存文件的落盘时刻（纳秒），Fast-Stat 的唯一可信锚点。
-
-        取文件系统时间戳而非进程内时钟：它与待比较的文件 mtime 处于同一时基，
-        是一次 write-then-close 的定局时间（关闭后再取值，之后不再变动），因而
-        能稳定区分“索引落盘之前就有的旧内容”与“索引落盘之后才写的新内容”。
-        缓存未启用或文件不存在时返回 0，由调用方按“无锚点”处理。
-        """
-        if self._chunks_cache_path is None:
-            return 0
-        try:
-            return int(self._chunks_cache_path.stat().st_mtime_ns)
-        except OSError:
-            return 0
+        seen_ns = self._stat_seen_ns.get(source)
+        if seen_ns is None:
+            return False
+        return mtime_ns < seen_ns
 
     def _sync_locked(self) -> list[Chunk]:
         self.vault_path.mkdir(parents=True, exist_ok=True)
         failed_before = dict(self.failed_files)
         found: set[str] = set()
-        changed: list[tuple[str, str, list[Chunk], tuple[int, int]]] = []
+        changed: list[tuple[str, str, list[Chunk], tuple[int, int], int]] = []
         for path in self._markdown_files():
             source = self._source(path)
             found.add(source)
             try:
                 stat = path.stat()
+                # 观测时刻：与文件 mtime 配对存入 _stat_seen_ns，供下一轮
+                # _fast_path_is_trustworthy 用同源进程时钟做判定。必须尽量贴近
+                # 上面这次 stat，否则会把观测期间真实发生的改动误算成“可信”。
+                seen_ns = time.time_ns()
                 fast_sig = (int(stat.st_mtime_ns), int(stat.st_size))
                 if (
                     source in self._signatures
                     and self._stat_cache.get(source) == fast_sig
-                    and self._fast_path_is_trustworthy(int(stat.st_mtime_ns))
+                    and self._fast_path_is_trustworthy(source, int(stat.st_mtime_ns))
                 ):
                     continue
 
                 raw = path.read_bytes()
                 signature = hashlib.sha256(raw).hexdigest()
                 if self._signatures.get(source) == signature:
+                    # 内容实测未变（可能是被 racily clean 判据逼下来复核的，也可能
+                    # 只是 mtime 被 touch 过）。按本次观测时刻重新登记，使该条目在
+                    # 下一轮恢复可信、重新走零读盘快速路径。
                     self._stat_cache[source] = fast_sig
+                    self._stat_seen_ns[source] = seen_ns
                     continue
                 text = raw.decode("utf-8-sig")
                 # 顺手复用上面 read_bytes 已经打开的目录项做一次 stat，记录文件
@@ -984,21 +966,23 @@ class MarkdownIndexer:
                 # mtime 语义上是"内容最后一次变化的时间"，而不是每次 touch 都更新。
                 mtime = float(stat.st_mtime)
                 chunks = self._chunk_file(source, text, mtime)
-                changed.append((source, signature, chunks, fast_sig))
+                changed.append((source, signature, chunks, fast_sig, seen_ns))
             except Exception as exc:
                 self.failed_files[source] = str(exc)
                 self._chunks.pop(source, None)
                 self._signatures.pop(source, None)
                 self._stat_cache.pop(source, None)
+                self._stat_seen_ns.pop(source, None)
                 self._fts_delete(source)
 
         # Text layer: changed files update the index even if embedding fails
         # afterwards, so lexical search still works without vectors.
-        for source, signature, chunks, fast_sig in changed:
+        for source, signature, chunks, fast_sig, seen_ns in changed:
             old_chunks = self._chunks.get(source)
             self._chunks[source] = chunks
             self._signatures[source] = signature
             self._stat_cache[source] = fast_sig
+            self._stat_seen_ns[source] = seen_ns
             self.failed_files.pop(source, None)
             self._fts_upsert(source, chunks)
             # Disk-backed mode: re-chunking a file orphans its old vector ids.
@@ -1031,6 +1015,7 @@ class MarkdownIndexer:
             self._chunks.pop(source, None)
             self._signatures.pop(source, None)
             self._stat_cache.pop(source, None)
+            self._stat_seen_ns.pop(source, None)
             self.failed_files.pop(source, None)
             self._fts_delete(source)
             if removed_ids:
@@ -1040,8 +1025,8 @@ class MarkdownIndexer:
                 except Exception:
                     pass
         self.last_sync = time.time()
-        # 本轮扫描的结束时刻（纳秒），仅供观测/诊断；快速路径判据已改用
-        # _index_written_ns()，兜底锚点改为扫描起点（见 _sync_locked）。
+        # 本轮扫描的结束时刻（纳秒），仅供观测/诊断使用，不参与快速路径判据
+        # （判据见 _fast_path_is_trustworthy，基于 _stat_seen_ns）。
         self._scan_completed_ns = time.time_ns()
         # 什么都没变时跳过缓存重写：原生监听（[cache] placement = "vault"）下，
         # 每次写缓存都会再次触发文件事件，无变化也重写等于自激的同步死循环。
@@ -2281,6 +2266,7 @@ class MarkdownIndexer:
             # 缓存整体丢弃，失败名单也随之作废（它只是缓存的附属观测数据）。
             self.failed_files.clear()
             self._stat_cache.clear()
+            self._stat_seen_ns.clear()
         # FTS index + optional sqlite-vec backend share the cache lifecycle.
         if self._fts is not None:
             try:
@@ -2325,6 +2311,7 @@ class MarkdownIndexer:
             self._chunks.clear()
             self._signatures.clear()
             self._stat_cache.clear()
+            self._stat_seen_ns.clear()
             self.failed_files.clear()
             self._disk_vectors.clear()
             if self._vectors_on_disk:

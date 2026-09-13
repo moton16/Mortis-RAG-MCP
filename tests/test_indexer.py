@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
-from mortis_rag_mcp.config import AppConfig, CacheConfig, EmbeddingConfig
+from mortis_rag_mcp.config import AppConfig, EmbeddingConfig
 from mortis_rag_mcp.indexer import MarkdownIndexer
 
 
@@ -63,49 +63,40 @@ def test_incremental_evicts_stale_when_mtime_does_not_advance(tmp_path):
     双双不变，文件被误判为未修改，旧 chunk 静默残留并继续被召回（Windows CI
     稳定复现；ext4 纳秒精度掩盖了它）。
 
-    构造方式：先完成一次正常 sync，再把索引缓存与笔记的 mtime 一并钉到同一
-    时刻 T，并让 _stat_cache 记下 (T, size)。此时新一轮读到的 (mtime_ns, size)
-    与缓存逐位相同——签名判据为真，而 mtime 并不早于锚点 T，构成 Git 定义的
-    *racily clean* 条目。于是可信度判据成为唯一的决定因素：禁用判据时本用例
-    必然失败（已验证），启用时回退 sha256 精确检出内容变化。
+    构造方式：先完成一次正常 sync，再把笔记的 mtime 钉到与“该条目的观测时刻
+    _stat_seen_ns 完全相等”，并把 _stat_cache 的签名同步成该 (mtime, size)。此时
+    新一轮读到的 (mtime_ns, size) 与缓存逐位相同——签名判据为真；但 mtime 并不
+    严格早于观测时刻，构成 racily clean 条目，可信度判据成为唯一决定因素：禁用
+    判据时本用例必然失败（已验证），启用时回退 sha256 精确检出内容变化。
 
-    注意本用例刻意启用 cache（CacheConfig(enabled=True)）：判据的锚点是索引
-    文件自身的时间戳，只有启用了索引缓存才存在这个锚点。缓存关闭时判据不做
-    判断、直接信任签名（见 _fast_path_is_trustworthy 的说明），因此本用例必须
-    开缓存才具备鉴别力。
+    这里刻意不依赖 cache 是否启用：判据基于 _stat_seen_ns（进程时钟内部自比），
+    在 AppConfig 默认的 cache.enabled=False 下同样生效——这一点很关键，上游的
+    test_incremental_add_modify_delete_and_rename 正是在默认配置下暴露该 bug 的。
 
-    易踩的坑：若只在 sync 之后改文件、不把 (T, size) 写进 _stat_cache，缓存里
-    留的是首页真实 mtime，签名判据会先短路为假，文件直接走 sha256 被正确检出，
-    用例恒绿而毫无鉴别力——这正是本用例初版失效的原因。
+    易踩的坑：若只在 sync 之后改文件、不把签名对齐进 _stat_cache，缓存里留的是
+    上一轮真实 mtime，签名判据会先短路为假，文件直接走 sha256 被正确检出，用例
+    恒绿而毫无鉴别力——这正是本用例初版失效的原因。
     """
     import os
 
     note = tmp_path / "old.md"
     note.write_text("# Old\nold content", encoding="utf-8")
     indexer = MarkdownIndexer(
-        tmp_path,
-        AppConfig(
-            embedding=EmbeddingConfig(mode="static", dimension=4),
-            cache=CacheConfig(enabled=True, dir=str(tmp_path / ".cache")),
-        ),
+        tmp_path, AppConfig(embedding=EmbeddingConfig(mode="static", dimension=4))
     )
     indexer.sync()
     assert any("old content" in chunk.content for chunk in indexer.all_chunks())
-    cache_path = indexer._chunks_cache_path
-    assert cache_path is not None and cache_path.exists()
+    assert "old.md" in indexer._stat_seen_ns
 
-    # 把索引缓存与笔记的 mtime 钉到同一时刻 T：这精确复现 Git 的
-    # “mtime 与索引文件时间戳相同”判定，也就是 racily clean 条目的定义。
-    stamp = time.time_ns()
-    os.utime(cache_path, ns=(stamp, stamp))
-    os.utime(note, ns=(stamp, stamp))
-    # 让 _stat_cache 记下被钉住的 (T, size)，签名判据才会为真；否则文件会直接
-    # 走 sha256 被正确检出，用例就失去鉴别力了。
-    indexer._stat_cache["old.md"] = (stamp, note.stat().st_size)
+    # 把笔记 mtime 钉到“该条目的观测时刻”，复现时间戳粒度碰撞下的 racily clean：
+    # mtime 与 seen 相等 => mtime < seen 为假 => 判据必须拒绝信任签名。
+    seen = indexer._stat_seen_ns["old.md"]
+    os.utime(note, ns=(seen, seen))
+    indexer._stat_cache["old.md"] = (seen, note.stat().st_size)
 
     before = note.stat()
     note.write_text("# New\nnew content", encoding="utf-8")
-    # 等长内容 + mtime 恢复成 T：新一轮 (mtime_ns, size) 与缓存逐位相同。
+    # 等长内容 + mtime 恢复成同一时刻：新一轮 (mtime_ns, size) 与缓存逐位相同。
     os.utime(note, ns=(before.st_atime_ns, before.st_mtime_ns))
     after = note.stat()
     assert after.st_size == before.st_size, "本用例前提：内容等长"
@@ -114,8 +105,8 @@ def test_incremental_evicts_stale_when_mtime_does_not_advance(tmp_path):
         int(after.st_mtime_ns),
         int(after.st_size),
     ), "本用例前提：快速路径签名判据为真，可信度判据才是决定因素"
-    assert indexer._index_written_ns() == stamp, (
-        "本用例前提：锚点必须等于被钉住的 T，才构成 racily clean 判定"
+    assert indexer._fast_path_is_trustworthy("old.md", int(after.st_mtime_ns)) is False, (
+        "本用例前提：该条目必须被判定为不可信（racily clean），才具备鉴别力"
     )
 
     indexer.sync()
