@@ -82,3 +82,14 @@ subdir = ".mcp_cache"
 # The current indexer always filters .md files, .obsidian, and common
 # temporary Markdown names (~*.md, *.tmp.md, *.swp.md, *.swo.md).
 # Those filters are implementation defaults, not configurable keys today.
+
+# ── PDF/Office 摄取层（默认关闭）────────────────────────────
+# 开启后可用 kb_ingest 把库里的 PDF/DOCX/PPTX/XLSX 解析成 Markdown 收进
+# .mortis-parsed/ 子目录并纳入索引。解析走 MinerU 云端 API：
+#   - 配了 api_key → v4 精准接口（≤200MB/200页，每天 1000 页高优先级额度）
+#   - 没配 api_key → Agent 免登接口（≤10MB/20页，IP 限频，零配置试用）
+# 云端都失败且装了 pymupdf（pip install pymupdf）→ 本地纯文本兜底。
+[ingest]
+enabled = false
+# api_key = "${MINERU_API_KEY}"
+# model_version = "vlm"

@@ -30,3 +30,9 @@
 
 ### C3 — moton16,2026-9-13,Antigravity,Gemini 3.8 Flash — docs(skill): SKILL.md 5.0 重写
 - skills/mortis-rag-mcp/SKILL.md：5.0.0 重写，改为 5 级判定表，删除冗余 schema 描述，增加行为反模式与摄取层管理机制说明
+
+### C4 — moton16,2026-9-13,Antigravity,Gemini 3.8 Flash — feat(config,ingest): IngestConfig + MinerU 双通道客户端
+- config.py / app.toml.example：新增 IngestConfig（enabled 默认 False，纯 opt-in）、配置文件样例注释
+- mortis_rag_mcp/ingest/mineru.py：纯标准库 urllib 实现 MinerU v4 精准与 Agent 免登双通道客户端，含 429 Retry-After 重试、致命错误码不重试、zip 提取
+- tests/test_ingest_mineru.py：通道路由、错误重试判定、解包、轮询状态机测试（全部 mock 网络层）
+- 验证：pytest tests/test_ingest_mineru.py 15 passed (0.23s)

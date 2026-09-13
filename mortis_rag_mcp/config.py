@@ -88,6 +88,23 @@ class CacheConfig:
     max_age_days: int = 0
 
 
+@dataclass(slots=True)
+class IngestConfig:
+    enabled: bool = False                # 默认关闭：PDF 摄取层opt-in，README/QUICKSTART 必须明确
+    api_key: str = ""                    # MinerU v4 token（支持 ${ENV_VAR} 插值）；空串 → Agent 免登通道
+    model_version: str = "vlm"           # v4 模型：pipeline / vlm（官方推荐 vlm）
+    language: str = "ch"
+    is_ocr: bool = False
+    enable_formula: bool = True
+    enable_table: bool = True
+    poll_interval: float = 3.0           # 轮询间隔（秒）
+    poll_timeout: float = 600.0          # 单文件解析最长等待（秒）
+    output_dirname: str = ".mortis-parsed"  # 产物子目录（vault 根下，镜像源结构）
+    pymupdf_fallback: bool = True        # 云端通道全失败时本地兜底（需可选依赖 pymupdf）
+    convert_small_tables: bool = True    # 小表格 HTML→markdown pipe；含跨行跨列的保留 HTML
+    table_convert_max_cells: int = 60
+
+
 DEFAULT_EXCLUDE_PATTERNS = [
     ".obsidian",
     # Obsidian 的默认回收站：里面的"已删除"笔记不该再被检索（隐私）。
@@ -113,6 +130,7 @@ class AppConfig:
     reranker: RerankerConfig = field(default_factory=RerankerConfig)
     vector: VectorConfig = field(default_factory=VectorConfig)
     cache: CacheConfig = field(default_factory=CacheConfig)
+    ingest: IngestConfig = field(default_factory=IngestConfig)
     # 混合检索开关：true（默认）用 FTS5 BM25 + 向量余弦 + bigram 词法三路 RRF
     # 融合；false 完整还原旧的「词法软信号 + 余弦」行为。
     use_hybrid: bool = True
@@ -347,6 +365,22 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
         id=str(_env(cache.get("id", ""))),
         max_age_days=_numeric(cache, data, "max_age_days", int, 0, 0),
     )
+    ingest = _section(data, "ingest")
+    ing = IngestConfig(
+        enabled=bool(ingest.get("enabled", False)),
+        api_key=str(_env(ingest.get("api_key", ""))),
+        model_version=str(_env(ingest.get("model_version", "vlm"))),
+        language=str(_env(ingest.get("language", "ch"))),
+        is_ocr=bool(ingest.get("is_ocr", False)),
+        enable_formula=bool(ingest.get("enable_formula", True)),
+        enable_table=bool(ingest.get("enable_table", True)),
+        poll_interval=_numeric(ingest, data, "poll_interval", float, 3.0, 0.1, 60.0),
+        poll_timeout=_numeric(ingest, data, "poll_timeout", float, 600.0, 1.0, 7200.0),
+        output_dirname=str(_env(ingest.get("output_dirname", ".mortis-parsed"))),
+        pymupdf_fallback=bool(ingest.get("pymupdf_fallback", True)),
+        convert_small_tables=bool(ingest.get("convert_small_tables", True)),
+        table_convert_max_cells=_numeric(ingest, data, "table_convert_max_cells", int, 60, 1),
+    )
     raw_exclude_patterns = index.get("exclude_patterns", data.get("exclude_patterns", DEFAULT_EXCLUDE_PATTERNS))
     if isinstance(raw_exclude_patterns, str):
         exclude_patterns = [p.strip() for p in raw_exclude_patterns.split(",") if p.strip()]
@@ -373,6 +407,7 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
         reranker=rer,
         vector=VectorConfig(backend=str(vector.get("backend", "memory")).lower()),
         cache=cch,
+        ingest=ing,
         use_hybrid=bool(index.get("use_hybrid", data.get("use_hybrid", True))),
         chunk_size=_numeric(index, data, "chunk_size", int, 1200, 1),
         chunk_overlap=_numeric(index, data, "chunk_overlap", int, 0, 0),
