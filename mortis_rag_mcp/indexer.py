@@ -942,6 +942,15 @@ class MarkdownIndexer:
         与 Git 的差异说明：Git 用「索引文件自身的 mtime」当锚点（同为文件系统
         时间戳，天然同时基），本实现用进程时钟 + 余量，因为 cache.enabled=False
         （AppConfig 默认值）时不落任何盘上锚点，而正确性修复必须覆盖默认配置。
+
+        已知残余风险（与 Git 同类的限制）：上述归纳假设 mtime 只会前进。若外部
+        工具显式回拨 mtime（os.utime / rsync --times / tar 解包 / 备份还原）到
+        **恰好等于登记的 mtime**，且该条目满足 seen_ns - mtime > MARGIN，签名
+        相等 + 判据为真同时成立，等长替换会被漏检。实践中窗口很窄：小文件登记时
+        seen 只比 mtime 晚几毫秒，回拨到登记 mtime 会被余量判据拦下（已实测）；
+        只有读盘+哈希耗时超过 50ms 的大文件、或 seen 被后续复核推远的条目才可能
+        触发。回拨到其他任何 mtime 都会因签名失配被正常检出。Git 对
+        「mtime 回拨到与缓存完全相同」有同样的盲区。
         """
         seen_ns = self._stat_seen_ns.get(source)
         if seen_ns is None:

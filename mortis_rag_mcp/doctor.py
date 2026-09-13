@@ -45,6 +45,23 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
 
+def _section_age_minutes(at: object) -> int | None:
+    """解析 section 的 at 时间戳，返回距今的整分钟数；解析失败返回 None。
+
+    供 full=False 沿用旧探测结果时生成肉眼可读的陈旧度标注（对抗审查 F5）。
+    """
+    if not isinstance(at, str) or not at:
+        return None
+    try:
+        then = datetime.fromisoformat(at)
+    except ValueError:
+        return None
+    if then.tzinfo is None:
+        then = then.astimezone()
+    delta = datetime.now(then.tzinfo) - then
+    return max(0, int(delta.total_seconds() // 60))
+
+
 def _section(ok: bool, detail: str) -> dict:
     return {"ok": ok, "detail": detail, "at": _now_iso()}
 
@@ -345,14 +362,22 @@ def run(full: bool = True, app_config: str | None = None, quiet: bool = False) -
             sections["embedding_api"] = probe_embedding(cfg)
             sections["reranker_api"] = probe_reranker(cfg)
         else:
-            suffix = "（沿用上次全量探测）"
+            # 对齐对抗审查 F5：沿用旧探测结果时必须让"陈旧"肉眼可见。
+            # full=False 不重新探活外部 API，若沿用旧 ok=True 而实际已宕机，
+            # 信任锚会在最长 7 天新鲜度窗口内显示假健康；这里把上次探测的
+            # 距今时长直接写进 detail，消费方无需比对时间戳即可识破。
             for name in ("embedding_api", "reranker_api"):
                 old = prev.get("sections", {}).get(name)
                 if old:
                     old = dict(old)
-                    raw_detail = str(old.get("detail", ""))
-                    if not raw_detail.endswith(suffix):
-                        old["detail"] = raw_detail + suffix
+                    raw_detail = str(old.get("detail", "")).rsplit("（", 1)[0]
+                    age_min = _section_age_minutes(old.get("at"))
+                    age_note = (
+                        f"（沿用 {age_min} 分钟前的全量探测结果，本次未重新探活）"
+                        if age_min is not None
+                        else "（沿用上次全量探测结果，本次未重新探活）"
+                    )
+                    old["detail"] = raw_detail + age_note
                     sections[name] = old
         merged = {**prev.get("sections", {}), **sections}
 

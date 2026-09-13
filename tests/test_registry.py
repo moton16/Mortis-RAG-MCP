@@ -215,3 +215,48 @@ def test_registry_set_solo_unknown_raises(tmp_path):
         raised = True
         assert "not registered" in str(exc)
     assert raised
+
+
+def test_process_file_lock_reentrancy_is_per_path(tmp_path):
+    """回归测试（对抗审查 F3）：重入判定必须按锁路径，而非线程深度。
+
+    旧实现用线程级 lock_depth 计数：持 A 锁再取 B 锁时，B 走重入分支直接
+    放行，跨进程互斥被静默跳过。修复后 held 集合按解析后的锁路径记录，
+    同路径重入放行、异路径真正取锁。
+    """
+    import threading
+
+    from mortis_rag_mcp.registry import _process_file_lock, _thread_local
+
+    lock_a = tmp_path / "a.lock"
+    lock_b = tmp_path / "b.lock"
+
+    with _process_file_lock(lock_a):
+        # 同路径重入：放行且不报错
+        with _process_file_lock(lock_a):
+            pass
+        # 持 A 取 B：修复前这里会跳过 B 的真实加锁；修复后必须真正持有 B，
+        # 且 held 集合同时包含两把锁。
+        with _process_file_lock(lock_b):
+            held = getattr(_thread_local, "held_locks", set())
+            assert len(held) == 2, f"持 A 取 B 时应同时持有两把锁，实际 held={held}"
+        assert len(getattr(_thread_local, "held_locks", set())) == 1
+    assert len(getattr(_thread_local, "held_locks", set())) == 0
+
+    # 异路径不重入：另一线程持 B 时，本线程取 B 必须被阻塞（真实互斥）。
+    acquired = []
+
+    def blocker():
+        with _process_file_lock(lock_b):
+            acquired.append("blocker-got")
+            time.sleep(0.3)
+
+    t = threading.Thread(target=blocker)
+    t.start()
+    time.sleep(0.1)  # 确保 blocker 先拿到锁
+    with _process_file_lock(lock_a):
+        with _process_file_lock(lock_b):
+            acquired.append("main-got")
+    t.join()
+    # blocker 必然先于 main 拿到 B 锁：证明异路径取锁是真实互斥而非重入放行
+    assert acquired == ["blocker-got", "main-got"]

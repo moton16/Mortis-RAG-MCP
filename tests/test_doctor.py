@@ -1,3 +1,5 @@
+import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 from mortis_rag_mcp import doctor
@@ -140,7 +142,34 @@ def test_doctor_run_does_not_duplicate_suffix(tmp_path, monkeypatch):
     doctor.run(full=False, quiet=True)
     data = doctor._read_json()
     detail = data["sections"]["embedding_api"]["detail"]
-    assert detail.count("（沿用上次全量探测）") == 1
+    # 沿用标注必须恰好出现一次，且标明"未重新探活"
+    assert detail.count("沿用") == 1
+    assert "本次未重新探活" in detail
+
+
+def test_doctor_run_carries_over_with_age_annotation(tmp_path, monkeypatch):
+    """full=False 沿用旧探测结果时，陈旧度（距今分钟数）必须写进 detail。"""
+    monkeypatch.setattr(doctor, "_status_dir", lambda: tmp_path)
+    status_json = tmp_path / "status.json"
+    old_at = (
+        datetime.now(timezone.utc).astimezone() - timedelta(minutes=90)
+    ).isoformat(timespec="seconds")
+    status_json.write_text(
+        json.dumps(
+            {
+                "sections": {
+                    "embedding_api": {"ok": True, "detail": "dim=384, 10ms", "at": old_at}
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    doctor.run(full=False, quiet=True)
+    data = doctor._read_json()
+    detail = data["sections"]["embedding_api"]["detail"]
+    assert "90 分钟前" in detail
+    assert "本次未重新探活" in detail
 
 
 def test_doctor_record_test_run_preserves_generated_at(tmp_path, monkeypatch):

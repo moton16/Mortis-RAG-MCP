@@ -25,15 +25,27 @@ _thread_local = threading.local()
 @contextlib.contextmanager
 def _process_file_lock(lock_path: Path):
     """Advisory cross-process file lock using msvcrt (Windows) or fcntl (POSIX).
-    Supports reentrancy within the same thread.
+
+    重入按**解析后的锁路径**判定：同一线程对同一把锁的重入直接放行；持有一把
+    锁的同时去取**另一把**锁则必须真正取锁。此前实现按线程深度计数判定，导致
+    「持 A 锁再取 B 锁」时 B 的跨进程互斥被静默跳过（如 doctor 持 status.lock
+    期间触发 registry 的 vaults.lock）。
+
+    注意：嵌套获取两把**不同**的锁存在跨进程死锁风险（A 持锁1等锁2、B 持锁2
+    等锁1）。当前调用方不存在此模式；未来若引入，必须约定全局一致的获取顺序。
     """
-    depth = getattr(_thread_local, "lock_depth", 0)
-    if depth > 0:
-        _thread_local.lock_depth = depth + 1
-        try:
-            yield
-        finally:
-            _thread_local.lock_depth = depth
+    try:
+        key = os.path.normcase(str(lock_path.resolve()))
+    except OSError:
+        key = os.path.normcase(str(lock_path.absolute()))
+
+    held: set = getattr(_thread_local, "held_locks", None)
+    if held is None:
+        held = set()
+        _thread_local.held_locks = held
+
+    if key in held:
+        yield
         return
 
     try:
@@ -61,11 +73,11 @@ def _process_file_lock(lock_path: Path):
             except OSError:
                 pass
 
-        _thread_local.lock_depth = 1
+        held.add(key)
         try:
             yield
         finally:
-            _thread_local.lock_depth = 0
+            held.discard(key)
             if locked:
                 if sys.platform == "win32":
                     import msvcrt
