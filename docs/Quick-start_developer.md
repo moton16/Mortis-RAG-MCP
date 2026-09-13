@@ -47,7 +47,7 @@ Mortis-RAG-MCP/
 │   └── Execution-plan_developer.md # 待执行功能的代码级方案
 ├── QUICKSTART_user.md       # 用户向：初次部署指南
 ├── CHANGELOG_user.md        # 用户向：release 版本变更（无技术细节）
-└── README.md / README.zh-CN.md
+└── README.md (中文主页) / README_EN.md (English)
 ```
 
 ## 3. 架构分层

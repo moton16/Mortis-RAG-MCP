@@ -16,7 +16,7 @@
 > 两边一致、未改名（改了会让注册表和全部 embedding 缓存作废）。这是一处有意的本地分叉，
 > `git pull` 上游对 `vault\\\\\\\_mcp/` 的改动时需注意。
 > \\\\\\\*\\\\\\\*读者\\\\\\\*\\\\\\\*：任何要查阅、二次开发或改进本项目的开发者。读完本文应能：理解项目全貌与每个模块的职责、独立搭建开发环境、按本文的 how-to 完成常见改动、知道改动会牵动哪些缓存/测试/文档。
-> \\\\\\\*\\\\\\\*相关文档\\\\\\\*\\\\\\\*：用户向导见 \\\\\\\[README.zh-CN.md](../README.zh-CN.md) / \\\\\\\[README.md](../README.md)；快速开始见 \\\\\\\[QUICKSTART.md](QUICKSTART.md)；版本变更见 \\\\\\\[CHANGELOG.md](../CHANGELOG.md)；AI 调用技巧见 \\\\\\\[skills/mortis-rag-mcp/SKILL.md](../skills/mortis-rag-mcp/SKILL.md)。
+> \\\\\\\*\\\\\\\*相关文档\\\\\\\*\\\\\\\*：用户向导见 \\\\\\\[README.md](../README.md)（中文主页） / \\\\\\\[README_EN.md](../README_EN.md)；快速开始见 \\\\\\\[QUICKSTART_user.md](../QUICKSTART_user.md)；版本变更见 \\\\\\\[CHANGELOG_user.md](../CHANGELOG_user.md)；AI 调用技巧见 \\\\\\\[skills/mortis-rag-mcp/SKILL.md](../skills/mortis-rag-mcp/SKILL.md)。
 
 \---
 

@@ -88,3 +88,9 @@
 - 移除根目录冗余的 `AGENTS.md` 与 `CLAUDE.md`，开发者协作与文档分工准则统一收敛于 `docs/Quick-start_developer.md` 与 `docs/PROJECT_GUIDE.md`。
 - 大幅精简重写 `README.md` 与 `README.zh-CN.md`，彻底移除数百行历史故障复盘、内存基准分析与底层结构排查等技术黑话。
 - 主页文档全面对齐 `QUICKSTART_user.md` 与 `CHANGELOG_user.md` 简化版，聚焦产品特性、5 分钟极简上手、核心工具速查与文档导航，打造清爽优雅的项目主页。
+
+### C11 — moton16,2026-9-13,Antigravity,Gemini 3.8 Flash — docs: make Chinese README default and add README_EN with bilingual switcher
+- 将 `README.md`（GitHub 默认渲染入口）设为中文主页，直接匹配主力用户与仓库母语使用习惯。
+- 将英文版独立收敛为 `README_EN.md`，两份文档顶部互设 `[English](README_EN.md) | 简体中文` 双向语言切换链接。
+- 移除多余的 `README.zh-CN.md`，同步更新 `docs/Quick-start_developer.md` 与 `docs/PROJECT_GUIDE.md` 中的文档索引。
+
