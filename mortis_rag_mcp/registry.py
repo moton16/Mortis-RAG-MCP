@@ -103,6 +103,8 @@ def user_config_dir() -> Path:
         try:
             old.rename(new)
         except OSError:
+            if new.exists():
+                return new
             return old
     return new
 

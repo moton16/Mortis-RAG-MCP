@@ -66,3 +66,91 @@ def test_doctor_run_quiet_and_write(tmp_path, monkeypatch):
     content = status_md.read_text(encoding="utf-8")
     assert "给 Agent 的硬约束" in content
     assert "python -m mortis_rag_mcp --doctor" in content
+
+
+def test_doctor_render_md_sanitizes_pipe_and_newlines():
+    data = {
+        "overall": True,
+        "sections": {
+            "config": {
+                "ok": True,
+                "detail": "Line1\nLine2|with pipe\r\nLine3",
+            }
+        }
+    }
+    rendered = doctor.render_md(data)
+    # The table row must NOT contain unescaped newline or bare pipe inside detail
+    for line in rendered.splitlines():
+        if line.startswith("| 配置 |"):
+            assert "\n" not in line
+            assert "Line1 Line2\\|with pipe Line3" in line
+
+
+def test_doctor_check_config_reranker_missing_key():
+    mock_cfg = MagicMock()
+    mock_cfg.embedding.mode = "static"
+    mock_cfg.embedding.model = ""
+    mock_cfg.embedding.endpoint = ""
+    mock_cfg.embedding.api_key = ""
+    mock_cfg.reranker.enabled = True
+    mock_cfg.reranker.endpoint = "https://remote.api/rerank"
+    mock_cfg.reranker.api_key = ""
+    with patch("mortis_rag_mcp.config.load_config", return_value=mock_cfg):
+        res, _ = doctor.check_config(None)
+        assert res["ok"] is False
+        assert "reranker api_key 缺失" in res["detail"]
+
+
+def test_doctor_check_config_local_endpoint_hosts():
+    for host in ("http://0.0.0.0:11434", "http://[::1]:11434", "http://host.docker.internal:11434"):
+        mock_cfg = MagicMock()
+        mock_cfg.embedding.mode = "external"
+        mock_cfg.embedding.model = "nomic-embed-text"
+        mock_cfg.embedding.endpoint = host
+        mock_cfg.embedding.api_key = ""
+        mock_cfg.reranker.enabled = False
+        with patch("mortis_rag_mcp.config.load_config", return_value=mock_cfg):
+            res, _ = doctor.check_config(None)
+            assert res["ok"] is True
+            assert "免密/本地" in res["detail"]
+
+
+def test_probe_embedding_dimension_mismatch():
+    mock_cfg = MagicMock()
+    mock_cfg.embedding.mode = "external"
+    mock_cfg.embedding.dimension = 1024
+    mock_provider = MagicMock()
+    mock_provider.embed.return_value = [[0.1] * 1536]
+    with patch("mortis_rag_mcp.providers.create_embedding_provider", return_value=mock_provider):
+        res = doctor.probe_embedding(mock_cfg)
+        assert res["ok"] is False
+        assert "维度不匹配" in res["detail"]
+
+
+def test_doctor_run_does_not_duplicate_suffix(tmp_path, monkeypatch):
+    monkeypatch.setattr(doctor, "_status_dir", lambda: tmp_path)
+    # 模拟第一次有全量探测结果
+    status_json = tmp_path / "status.json"
+    status_json.write_text(
+        '{"sections": {"embedding_api": {"ok": true, "detail": "dim=384, 10ms"}}}',
+        encoding="utf-8"
+    )
+    # 连续运行两次 full=False
+    doctor.run(full=False, quiet=True)
+    doctor.run(full=False, quiet=True)
+    data = doctor._read_json()
+    detail = data["sections"]["embedding_api"]["detail"]
+    assert detail.count("（沿用上次全量探测）") == 1
+
+
+def test_doctor_record_test_run_preserves_generated_at(tmp_path, monkeypatch):
+    monkeypatch.setattr(doctor, "_status_dir", lambda: tmp_path)
+    status_json = tmp_path / "status.json"
+    status_json.write_text(
+        '{"generated_at": "2026-09-01T00:00:00+08:00", "sections": {}}',
+        encoding="utf-8"
+    )
+    doctor.record_test_run(passed=10, failed=0, skipped=0, total_collected=10)
+    data = doctor._read_json()
+    assert data["generated_at"] == "2026-09-01T00:00:00+08:00"
+

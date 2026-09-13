@@ -78,6 +78,8 @@ def resolve_default_cache_dir() -> str:
         try:
             old.rename(new)
         except OSError:
+            if new.exists():
+                return str(new)
             return str(old)
     return str(new)
 

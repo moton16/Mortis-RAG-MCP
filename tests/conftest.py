@@ -2,8 +2,18 @@
 from __future__ import annotations
 
 
+import os
+
+
 def pytest_sessionfinish(session, exitstatus):
     try:
+        if os.getenv("MORTIS_RAG_NO_STATUS_HOOK") == "1":
+            return
+        if os.getenv("CI") or os.getenv("GITHUB_ACTIONS"):
+            return
+        if os.getenv("VAULT_MCP_REGISTRY") or os.getenv("MORTIS_RAG_REGISTRY"):
+            return
+
         reporter = session.config.pluginmanager.get_plugin("terminalreporter")
         stats = getattr(reporter, "stats", {}) if reporter else {}
         passed = len(stats.get("passed", []))

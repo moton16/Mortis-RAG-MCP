@@ -99,7 +99,7 @@
 - 详细说明 MinerU Token 获取地址（mineru.net）、环境变量设置（`MINERU_API_TOKEN`）与免登轻量试用通道的区别。
 - 在客户端连接配置 JSON 示例中补充展示 `MINERU_API_TOKEN` 环境变量注入项。
 
-### C13 — moton16,2026-9-13,Antigravity,Gemini 3.8 Flash — feat(doctor,migration): Agent 信任锚（STATUS.md / doctor.py）+ 用户数据无损原子迁移
+### C13 — Vodyanitsaaa,2026-9-13,Antigravity,Gemini 3.8 Flash — feat(doctor,migration): Agent 信任锚（STATUS.md / doctor.py）+ 用户数据无损原子迁移
 - **路径与配置无损原子迁移（~/.vault_mcp* -> ~/.mortis_rag_mcp*）**：
   - `registry.py`：保持 `user_config_dir()` 函数名，对 `~/.vault_mcp` 纯原子 `os.rename` 迁移至 `~/.mortis_rag_mcp`，遇 `OSError` 严格安全回退读旧目录，绝不使用 `shutil.move`；`registry_path()` 支持 `MORTIS_RAG_REGISTRY` 优先回退 `VAULT_MCP_REGISTRY`。
   - `config.py`：新增 `API_KEY_ENV_VARS = ("MORTIS_RAG_API_KEY", "VAULT_MCP_API_KEY")` 及 `resolve_api_key()`；`resolve_default_cache_dir()` 延迟至运行时调用并安全原子搬迁 `~/.mortis_rag_mcp_cache`；`resolve_config_path()` 支持 `MORTIS_RAG_CONFIG` > `VAULT_MCP_CONFIG` > `~/.mortis_rag_mcp/config.toml` > `~/.vault_mcp/config.toml` 回退链。
@@ -111,4 +111,12 @@
 - **Skill 与规范升级**：
   - `skills/mortis-rag-mcp/SKILL.md`：bump 至 5.1.0，插入信任锚硬约束条款，更新配置链。
   - `pyproject.toml` 及全量文档 bump 至 0.7.1。
-
+### C14 — Vodyanitsaaa,2026-9-13,Antigravity,Gemini 3.8 Flash — fix(doctor,migration): 修复对抗审查发现的表格注入、迁移竞争与门禁防假缺陷
+- **防注入与结构安全**：`doctor.py` 的 `render_md()` 增加 Markdown 表格单元格转义（过滤换行、转义管道符），杜绝异常或路径破坏 Agent 信任锚。
+- **并发迁移竞态保护**：`registry.py`（`user_config_dir`）与 `config.py`（`resolve_default_cache_dir`）在 `rename` 抛出 `OSError` 时二次检测 `new.exists()`，胜出进程完成迁移后败者直接复用新目录，杜绝死路径回退。
+- **配置与门禁严密化**：
+  - `doctor.py`：`check_config()` 校验 `reranker` 鉴权，杜绝静态 embedding + 缺 key reranker 组合产生虚假 VALID；扩充本地免密端点支持（`0.0.0.0`、`::1`、`host.docker.internal`）。
+  - `probe_embedding()`：增加端点实际返回维度与配置 `dimension` 一致性校对。
+  - `run()`：`quiet=True` 场景禁止触碰 `sys.stdout.reconfigure`，规避后台刷新与 stdio JSON-RPC 主线程竞争；去重沿用探测提示后缀。
+- **单测宿主环境隔离**：`conftest.py` 检测隔离环境变量，在隔离测试与 CI 下跳过改写真实宿主 `STATUS.md`；`record_test_run()` 使用 `setdefault` 保持信任锚原始过期时间戳。
+- **测试补充**：在 `tests/test_doctor.py` 与 `tests/test_path_migration.py` 中新增 8 个回归测试（测试全绿：257 passed, 2 skipped）。

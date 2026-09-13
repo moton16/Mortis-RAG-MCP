@@ -151,3 +151,37 @@ def test_resolve_config_path_and_cache_dir_chain(tmp_path, monkeypatch):
     # If both missing, returns None
     home_old_cfg.unlink()
     assert resolve_config_path() is None
+
+
+def test_user_config_dir_rename_race_fallback_to_new_if_exists(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    old_dir = tmp_path / ".vault_mcp"
+    new_dir = tmp_path / ".mortis_rag_mcp"
+    old_dir.mkdir()
+
+    # Simulate race: rename raises OSError, but concurrent process has already created new_dir
+    def fake_rename(self, target):
+        new_dir.mkdir(exist_ok=True)
+        raise OSError("WinError 183: Cannot create a file when that file already exists")
+
+    with patch.object(Path, "rename", fake_rename):
+        res = user_config_dir()
+        assert res == new_dir
+        assert new_dir.exists()
+
+
+def test_resolve_default_cache_dir_rename_race_fallback_to_new_if_exists(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    old_cache = tmp_path / ".vault_mcp_cache"
+    new_cache = tmp_path / ".mortis_rag_mcp_cache"
+    old_cache.mkdir()
+
+    def fake_rename(self, target):
+        new_cache.mkdir(exist_ok=True)
+        raise OSError("WinError 183: Cannot create a file when that file already exists")
+
+    with patch.object(Path, "rename", fake_rename):
+        res = resolve_default_cache_dir()
+        assert res == str(new_cache)
+        assert new_cache.exists()
+

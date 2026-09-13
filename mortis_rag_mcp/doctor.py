@@ -150,7 +150,7 @@ def check_config(app_config: str | None) -> tuple[dict, object | None]:
         model = getattr(emb, "model", "?")
         endpoint = str(getattr(emb, "endpoint", "")).lower()
         key = resolve_api_key(getattr(emb, "api_key", "") or "")
-        is_local = "localhost" in endpoint or "127.0.0.1" in endpoint
+        is_local = any(h in endpoint for h in ("localhost", "127.0.0.1", "0.0.0.0", "::1", "host.docker.internal"))
         key_configured = bool(key) or mode == "static" or is_local
 
         # 消除 static 模式下自相矛盾的"缺失"提示
@@ -163,7 +163,17 @@ def check_config(app_config: str | None) -> tuple[dict, object | None]:
         else:
             status_text = "缺失"
 
-        detail = f"{Path(str(path)).name if path else '内置默认'}：embedding={mode}/{model}，api_key {status_text}"
+        rr = getattr(cfg, "reranker", None)
+        rr_detail = ""
+        if getattr(rr, "enabled", False):
+            rr_key = resolve_api_key(getattr(rr, "api_key", "") or "")
+            rr_ep = str(getattr(rr, "endpoint", "")).lower()
+            rr_local = any(h in rr_ep for h in ("localhost", "127.0.0.1", "0.0.0.0", "::1", "host.docker.internal"))
+            if not (rr_key or rr_local):
+                key_configured = False
+                rr_detail = "，reranker api_key 缺失"
+
+        detail = f"{Path(str(path)).name if path else '内置默认'}：embedding={mode}/{model}，api_key {status_text}{rr_detail}"
         return _section(key_configured, detail), cfg
     except Exception as exc:
         return _section(False, f"配置加载失败：{exc}"), None
@@ -215,7 +225,11 @@ def probe_embedding(cfg: object) -> dict:
         vecs = provider.embed(["ping"])
         ms = int((time.monotonic() - t0) * 1000)
         if vecs and len(vecs) == 1 and len(vecs[0]) > 0:
-            return _section(True, f"探活成功，dim={len(vecs[0])}，{ms}ms")
+            actual_dim = len(vecs[0])
+            expected_dim = getattr(emb, "dimension", None)
+            if expected_dim and actual_dim != expected_dim:
+                return _section(False, f"维度不匹配：模型返回 {actual_dim} 维，配置预期 {expected_dim} 维")
+            return _section(True, f"探活成功，dim={actual_dim}，{ms}ms")
         return _section(False, "探活返回空向量")
     except Exception as exc:
         return _section(False, f"探测失败：{exc}")
@@ -253,7 +267,8 @@ def render_md(data: dict) -> str:
         sec = data.get("sections", {}).get(key)
         if not sec:
             continue
-        rows.append(f"| {label} | {'✅' if sec.get('ok') else '❌'} | {sec.get('detail', '')} |")
+        detail = str(sec.get("detail", "")).replace("\r", "").replace("\n", " ").replace("|", "\\|")
+        rows.append(f"| {label} | {'✅' if sec.get('ok') else '❌'} | {detail} |")
     table = "\n".join(rows)
     return f"""# Mortis'RAG MCP — 本机环境状态（AGENT 信任锚）
 
@@ -277,11 +292,12 @@ def render_md(data: dict) -> str:
 
 
 def run(full: bool = True, app_config: str | None = None, quiet: bool = False) -> int:
-    for stream in (sys.stdout, sys.stderr):
-        try:
-            stream.reconfigure(encoding="utf-8", errors="replace")
-        except (AttributeError, ValueError, OSError):
-            pass
+    if not quiet:
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except (AttributeError, ValueError, OSError):
+                pass
     prev = _read_json()
     sections: dict = {}
     sections["python"] = check_python()
@@ -295,11 +311,14 @@ def run(full: bool = True, app_config: str | None = None, quiet: bool = False) -
         sections["embedding_api"] = probe_embedding(cfg)
         sections["reranker_api"] = probe_reranker(cfg)
     else:
+        suffix = "（沿用上次全量探测）"
         for name in ("embedding_api", "reranker_api"):
             old = prev.get("sections", {}).get(name)
             if old:
                 old = dict(old)
-                old["detail"] = str(old.get("detail", "")) + "（沿用上次全量探测）"
+                raw_detail = str(old.get("detail", ""))
+                if not raw_detail.endswith(suffix):
+                    old["detail"] = raw_detail + suffix
                 sections[name] = old
     merged = {**prev.get("sections", {}), **sections}
     # 门禁加固：核心项至少 4 项（python, package, config, registry）全部在场且 ok
@@ -332,7 +351,7 @@ def record_test_run(passed: int, failed: int, skipped: int, total_collected: int
         detail_suffix = "" if is_full_run else "（局部测试）"
         sections["tests"] = _section(failed == 0, f"{passed} passed, {failed} failed, {skipped} skipped（commit {_git_commit()}）{detail_suffix}")
         data["sections"] = sections
-        data["generated_at"] = _now_iso()
+        data.setdefault("generated_at", _now_iso())
         data.setdefault("freshness_days", FRESHNESS_DAYS)
         data.setdefault("version", _repo_version())
         data.setdefault("commit", _git_commit())

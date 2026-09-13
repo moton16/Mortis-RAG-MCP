@@ -661,7 +661,7 @@ MCP 工具的参数可能被提示注入的 LLM 操控，项目按「零信任�
 ## 十一、测试体系
 
 ```
-tests/（24 个文件，约 5000 行；python -m pytest -q 全绿：243+ passed, 2 skipped）
+tests/（24 个文件，约 5100 行；python -m pytest -q 全绿：257+ passed, 2 skipped）
 ├── conftest.py               # pytest 全局钩子：sessionfinish 记录测试成绩入 STATUS.md（解耦 overall）
 ├── test_doctor.py            # doctor 模块探活、离线容错、状态防假、静默生成单测
 ├── test_path_migration.py    # 路径与配置无损原子迁移（~/.vault_mcp* -> ~/.mortis_rag_mcp*）
