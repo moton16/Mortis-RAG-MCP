@@ -41,7 +41,7 @@ def test_iter_table_blocks_basic():
     assert iter_table_blocks(lines) == [(0, 1), (3, 5)]
 
 
-def test_iter_table_blocks_unclosed_protects_to_end():
+def test_iter_table_blocks_unclosed_bounded():
     lines = [
         "Text before",
         "<table>",
@@ -50,7 +50,7 @@ def test_iter_table_blocks_unclosed_protects_to_end():
         "End of document",
     ]
     blocks = iter_table_blocks(lines)
-    assert blocks == [(1, 4)]
+    assert blocks == [(1, 2)]
 
 
 def test_convert_small_tables_to_pipe():

@@ -204,11 +204,23 @@ class AppConfig:
             raise ValueError("watch_method must be 'auto', 'native' or 'poll'")
         if self.watch_fallback_interval < 0:
             raise ValueError("watch_fallback_interval must be >= 0")
+        out_dir = (self.ingest.output_dirname or "").strip("/\\ ")
+        if not out_dir or ".." in Path(out_dir).parts or out_dir in (".", "/"):
+            self.ingest.output_dirname = ".mortis-parsed"
+        else:
+            self.ingest.output_dirname = out_dir
 
 
 def _env(value: Any) -> Any:
     if isinstance(value, str):
-        return re.sub(r"\$\{([^}]+)\}", lambda m: os.getenv(m.group(1), ""), value)
+        def _replace_var(m: re.Match) -> str:
+            var_name = m.group(1)
+            val = os.getenv(var_name)
+            if val is None:
+                sys.stderr.write(f"[Mortis'RAG Config WARNING] Environment variable ${{{var_name}}} is not set.\n")
+                return ""
+            return val
+        return re.sub(r"\$\{([^}]+)\}", _replace_var, value)
     return value
 
 

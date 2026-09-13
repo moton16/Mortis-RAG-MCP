@@ -144,7 +144,7 @@ def test_pymupdf_fallback(tmp_path: Path, monkeypatch):
     doc.write_bytes(b"fallback pdf content")
 
     def fake_parse(self, path, **kwargs):
-        raise MineruError("cloud network failure", retryable=True)
+        raise MineruError("cloud permanent failure", retryable=False)
 
     monkeypatch.setattr("mortis_rag_mcp.ingest.mineru.MineruClient.parse", fake_parse)
     monkeypatch.setattr(mgr, "_pymupdf_fallback", lambda path: "Fallback local text extraction")

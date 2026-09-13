@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import atexit
 import json
+import os
 import sys
 import threading
 from argparse import ArgumentParser
@@ -15,7 +16,7 @@ from .indexer import Chunk, MarkdownIndexer, SearchFilter, dedupe_by_content_has
 from .ingest import IngestManager, INGEST_EXTS
 from .registry import VaultEntry, VaultRegistry, registry_path
 
-SERVER_INFO = {"name": "mortis-rag-mcp", "version": "0.6.0", "title": "Mortis'RAG MCP"}
+SERVER_INFO = {"name": "mortis-rag-mcp", "version": "0.7.0", "title": "Mortis'RAG MCP"}
 
 SERVER_INSTRUCTIONS = (
     "本服务器提供本地 Markdown 知识库检索。路由纪律："
@@ -268,6 +269,41 @@ def _text_content(value: Any) -> dict[str, Any]:
     return {"content": [{"type": "text", "text": json.dumps(value, ensure_ascii=False)}]}
 
 
+_EXCLUDED_SCAN_DIRS = {".git", "node_modules", ".venv", ".trash", ".obsidian", ".stversions", ".stfolder", ".DS_Store"}
+
+
+def _count_vault_docs(vault_path: str | Path, output_dirname: str = ".mortis-parsed") -> tuple[int, int]:
+    """统计 vault 内的 Markdown 笔记数与可摄取文档数。
+    使用 scandir 剪枝遍历，排除 .git/node_modules/产物目录 (D8b, D17)。
+    """
+    vpath = Path(vault_path).expanduser().resolve()
+    out_name = (output_dirname or ".mortis-parsed").strip("/\\ ")
+    md_count = 0
+    doc_count = 0
+    entries = [vpath]
+    while entries:
+        curr = entries.pop()
+        try:
+            with os.scandir(curr) as it:
+                for entry in it:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            if entry.name in _EXCLUDED_SCAN_DIRS or entry.name == out_name:
+                                continue
+                            entries.append(Path(entry.path))
+                        elif entry.is_file(follow_symlinks=False):
+                            name_lower = entry.name.lower()
+                            if name_lower.endswith((".md", ".markdown")):
+                                md_count += 1
+                            elif Path(name_lower).suffix in INGEST_EXTS:
+                                doc_count += 1
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    return md_count, doc_count
+
+
 class VaultMcpServer:
     def __init__(self, config_path: str | Path | None = None) -> None:
         # 0.3.0 起配置解析链：显式 --app-config > VAULT_MCP_CONFIG 环境变量
@@ -277,6 +313,7 @@ class VaultMcpServer:
         self._indexers: dict[str, MarkdownIndexer] = {}
         self._ingest_managers: dict[str, IngestManager] = {}
         self._indexers_lock = threading.Lock()
+        self._ingest_managers_lock = threading.Lock()
         self._startup_lock = threading.Lock()
         self._started = False
         self._migrate_legacy()
@@ -422,11 +459,7 @@ class VaultMcpServer:
             entry = self.registry.add(resolved, name_arg, description=desc, persist=False)
         indexer = self._indexer_for({"vault_path": entry.path})
         threading.Thread(target=indexer.sync, daemon=True, name="vault-init").start()
-        md_files = sum(1 for _ in Path(entry.path).rglob("*.md") if _.is_file())
-        doc_files = sum(
-            1 for p in Path(entry.path).rglob("*")
-            if p.is_file() and p.suffix.lower() in INGEST_EXTS
-        )
+        md_files, doc_files = _count_vault_docs(entry.path, self.config.ingest.output_dirname)
         res = {
             "registered": True,
             "path": entry.path,
@@ -473,11 +506,7 @@ class VaultMcpServer:
                 entry = self.registry.add(resolved, name_arg, solo=True, persist=False)
             indexer = self._indexer_for({"vault_path": entry.path})
             threading.Thread(target=indexer.sync, daemon=True, name="vault-init").start()
-            md_files = sum(1 for _ in Path(entry.path).rglob("*.md") if _.is_file())
-            doc_files = sum(
-                1 for p in Path(entry.path).rglob("*")
-                if p.is_file() and p.suffix.lower() in INGEST_EXTS
-            )
+            md_files, doc_files = _count_vault_docs(entry.path, self.config.ingest.output_dirname)
             res = {
                 "solo": True,
                 "registered": True,
@@ -551,8 +580,16 @@ class VaultMcpServer:
         key = str(Path(vault_path).resolve())
         manager = self._ingest_managers.get(key)
         if manager is None:
-            manager = IngestManager(vault_path, self.config.ingest)
-            self._ingest_managers[key] = manager
+            with self._ingest_managers_lock:
+                manager = self._ingest_managers.get(key)
+                if manager is None:
+                    def _on_job_finished(out_path: str) -> None:
+                        indexer = self._indexers.get(key)
+                        if indexer is not None:
+                            threading.Thread(target=indexer.sync, daemon=True, name="ingest-sync").start()
+
+                    manager = IngestManager(vault_path, self.config.ingest, on_job_finished=_on_job_finished)
+                    self._ingest_managers[key] = manager
         return manager
 
     def _kb_ingest(self, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -566,13 +603,10 @@ class VaultMcpServer:
             return {"pending": manager.scan_pending()}
         if action == "status":
             return manager.status(str(arguments.get("job_id", "")).strip() or None)
-        result = manager.submit(arguments.get("sources") or None)
+        force = bool(arguments.get("force", False))
+        result = manager.submit(arguments.get("sources") or None, force=force)
         result["hint"] = ("解析在后台进行，用 kb_ingest(action='status') 查进度；"
                           "done 的文档已写入 .mortis-parsed/ 并可被 kb_search 检索。")
-        # 触发一次增量同步，把已落盘产物立即纳入索引（watcher 也会捕获，双保险）
-        indexer = self._indexers.get(str(Path(vault).resolve()))
-        if indexer is not None:
-            threading.Thread(target=indexer.sync, daemon=True, name="ingest-sync").start()
         return result
 
     def _fanout_search(self, query: str, top_k: int, use_rerank: bool, group_by_vault: bool = False, filters: SearchFilter | None = None, dedupe: bool = True) -> dict[str, Any]:
@@ -593,6 +627,7 @@ class VaultMcpServer:
                 mtime_before=filters.mtime_before,
             )
         all_entries = self.registry.load()
+        vault_name_map = {entry.path: entry.name for entry in all_entries}
         # solo 库只在显式指定 vault_path 时被检索；fan-out 跳过它们并原样
         # 报告在 excluded_solo 里，否则"忘了一个库是 solo"会变成检索黑洞。
         excluded_solo = [entry.path for entry in all_entries if entry.solo]
@@ -700,7 +735,7 @@ class VaultMcpServer:
             )
             res: dict[str, Any] = {"groups": groups, "searched": searched, "errors": errors, "excluded_solo": excluded_solo}
             if len(searched) > 1:
-                names = [Path(s).name for s in searched]
+                names = [vault_name_map.get(s, Path(s).name) for s in searched]
                 res["hint"] = (
                     f"本次检索横跨 {len(searched)} 个库：{names}。若用户问题指向特定库或目录，"
                     "下次请传 vault_path 或 path_prefix 定向检索，精度更高、噪音更少。"
@@ -717,7 +752,7 @@ class VaultMcpServer:
             out_chunks.append(data)
         res = {"chunks": out_chunks, "searched": searched, "errors": errors, "excluded_solo": excluded_solo}
         if len(searched) > 1:
-            names = [Path(s).name for s in searched]
+            names = [vault_name_map.get(s, Path(s).name) for s in searched]
             res["hint"] = (
                 f"本次检索横跨 {len(searched)} 个库：{names}。若用户问题指向特定库或目录，"
                 "下次请传 vault_path 或 path_prefix 定向检索，精度更高、噪音更少。"

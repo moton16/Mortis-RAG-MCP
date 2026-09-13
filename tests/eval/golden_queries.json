@@ -1,8 +1,8 @@
 {
-  "说明": "金标准查询集。expect = 期望命中的 source 子串（库内相对路径）。path_prefix/vault_path 可选，用于验证定向检索。初始先放占位，各开发者按自己的库补充 20-30 条。",
+  "说明": "金标准查询集。expect = 期望命中的 source 子串（库内相对路径）。path_prefix/vault_path 可选，用于验证定向检索。vault 支持相对路径（相对当前 JSON 文件路径）。",
   "queries": [
     {
-      "vault": "D:/path/to/vault",
+      "vault": "./vault",
       "query": "TTL 与非门的噪声容限怎么算",
       "expect": "数电/",
       "path_prefix": "",

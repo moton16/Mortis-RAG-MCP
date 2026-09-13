@@ -31,7 +31,8 @@ Mortis-RAG-MCP/
 │   ├── __main__.py          # 入口：python -m mortis_rag_mcp --serve-mcp-stdio
 │   ├── config.py            # 配置加载（390 行）
 │   ├── registry.py          # 用户级知识库注册表（304 行）
-│   ├── server.py            # MCP 协议层 + 13 个工具 handler（879 行）
+│   ├── server.py            # MCP 协议层 + 15 个工具 handler（1000+ 行）
+│   ├── ingest/              # PDF/Office 异步摄取与表格处理（worker, mineru, tables）
 │   ├── indexer.py           # 索引与检索核心（2787 行，全项目的心脏）
 │   ├── providers.py         # embedding / reranker HTTP 封装（230 行）
 │   ├── fts.py               # FTS5 SQLite 封装（149 行）

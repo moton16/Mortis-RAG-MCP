@@ -125,11 +125,14 @@ class FtsIndex:
         with self._lock:
             conn = self._connect()
             if path_prefix:
+                norm_prefix = path_prefix.replace("\\", "/").rstrip("/")
+                pat1 = self._like_prefix(norm_prefix)
+                pat2 = self._like_prefix(".mortis-parsed/" + norm_prefix)
                 rows = conn.execute(
                     "SELECT chunk_id, bm25(chunks_fts) FROM chunks_fts "
-                    "WHERE chunks_fts MATCH ? AND source LIKE ? ESCAPE '\\' "
+                    "WHERE chunks_fts MATCH ? AND (source LIKE ? ESCAPE '\\' OR source LIKE ? ESCAPE '\\') "
                     "ORDER BY bm25(chunks_fts) LIMIT ?",
-                    (match_sql, self._like_prefix(path_prefix), max(1, int(limit))),
+                    (match_sql, pat1, pat2, max(1, int(limit))),
                 ).fetchall()
             else:
                 rows = conn.execute(

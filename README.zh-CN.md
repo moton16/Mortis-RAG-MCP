@@ -224,7 +224,7 @@ python -m vault_mcp --serve-mcp-stdio --app-config .\config\app.toml
 
 ### 3.4 功能模块 / API 调用方式
 
-共 13 个工具，均为 `tools/call` 的 JSON-RPC 请求：
+共 15 个工具，均为 `tools/call` 的 JSON-RPC 请求：
 
 > **0.6.0 工具更名（Breaking）**：`kb_unregister` → `kb_remove`、`kb_vaults` → `kb_list`、
 > 原 `kb_list`（列文件）→ `kb_list_files`，旧名不再保留。
@@ -353,6 +353,33 @@ python -m vault_mcp --serve-mcp-stdio --app-config .\config\app.toml
 - **核心承诺：导入后的下一次同步 0 次 embedding API 调用**（文本层、向量、FTS 原样落地；本机 cache key 由导入逻辑自动重写）。
 - 安全：zip 成员按白名单精确校验（路径穿越名直接拒绝）；快照的向量模型/维度与本机配置不一致时拒绝导入，`force = true` 可强制——此时只导入文本层，向量由本地重新计算。
 - 前提：`[cache] enabled = true` 且导出前完成过至少一次索引。
+
+#### `kb_exempt` — 排除私密/草稿笔记（0.5.0 新增）
+
+```json
+{"name": "kb_exempt", "arguments": {"vault_path": "D:\\笔记\\工作库"}}
+```
+
+- 查看或更新 `.vaultignore` 规则与 `rag: false` 排除标记，保护草稿或敏感文件不被检索。
+
+#### `kb_describe` — 设置知识库自然语言描述（0.7.0 新增）
+
+```json
+{"name": "kb_describe", "arguments": {"vault_path": "D:\\我的笔记", "description": "包含数字电路、考研复习与计算机体系结构的学习笔记"}}
+```
+
+- 为知识库设置业务领域与内容描述，供 AI Agent 自动判定检索路由，避免无意义的全局 fan-out。
+
+#### `kb_ingest` — 摄取 PDF / Office 文档（0.7.0 新增）
+
+```json
+{"name": "kb_ingest", "arguments": {"action": "pending", "vault_path": "D:\\我的笔记"}}
+{"name": "kb_ingest", "arguments": {"action": "submit", "vault_path": "D:\\我的笔记", "sources": ["教材/数电.pdf"]}}
+{"name": "kb_ingest", "arguments": {"action": "status", "vault_path": "D:\\我的笔记"}}
+```
+
+- 异步解析 PDF/Office 文档为标准 Markdown 格式并存入 `.mortis-parsed/`。
+- 支持表格原子保护、跨进程安全锁与智能重试机制。
 
 ### 3.5 运行测试
 

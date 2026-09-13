@@ -18,8 +18,8 @@ venv/
 # 后续的 ! 白名单将永远无法生效（gitignore 只对"未被排除目录内的文件"生效）。
 docs/*
 !docs/Changelog_developer.md
+!docs/PROJECT_GUIDE.md
 !docs/Quick-start_developer.md
-!docs/Execution-plan_developer.md
 # Tooling / test artifacts
 .pytest_cache/
 .smoke_vaults.toml

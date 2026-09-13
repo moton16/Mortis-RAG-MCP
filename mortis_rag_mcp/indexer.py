@@ -20,7 +20,7 @@ from .config import AppConfig
 from . import fsnotify
 from .fsnotify import WindowsDirectoryWatcher, watcher_available
 from .fts import FtsIndex
-from .ingest.tables import iter_table_blocks, split_large_table
+from .ingest.tables import iter_table_blocks, split_large_table, split_table_into_chunks
 from .providers import EmbeddingProvider, ProviderError, RerankerProvider, create_embedding_provider, create_reranker_provider
 from .vector import create_vector_backend
 
@@ -154,7 +154,7 @@ class Chunk:
     embedding: array | None = field(default=None, repr=False)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        d = {
             "id": self.id,
             "content": self.content,
             "score": self.score,
@@ -162,6 +162,9 @@ class Chunk:
             "title": self.title,
             "metadata": dict(self.metadata),
         }
+        if "source_pdf" in self.metadata:
+            d["source_pdf"] = self.metadata["source_pdf"]
+        return d
 
 
 @dataclass
@@ -192,7 +195,19 @@ class SearchFilter:
             if os.name == "nt":
                 prefix = prefix.casefold()
                 source = source.casefold()
-            if prefix and not source.startswith(prefix):
+            matched = False
+            if prefix and source.startswith(prefix):
+                matched = True
+            elif prefix:
+                # D14: 穿透 .mortis-parsed/ 产物目录，召回对应的 PDF 摄取文档
+                for parsed_dir in (".mortis-parsed/", ".mortis-parsed"):
+                    pdir = parsed_dir.casefold() if os.name == "nt" else parsed_dir
+                    if source.startswith(pdir):
+                        stripped = source[len(pdir):].lstrip("/")
+                        if stripped.startswith(prefix):
+                            matched = True
+                            break
+            if not matched:
                 return False
         if self.tags:
             wanted = {str(tag).lower().lstrip("#") for tag in self.tags if str(tag).strip()}
@@ -1338,7 +1353,7 @@ class MarkdownIndexer:
         if not sections and body:
             if any(line.strip() for line in body):
                 sections = [(title, body_start + 1, body)]
-        return self._make_chunks(source, title, tags, sections, mtime)
+        return self._make_chunks(source, title, tags, sections, mtime, source_pdf=properties.get("source_pdf"))
 
     @staticmethod
     def _frontmatter(lines: list[str]) -> tuple[int, list[str], dict[str, Any]]:
@@ -1486,53 +1501,58 @@ class MarkdownIndexer:
         tags: list[str],
         sections: list[tuple[str, int, list[str]]],
         mtime: float | None = None,
+        source_pdf: str | None = None,
     ) -> list[Chunk]:
         result: list[Chunk] = []
         chunk_index = 0
         overlap = self.config.chunk_overlap
         for heading, start, lines in sections:
             table_blocks = iter_table_blocks(lines)
-            if any((sum(len(l) + 1 for l in lines[s:e+1]) > 2 * self.config.chunk_size) for s, e in table_blocks):
-                new_lines: list[str] = []
-                idx = 0
-                for s, e in table_blocks:
-                    new_lines.extend(lines[idx:s])
-                    tbl_chunk = lines[s:e+1]
-                    tbl_chars = sum(len(l) + 1 for l in tbl_chunk)
-                    if tbl_chars > 2 * self.config.chunk_size:
-                        avg_line = max(1, tbl_chars // max(1, len(tbl_chunk)))
-                        max_lines = max(5, self.config.chunk_size // avg_line)
-                        parts = split_large_table(tbl_chunk, max_lines)
-                        for part in parts:
-                            new_lines.extend(part)
-                    else:
-                        new_lines.extend(tbl_chunk)
-                    idx = e + 1
-                new_lines.extend(lines[idx:])
-                lines = new_lines
-                table_blocks = iter_table_blocks(lines)
-
-            cannot_cut = {i for s, e in table_blocks for i in range(s + 1, e + 1)}
-            table_starts = {s: sum(len(l) + 1 for l in lines[s:e+1]) for s, e in table_blocks}
-
+            table_map = {s: e for s, e in table_blocks}
+            offset = 0
             current: list[str] = []
             current_start = start
             current_length = 0
             carry: list[str] = []
             carry_length = 0
-            for offset, line in enumerate(lines):
-                if current and offset in table_starts and (current_length + table_starts[offset] > self.config.chunk_size):
-                    result.append(self._new_chunk(source, title, heading, current_start, start + offset - 1, chunk_index, tags, current, mtime))
-                    chunk_index += 1
-                    carry, carry_length = self._overlap_tail(current, overlap)
-                    current = list(carry)
-                    current_start = start + offset - len(carry)
-                    current_length = carry_length
 
-                # 超长行必须按字符硬切：仅在非表格内部时硬切
-                if len(line) > self.config.chunk_size and offset not in cannot_cut:
+            while offset < len(lines):
+                if offset in table_map:
+                    # 遇到表格开始：先将此前积攒的正文文本 flush 为 chunk
                     if current:
-                        result.append(self._new_chunk(source, title, heading, current_start, start + offset - 1, chunk_index, tags, current, mtime))
+                        result.append(self._new_chunk(source, title, heading, current_start, start + offset - 1, chunk_index, tags, current, mtime, source_pdf=source_pdf))
+                        chunk_index += 1
+                        current = []
+                        current_length = 0
+                        carry = []
+                        carry_length = 0
+
+                    s = offset
+                    e = table_map[s]
+                    tbl_lines = lines[s : e + 1]
+                    tbl_chars = sum(len(l) + 1 for l in tbl_lines)
+
+                    if tbl_chars <= self.config.chunk_size:
+                        # 整个表格未超预算：作为一个完整原子 chunk
+                        result.append(self._new_chunk(source, title, heading, start + s, start + e, chunk_index, tags, tbl_lines, mtime, source_pdf=source_pdf))
+                        chunk_index += 1
+                    else:
+                        # 表格超预算：使用 split_table_into_chunks 做保真且受限的分片 (D3, D4a, D4b, D5)
+                        tbl_chunks = split_table_into_chunks(tbl_lines, self.config.chunk_size)
+                        for sub_s, sub_e, chunk_lines in tbl_chunks:
+                            result.append(self._new_chunk(source, title, heading, start + s + sub_s, start + s + sub_e, chunk_index, tags, chunk_lines, mtime, source_pdf=source_pdf))
+                            chunk_index += 1
+
+                    # 表格处理完毕，直接跳到表格末尾下一行，绝对不在 lines 里插入额外虚行，行号绝不漂移 (D4c)
+                    offset = e + 1
+                    current_start = start + offset
+                    continue
+
+                line = lines[offset]
+                # 非表格行超长按字符切块
+                if len(line) > self.config.chunk_size:
+                    if current:
+                        result.append(self._new_chunk(source, title, heading, current_start, start + offset - 1, chunk_index, tags, current, mtime, source_pdf=source_pdf))
                         chunk_index += 1
                         carry, carry_length = self._overlap_tail(current, overlap)
                         current = list(carry)
@@ -1541,23 +1561,28 @@ class MarkdownIndexer:
                     for piece_start in range(0, len(line), self.config.chunk_size):
                         piece = line[piece_start : piece_start + self.config.chunk_size]
                         if current:
-                            result.append(self._new_chunk(source, title, heading, current_start, start + offset - 1, chunk_index, tags, current, mtime))
+                            result.append(self._new_chunk(source, title, heading, current_start, start + offset - 1, chunk_index, tags, current, mtime, source_pdf=source_pdf))
                             chunk_index += 1
                         current = [piece]
                         current_length = len(piece) + 1
                         current_start = start + offset
+                    offset += 1
                     continue
-                if current and current_length + len(line) + 1 > self.config.chunk_size and offset not in cannot_cut:
-                    result.append(self._new_chunk(source, title, heading, current_start, start + offset - 1, chunk_index, tags, current, mtime))
+
+                if current and current_length + len(line) + 1 > self.config.chunk_size:
+                    result.append(self._new_chunk(source, title, heading, current_start, start + offset - 1, chunk_index, tags, current, mtime, source_pdf=source_pdf))
                     chunk_index += 1
                     carry, carry_length = self._overlap_tail(current, overlap)
                     current = list(carry)
                     current_start = start + offset - len(carry)
                     current_length = carry_length
+
                 current.append(line)
                 current_length += len(line) + 1
+                offset += 1
+
             if current:
-                result.append(self._new_chunk(source, title, heading, current_start, start + len(lines) - 1, chunk_index, tags, current, mtime))
+                result.append(self._new_chunk(source, title, heading, current_start, start + len(lines) - 1, chunk_index, tags, current, mtime, source_pdf=source_pdf))
                 chunk_index += 1
         return result
 
@@ -1576,22 +1601,32 @@ class MarkdownIndexer:
         return list(reversed(tail)), length
 
     @staticmethod
-    def _new_chunk(source: str, title: str, heading: str, start: int, end: int, index: int, tags: list[str], lines: list[str], mtime: float | None = None) -> Chunk:
+    def _new_chunk(
+        source: str,
+        title: str,
+        heading: str,
+        start: int,
+        end: int,
+        index: int,
+        tags: list[str],
+        lines: list[str],
+        mtime: float | None = None,
+        source_pdf: str | None = None,
+    ) -> Chunk:
         content = "\n".join(lines).strip()
         identifier = hashlib.sha1(f"{source}\0{index}\0{content}".encode("utf-8")).hexdigest()
-        return Chunk(identifier, content, source, title, {
+        meta = {
             "heading": heading,
             "start_line": start,
             "end_line": max(start, end),
             "chunk_index": index,
             "tags": list(tags),
-            # epoch 秒，供 kb_search 的 mtime_after / mtime_before 过滤；
-            # 老缓存里没有这个字段，SearchFilter 会放行而不是判为不匹配。
             "mtime": mtime,
-            # chunk 正文的 sha256 前 16 位：内容完全相同的 chunk（重复备份、
-            # 复制粘贴的段落）共享同一个哈希，embedding 与检索去重都靠它。
             "content_hash": hashlib.sha256(content.encode("utf-8")).hexdigest()[:16],
-        })
+        }
+        if source_pdf:
+            meta["source_pdf"] = source_pdf
+        return Chunk(identifier, content, source, title, meta)
 
     def all_chunks(self) -> list[Chunk]:
         """全部 chunk 的快照。

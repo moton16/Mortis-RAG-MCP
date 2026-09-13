@@ -53,4 +53,28 @@
 - README.zh-CN.md：增补"PDF / Office 文档摄取（默认关闭）"小节，阐明两步开启方式与 .mortis-parsed/ 落盘设计
 - QUICKSTART_user.md：配置段末尾追加第 6 条摄取说明
 
+### D1 — moton16,2026-9-13,Antigravity,Gemini 3.8 Flash — docs: 新增 v0.7.0 本地提交对抗审查报告
+- 新增 `docs/v0.7.0/Adversarial-review-merged_developer.md`：针对 C0-C7 8 轮 commit 进行全量对抗审查（Adversarial Review / Red Team Review），整合两轮（静态代码审查 + 实测探针深挖），按根因去重、统一为 `D1–D20` 编号。
+- 梳理出 3 项 P0（`kb_ingest` 路径逃逸外发、未闭合 `<table>` 三条故障分支、已闭合大表超预算 chunk）、5 项 P1、6 项 P2、6 项 P3，其中 8 条附实测复现数据，并提供代码级修复指引与 14 条验收门禁。
+
+### C8 — moton16,2026-9-13,Antigravity,Gemini — fix(ingest,indexer,server): 全面修复对抗审查 20 项缺陷并达成 14 项门禁
+- **P0 缺陷彻底清零**：
+  - D1: `_validate_safe_source` 纵深校验前移至 `submit` 与 `_run_job` 双重防御，严防路径穿越与任意文件上传。
+  - D2: `iter_table_blocks` 排除围栏代码块，对未闭合表格设行数与字符双重界限；`convert_small_tables` 严格要求已闭合 `</table>`，根除正文被删隐患。
+  - D3: 表格按字符预算动态装箱，长单元格细粒度切分，确保所有 chunk 严格不超过 `chunk_size`。
+- **P1 缺陷全面加固**：
+  - D4: `split_large_table` 保留同行的 `<tr>` 与表头，`split_table_into_chunks` 直出物理行号区间，杜绝行号漂移。
+  - D5: 单行超长表按行与单元格拆包重构，保证每个分片均为闭合合法 `<table>` 片段。
+  - D6: 引入 `.ingest.lock` 跨进程文件锁，`_ingest_manager_for` 补齐双检锁，杜绝多进程与多线程竞争。
+  - D7: `retryable=True` 错误维持 failed 状态并支持 force 重新入队，PyMuPDF 兜底仅对 PDF 生效且显式 close()。
+  - D8: `scan_pending` 与 `_count_vault_docs` 改用 scandir 剪枝并跳过全量哈希，根除服务假死。
+- **P2 / P3 完备性与可观测性**：
+  - D9: `IngestManager` 支持 `on_job_finished` 回调，解析落盘后自动拉起增量索引同步。
+  - D10 / D11: 启动自愈 zombie parsing 任务，submit 去重防止额度浪费。
+  - D13 / D14: 配置防御与告警，SearchFilter 与 FTS 支持原目录前缀定向召回 `.mortis-parsed` 产物。
+  - D15 / D16: 移除全局盲替换，优化 status 汇总可观测性 (`done_full` / `done_fallback`)。
+  - D17 / D18 / D19 / D20: 统一版本号 0.7.0 与 15 个工具计数，eval_search 支持 MRR 与无外网模式，fanout hint 采用 VaultEntry.name，231 项全真测试 100% 通过。
+
+
+
 
