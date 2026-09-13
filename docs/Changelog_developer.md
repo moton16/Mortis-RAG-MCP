@@ -11,3 +11,9 @@
 - 方案依据：MinerU 官方 API 文档（mineru.net/apiManage/docs）已核实全量端点/参数/错误码（v4 精准 + Agent 轻量免登双通道）；同类项目调研（proofsh/obsidian-notes-rag 链接图谱、gbrain per-page max-pool/title boost/CRAG、parent-document retrieval 业界数据）。
 - 未动：`CHANGELOG_user.md`（按分工只在 release 时改）、`QUICKSTART_user.md`（PDF 章节文案已写入 Execution-plan P2-8，随功能 commit 一并落地，不提前记录不存在的功能）。
 - 验证：docs 纯文档改动，无代码变更；方案内代码均对照现行源码核实（VaultEntry 字段、save() json.dumps 序列化、MarkdownIndexer 构造签名、_fanout_search 返回结构、initialize 响应位置）。
+
+### C0 — moton16,2026-9-13,Antigravity,Gemini 3.8 Flash — test(eval): 检索评测 harness（Hit@K 金标准回归脚本）
+- 新增 `scripts/eval_search.py`（Hit@K 回归）、`tests/eval/golden_queries.json` 骨架
+- 动机：P1-P3 都会动检索行为，先立度量尺
+- 验证：占位查询跑通（MISS 正常捕获，耗时 0.00s）；真实 vault 抽测跑通（0.09s）；Hit@5 基线 = 0.0%
+
