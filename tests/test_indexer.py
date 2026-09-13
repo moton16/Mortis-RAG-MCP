@@ -69,6 +69,11 @@ def test_incremental_evicts_stale_when_mtime_does_not_advance(tmp_path):
     *racily clean* 条目。于是可信度判据成为唯一的决定因素：禁用判据时本用例
     必然失败（已验证），启用时回退 sha256 精确检出内容变化。
 
+    注意本用例刻意启用 cache（CacheConfig(enabled=True)）：判据的锚点是索引
+    文件自身的时间戳，只有启用了索引缓存才存在这个锚点。缓存关闭时判据不做
+    判断、直接信任签名（见 _fast_path_is_trustworthy 的说明），因此本用例必须
+    开缓存才具备鉴别力。
+
     易踩的坑：若只在 sync 之后改文件、不把 (T, size) 写进 _stat_cache，缓存里
     留的是首页真实 mtime，签名判据会先短路为假，文件直接走 sha256 被正确检出，
     用例恒绿而毫无鉴别力——这正是本用例初版失效的原因。

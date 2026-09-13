@@ -894,7 +894,7 @@ class MarkdownIndexer:
         with self._sync_lock:
             return self._sync_locked()
 
-    def _fast_path_is_trustworthy(self, mtime_ns: int, scan_started_ns: int) -> bool:
+    def _fast_path_is_trustworthy(self, mtime_ns: int) -> bool:
         """(mtime_ns, size) 快速短路是否可信 —— Git “racily clean” 判据。
 
         快速路径靠 (mtime_ns, size) 相等跳过 sha256，但该判据只在“内容变化必然
@@ -918,27 +918,35 @@ class MarkdownIndexer:
         的只有“mtime 与锚点相同或更晚”的条目。判据因此取反向：只有 mtime 严格
         早于锚点才信任签名相等。
 
-        锚点优先取索引缓存文件的 st_mtime_ns（一次 write-then-close 的定局时间，
-        单调、跨进程重启有效，且与待比较的文件 mtime 同处一个时基）；缓存未启用
-        时退化为本次扫描的起点时刻 scan_started_ns。把兜底锚点放在扫描“开始”
-        而非“结束”是关键：不变文件上一轮就已存在，其 mtime 必然早于本轮起点，
-        不会因粒度碰撞被反复误判为可疑，零读盘快速路径得以稳定成立；而扫描期间
-        被写过的文件 mtime >= 起点，会被强制 sha256 复核。无锚点时返回 False
-        （退化为全量精算，宁可慢不可错）。
+        锚点必须是**索引文件自身的时间戳**：它是文件系统里的一个定局时间，与待
+        比较的文件 mtime 同处一个时基，且由“写索引”这一动作一次性确定（先关闭
+        文件再取值，之后不再变动），因此能稳定区分“索引落盘之前就存在的旧内容”
+        与“索引落盘之后才写入的新内容”。
+
+        缓存未启用（cache.enabled=False，也是 AppConfig 的默认值）时不存在这样的
+        锚点，此时**不做判断、直接返回 True**，继续信任 (mtime_ns, size) 签名。
+        理由：进程内时钟（time.time_ns）与文件系统时间戳是两个不同的时基，跨时基
+        比较在时间戳粒度较粗的平台上（NTFS / FAT32）会因取整而失真——本地实测
+        不变文件的 mtime 仅比扫描起点早约 3ms，一旦两者落入同一刻度，
+        `mtime < scan_start` 即为假，未改动文件被反复误判为可疑、被迫读盘，
+        直接破坏 docs/PROJECT_GUIDE.md 记载的“未改变则彻底跳过读取内容”契约
+        （tests/test_improvements.py::test_fast_stat_skips_disk_read_when_unmodified
+        的断言正是读盘次数必须为 0）。宁可在此退化也不引入确定的回归：无缓存
+        模式下没有可比的锚点，就不虚构一个不可靠的比较。
         """
         anchor_ns = self._index_written_ns()
         if anchor_ns <= 0:
-            anchor_ns = scan_started_ns
-        if anchor_ns <= 0:
-            return False
+            # 无索引文件锚点：不引入跨时基比较，信任签名以保住零读盘契约。
+            return True
         return mtime_ns < anchor_ns
 
     def _index_written_ns(self) -> int:
-        """索引缓存文件的落盘时刻（纳秒），Fast-Stat 的首选可信锚点。
+        """索引缓存文件的落盘时刻（纳秒），Fast-Stat 的唯一可信锚点。
 
-        取文件系统时间戳而非进程内时钟：它单调、跨进程重启有效，且与待比较的
-        文件 mtime 处于同一时基。缓存未启用或文件不存在时返回 0，由调用方退化
-        到进程内扫描完成时刻。
+        取文件系统时间戳而非进程内时钟：它与待比较的文件 mtime 处于同一时基，
+        是一次 write-then-close 的定局时间（关闭后再取值，之后不再变动），因而
+        能稳定区分“索引落盘之前就有的旧内容”与“索引落盘之后才写的新内容”。
+        缓存未启用或文件不存在时返回 0，由调用方按“无锚点”处理。
         """
         if self._chunks_cache_path is None:
             return 0
@@ -949,11 +957,6 @@ class MarkdownIndexer:
 
     def _sync_locked(self) -> list[Chunk]:
         self.vault_path.mkdir(parents=True, exist_ok=True)
-        # 本次扫描的起点时刻（纳秒），缓存未启用时的退化锚点。必须在本轮任何
-        # stat 之前取：这样“上一轮就已存在且此后没被动过”的文件其 mtime 严格早
-        # 于该值，能被判定可信、继续享受零读盘快速路径；而扫描期间被写过的文件
-        # mtime >= 该值，会被强制走 sha256 复核。
-        scan_started_ns = time.time_ns()
         failed_before = dict(self.failed_files)
         found: set[str] = set()
         changed: list[tuple[str, str, list[Chunk], tuple[int, int]]] = []
@@ -966,9 +969,7 @@ class MarkdownIndexer:
                 if (
                     source in self._signatures
                     and self._stat_cache.get(source) == fast_sig
-                    and self._fast_path_is_trustworthy(
-                        int(stat.st_mtime_ns), scan_started_ns
-                    )
+                    and self._fast_path_is_trustworthy(int(stat.st_mtime_ns))
                 ):
                     continue
 
