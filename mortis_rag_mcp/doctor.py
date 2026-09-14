@@ -16,14 +16,20 @@ from __future__ import annotations
 import json
 import os
 import platform
+import re
 import subprocess
 import sys
 import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, Mapping
 
 FRESHNESS_DAYS = 7
+
+# 沿用标注的统一形状：必须以「（沿用…本次未重新…）」结尾，且不含嵌套括号。
+# 只认这一种形状，避免把探活项自身合法含括号的 detail 切坏（见 _strip_carryover_note）。
+_CARRYOVER_NOTE_RE = re.compile(r"（沿用[^（）]*本次未重新[^（）]*）\s*$")
 
 
 # ---------- 路径与小工具 ----------
@@ -64,6 +70,52 @@ def _section_age_minutes(at: object) -> int | None:
 
 def _section(ok: bool, detail: str) -> dict:
     return {"ok": ok, "detail": detail, "at": _now_iso()}
+
+
+def _strip_carryover_note(detail: str) -> str:
+    """剥掉上一次 full=False 追加的「沿用」标注，保证重复刷新不叠加。
+
+    刻意不用 `rsplit("（", 1)[0]`：探活项自身的 detail 就合法地含全角括号
+    （`mode=static（非 external，跳过在线探测）`、`未启用（跳过）`），按最后一个
+    「（」切会把原始信息一并切掉，刷新后的 detail 变成一句自相矛盾的话。
+    这里只认完整的「（沿用…本次未重新…）」尾部形状。
+    """
+    return _CARRYOVER_NOTE_RE.sub("", detail)
+
+
+def _carry_probe_section(section: Mapping[str, Any]) -> dict:
+    """沿用旧的全量探活结果，并把「陈旧」写进 detail（对抗审查 F5）。
+
+    full=False 不重新探活外部 API，若沿用旧 ok=True 而实际已宕机，信任锚会在最长
+    FRESHNESS_DAYS 新鲜度窗口内显示假健康；把上次探测的距今时长直接写进 detail，
+    消费方无需比对时间戳即可识破。
+    """
+    carried = dict(section)
+    age_min = _section_age_minutes(carried.get("at"))
+    age_note = (
+        f"（沿用 {age_min} 分钟前的全量探测结果，本次未重新探活）"
+        if age_min is not None
+        else "（沿用上次全量探测结果，本次未重新探活）"
+    )
+    carried["detail"] = _strip_carryover_note(str(carried.get("detail", ""))) + age_note
+    return carried
+
+
+def _carry_tests_section(section: Mapping[str, Any]) -> dict:
+    """沿用旧的测试成绩，并同样标注陈旧度。
+
+    测试成绩只在 pytest 里刷新，`--doctor` 与启动期轻量刷新都不会重跑；若原样并入
+    merged，`--doctor` 刚把 generated_at 刷成"现在"，旧成绩单就会被读成"刚刚测过"。
+    """
+    carried = dict(section)
+    age_min = _section_age_minutes(carried.get("at"))
+    age_note = (
+        f"（沿用 {age_min} 分钟前的测试成绩，本次未重新跑测试）"
+        if age_min is not None
+        else "（沿用上次测试成绩，本次未重新跑测试）"
+    )
+    carried["detail"] = _strip_carryover_note(str(carried.get("detail", ""))) + age_note
+    return carried
 
 
 def _read_json() -> dict:
@@ -144,13 +196,34 @@ def check_package() -> dict:
 
 
 def check_optional_deps() -> dict:
+    """探测可选加速依赖的安装情况（只探存在性，不真正 import）。
+
+    刻意不用 `__import__`：本函数在服务端启动的后台刷新线程里跑，与 stdio 握手
+    同期；numpy 的**首次导入**是数百毫秒级 CPU，会与握手抢 GIL，而这里只是想
+    在报告里写一行版本号 —— 代价明显不成比例。改用 `find_spec` 探存在性
+    （对顶层模块不触发导入）+ 发行档案读版本号。
+
+    退化面：极少数只以裸目录存在、没有 dist-info/metadata 的包会显示 `unknown`
+    而非真实 `__version__`；这类包在本项目语境下不存在（numpy / sqlite-vec 都以
+    发行包形式安装）。
+    """
+    import importlib.metadata as _md
+    import importlib.util as _ilu
+
     found, missing = [], []
     for mod in ("numpy", "sqlite_vec"):
         try:
-            m = __import__(mod)
-            found.append(f"{mod} {getattr(m, '__version__', '?')}")
+            spec = _ilu.find_spec(mod)
         except Exception:
+            spec = None
+        if spec is None:
             missing.append(mod)
+            continue
+        try:
+            ver = _md.version(mod)
+        except Exception:
+            ver = "unknown"
+        found.append(f"{mod} {ver}")
     detail = "已装：" + "、".join(found) if found else ""
     if missing:
         detail += ("；" if detail else "") + "未装（自动回退，不影响核心）：" + "、".join(missing)
@@ -158,18 +231,48 @@ def check_optional_deps() -> dict:
 
 
 def _is_local_endpoint(endpoint: str) -> bool:
+    """判定 endpoint 是否指向本机 —— 必须 fail-closed。
+
+    信任锚语义：判为「本机」即允许免 API key，且 STATUS.md 会据此标 ✅。
+    因此这里只认两类明确形态：
+
+    1. 主机名白名单（`localhost` / `host.docker.internal`，后者是容器内访问宿主的
+       既定写法，显式保留）；
+    2. 能严格解析为 IP 字面量、且确属环回（含 `::ffff:127.0.0.1` 这类 v4-mapped
+       v6）或全零地址（`0.0.0.0` / `::`，连接时由内核映射回本机）。
+
+    绝不做前缀/子串模糊匹配：此前 `host.startswith("127.")` 会把
+    `127.0.0.1.attacker.com`、`127.example.com` 这类**远端域名**判成本机，
+    于是远端端点漏配 key 也会被信任锚标成健康，agent 跳过预检直到真实调用才撞
+    401 —— 这正是信任锚最不能犯的错（说谎）。
+
+    代价是 `127.1` / 十进制 `2130706433` 等花式 IP 写法不再被认作本机，会要求
+    配置 key —— 方向是 fail-closed，可接受。
+    """
     if not endpoint:
         return False
     try:
         from urllib.parse import urlsplit
         ep = endpoint if "://" in endpoint else f"http://{endpoint}"
         host = (urlsplit(ep).hostname or "").lower()
-        return (
-            host in ("localhost", "127.0.0.1", "0.0.0.0", "::1", "host.docker.internal")
-            or host.startswith("127.")
-        )
     except Exception:
         return False
+    if not host:
+        return False
+    if host in ("localhost", "host.docker.internal"):
+        return True
+    try:
+        from ipaddress import ip_address
+        addr = ip_address(host)
+    except ValueError:
+        # 域名（含 127.0.0.1.attacker.com / localhost. 尾点 / punycode 等）到此即拒。
+        return False
+    if addr.is_loopback:
+        return True
+    mapped = getattr(addr, "ipv4_mapped", None)
+    if mapped is not None and mapped.is_loopback:
+        return True
+    return addr.is_unspecified
 
 
 def check_config(app_config: str | None) -> tuple[dict, object | None]:
@@ -363,22 +466,15 @@ def run(full: bool = True, app_config: str | None = None, quiet: bool = False) -
             sections["reranker_api"] = probe_reranker(cfg)
         else:
             # 对齐对抗审查 F5：沿用旧探测结果时必须让"陈旧"肉眼可见。
-            # full=False 不重新探活外部 API，若沿用旧 ok=True 而实际已宕机，
-            # 信任锚会在最长 7 天新鲜度窗口内显示假健康；这里把上次探测的
-            # 距今时长直接写进 detail，消费方无需比对时间戳即可识破。
             for name in ("embedding_api", "reranker_api"):
                 old = prev.get("sections", {}).get(name)
                 if old:
-                    old = dict(old)
-                    raw_detail = str(old.get("detail", "")).rsplit("（", 1)[0]
-                    age_min = _section_age_minutes(old.get("at"))
-                    age_note = (
-                        f"（沿用 {age_min} 分钟前的全量探测结果，本次未重新探活）"
-                        if age_min is not None
-                        else "（沿用上次全量探测结果，本次未重新探活）"
-                    )
-                    old["detail"] = raw_detail + age_note
-                    sections[name] = old
+                    sections[name] = _carry_probe_section(old)
+        # tests 与探活无关，full=True / full=False 都不会重新采集，因此两个分支都要
+        # 补陈旧度标注：否则 --doctor 刚刷新的 generated_at 会把旧成绩单一起"续期"。
+        prev_sections = prev.get("sections", {})
+        if "tests" not in sections and prev_sections.get("tests"):
+            sections["tests"] = _carry_tests_section(prev_sections["tests"])
         merged = {**prev.get("sections", {}), **sections}
 
         # 门禁加固：

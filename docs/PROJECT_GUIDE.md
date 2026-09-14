@@ -441,7 +441,7 @@ query 为空 → 直接返回（过滤+分页后）的 chunk 列表
 
 `\\\\\\\_\\\\\\\_init\\\\\\\_\\\\\\\_` 导出 `AppConfig / Chunk / MarkdownIndexer / load\\\\\\\_config` 等公共 API（可编程嵌入使用）；`\\\\\\\_\\\\\\\_main\\\\\\\_\\\\\\\_` 仅转发 `server.main`，`python -m vault\\\\\\\_mcp --serve-mcp-stdio` 即服务。
 
-### 4.10 `doctor.py`（约 150 行）—— 本机环境自检与 Agent 信任锚生成器
+### 4.10 `doctor.py`（约 460 行）—— 本机环境自检与 Agent 信任锚生成器
 
 **职责**：提供一键环境体检与 agent 信任锚（`STATUS.md` / `status.json`）。
 * **零第三方依赖**：探活直接复用 `providers.py`，不引入外部 HTTP 库。
@@ -450,6 +450,8 @@ query 为空 → 直接返回（过滤+分页后）的 chunk 列表
   * 轻量模式（MCP 启动后台异步触发）：不发网络探活，复用上次全量探活结果并追加标记。
 * **双向信任锚**：落盘 `~/.mortis_rag_mcp/STATUS.md`（给 Agent 的硬约束规范：7 天内 VALID 禁止任何形式的环境预检；失败/过期只跑一次 `--doctor`；仍失败触发熔断直接报错用户）与 `status.json`（机器可读）。
 * **健壮性保障**：核心项门禁（至少 4 项核心存在且通过才允许 VALID，杜绝空跑伪阳性）；单库离线警告不锁死全局；Windows 访问冲突带 4 阶退避原子写重试；测试成绩记录解耦。
+* **免密端点 fail-closed**：`_is_local_endpoint()` 只认 `localhost` / `host.docker.internal` 白名单与**严格 IP 解析**后的环回地址，绝不做前缀模糊匹配——此前的 `startswith("127.")` 会把 `127.0.0.1.attacker.com` 这类**远端域名**判成本机，远端端点漏配 key 也被信任锚标 ✅，agent 据此跳过预检直到真实调用才撞 401。代价是 `127.1` / 十进制 `2130706433` 等花式 IP 写法不再免密（方向安全）。
+* **启动期不真导入**：`check_optional_deps()` 用 `find_spec` + 发行档案取版本号，不 `import numpy`——本函数跑在与 stdio 握手同期的后台线程，首次导入的数百毫秒会与握手抢 GIL，而它只为报告里一行版本号。
 
 \---
 
@@ -609,6 +611,10 @@ query 为空 → 直接返回（过滤+分页后）的 chunk 列表
 - 仅当旧目录独占存在时尝试原子的 `os.rename` 迁移；
 - 遇到任何 `OSError`（如文件锁占用、跨卷），严格原地安全回退读旧目录，绝不使用 `shutil.move`，严防目录分裂与数据丢失；
 - 环境变量优先级：`MORTIS_RAG_API_KEY` > `VAULT_MCP_API_KEY`；`MORTIS_RAG_CONFIG` > `VAULT_MCP_CONFIG`；`MORTIS_RAG_REGISTRY` > `VAULT_MCP_REGISTRY`。
+
+**两条已知边界（排障时先看这里）**：
+- **新目录先存在时只搬注册表**：若 `~/.mortis_rag_mcp/` 已被预先创建（例如照文档把 `config.toml` 直接放进去），`user_config_dir()` 的整目录 rename 不会触发，`registry_path()` 只做单文件迁移 `vaults.toml`。此时旧的 `~/.vault_mcp/config.toml` 会留在原地——**当前仍能被 `resolve_config_path()` 的旧名回退读到，不会失效**，但两处配置并存会分裂。判断依据：`config.toml` 究竟在哪一侧。
+- **降级不可逆**：迁移是 rename（移动）而非复制。回退到 0.7.1 之前的版本（只认 `~/.vault_mcp`、`VAULT_MCP_*`）前，需先把 `~/.mortis_rag_mcp` 手工改回 `~/.vault_mcp`，否则旧版本会读到空注册表并在旧路径写出一份新的空注册表，表现为"知识库全没了"（真实数据仍在磁盘上，未损坏）。
 
 \---
 
