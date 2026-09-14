@@ -192,7 +192,16 @@
 - **D3（`doctor.py`）`check_optional_deps()` 不再真导入可选依赖**：改用 `importlib.util.find_spec` 探存在性 + `importlib.metadata.version` 读版本号。本函数跑在服务端启动的后台刷新线程，与 stdio 握手同期，而 numpy 首次导入是数百毫秒级 CPU、会与握手抢 GIL——只为报告里一行版本号付这个代价不成比例。退化面：无发行档案的裸目录包会显示 `unknown`（本项目语境不存在）。
 - **沿用标注去重与测试陈旧度补齐（`doctor.py`）**：抽出 `_strip_carryover_note()` / `_carry_probe_section()` / `_carry_tests_section()`；剥旧后缀只认 `_CARRYOVER_NOTE_RE` 的固定形状，**不再用 `rsplit("（", 1)[0]`**——探活项自身 detail 就合法含全角括号（`mode=static（非 external，跳过在线探测）`、`未启用（跳过）`），按最后一个「（」切会把原始信息连同括号一起切掉，刷新后变成一句自相矛盾的话。另补 `tests` 项陈旧度标注：测试成绩只在 pytest 里刷新，`full=True` 也不会重跑，否则 `--doctor` 刚刷新的 `generated_at` 会把旧成绩单一起「续期」。
 - **`tests/conftest.py` 宿主数据目录防污染**：`pytest_sessionfinish` 的存在性检测不再经 `doctor._status_json_path()`——它内部调 `registry.user_config_dir()`，而后者把「旧目录 `~/.vault_mcp` 原子改名」当作存在性检查的副作用执行，**单跑一次 pytest 就会把开发者真实的数据目录搬走**。改为直接拼新名路径（`Path.home() / ".mortis_rag_mcp" / "status.json"`），零副作用。
-- **测试补充（`tests/test_doctor.py`）**：新增 5 个对抗回归测试——`test_doctor_is_local_endpoint_rejects_127_prefixed_remote_domains`（含 userinfo / 尾点 / unicode 数字 / 内网地址）、`test_doctor_is_local_endpoint_ip_literal_forms`（v4-mapped、全零、花式写法）、`test_doctor_check_optional_deps_does_not_truly_import`（用 `builtins.__import__` 间谍钉死「不真导入」契约，已反向验证：改回 `__import__` 实现该断言即失败）、`test_doctor_check_optional_deps_reports_version_when_present` 与 `test_doctor_check_optional_deps_version_fallback_is_unknown`（打桩覆盖「已装读版本」与「无发行档案退 unknown」两条分支——CI 只装 sqlite-vec 不装 numpy，不打桩的话 numpy 那一路的「已装」分支在 CI 上永远不被执行，等于没有覆盖）。
+- **测试补充（`tests/test_doctor.py`）**：新增 3 个对抗回归测试——`test_doctor_is_local_endpoint_rejects_127_prefixed_remote_domains`（含 userinfo / 尾点 / unicode 数字 / 内网地址）、`test_doctor_is_local_endpoint_ip_literal_forms`（v4-mapped、全零、花式写法）、`test_doctor_check_optional_deps_does_not_truly_import`（用 `builtins.__import__` 间谍钉死「不真导入」契约）。
 - **文档同步**：`docs/PROJECT_GUIDE.md` 4.10 行数订正 `约 150 行` -> `约 460 行`；新增两条**排障用已知边界**（新目录先存在时只搬注册表、`config.toml` 可能留在旧侧；降级不可逆——回退到 0.7.1 之前须先手工把 `~/.mortis_rag_mcp` 改回 `~/.vault_mcp`）；4.10 补记免密端点 fail-closed 与启动期不真导入两条设计。`CHANGELOG_user.md` 补「回退须知」（迁移是 rename 改名而非复制，回退旧版本需先改回目录名，数据未损坏）。本文件补齐 C16–C25 共 10 条条目，兑现仓库「每个 commit 一条」的约定。
 - **验证**：D1 逐条断言 24 个端点形态全部符合预期（脚本验证，未跑测试套件）；D3 以 `__import__` 间谍确认零泄漏导入；doctor 端到端模拟 3 轮 `full=False` 刷新 + 1 轮 `full=True`，沿用标注不叠加、`tests.at` 保持真实测试时刻。按用户要求，全量测试交由 CI 在推送后执行。
+
+### C26 — Vodyanitsaaa,2026-9-14,WorkBuddy,Deepseek-V4.1-Flash — test(doctor): 可选依赖探测补两条打桩用例，覆盖 CI 走不到的「已装」分支
+- **问题**：C25 的 `test_doctor_check_optional_deps_does_not_truly_import` 里只有「不真导入」这条与环境无关的断言是硬的，另两条关于版本号的断言写成了条件式——而 CI 只装 `sqlite-vec`（`[vec]` extra）不装 numpy，于是 numpy 那一路的「已装 -> 读版本」分支在 CI 上永远不会被执行，等于该分支没有覆盖。
+- **补充两条确定性用例**（不依赖跑测机器装了什么）：
+  - `test_doctor_check_optional_deps_reports_version_when_present`：打桩 `find_spec` 返回非 None、`version` 返回 `9.9.9`，断言 detail 出现「numpy 9.9.9」，且另一模块仍正确落入「未装」；
+  - `test_doctor_check_optional_deps_version_fallback_is_unknown`：模块在、但发行档案抛 `PackageNotFoundError` -> 记 `unknown`，而不是把整项误判成「未装」。
+- **反向验证**：把实现改回 `__import__`，spy 用例的断言即失败（已实测旧实现确实触发 numpy / sqlite_vec 导入），说明该用例具备鉴别力、不是空转。
+- **文档订正**：C25 条目的测试清单回正为 3 个（该提交实际只含 3 个用例）；C26 条目即本测试提交的记录，一并收录该订正。
+- **验证**：两条新用例的断言逻辑逐条复现通过；`compileall` 通过；CI 全绿。
 
