@@ -263,6 +263,47 @@ def test_doctor_check_optional_deps_does_not_truly_import(monkeypatch):
         assert "未装" in res["detail"]
 
 
+def test_doctor_check_optional_deps_reports_version_when_present(monkeypatch):
+    """「已装」分支必须真的读出版本号 —— 打桩覆盖，避免依赖跑测机器装了什么。
+
+    CI 只装 sqlite-vec 不装 numpy，若不打桩，「已装」分支在 numpy 这一路永远不被
+    执行，等于这条分支没有测试覆盖。
+    """
+    import importlib.metadata
+    import importlib.util
+
+    monkeypatch.setattr(
+        importlib.util, "find_spec", lambda mod: object() if mod == "numpy" else None
+    )
+    monkeypatch.setattr(
+        importlib.metadata, "version", lambda mod: "9.9.9" if mod == "numpy" else "0.0.1"
+    )
+    res = doctor.check_optional_deps()
+
+    assert res["ok"] is True
+    assert "numpy 9.9.9" in res["detail"]
+    assert "sqlite_vec" in res["detail"] and "未装" in res["detail"]
+
+
+def test_doctor_check_optional_deps_version_fallback_is_unknown(monkeypatch):
+    """模块在、发行档案读不到 -> 记 unknown，而不是把整项误判成「未装」。"""
+    import importlib.metadata
+    import importlib.util
+
+    monkeypatch.setattr(importlib.util, "find_spec", lambda mod: object())
+
+    def _boom(mod):
+        raise importlib.metadata.PackageNotFoundError(mod)
+
+    monkeypatch.setattr(importlib.metadata, "version", _boom)
+    res = doctor.check_optional_deps()
+
+    assert res["ok"] is True
+    assert "numpy unknown" in res["detail"]
+    assert "sqlite_vec unknown" in res["detail"]
+    assert "未装" not in res["detail"]
+
+
 def test_doctor_external_mode_requires_endpoint_and_model():
     mock_cfg = MagicMock()
     mock_cfg.embedding.mode = "external"
