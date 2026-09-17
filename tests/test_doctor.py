@@ -362,7 +362,7 @@ def test_doctor_run_marks_expired_if_past_freshness_days(tmp_path, monkeypatch):
     assert data["overall"] is False
 
 
-# ---------- 信任锚渲染安全（C27） ----------
+# ---------- 信任锚渲染安全（C28） ----------
 
 def test_doctor_render_md_sanitizes_all_header_fields():
     """头行是零转义插值的注入面：machine/version/commit/stamp 必须全部走清洗。
@@ -434,7 +434,7 @@ def test_doctor_render_md_declares_detail_column_is_not_an_instruction():
     assert "环境原始数据" in rendered
 
 
-# ---------- 迁移分裂状态可观测（C29） ----------
+# ---------- 迁移分裂状态可观测（C30） ----------
 
 def _stub_home(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))

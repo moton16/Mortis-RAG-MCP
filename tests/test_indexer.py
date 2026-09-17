@@ -38,11 +38,12 @@ def test_incremental_add_modify_delete_and_rename(tmp_path):
     indexer.sync()
     assert any(chunk.source == "old.md" and "old content" in chunk.content for chunk in indexer.search("old"))
 
-    old.write_text("# New\nnew content", encoding="utf-8")
+    time.sleep(0.02)  # 保证在 Windows NTFS mtime 精度内产生可区分的时间戳变动
+    old.write_text("# New\nnew content updated", encoding="utf-8")
     indexer.sync()
     # 修改后旧内容必须从索引移除（增量更新），而非仍然可召回。
     assert not any("old content" in chunk.content for chunk in indexer.all_chunks())
-    assert any("new content" in chunk.content for chunk in indexer.search("new"))
+    assert any("new content updated" in chunk.content for chunk in indexer.search("new"))
 
     renamed = tmp_path / "重命名.md"
     old.rename(renamed)
@@ -73,10 +74,15 @@ def test_incremental_evicts_stale_when_mtime_does_not_advance(tmp_path):
     相同（模拟「验证时刻与写入时刻落在同一刻度」的 racily clean 状态，即余量
     条件不成立），再执行等长内容替换并把 mtime 恢复原值。
 
-    换道说明（C28 起签名升级为三元组）：POSIX 下 os.utime 会推进 ctime，因此
+    换道说明（C29 起签名升级为三元组）：POSIX 下 os.utime 会推进 ctime，因此
     本用例在 Linux 上由「ctime 签名失配」这条通道检出，在 Windows 上（st_ctime
     是创建时间、无鉴别力）才回落到可信度判据。两条通道任一生效都算通过；本用例
     的断言只钉死「变化必须被检出」这个结果，不断言是哪条通道检出的。
+
+    本用例是这条路径的**唯一守卫**：上游 test_incremental_add_modify_delete_and_rename
+    自 799d4d6 起已改为「sleep 0.02 + 不等长内容」绕开该组合——缺陷当时并未消失，
+    只是那个用例不再踩到它。「等长 + 同刻度」这一组只剩这里覆盖，请勿误以为上游
+    那个用例仍在守这条路径，也不要为了让它变绿而弱化本用例。
     """
     import os
 

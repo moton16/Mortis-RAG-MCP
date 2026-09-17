@@ -1075,7 +1075,7 @@ class MarkdownIndexer:
         状态），因为条目端条件 `seen - mtime > margin` 对任何 mtime 已变旧超过
         margin 的文件几乎恒真——所以「窗口很窄」的说法只对攻击者需要命中原
         mtime 这一点成立，对条目端并不成立（旧的 docstring 在此处写过「窗口很
-        窄…已实测」，该表述已被实测证伪，见 docs/Changelog_developer.md C28）。
+        窄…已实测」，该表述已被实测证伪，见 docs/Changelog_developer.md C29）。
 
         现在签名含 st_ctime_ns：POSIX 下 ctime 是 inode 元数据变更时间，由内核
         维护，os.utime / rsync --times / tar / 快照还原**无法**把它改回去，于是
