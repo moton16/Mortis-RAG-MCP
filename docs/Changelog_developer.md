@@ -248,7 +248,7 @@
 - **回退须知补漏（有真金白银成本）**：`CHANGELOG_user.md` 的回退须知原文只提 `~/.mortis_rag_mcp` 一个目录，**漏了 `~/.mortis_rag_mcp_cache`**。照该说明操作会「库列表回来但缓存全部失效 → 所有笔记重新嵌入」，用付费 embedding 即重复计费。现补齐两个目录并写明后果；`QUICKSTART_user.md` 增 0.7.1 小节（新目录名、新环境变量名、回退路径）并指向该须知。
 - **README 双份同步**：中英两份徽章 `Version-0.7.0` → `Version-0.7.1`；「核心特性」各增一条 **Agent 信任锚**（一条 `--doctor` 命令 + 免预检收益），让首次访问者能直接看到本版本的主要卖点。
 - **`docs/PROJECT_GUIDE.md`**：新增 v0.7.1 版本变更详录段（本节之上）；订正模块行数 `config 390→465`、`registry 197→363`、`indexer 2681→3145`、`server 793→1064`、`doctor 460→711`（其中 config/registry/indexer/server 四处在本分支之前就已漂移，一并按当前实测值对齐）。
-- **`.github/workflows/ci.yml`**：push 触发由 `branches: ["**"]` **收窄为 `[main, "ci/**"]`**。原写法在合入上游后会对**任意分支 push 永久生效**，且同仓分支 PR 会 push + pull_request 双跑 5 个 job；收窄后恢复「主分支 + ci 分支」的常态，本 PR 仍由 `pull_request` 事件正常触发 5 个 job。该行为改变已在 PR 描述中显式说明。
-- **docs 入库口径**：`docs/` 下仅三份白名单文件入库（`Changelog_developer.md` / `PROJECT_GUIDE.md` / `Quick-start_developer.md`），版本内规划文档 `docs/V0.7.1/Plan_agent-status.md` **不入库**，`.gitignore` 不动；其设计意图以摘要形式写入 PR 描述。
+- **`.github/workflows/ci.yml`**：push 触发由 `branches: ["**"]` **收窄为 `[main, "ci/**"]`**。原写法在合入上游后会对**任意分支 push 永久生效**，且同仓分支 PR 会 push + pull_request 双跑 5 个 job；收窄后恢复「主分支 + ci 分支」的常态，本分支自身的 push 不再触发 CI；落地到 `main` 后由 `main` 的 push 事件正常触发 5 个 job。该行为改变已在提交信息中显式说明。
+- **docs 入库口径**：`docs/` 下仅三份白名单文件入库（`Changelog_developer.md` / `PROJECT_GUIDE.md` / `Quick-start_developer.md`），版本内规划文档 `docs/V0.7.1/Plan_agent-status.md` **不入库**，`.gitignore` 不动；其设计意图以摘要形式写入本次落地的提交信息。
 - **验证**：`git status` 仅含预期文件；受影响模块测试子集 108 passed；全量测试按约定交 CI 执行。
 
