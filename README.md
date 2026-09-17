@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/moton16/Mortis-RAG-MCP/actions/workflows/ci.yml/badge.svg)](https://github.com/moton16/Mortis-RAG-MCP/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Version: 0.7.0](https://img.shields.io/badge/Version-0.7.0-blue.svg)](CHANGELOG_user.md)
+[![Version: 0.7.1](https://img.shields.io/badge/Version-0.7.1-blue.svg)](CHANGELOG_user.md)
 
 [English](README_EN.md) | 简体中文
 
@@ -14,6 +14,7 @@
 ## 🌟 核心特性
 
 - 📂 **自由挂载，零路径绑定**：通过 `kb_init` 一键挂载任意本地文件夹为知识库，配置持久化保存，不绑定死路径，换电脑或多库管理极简。
+- 🔍 **Agent 信任锚，免预检开箱即搜（0.7.1）**：一条 `python -m mortis_rag_mcp --doctor` 生成本机环境凭证（`STATUS.md`）。AI 助手读到 ✅ 即**不再做任何环境/依赖/key 预检**，首次提问就直接检索，省掉每次调用前的反复试探；真出问题才提示你跑那一条命令，且失败不会陷入重试死循环。
 - 📄 **文档智能解析与摄取（0.7.0）**：支持将知识库内的 PDF、Word、PPT、Excel 与图片等文件自动转换为 Markdown 纳入搜索；解析文件单独存放，原笔记与源文件零修改、零污染。
 - 🎯 **智能定向路由（0.7.0）**：支持为知识库添加一句话自然语言描述，AI 检索时按意图精准选库，大幅减少无关库干扰，回答更快更准。
 - 📊 **表格排版与完整保护（0.7.0）**：复杂表格与数据表头完整保护，不被生硬切断，检索结果排版清晰美观。

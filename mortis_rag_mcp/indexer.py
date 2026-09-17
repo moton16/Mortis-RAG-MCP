@@ -3,6 +3,7 @@ from __future__ import annotations
 import fnmatch
 import hashlib
 import json
+import math
 import os
 import re
 import struct
@@ -26,12 +27,32 @@ from .vector import create_vector_backend
 
 _RRF_K = 60
 
-# Fast-Stat 可信判据的安全余量（纳秒）。文件时间戳并非真纳秒：Windows 系统定时器
-# 最坏 15.6ms 才更新一次（实测 NTFS 刻度约 3ms，FAT32 达 2s），且时间戳可能因
-# 取整而超前于进程时钟（Windows CI 实测约 3% 概率，见 CI 诊断 racycount=1/30）。
-# 余量取 50ms > 2 倍最坏刻度，保证「登记之后发生的写入必然推动 mtime 前进」，
-# 论证见 _fast_path_is_trustworthy。
+# Fast-Stat 可信判据的安全余量**下限**（纳秒）。文件时间戳并非真纳秒：Windows
+# 系统定时器最坏 15.6ms 才更新一次（实测 NTFS 刻度约 3ms，FAT32 达 2s），且
+# 时间戳可能因取整而超前于进程时钟（Windows CI 实测约 3% 概率，见 CI 诊断
+# racycount=1/30）。
+#
+# 注意这里是下限而非实际取值：实际余量由 _effective_margin_ns() 从**库所在
+# 文件系统探测到的真实刻度**推导（margin = max(下限, 2 × 刻度)）。固定 50ms
+# 曾在粗粒度文件系统上失守——当刻度 > 余量时，「登记之后发生的写入必然推动
+# mtime 前进」的归纳前提不成立（论证与反例见 _fast_path_is_trustworthy）。
 _MTIME_TRUST_MARGIN_NS = 50_000_000
+
+# 时间戳刻度探测（用于推导余量）。刻度估计取库内文件 mtime_ns 的最大公约数：
+# 真实刻度 T 的任何正整数倍都必然整除所有时间戳，故 gcd 只会**高估**刻度、
+# 绝不会低估；高估的方向是把余量调大（更保守、只多读盘），低估才会漏检，而
+# gcd 在数学上不可能低估。见 _probe_mtime_tick_ns()。
+_MTIME_TICK_PROBE_MIN_SAMPLES = 2   # 至少两个样本才有差值可比
+_MTIME_TICK_PROBE_MAX_SAMPLES = 64  # 单进程内最多保留的探测样本
+_MTIME_TICK_COARSE_NS = 50_000_000  # 刻度粗于此时直接禁用快速路径（fail-closed）
+
+# mtime 停在未来的条目（网络盘/共享盘时钟超前、备份还原、手工 touch）的复核
+# 上限：跨墙钟复核这么多次后签名仍未变，就接受它稳定并恢复零读盘，而不是因
+# 外部时钟偏移永久惩罚它（每轮重读+重哈希）。见 _fast_path_is_trustworthy。
+_FUTURE_MTIME_RECHECK_LIMIT = 2
+# 「跨墙钟」的最小间隔：两次内容级验证的进程时钟读数至少差这么多才算两次独立
+# 观测，否则同一毫秒内的连续 sync 会把复核计数刷满。
+_FUTURE_MTIME_MIN_OBSERVATION_GAP_NS = 1_000_000
 
 # native 监听回调的防抖延迟上限：编辑器保存风暴（事件持续不断）会让防抖定时器
 # 一直顺延，超过这个窗口就必须同步一次，不能让事件流饿死同步。
@@ -535,6 +556,36 @@ def rerank_chunks(query: str, ranked: list[Chunk], reranker_provider: Any, cap: 
     return ordered + [replace(c) for c in ranked[len(candidates):]]
 
 
+def _probe_mtime_tick_ns(mtime_samples: Iterable[int]) -> int | None:
+    """从一批文件 mtime_ns 估计文件系统时间戳的刻度（纳秒）；样本不足返回 None。
+
+    背景：Fast-Stat 快速路径的安全性依赖「余量 > 时间戳刻度」——只有刻度小于
+    余量，「登记之后发生的写入必然推动 mtime 前进」的归纳才成立。而刻度是**文件
+    系统属性**，写死在代码里的固定余量无法同时适配 NTFS（约 3ms）、ext4（真纳秒）
+    与 FAT32/exFAT/部分 SMB 共享（2s）。所以这里从库内真实时间戳反推刻度。
+
+    算法：取全部时间戳的最大公约数，并在「全部值」与「相邻差值」两组中取较小者。
+    正确性方向：真实刻度 T 整除所有时间戳，故任何 gcd 都是 T 的正整数倍——**只会
+    高估、不会低估**。高估使余量变大 → 更保守（多读盘，正确性安全）；低估才会
+    漏检，而 gcd 不可能低估。取两组 gcd 的较小者只是为了压低高估幅度。
+
+    退化面（明确记录）：样本不足两个（库内可索引文件少于 2 个）时无法求差值，
+    返回 None，调用方退回固定下限 _MTIME_TRUST_MARGIN_NS——此时粗刻度库仍存在
+    该固定余量的失效面，这是本探测唯一的未覆盖面。
+    """
+    values = sorted({int(v) for v in mtime_samples if isinstance(v, int) and v > 0})
+    if len(values) < _MTIME_TICK_PROBE_MIN_SAMPLES:
+        return None
+    g_value = 0
+    for value in values:
+        g_value = math.gcd(g_value, value)
+    g_delta = 0
+    for prev, cur in zip(values, values[1:]):
+        g_delta = math.gcd(g_delta, cur - prev)
+    candidates = [g for g in (g_value, g_delta) if g > 0]
+    return min(candidates) if candidates else None
+
+
 class MarkdownIndexer:
     def __init__(
         self,
@@ -554,12 +605,27 @@ class MarkdownIndexer:
                 self.reranker_provider = None
         self._chunks: dict[str, list[Chunk]] = {}
         self._signatures: dict[str, str] = {}
-        self._stat_cache: dict[str, tuple[int, int]] = {}
-        # 记录每个 source 的 (mtime_ns, size) 签名是在哪个进程时钟时刻通过内容级
-        # 验证（read + sha256）的。快速路径判据要求文件 mtime 严格早于该时刻减去
-        # 安全余量 _MTIME_TRUST_MARGIN_NS 才信任签名相等，以识别「改动落在时间戳
-        # 粒度同一刻度内」的 racily clean 条目。论证见 _fast_path_is_trustworthy。
+        self._stat_cache: dict[str, tuple[int, int, int]] = {}
+        # 记录每个 source 的 (mtime_ns, size, ctime_ns) 签名是在哪个进程时钟时刻通过
+        # 内容级验证（read + sha256）的。快速路径判据要求文件 mtime 严格早于该时刻
+        # 减去安全余量（余量从实际时间戳刻度推导，见 _effective_margin_ns）才信任
+        # 签名相等，以识别「改动落在时间戳粒度同一刻度内」的 racily clean 条目。
+        # 论证与残余风险见 _fast_path_is_trustworthy。
         self._stat_seen_ns: dict[str, int] = {}
+        # 每个 source 的签名在**多少个不同的墙钟时刻**被内容级验证确认过（首次登记
+        # 记 1）。仅供「mtime 停在未来」的条目判稳：这类条目的余量归纳永远不成立，
+        # 若不做兜底会永久失去零读盘快速路径。见 _fast_path_is_trustworthy。
+        self._stat_confirmations: dict[str, int] = {}
+        # 本轮扫描采样到的 mtime（供刻度探测）；样本足够即探一次，之后不再采。
+        self._mtime_tick_samples: list[int] = []
+        # 刻度探测结果与状态：None = 未探测或样本不足（退回固定下限余量）。
+        self._mtime_tick_ns: int | None = None
+        self._mtime_tick_probed = False
+        # 非 None 表示快速路径已被整体禁用（探测到粗刻度），值为可读的原因。
+        self._fast_path_disabled_reason: str | None = None
+        # 快速路径的观测性告警（source -> 说明），如「mtime 停在未来、复核够次数后
+        # 按稳定条目接受」。与 failed_files 同类：只是诊断数据，不影响检索结果。
+        self.fast_path_warnings: dict[str, str] = {}
         # 本轮扫描的结束时刻（纳秒），仅供观测/诊断。
         self._scan_completed_ns: int = 0
         # 文本层缓存失效时，初始化阶段读出来的向量暂存到这里，等 sync 重建
@@ -904,70 +970,181 @@ class MarkdownIndexer:
         with self._sync_lock:
             return self._sync_locked()
 
+    def _effective_margin_ns(self) -> int:
+        """本次库实际使用的可信余量：max(下限, 2 × 探测到的刻度)。
+
+        刻度未知（探测样本不足，见 _probe_mtime_tick_ns 的退化面）时退回下限。
+        余量取刻度的 2 倍：归纳推导要求 `seen - mtime > MARGIN > tick`，2 倍是
+        给「时间戳因取整而滞后至多一个刻度」留一处余裕。
+        """
+        tick = getattr(self, "_mtime_tick_ns", None)
+        if not tick or tick <= 0:
+            return _MTIME_TRUST_MARGIN_NS
+        return max(_MTIME_TRUST_MARGIN_NS, 2 * tick)
+
+    def _finalize_mtime_tick_probe(self, samples: Iterable[int]) -> None:
+        """本轮扫描结束后收敛刻度探测结果（每进程只需成功一次）。
+
+        只在样本足够时才置 _mtime_tick_probed，否则下一轮继续尝试——库内文件
+        从 1 个长到多个时仍能补探。
+
+        时机安全性：本方法在**扫描循环之后**调用，而快速路径只可能在
+        _stat_cache 非空时命中（_stat_cache 是进程内存量、不持久化，每进程首次
+        sync 必然为空），所以首次 sync 不会在任何文件上使用未探测的余量。
+        """
+        if self._mtime_tick_probed:
+            return
+        tick = _probe_mtime_tick_ns(list(samples))
+        if tick is None:
+            return
+        self._mtime_tick_probed = True
+        self._mtime_tick_ns = tick
+        if tick > _MTIME_TICK_COARSE_NS:
+            # 刻度粗于安全下限：固定余量的归纳前提不成立，快速路径整体禁用以求
+            # fail-closed——宁可每轮读盘，也不静默返回过期内容。
+            self._fast_path_disabled_reason = (
+                f"文件系统时间戳刻度约 {tick / 1e6:.0f}ms，粗于安全下限 "
+                f"{_MTIME_TICK_COARSE_NS / 1e6:.0f}ms（同刻度内的等长替换会让 "
+                f"签名逐位不变），已按 fail-closed 禁用 Fast-Stat 快速路径"
+            )
+
+    def _record_confirmation(self, source: str, prev_seen_ns: int | None, verified_at_ns: int) -> None:
+        """累计「跨墙钟的内容级确认次数」，供 mtime 停在未来的条目判稳。"""
+        count = self._stat_confirmations.get(source, 0) or 1
+        if prev_seen_ns is None or verified_at_ns - prev_seen_ns >= _FUTURE_MTIME_MIN_OBSERVATION_GAP_NS:
+            count += 1
+        self._stat_confirmations[source] = count
+
+    def _note_fast_path_warning(self, source: str, message: str) -> None:
+        try:
+            self.fast_path_warnings.setdefault(source, message)
+        except AttributeError:
+            self.fast_path_warnings = {source: message}
+
     def _fast_path_is_trustworthy(self, source: str, mtime_ns: int) -> bool:
-        """(mtime_ns, size) 签名相等是否足以断定“文件未修改”。
+        """签名相等是否足以断定“文件未修改”。
 
         这正是 Git 的 *racily clean* 问题（git-scm.com/docs/racy-git）：若内容
-        变化发生在时间戳粒度的一个刻度之内，`(mtime_ns, size)` 会双双不变，签名
-        相等就成了假证据。等长替换（"old content" -> "new content"，均 18 字节）
-        配上 NTFS/FAT32 就会命中，旧 chunk 静默残留并继续被召回——Windows CI
-        上稳定复现、ext4 纳秒精度掩盖掉的正是它。
+        变化发生在时间戳粒度的一个刻度之内，签名会双双不变，签名相等就成了假
+        证据。等长替换（"old content" -> "new content"，均 18 字节）配上粗粒度
+        时间戳就会命中，旧 chunk 静默残留并继续被召回。
 
-        判据：仅当文件 mtime 严格早于「该签名被内容级验证的时刻」减去一个安全
-        余量时，才信任签名相等：
+        ## 判据
 
-            mtime_ns < seen_ns - _MTIME_TRUST_MARGIN_NS
+        仅当文件 mtime 严格早于「该签名被内容级验证的时刻」减去安全余量时，才
+        信任签名相等：
+
+            mtime_ns < seen_ns - margin
 
         其中 seen_ns 是上一轮 read + sha256 完成后取的进程时钟读数（与所哈希的
-        内容严格对应）。余量必须显著大于文件时间戳的最大刻度（Windows 系统定时
-        器最坏 15.6ms，故取 50ms），理由是一条可靠的归纳：
+        内容严格对应）；margin 由 _effective_margin_ns() 从**实际文件系统刻度**
+        推导，即 max(50ms, 2 × tick)。
 
-        设条目登记时已满足 seen_ns - mtime > MARGIN。此后任何一次真实写入都发生
-        在 seen_ns 之后，其落盘时间戳 T2 满足 T2 >= 写入时刻 - 刻度（时间戳只会
+        ## 归纳与其真实前提
+
+        设条目登记时已满足 seen_ns - mtime > margin。此后任何一次真实写入都发生
+        在 seen_ns 之后，其落盘时间戳 T2 满足 T2 >= 写入时刻 - tick（时间戳只会
         因取整而滞后至多一个刻度）。于是
 
-            T2 >= seen_ns - tick > mtime + MARGIN - tick > mtime + tick > mtime
+            T2 >= seen_ns - tick > mtime + margin - tick >= mtime + tick > mtime
 
-        即**任何登记之后的写入都必然推动 mtime 前进**，签名必然失配、走正常
-        sha256 路径检出——不存在漏检窗口。反过来，登记时刻与 mtime 靠得太近
-        （< MARGIN，包括 Windows 实测约 3% 的「时间戳超前于进程时钟」取整碰撞，
-        见 CI 诊断 racycount=1/30）的条目一律不信任，下一轮强制读盘复核；复核会
-        把 seen_ns 推到更晚，随着真实时间流逝终能满足余量、固化为准可信条目。
+        即「登记之后的写入必然推动 mtime 前进」，签名必然失配、走正常 sha256
+        路径检出。**但请注意该结论的前提是 margin > tick**——这正是本判据此前
+        的失效点：旧实现把余量写死成 50ms，而同文件注释自己写着 FAT32 刻度可达
+        2s，前提不成立时（刻度 >= margin）登记后落在同一刻度内的等长替换会让
+        mtime 与 size 逐位不变、判据同时为真，**静默漏检**（实测复现）。因此
+        余量现在从库内真实时间戳反推（_probe_mtime_tick_ns），并在探测到刻度粗
+        于 _MTIME_TICK_COARSE_NS 时**整体禁用快速路径**（fail-closed）——宁可
+        每轮读盘也不漏检。禁用的代价是丢掉零读盘优化，正确性优先。
 
-        代价：刚被写过的文件在其 mtime 变旧到 50ms 之前，每轮 sync 都会多付一次
-        读盘复核。对「写完立刻连续 sync」的测试与热文件这是可感知的，但方向是
-        安全的（宁可多读不可漏检），且一旦超过余量即恢复零读盘——这也是本判据
-        与“签名相等即跳过”的原始实现的全部行为差异。
+        登记时刻与 mtime 靠得太近（< margin，含 Windows 实测约 3% 的「时间戳
+        超前于进程时钟」取整碰撞，见 CI 诊断 racycount=1/30）的条目一律不信任，
+        下一轮强制读盘复核；复核会把 seen_ns 推得更晚，随着真实时间流逝终能满
+        足余量、固化为准可信条目。
 
-        与 Git 的差异说明：Git 用「索引文件自身的 mtime」当锚点（同为文件系统
-        时间戳，天然同时基），本实现用进程时钟 + 余量，因为 cache.enabled=False
-        （AppConfig 默认值）时不落任何盘上锚点，而正确性修复必须覆盖默认配置。
+        代价：刚被写过的文件在其 mtime 变旧到 margin 之前，每轮 sync 都会多付
+        一次读盘复核。方向是安全的（宁可多读不可漏检），且一旦超过余量即恢复
+        零读盘。
 
-        已知残余风险（与 Git 同类的限制）：上述归纳假设 mtime 只会前进。若外部
-        工具显式回拨 mtime（os.utime / rsync --times / tar 解包 / 备份还原）到
-        **恰好等于登记的 mtime**，且该条目满足 seen_ns - mtime > MARGIN，签名
-        相等 + 判据为真同时成立，等长替换会被漏检。实践中窗口很窄：小文件登记时
-        seen 只比 mtime 晚几毫秒，回拨到登记 mtime 会被余量判据拦下（已实测）；
-        只有读盘+哈希耗时超过 50ms 的大文件、或 seen 被后续复核推远的条目才可能
-        触发。回拨到其他任何 mtime 都会因签名失配被正常检出。Git 对
-        「mtime 回拨到与缓存完全相同」有同样的盲区。
+        ## 签名已升级为 (mtime_ns, size, st_ctime_ns)
+
+        上一版签名只有 (mtime_ns, size)，于是「外部显式回拨 mtime」这条路径完
+        全落在判据之外：只要回拨到与登记值逐位相同，签名相等与判据为真可以同时
+        成立，等长替换被漏检。**实测在完全自然的稳态下即可复现**（条目
+        seen-mtime = 152.5ms，即「上次写完之后隔了 150ms 又 sync 过」这种日常
+        状态），因为条目端条件 `seen - mtime > margin` 对任何 mtime 已变旧超过
+        margin 的文件几乎恒真——所以「窗口很窄」的说法只对攻击者需要命中原
+        mtime 这一点成立，对条目端并不成立（旧的 docstring 在此处写过「窗口很
+        窄…已实测」，该表述已被实测证伪，见 docs/Changelog_developer.md C28）。
+
+        现在签名含 st_ctime_ns：POSIX 下 ctime 是 inode 元数据变更时间，由内核
+        维护，os.utime / rsync --times / tar / 快照还原**无法**把它改回去，于是
+        回拨 mtime 必然改变 ctime → 签名失配 → 正常 sha256 路径检出。
+
+        残余风险（如实申报）：**Windows 上 st_ctime 是创建时间，没有鉴别力**，
+        上述回拨路径在 Windows 侧仍然存在；Windows 侧只有 (mtime_ns, size) 两个
+        有效通道，与 Git 对「mtime 回拨到与缓存完全相同」的盲区同类。粗刻度带
+        来的同刻度漏检已由上面的刻度探测堵死，回拨漏检在 POSIX 侧已堵死，剩下
+        的就是 Windows + 显式回拨这一个组合面，需要更强的通道（如持久化内容摘
+        要或 USN 日志）才能进一步收敛，本轮不做。另一个方向安全的副作用：POSIX
+        下任何元数据变更（chmod / rename 等）都会使 ctime 变化、令条目多付一次
+        读盘复核——只多读盘，不影响正确性。
+
+        ## mtime 停在未来：不永久惩罚
+
+        外部时基偏移（网络盘/共享盘时钟超前、备份还原、手工 touch）会让 mtime
+        长期大于 seen_ns，上面的余量归纳永远不成立。旧实现因此让该文件**永久**
+        失去零读盘快速路径（实测连续三轮都读盘）。现在把这种情况识别为独立状态：
+        若该签名已在**跨墙钟**的多次内容级复核（间隔 >=
+        _FUTURE_MTIME_MIN_OBSERVATION_GAP_NS）中始终未变，且次数超过
+        _FUTURE_MTIME_RECHECK_LIMIT，则接受它稳定、恢复零读盘，并在
+        fast_path_warnings 里留一条告警。这是「复核次数上限 + 告警」，不是无声
+        豁免：上限内仍然每轮精确校验。
+
+        ## 与 Git 的差异
+
+        Git 用「索引文件自身的 mtime」当锚点（同为文件系统时间戳，天然同时基），
+        本实现用进程时钟 + 余量，因为 cache.enabled=False（AppConfig 默认值）时
+        不落任何盘上锚点，而正确性修复必须覆盖默认配置。
         """
+        if getattr(self, "_fast_path_disabled_reason", None):
+            # 探测到粗刻度：不对任何文件使用快速路径（fail-closed）。
+            return False
         seen_ns = self._stat_seen_ns.get(source)
         if seen_ns is None:
             return False
-        return mtime_ns < seen_ns - _MTIME_TRUST_MARGIN_NS
+        if mtime_ns < seen_ns - self._effective_margin_ns():
+            return True
+        if mtime_ns > seen_ns:
+            confirmations = getattr(self, "_stat_confirmations", {}).get(source, 0)
+            if confirmations > _FUTURE_MTIME_RECHECK_LIMIT:
+                self._note_fast_path_warning(
+                    source,
+                    f"mtime 长期晚于本机墙钟（seen-mtime={-(mtime_ns - seen_ns) / 1e6:.0f}ms），"
+                    f"经 {confirmations} 次跨墙钟复核签名未变，已按稳定条目接受",
+                )
+                return True
+        return False
 
     def _sync_locked(self) -> list[Chunk]:
         self.vault_path.mkdir(parents=True, exist_ok=True)
         failed_before = dict(self.failed_files)
         found: set[str] = set()
-        changed: list[tuple[str, str, list[Chunk], tuple[int, int], int]] = []
+        changed: list[tuple[str, str, list[Chunk], tuple[int, int, int], int]] = []
+        # 时间戳刻度探测的样本：直接复用本循环本来就要做的 stat（零额外 I/O）。
+        mtime_samples: list[int] = []
         for path in self._markdown_files():
             source = self._source(path)
             found.add(source)
             try:
                 stat = path.stat()
-                fast_sig = (int(stat.st_mtime_ns), int(stat.st_size))
+                # 签名是三元组：mtime + size 之外再加入 ctime。POSIX 下 ctime 由内核
+                # 维护、os.utime 改不回去，是「mtime 被显式回拨」这条路径的唯一
+                # 鉴别通道（Windows 下 st_ctime 是创建时间、无鉴别力，残余风险见
+                # _fast_path_is_trustworthy）。
+                fast_sig = (int(stat.st_mtime_ns), int(stat.st_size), int(stat.st_ctime_ns))
+                if len(mtime_samples) < _MTIME_TICK_PROBE_MAX_SAMPLES:
+                    mtime_samples.append(int(stat.st_mtime_ns))
                 if (
                     source in self._signatures
                     and self._stat_cache.get(source) == fast_sig
@@ -990,8 +1167,10 @@ class MarkdownIndexer:
                     # 只是 mtime 被 touch 过）。按本轮验证时刻重新登记；只要
                     # verified_at 与 mtime 拉开了足够余量，该条目即恢复可信、
                     # 重新走零读盘快速路径。
+                    prev_seen_ns = self._stat_seen_ns.get(source)
                     self._stat_cache[source] = fast_sig
                     self._stat_seen_ns[source] = verified_at_ns
+                    self._record_confirmation(source, prev_seen_ns, verified_at_ns)
                     continue
                 text = raw.decode("utf-8-sig")
                 # 顺手复用上面 read_bytes 已经打开的目录项做一次 stat，记录文件
@@ -1008,7 +1187,13 @@ class MarkdownIndexer:
                 self._signatures.pop(source, None)
                 self._stat_cache.pop(source, None)
                 self._stat_seen_ns.pop(source, None)
+                self._stat_confirmations.pop(source, None)
                 self._fts_delete(source)
+
+        # 扫描结束即收敛刻度探测结果。安全：快速路径只可能在 _stat_cache 非空时
+        # 命中，而它是进程内存量、每进程首次 sync 必然为空，故首次扫描不会用未
+        # 探测的余量做跳过决定。
+        self._finalize_mtime_tick_probe(mtime_samples)
 
         # Text layer: changed files update the index even if embedding fails
         # afterwards, so lexical search still works without vectors.
@@ -1018,6 +1203,9 @@ class MarkdownIndexer:
             self._signatures[source] = signature
             self._stat_cache[source] = fast_sig
             self._stat_seen_ns[source] = verified_at_ns
+            # 内容刚被重建：这是该签名的第一次内容级确认。
+            self._stat_confirmations[source] = 1
+            self.fast_path_warnings.pop(source, None)
             self.failed_files.pop(source, None)
             self._fts_upsert(source, chunks)
             # Disk-backed mode: re-chunking a file orphans its old vector ids.
@@ -1051,6 +1239,8 @@ class MarkdownIndexer:
             self._signatures.pop(source, None)
             self._stat_cache.pop(source, None)
             self._stat_seen_ns.pop(source, None)
+            self._stat_confirmations.pop(source, None)
+            self.fast_path_warnings.pop(source, None)
             self.failed_files.pop(source, None)
             self._fts_delete(source)
             if removed_ids:
@@ -2302,6 +2492,8 @@ class MarkdownIndexer:
             self.failed_files.clear()
             self._stat_cache.clear()
             self._stat_seen_ns.clear()
+            self._stat_confirmations.clear()
+            self.fast_path_warnings.clear()
         # FTS index + optional sqlite-vec backend share the cache lifecycle.
         if self._fts is not None:
             try:
@@ -2347,6 +2539,8 @@ class MarkdownIndexer:
             self._signatures.clear()
             self._stat_cache.clear()
             self._stat_seen_ns.clear()
+            self._stat_confirmations.clear()
+            self.fast_path_warnings.clear()
             self.failed_files.clear()
             self._disk_vectors.clear()
             if self._vectors_on_disk:

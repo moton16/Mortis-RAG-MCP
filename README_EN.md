@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/moton16/Mortis-RAG-MCP/actions/workflows/ci.yml/badge.svg)](https://github.com/moton16/Mortis-RAG-MCP/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Version: 0.7.0](https://img.shields.io/badge/Version-0.7.0-blue.svg)](CHANGELOG_user.md)
+[![Version: 0.7.1](https://img.shields.io/badge/Version-0.7.1-blue.svg)](CHANGELOG_user.md)
 
 English | [简体中文](README.md)
 
@@ -14,6 +14,7 @@ English | [简体中文](README.md)
 ## 🌟 Key Features
 
 - 📂 **Zero Hardcoded Paths**: Attach any local folder as a knowledge base using `kb_init`. Persistent user-level registry without modifying configs or locking to fixed directories.
+- 🔍 **Agent Trust Anchor, No Pre-flight Checks (0.7.1)**: One command (`python -m mortis_rag_mcp --doctor`) writes a local environment receipt (`STATUS.md`). Once an agent sees ✅, it **skips every environment / dependency / API-key pre-flight check** and queries your notes immediately instead of probing first. If something is actually broken, the receipt points to that single command — and a failed check never turns into a retry loop.
 - 📄 **Document Parsing & Ingestion (0.7.0)**: Automatically converts PDF, Word, PPT, Excel, and images into Markdown for seamless retrieval. Parsed files reside cleanly in `.mortis-parsed/` without modifying or polluting source documents.
 - 🎯 **Intelligent Vault Routing (0.7.0)**: Add a natural-language description to each vault. AI agents pick the most relevant knowledge base automatically, cutting down noise and boosting response speed.
 - 📊 **Table Structure Preservation (0.7.0)**: Complex tables and headers remain intact across chunk boundaries, ensuring clean and legible table search results.

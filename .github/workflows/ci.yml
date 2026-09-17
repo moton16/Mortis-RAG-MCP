@@ -1,8 +1,11 @@
 name: CI
 
 on:
+  # push 只在 main 与 ci/** 上触发。本仓库同时是上游本体，宽触发（["**"]）合入后
+  # 会对任意分支 push 永久生效，且同仓分支 PR 会 push + pull_request 双跑全部 job。
+  # feature 分支已由 pull_request 事件覆盖，不需要 push 触发。
   push:
-    branches: ["**"]
+    branches: [main, "ci/**"]
   pull_request:
   workflow_dispatch:
 

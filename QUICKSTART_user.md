@@ -8,6 +8,15 @@
 - 你的笔记目录、注册表、API key **全部在你自己的机器上**，仓库里不含任何个人配置（`config/app.toml` 已被 .gitignore 排除）。
 - 首次启动后，所有知识库关系由**用户级注册表** `~/.mortis_rag_mcp/vaults.toml`（兼容旧路径 `~/.vault_mcp/vaults.toml`）管理，不写在代码或仓库里。
 
+### 0.1 从旧版本升级上来（0.7.1 变更要点）
+
+0.7.1 把用户数据目录一起更名了，**自动迁移，不需要你动手**。四点需要知道：
+
+1. **目录改名（首次启动自动完成）**：`~/.vault_mcp` → `~/.mortis_rag_mcp`；缓存目录 `~/.vault_mcp_cache` → `~/.mortis_rag_mcp_cache`。旧路径仍被兼容读取，迁移只做一次原子改名，不复制、不删数据。
+2. **环境变量改名（旧名永久兼容）**：`VAULT_MCP_API_KEY` → `MORTIS_RAG_API_KEY`；配置与注册表覆盖变量同理：`VAULT_MCP_CONFIG` → `MORTIS_RAG_CONFIG`、`VAULT_MCP_REGISTRY` → `MORTIS_RAG_REGISTRY`。新名优先，旧名继续生效。
+3. **一键体检（新增）**：`python -m mortis_rag_mcp --doctor` 会在终端打印体检报告并写入 `~/.mortis_rag_mcp/STATUS.md`。AI 助手读到 ✅ 就不再重复预检环境（不查 venv、不点依赖、不探活 API），直接检索。
+4. **若要退回 0.7.1 之前的老版本**：必须把 `~/.mortis_rag_mcp` **和** `~/.mortis_rag_mcp_cache` **两个**目录都手工改回旧名——只改前一个，库列表会回来但缓存全部失效、所有笔记要重新嵌入（用付费 embedding 会重新计费）。完整说明见 [CHANGELOG_user.md](CHANGELOG_user.md) 的「回退须知」。
+
 ## 1. 安装
 
 ```powershell
