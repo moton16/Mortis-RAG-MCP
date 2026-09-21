@@ -196,7 +196,7 @@ def _tool_definitions() -> list[dict[str, Any]]:
         },
         {
             "name": "kb_list_files",
-            "description": "列出已索引的 Markdown 文件。可传 vault_path 指定知识库。",
+            "description": "列出已索引的 Markdown 与纯文本文件。可传 vault_path 指定知识库。",
             "inputSchema": {"type": "object", "properties": {"vault_path": {"type": "string", "description": vault_path_hint}}},
         },
         {
@@ -220,7 +220,7 @@ def _tool_definitions() -> list[dict[str, Any]]:
         },
         {
             "name": "kb_read",
-            "description": "读取知识库原文（不调用 LLM 生成回答；若索引有未同步的变更会先触发一次增量同步，可能调用 embedding API，建议带上 start_line/end_line 限定范围避免一次拉全篇）。多库环境下建议显式传 vault_path（fan-out 结果中的 source 是库内相对路径）。",
+            "description": "读取知识库原文（只读磁盘原文，不触发同步、不调用 embedding API；建议带上 start_line/end_line 限定范围避免一次拉全篇）。多库环境下建议显式传 vault_path（fan-out 结果中的 source 是库内相对路径）。",
             "inputSchema": {"type": "object", "required": ["source"], "properties": {
                 "source": {"type": "string"}, "heading": {"type": "string"}, "start_line": {"type": "integer", "minimum": 1}, "end_line": {"type": "integer", "minimum": 1},
                 "vault_path": {"type": "string", "description": vault_path_hint},

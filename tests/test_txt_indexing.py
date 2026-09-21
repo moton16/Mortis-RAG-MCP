@@ -140,3 +140,39 @@ def test_txt_equal_length_incremental_update(tmp_path):
     r_update = json.loads(resp2[1]["result"]["content"][0]["text"])
     assert len(r_update["chunks"]) > 0
     assert "ZZZZ" in r_update["chunks"][0]["content"]
+
+
+def test_txt_in_get_exemptions_and_stats_excludes_ingest_exts(tmp_path):
+    vault = tmp_path / "txt_exempt_vault"
+    vault.mkdir()
+    (vault / "normal.md").write_text("# MD\nmarkdown content", encoding="utf-8")
+    (vault / "novel.txt").write_text("第一章 故事开始\n内容", encoding="utf-8")
+    (vault / "secret.txt").write_text("绝密txt内容", encoding="utf-8")
+    (vault / "document.pdf").write_bytes(b"dummy pdf")
+    (vault / "slides.pptx").write_bytes(b"dummy pptx")
+    (vault / "unknown.xyz").write_bytes(b"dummy xyz")
+
+    from mortis_rag_mcp.config import AppConfig, EmbeddingConfig
+    from mortis_rag_mcp.indexer import MarkdownIndexer
+    from mortis_rag_mcp.ingest import INGEST_EXTS
+
+    config = AppConfig(vault_path=str(vault), embedding=EmbeddingConfig(mode="static", dimension=4))
+    indexer = MarkdownIndexer(vault, config)
+    indexer.sync()
+
+    # 1. 豁免 secret.txt
+    indexer.add_exemption_pattern("secret.txt")
+
+    # 2. 检查 get_exemptions()，确保 .txt 是一等公民
+    exemptions = indexer.get_exemptions()
+    assert exemptions["total_text_files"] >= 3
+    assert "secret.txt" in exemptions["exempt_files_sample"]
+
+    # 3. 检查 stats() skipped_unsupported 不包含 INGEST_EXTS (如 pdf, pptx)
+    stats = indexer.stats()
+    skipped = stats["skipped_unsupported"]
+    assert "xyz" in skipped
+    for ext in INGEST_EXTS:
+        bare_ext = ext.lstrip(".")
+        assert bare_ext not in skipped, f"skipped_unsupported 误包含了可摄取格式: {bare_ext}"
+

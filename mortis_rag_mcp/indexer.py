@@ -21,6 +21,7 @@ from .config import AppConfig
 from . import fsnotify
 from .fsnotify import WindowsDirectoryWatcher, watcher_available
 from .fts import FtsIndex
+from .ingest import INGEST_EXTS
 from .ingest.tables import iter_table_blocks, split_large_table, split_table_into_chunks
 from .providers import EmbeddingProvider, ProviderError, RerankerProvider, create_embedding_provider, create_reranker_provider
 from .vector import create_vector_backend
@@ -2422,7 +2423,7 @@ class MarkdownIndexer:
                                     exempt_count += 1
                             except Exception:
                                 pass
-                    elif not entry.name.startswith((".", "~")):
+                    elif suffix not in INGEST_EXTS and not entry.name.startswith((".", "~")):
                         ext = suffix.lstrip(".")
                         if ext:
                             unsupported_counts[ext] = unsupported_counts.get(ext, 0) + 1
@@ -2443,6 +2444,47 @@ class MarkdownIndexer:
             "vector_backend": getattr(self._vector_backend, "name", self.config.vector.backend),
         }
 
+    def _iter_vault_text_files(self) -> list[str]:
+        """按 scandir 剪枝遍历收集库内全部可索引文本文件（.md / .txt）。"""
+        if not self.vault_path.exists():
+            return []
+        found: list[str] = []
+        stack = [self.vault_path]
+        while stack:
+            current = stack.pop()
+            try:
+                entries = os.scandir(current)
+            except OSError:
+                continue
+            with entries:
+                for entry in entries:
+                    try:
+                        is_dir = entry.is_dir(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    path = Path(entry.path)
+                    if is_dir:
+                        if (
+                            entry.name.startswith(".")
+                            or self._ignored_name(entry.name)
+                            or entry.name == "node_modules"
+                            or (
+                                self.config.cache.placement == "vault"
+                                and self.config.cache.subdir
+                                and entry.name == self.config.cache.subdir
+                            )
+                        ):
+                            continue
+                        stack.append(path)
+                        continue
+                    if self._ignored_name(entry.name):
+                        continue
+                    suffix = path.suffix.lower()
+                    if suffix in _INDEXABLE_TEXT_EXTS:
+                        found.append(self._source(path))
+        found.sort()
+        return found
+
     def get_exemptions(self) -> dict[str, Any]:
         ignore_file_path = self.vault_path / self.config.ignore_file
         vaultignore_rules: list[str] = []
@@ -2455,17 +2497,16 @@ class MarkdownIndexer:
             except Exception:
                 pass
 
+        all_text_files: list[str] = []
         all_md_files: list[str] = []
         exempt_files: list[dict[str, str]] = []
-        if self.vault_path.exists():
-            for path in sorted(self.vault_path.rglob("*.md")):
-                if not path.is_file() or self._ignored_name(path.name):
-                    continue
-                source = self._source(path)
+        for source in self._iter_vault_text_files():
+            all_text_files.append(source)
+            if source.lower().endswith((".md", ".markdown")):
                 all_md_files.append(source)
-                check_res = self.check_exemption(source)
-                if check_res["is_exempt"]:
-                    exempt_files.append({"source": source, "reason": check_res["reason"]})
+            check_res = self.check_exemption(source)
+            if check_res["is_exempt"]:
+                exempt_files.append({"source": source, "reason": check_res["reason"]})
 
         return {
             "vault_path": str(self.vault_path.resolve()),
@@ -2475,6 +2516,7 @@ class MarkdownIndexer:
             "exclude_tags": list(self.config.exclude_tags),
             "exclude_frontmatter_keys": list(self.config.exclude_frontmatter_keys),
             "total_md_files": len(all_md_files),
+            "total_text_files": len(all_text_files),
             "indexed_files": len(self._chunks),
             "exempt_files_count": len(exempt_files),
             "exempt_files_sample": [item["source"] for item in exempt_files[:50]],
@@ -3169,10 +3211,10 @@ class MarkdownIndexer:
                 self._fts = None
 
     def _safe_path(self, source: str) -> Path:
-        # kb_read 只能读 Markdown：拒绝任意扩展名，防止把私钥/配置等任意
+        # kb_read 只能读 Markdown 与纯文本文件：拒绝任意扩展名，防止把私钥/配置等任意
         # 文件当文本读出（组合 vault_path 注入 = 任意文件读取）。
         if Path(source).suffix.lower() not in self._READABLE_SUFFIXES:
-            raise ValueError(f"source must be a Markdown file: {source!r}")
+            raise ValueError(f"source must be a Markdown or plain-text file (.md/.markdown/.txt): {source!r}")
         candidate = (self.vault_path / source.replace("\\", "/")).resolve()
         root = self.vault_path.resolve()
         if candidate != root and root not in candidate.parents:

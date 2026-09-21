@@ -360,4 +360,13 @@
   - `add_exemption_pattern` 改为复用 `_prune_ignored_sources`，返回体透传 `"sync": "background"`。
 - **用例补充**：在 `tests/test_anti_contention.py` 中新增 `test_remove_exemption_pattern_is_non_blocking`、`test_set_file_exemption_is_non_blocking` 与 `test_prune_ignored_sources_clears_all_layers`；同步调优 `tests/test_exempt.py` 的轮询等待；`CHANGELOG_user.md` 移除已知限制节。
 
+### C40 — moton16,2026-09-21,Antigravity,Gemini 3.8 Flash — fix(indexer,server): .txt 豁免可见性 / skipped_unsupported 排除可摄取格式 / 描述文案订正
+- **.txt 一等公民补齐**：`indexer.py` 新增 `_iter_vault_text_files()`，复用 scandir 剪枝算法统一收集 `.md` 与 `.txt`；`get_exemptions()` 接入该方法，使纯文本 `.txt` 的豁免状态完全可见，返回体新增 `total_text_files` 并向后兼容保留 `total_md_files`。
+- **消除未收录口径冲突**：`stats()` 中的 `skipped_unsupported` 统计显式排除 `INGEST_EXTS`（经确认无循环导入），避免与 `kb_init` 的 `ingestible_docs` 相互矛盾打架。
+- **文案与沙箱描述订正**：
+  - `indexer.py`：`_safe_path` 错误信息及注释由纯 Markdown 订正为包含 Markdown 与纯文本文件；
+  - `server.py`：`kb_list_files` 描述同步更新为「列出已索引的 Markdown 与纯文本文件」；`kb_read` 描述更新为「只读磁盘原文，不触发同步、不调用 embedding API」。
+- **用例补充**：在 `tests/test_txt_indexing.py` 与 `tests/test_ingest_server.py` 中新增用例，验证 `.txt` 在 `get_exemptions()` 中的可见性以及 `skipped_unsupported` 排除可摄取格式。
+
+
 

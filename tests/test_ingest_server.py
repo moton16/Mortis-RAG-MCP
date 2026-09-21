@@ -189,3 +189,31 @@ def test_stdio_kb_ingest_protocol_roundtrip(tmp_path):
     assert responses[3]["result"].get("isError") is True
     err_text = responses[3]["result"]["content"][0]["text"]
     assert "ingest disabled" in err_text
+
+
+def test_kb_stats_skipped_unsupported_excludes_ingest_exts(tmp_path):
+    vault = tmp_path / "stats_vault"
+    vault.mkdir()
+    (vault / "note.md").write_text("# Note\ncontent", encoding="utf-8")
+    (vault / "book.pdf").write_bytes(b"dummy pdf")
+    (vault / "report.docx").write_bytes(b"dummy docx")
+    (vault / "photo.raw").write_bytes(b"dummy raw")
+
+    config = tmp_path / "app.toml"
+    config.write_text('mode = "static"\n', encoding="utf-8")
+
+    from mortis_rag_mcp.ingest import INGEST_EXTS
+
+    responses = _run_stdio(config, [
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "kb_init", "arguments": {"path": str(vault), "name": "StatsVault"}}},
+        {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "kb_stats", "arguments": {"vault_path": "StatsVault"}}},
+    ])
+
+    stats = _payload(responses[2])
+    skipped = stats.get("skipped_unsupported", {})
+    assert "raw" in skipped
+    for ext in INGEST_EXTS:
+        bare = ext.lstrip(".")
+        assert bare not in skipped, f"kb_stats.skipped_unsupported 误包含了可摄取格式: {bare}"
+
