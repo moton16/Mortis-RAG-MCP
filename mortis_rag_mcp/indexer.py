@@ -201,6 +201,23 @@ class IgnoreMatcher:
         return matched, matched_rule
 
 
+def _candidate_terms(tokens: list[str]) -> list[str]:
+    """把查询词元展开成可用于定位的候选词：英文单词原样，中文按 2-gram 滑窗。"""
+    out: list[str] = []
+    for token in tokens or []:
+        t = token.strip()
+        if not t:
+            continue
+        if "\u4e00" <= t[0] <= "\u9fff":
+            if len(t) == 1:
+                out.append(t)
+                continue
+            out.extend(t[i:i + 2] for i in range(len(t) - 1))
+        elif len(t) >= 2:
+            out.append(t)
+    return out
+
+
 def _extract_snippet(content: str, query_tokens: list[str] | None = None, max_len: int = 150) -> str:
     """从 chunk 正文中提取围绕查询关键词的高光摘要片段（约 100~150 字符）。"""
     if not content:
@@ -220,6 +237,19 @@ def _extract_snippet(content: str, query_tokens: list[str] | None = None, max_le
         if idx != -1:
             match_idx = idx
             break
+
+    if match_idx == -1:
+        candidates = _candidate_terms(tokens)
+        best_term = None
+        best_count = 0
+        clean_text_lower = clean_text.lower()
+        for term in candidates:
+            cnt = clean_text_lower.count(term.lower())
+            if cnt > best_count:
+                best_count = cnt
+                best_term = term
+        if best_term is not None and best_count > 0:
+            match_idx = clean_text_lower.find(best_term.lower())
 
     if match_idx == -1:
         # 未直接定位到词元，取开头内容
@@ -663,6 +693,7 @@ def _probe_mtime_tick_ns(mtime_samples: Iterable[int]) -> int | None:
 
 class MarkdownIndexer:
     _extract_snippet = staticmethod(_extract_snippet)
+    _candidate_terms = staticmethod(_candidate_terms)
 
     def __init__(
         self,
@@ -734,6 +765,7 @@ class MarkdownIndexer:
         self._stopping = False
         self._sync_state: str = "idle"
         self._sync_progress: dict[str, Any] = {
+            "phase": "idle",
             "files_done": 0,
             "files_total": 0,
             "chunks_done": 0,
@@ -1237,10 +1269,18 @@ class MarkdownIndexer:
 
     def _sync_locked(self) -> list[Chunk]:
         self._sync_state = "scanning"
+        self._sync_progress = {
+            "phase": "scanning",
+            "files_done": 0,
+            "files_total": 0,
+            "chunks_done": 0,
+            "chunks_total": 0,
+        }
         try:
             return self._sync_locked_impl()
         finally:
             self._sync_state = "idle"
+            self._sync_progress["phase"] = "idle"
 
     def _sync_locked_impl(self) -> list[Chunk]:
         self.vault_path.mkdir(parents=True, exist_ok=True)
@@ -1249,7 +1289,9 @@ class MarkdownIndexer:
         changed: list[tuple[str, str, list[Chunk], tuple[int, int, int], int]] = []
         # 时间戳刻度探测的样本：直接复用本循环本来就要做的 stat（零额外 I/O）。
         mtime_samples: list[int] = []
-        for path in self._markdown_files():
+        files = list(self._markdown_files())
+        self._sync_progress["files_total"] = len(files)
+        for i, path in enumerate(files):
             source = self._source(path)
             found.add(source)
             try:
@@ -1305,6 +1347,8 @@ class MarkdownIndexer:
                 self._stat_seen_ns.pop(source, None)
                 self._stat_confirmations.pop(source, None)
                 self._fts_delete(source)
+            finally:
+                self._sync_progress["files_done"] = i + 1
 
         # 扫描结束即收敛刻度探测结果。安全：快速路径只可能在 _stat_cache 非空时
         # 命中，而它是进程内存量、每进程首次 sync 必然为空，故首次扫描不会用未
@@ -1315,6 +1359,7 @@ class MarkdownIndexer:
         # afterwards, so lexical search still works without vectors.
         if changed:
             self._sync_state = "fts"
+            self._sync_progress["phase"] = "fts"
         for source, signature, chunks, fast_sig, verified_at_ns in changed:
             old_chunks = self._chunks.get(source)
             self._chunks[source] = chunks
@@ -1347,6 +1392,7 @@ class MarkdownIndexer:
         # corpus while reusing the text chunks; when only a few files changed it
         # embeds just those chunks.
         self._sync_state = "embedding"
+        self._sync_progress["phase"] = "embedding"
         embed_did_work = self._embed_missing()
         # Disk-backed mode: persist newly embedded vectors and release RAM.
         self._flush_vectors_to_disk()
@@ -1547,6 +1593,7 @@ class MarkdownIndexer:
             return reused > 0 or self.failed_files != failed_before
         pending_chunks = [chunk for chunks in pending.values() for chunk in chunks]
         self._sync_progress = {
+            "phase": "embedding",
             "files_done": 0,
             "files_total": len(pending),
             "chunks_done": 0,

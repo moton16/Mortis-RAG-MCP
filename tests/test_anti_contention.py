@@ -250,3 +250,45 @@ def test_prune_ignored_sources_clears_all_layers(tmp_path):
     # doc2 保持完整
     assert "doc2.md" in indexer._chunks
 
+
+def test_sync_progress_state_machine(tmp_path):
+    """验证 P3-2: _sync_progress 状态机 phase 与 counts 在 scanning/fts/embedding/idle 间正确流转。"""
+    vault = tmp_path / "vault_progress"
+    vault.mkdir(parents=True)
+    for i in range(5):
+        (vault / f"file_{i}.md").write_text(f"# File {i}\nContent {i}", encoding="utf-8")
+
+    config = AppConfig(vault_path=str(vault), embedding=EmbeddingConfig(mode="static", dimension=4))
+    indexer = MarkdownIndexer(vault, config)
+
+    # 1. 初始状态
+    assert indexer._sync_state == "idle"
+    assert indexer._sync_progress["phase"] == "idle"
+    assert indexer._sync_progress["files_total"] == 0
+
+    phases_seen = []
+    original_markdown_files = indexer._markdown_files
+
+    def _spy_markdown_files():
+        phases_seen.append((indexer._sync_state, dict(indexer._sync_progress)))
+        return original_markdown_files()
+
+    indexer._markdown_files = _spy_markdown_files
+
+    indexer.sync()
+
+    # 2. 验证进入 _sync_locked 时已初始化并在 scanning 阶段，且重置了 progress
+    assert len(phases_seen) == 1
+    state, prog = phases_seen[0]
+    assert state == "scanning"
+    assert prog["phase"] == "scanning"
+    assert prog["files_done"] == 0
+    assert prog["files_total"] == 0
+
+    # 3. 完成后恢复为 idle
+    assert indexer._sync_state == "idle"
+    assert indexer._sync_progress["phase"] == "idle"
+    assert indexer._sync_progress["files_total"] == 5
+    assert indexer._sync_progress["files_done"] == 5
+
+

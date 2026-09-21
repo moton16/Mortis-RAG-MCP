@@ -163,3 +163,39 @@ def test_kb_search_preview_mode_integration(tmp_path):
     raw_full_size = len(json.dumps(r4, ensure_ascii=False))
     raw_preview_size = len(json.dumps(r5, ensure_ascii=False))
     assert raw_preview_size < raw_full_size * 0.7
+
+
+def test_snippet_centers_on_chinese_keyword():
+    # 前文 500 字无关内容 + 中文关键词句；断言 snippet 包含该关键词且不以正文开头
+    prefix = "无关背景内容填充段落，" * 50
+    keyword = "【噪声容限关键计算】"
+    suffix = "后续无关填充段落，" * 50
+    long_text = f"{prefix}{keyword}{suffix}"
+
+    # 模拟真实中文整句查询（无空格分词，作为单个长 token 传入）
+    query_tokens = ["噪声容限怎么计算"]
+    snippet = MarkdownIndexer._extract_snippet(long_text, query_tokens, max_len=150)
+
+    assert "噪声容限" in snippet
+    assert not snippet.startswith("无关背景内容填充段落")
+    assert snippet.startswith("...")
+    assert snippet.endswith("...")
+
+
+def test_snippet_handles_single_cjk_char_query():
+    # 单字中文兜底，不越界
+    prefix = "前置冗余数据" * 40
+    target = "【算】"
+    suffix = "后置冗余数据" * 40
+    long_text = f"{prefix}{target}{suffix}"
+
+    snippet = MarkdownIndexer._extract_snippet(long_text, ["算"], max_len=60)
+    assert "算" in snippet
+    assert not snippet.startswith("前置冗余数据")
+    assert snippet.startswith("...")
+
+    # 单字不在文本中，安全回退到开头，不越界崩溃
+    snippet_no_hit = MarkdownIndexer._extract_snippet(long_text, ["错"], max_len=50)
+    assert snippet_no_hit.startswith("前置冗余数据")
+    assert snippet_no_hit.endswith("...")
+

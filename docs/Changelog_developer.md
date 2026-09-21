@@ -368,5 +368,12 @@
   - `server.py`：`kb_list_files` 描述同步更新为「列出已索引的 Markdown 与纯文本文件」；`kb_read` 描述更新为「只读磁盘原文，不触发同步、不调用 embedding API」。
 - **用例补充**：在 `tests/test_txt_indexing.py` 与 `tests/test_ingest_server.py` 中新增用例，验证 `.txt` 在 `get_exemptions()` 中的可见性以及 `skipped_unsupported` 排除可摄取格式。
 
-
-
+### C41 — moton16,2026-09-21,Antigravity,Gemini 3.8 Flash — fix(indexer): 中文查询高光窗口与进度状态机（I5/I2 收口）
+- **修复中文预览模式高光退化**：在 `indexer.py` 中实现 `_candidate_terms`（将查询词元展开为候选词，英文保留 >= 2 字符词，中文按 2-gram 滑窗提取，单字中文兜底）。当初始精准整词匹配失败时，自动回退遍历候选词，挑选在正文中出现频次最高的词（并列取靠前者）居中构建高光窗口（`_extract_snippet`），彻底解决长句中文无空格分词导致预览窗口全部退化为首部 150 字的问题。
+- **打通 `_sync_progress` 状态机**：
+  - `_sync_progress` 引入 `"phase"` 字段，与 `_sync_state`（`"scanning"` -> `"fts"` -> `"embedding"` -> `"idle"`）保持强一致；
+  - `_sync_locked` 入口处强制重新初始化 `_sync_progress`（清除前次残留指标），在 `_sync_locked_impl` 收集文件后立即写入 `files_total`，并在扫描循环中实时递增 `files_done`；
+  - 进入 FTS 和向量嵌入阶段时同步推进 `phase`，在 `finally` 块中统一定点恢复为 `"idle"`，使前端/Agent 观测冷启动进度不再 90% 时间恒为 0。
+- **用例补充**：
+  - 在 `tests/test_preview_mode.py` 中新增 `test_snippet_centers_on_chinese_keyword`（验证 500 字前置干扰段落后精准聚焦中文关键词）与 `test_snippet_handles_single_cjk_char_query`（单字中文兜底与越界安全）；
+  - 在 `tests/test_anti_contention.py` 中新增 `test_sync_progress_state_machine`（验证 `phase` 流转与扫描进度计数实时性）。
