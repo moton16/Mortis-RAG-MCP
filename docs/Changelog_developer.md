@@ -325,4 +325,17 @@
   - 新增 `tests/test_anti_contention.py`（4 passed，覆盖内存剪枝+向量清理+failed_files弹出+缓存落盘、kb_read 零锁争用、try_sync_with_guard 超时快速熔断、stdio 冷启动渐进反馈）；
 - **验证**：全量测试套件 293 passed, 4 skipped（基线 279 + Phase 1 5 个 + Phase 2 2 个 + Phase 3 3 个 + Phase 4 4 个），0 破坏性回归。
 
-
+### C36 — Antigravity,2026-09-21,Google DeepMind,Gemini-3.8-Flash — docs(skill,tests): 同步 SKILL.md 5.2 二段式检索纪律与 v0.7.2 全量回归通过
+- **Agent 交互纪律重构 (SKILL.md 5.2.0)**：
+  - 更新版本至 5.2.0，对齐 v0.7.2 新特性；
+  - 判定表增加库名自然路由准则（无需再费力拼装 Windows 绝对物理路径）；
+  - 判定表增加 Scoped 定向多库检索准则（`vault_paths` 列表，支持跨独立库联合召回）；
+  - 增加大范围初筛与大 `top_k` 启用 `preview=True` 规范（单块体积压缩 70%+，获取高光摘要与物理行号）；
+  - 完善二段式精读工作流：先 `kb_search(..., preview=True)` 找锚点，后 `kb_read(source, start_line, end_line)` 读切题原文；
+  - 增加后台构建容灾识别纪律：若遇到 `status: "indexing"`，读取 `progress` 并根据 `retry_after` 友好告知用户，禁止紧密自旋死等；
+  - 格式认知升级：`.txt` 原生收录与 `.md` 同权，透明化告知 `skipped_unsupported`。
+- **服务细节微调**：
+  - `server.py`：在 `kb_stats` 前接入 `try_sync_with_guard(timeout=1.0)`，确保轻量统计既能获取最新计数，又绝不会在重度构建时导致前台假死；同时保持 `kb_read` 纯只读零锁无阻塞。
+- **全量测试与评测双重验收**：
+  - 全量单测套件：`uv run --with pytest pytest tests/ -q` 跑出 **293 passed, 4 skipped in 20.16s**（包含 Phase 1~4 新增的 14 个高严苛对抗用例全部通过，0 破坏性回归）；
+  - 黄金检索评测集：`scripts/eval_search.py --golden tests/eval/golden_queries.json --k 5` 评测结果 **Hit@5: 100.0%, MRR@5: 1.000**，检索质量零衰退。

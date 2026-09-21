@@ -1065,6 +1065,7 @@ class VaultMcpServer:
                 "truncated": truncated,
             })
         if name == "kb_stats":
+            indexer.try_sync_with_guard(timeout=1.0)
             return _text_content(indexer.stats())
         if name == "kb_exempt":
             action = str(arguments.get("action", "list")).strip()
