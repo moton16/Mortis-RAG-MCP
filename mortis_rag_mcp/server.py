@@ -14,7 +14,7 @@ from typing import Any
 from .config import load_config, resolve_config_path
 from .indexer import Chunk, MarkdownIndexer, SearchFilter, dedupe_by_content_hash, rerank_chunks
 from .ingest import IngestManager, INGEST_EXTS
-from .registry import VaultEntry, VaultRegistry, registry_path
+from .registry import VaultEntry, VaultRegistry, normalize_vault_key, registry_path
 
 SERVER_INFO = {"name": "mortis-rag-mcp", "version": "0.7.1", "title": "Mortis'RAG MCP"}
 
@@ -194,10 +194,12 @@ def _tool_definitions() -> list[dict[str, Any]]:
         },
         {
             "name": "kb_search",
-            "description": "搜索知识库并返回结构化 chunks。路由纪律：用户问题或上下文已明确指向特定库/目录时，必须传 vault_path 或 path_prefix 定向检索（精度更高、噪音更少）；仅在目标模糊或确需跨库时才省略 vault_path 做跨库 fan-out（结果带 vault 字段；solo 库被跳过并在 excluded_solo 中列出）。不确定有哪些库时先 kb_list 看各库 description 再决定。",
+            "description": "搜索知识库并返回结构化 chunks。路由纪律：用户问题或上下文已明确指向特定库/目录时，必须传 vault_path、vault_paths 或 path_prefix 定向检索（精度更高、噪音更少）；仅在目标模糊或确需跨库时才省略 vault_path 做跨库 fan-out（结果带 vault 字段；solo 库被跳过并在 excluded_solo 中列出）。不确定有哪些库时先 kb_list 看各库 description 再决定。",
             "inputSchema": {"type": "object", "required": ["query"], "properties": {
                 "query": {"type": "string"}, "top_k": {"type": "integer", "minimum": 1, "default": 10}, "use_rerank": {"type": "boolean", "default": True},
-                "vault_path": {"type": "string", "description": "可选，已注册知识库的绝对路径；缺省时跨全部非 solo 注册库检索"},
+                "vault_path": {"type": "string", "description": "可选，已注册知识库的名称或绝对路径；缺省时跨全部非 solo 注册库检索"},
+                "vault_paths": {"type": "array", "items": {"type": "string"}, "description": "可选，知识库名称或绝对路径数组；用于定向组合检索指定的若干个库（Scoped Multi-Vault）"},
+                "preview": {"type": "boolean", "default": False, "description": "可选，轻量预览模式：设为 true 时仅返回高光摘要与行号区间，不返回全文，有效节约模型上下文"},
                 "group_by_vault": {"type": "boolean", "default": False, "description": "可选，仅跨库检索（不传 vault_path）时生效：结果按知识库分组返回 groups，每组取 top_k 条"},
                 "path_prefix": {"type": "string", "description": "可选，只保留 source 以该前缀开头的 chunk（source 是库内相对 posix 路径）。用户提到具体课程名/文件夹名/主题目录时，用它把检索限定在该子树，如 '教材/'、'数字电路/'"},
                 "tags": {"type": "array", "items": {"type": "string"}, "description": "可选，frontmatter 标签过滤：命中任一标签即保留（大小写不敏感，自动去掉 '#' 前缀）"},
@@ -370,29 +372,102 @@ class VaultMcpServer:
             except Exception:
                 continue
 
-    def _resolve_vault_path(self, vault_path: str, *, for_registration: bool = False) -> str:
-        """Resolve a vault path against the user-level registry.
+    def _resolve_vault_path(self, raw_identifier: str, *, for_registration: bool = False) -> str:
+        """解析库标识符（支持已注册库名、别名或绝对物理路径）。
 
-        0.3.0: the old single-root containment check (LFI guard) is replaced by
-        a registration allow-list — only folders explicitly registered via
-        kb_init can be indexed or read, which keeps arbitrary-directory access
-        opt-in instead of inherited from a hardcoded path.
+        解析优先级：
+        1. 若非注册模式：优先按注册库的 name 进行大小写不敏感匹配；
+        2. 若未命中库名，则作为文件系统路径解析（自动规范化跨平台反斜杠）；
+        3. 严禁未注册相对路径逃逸。
         """
-        p = Path(vault_path).expanduser()
+        raw = str(raw_identifier or "").strip().strip("\"'")
+        if not raw:
+            raise ValueError("vault identifier is required; call kb_list to see registered vaults")
+
+        if not for_registration:
+            # 1. 优先尝试名称/别名匹配
+            named_matches = self.registry.get_by_name(raw)
+            if len(named_matches) == 1:
+                return named_matches[0].path
+            elif len(named_matches) > 1:
+                options = "\n".join(f"  - {e.name}: {e.path}" for e in named_matches)
+                raise ValueError(
+                    f"ambiguous vault name '{raw}' matches multiple vaults:\n{options}\n"
+                    "Please specify the explicit physical path instead."
+                )
+
+        # 2. 路径处理（规范化跨平台反斜杠）
+        norm = raw.replace("/", "\\") if os.name == "nt" else raw
+        p = Path(norm).expanduser()
         if not p.is_absolute():
-            raise ValueError(
-                "vault_path must be an absolute path; call kb_list to list registered vaults, or kb_init to register a folder"
-            )
+            if not for_registration:
+                entries = self.registry.load()
+                names = [f"'{e.name}'" for e in entries]
+                raise ValueError(
+                    f"vault '{raw}' is neither a registered vault name nor an absolute path. "
+                    f"Available vaults: {', '.join(names) if names else 'none'}"
+                )
+            raise ValueError(f"vault_path must be an absolute path for registration: {raw}")
+
         candidate = str(p.resolve())
         if for_registration:
             if not p.is_dir():
                 raise ValueError(f"not a readable directory: {candidate}")
             return candidate
-        if self.registry.get(candidate) is None:
+
+        entry = self.registry.get(candidate)
+        if entry is None:
             raise ValueError(
                 f"vault not registered: {candidate}; call kb_init first, or kb_list to list registered vaults"
             )
-        return candidate
+        return entry.path
+
+    def _parse_vault_targets(self, arguments: dict[str, Any]) -> list[str]:
+        """从入参中提取目标库列表（支持 vault_paths 数组、vault_path 逗号分隔或单值）。
+
+        安全门禁（F-05）：
+        严禁盲目 split(",")。优先将输入整体作为库名/路径匹配，
+        仅在整体未命中且包含逗号时才尝试拆分；以 vault_paths 数组作为推荐标准。
+        """
+        raw_list: list[str] = []
+        if "vault_paths" in arguments and isinstance(arguments["vault_paths"], (list, tuple)):
+            for item in arguments["vault_paths"]:
+                s = str(item).strip()
+                if s:
+                    raw_list.append(s)
+        elif "vault_path" in arguments and arguments["vault_path"]:
+            val = arguments["vault_path"]
+            if isinstance(val, (list, tuple)):
+                raw_list.extend(str(x).strip() for x in val if str(x).strip())
+            else:
+                s = str(val).strip()
+                if s:
+                    # F-05: 优先整体探测
+                    is_whole_match = False
+                    if self.registry.get_by_name(s):
+                        is_whole_match = True
+                    elif self.registry.get(s) is not None:
+                        is_whole_match = True
+                    else:
+                        try:
+                            if Path(s).expanduser().is_dir():
+                                is_whole_match = True
+                        except Exception:
+                            pass
+
+                    if is_whole_match or ("," not in s):
+                        raw_list.append(s)
+                    else:
+                        parts = [p.strip() for p in s.split(",") if p.strip()]
+                        raw_list.extend(parts)
+
+        seen = set()
+        deduped = []
+        for t in raw_list:
+            if t not in seen:
+                seen.add(t)
+                deduped.append(t)
+        return deduped
 
     def _default_vault_path(self) -> str:
         """Default vault when a call omits vault_path: the single registered
@@ -611,8 +686,17 @@ class VaultMcpServer:
                           "done 的文档已写入 .mortis-parsed/ 并可被 kb_search 检索。")
         return result
 
-    def _fanout_search(self, query: str, top_k: int, use_rerank: bool, group_by_vault: bool = False, filters: SearchFilter | None = None, dedupe: bool = True) -> dict[str, Any]:
-        """Search across every registered (existing) vault, merge and rerank once.
+    def _fanout_search(
+        self,
+        query: str,
+        top_k: int,
+        use_rerank: bool,
+        group_by_vault: bool = False,
+        filters: SearchFilter | None = None,
+        dedupe: bool = True,
+        target_vaults: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Search across registered vaults (either globally or scoped to target_vaults), merge and rerank once.
 
         group_by_vault=True 时返回按库分组的结果（每组 top_k 条），否则平铺返回。
         filters 的过滤条件对每个库分别生效，分页（offset/limit）只在最后合并
@@ -630,17 +714,36 @@ class VaultMcpServer:
             )
         all_entries = self.registry.load()
         vault_name_map = {entry.path: entry.name for entry in all_entries}
-        # solo 库只在显式指定 vault_path 时被检索；fan-out 跳过它们并原样
-        # 报告在 excluded_solo 里，否则"忘了一个库是 solo"会变成检索黑洞。
-        excluded_solo = [entry.path for entry in all_entries if entry.solo]
-        entries = [
-            entry for entry in all_entries
-            if Path(entry.path).is_dir() and not entry.solo
-        ]
+
+        target_keys: set[str] | None = None
+        if target_vaults is not None and len(target_vaults) > 0:
+            target_keys = {normalize_vault_key(self._resolve_vault_path(t)) for t in target_vaults}
+
+        entries: list[VaultEntry] = []
+        excluded_solo: list[str] = []
+
+        for entry in all_entries:
+            if not Path(entry.path).is_dir():
+                continue
+            entry_key = normalize_vault_key(entry.path)
+            if target_keys is not None:
+                # 定向多库检索（Scoped Multi-Vault）：显式包含的 solo 库允许合法参与检索
+                if entry_key in target_keys:
+                    entries.append(entry)
+            else:
+                # 全局盲搜：跳过所有 solo 库并汇报
+                if entry.solo:
+                    excluded_solo.append(entry.path)
+                else:
+                    entries.append(entry)
+
         if not entries:
+            if target_keys is not None:
+                raise ValueError(f"none of the requested vaults could be searched: {target_vaults}")
             if excluded_solo and len(excluded_solo) == len(all_entries):
                 raise ValueError(
-                    "no searchable vaults: all registered vaults are solo (excluded from global search); pass an explicit vault_path to search one"
+                    "no searchable vaults: all registered vaults are solo (excluded from global search); "
+                    "pass an explicit vault_path or vault_paths to search"
                 )
             raise ValueError("no readable registered vaults; call kb_init first")
         merged: list[tuple[VaultEntry, Chunk]] = []
@@ -736,7 +839,7 @@ class VaultMcpServer:
                 key=lambda group: -max(chunk["score"] for chunk in group["chunks"]),
             )
             res: dict[str, Any] = {"groups": groups, "searched": searched, "errors": errors, "excluded_solo": excluded_solo}
-            if len(searched) > 1:
+            if len(searched) > 1 and not target_vaults:
                 names = [vault_name_map.get(s, Path(s).name) for s in searched]
                 res["hint"] = (
                     f"本次检索横跨 {len(searched)} 个库：{names}。若用户问题指向特定库或目录，"
@@ -753,7 +856,7 @@ class VaultMcpServer:
             data["vault_name"] = entry.name
             out_chunks.append(data)
         res = {"chunks": out_chunks, "searched": searched, "errors": errors, "excluded_solo": excluded_solo}
-        if len(searched) > 1:
+        if len(searched) > 1 and not target_vaults:
             names = [vault_name_map.get(s, Path(s).name) for s in searched]
             res["hint"] = (
                 f"本次检索横跨 {len(searched)} 个库：{names}。若用户问题指向特定库或目录，"
@@ -825,46 +928,52 @@ class VaultMcpServer:
                 force = force.strip().lower() in {"1", "true", "yes", "on"}
             return _text_content(indexer.import_snapshot(snapshot, force=bool(force)))
         if name == "kb_search":
-            explicit = str(arguments.get("vault_path") or "").strip()
-            if not explicit:
-                entries = self.registry.load()
-                # 唯一的注册库是 solo 库时，不传 vault_path 的检索同样算"全局
-                # 检索"，必须拒绝而不是悄悄搜它——否则单库用户的 solo 等于没设。
-                # （检查放在这里而不是 _default_vault_path：后者被 kb_read/
-                # kb_stats 等管理类工具共用，单库默认它们是合理的。）
-                if len(entries) == 1 and entries[0].solo:
-                    raise ValueError(
-                        f"vault '{entries[0].name}' is solo (excluded from global search); "
-                        "pass an explicit vault_path to search it"
-                    )
-                if len(entries) > 1:
-                    query = str(arguments.get("query", ""))
-                    top_k = _parse_top_k(arguments.get("top_k", 10), self.config.max_top_k)
-                    use_rerank = arguments.get("use_rerank", True)
-                    if isinstance(use_rerank, str):
-                        use_rerank = use_rerank.strip().lower() in {"1", "true", "yes", "on"}
-                    group_by_vault = arguments.get("group_by_vault", False)
-                    if isinstance(group_by_vault, str):
-                        group_by_vault = group_by_vault.strip().lower() in {"1", "true", "yes", "on"}
-                    dedupe = arguments.get("dedupe", True)
-                    if isinstance(dedupe, str):
-                        dedupe = dedupe.strip().lower() not in {"0", "false", "no", "off"}
-                    return _text_content(self._fanout_search(query, top_k, bool(use_rerank), bool(group_by_vault), _search_filter(arguments, self.config.max_top_k), bool(dedupe)))
-        indexer = self._indexer_for(arguments)
-        indexer.sync()
-        if name == "kb_list_files":
-            return _text_content({"files": indexer.list_files()})
-        if name == "kb_search":
+            targets = self._parse_vault_targets(arguments)
             query = str(arguments.get("query", ""))
             top_k = _parse_top_k(arguments.get("top_k", 10), self.config.max_top_k)
             use_rerank = arguments.get("use_rerank", True)
             if isinstance(use_rerank, str):
                 use_rerank = use_rerank.strip().lower() in {"1", "true", "yes", "on"}
+            group_by_vault = arguments.get("group_by_vault", False)
+            if isinstance(group_by_vault, str):
+                group_by_vault = group_by_vault.strip().lower() in {"1", "true", "yes", "on"}
             dedupe = arguments.get("dedupe", True)
             if isinstance(dedupe, str):
                 dedupe = dedupe.strip().lower() not in {"0", "false", "no", "off"}
-            results = indexer.search(query, top_k, bool(use_rerank), filters=_search_filter(arguments, self.config.max_top_k), dedupe=bool(dedupe))
-            return _text_content({"chunks": [chunk.to_dict() for chunk in results]})
+            search_filters = _search_filter(arguments, self.config.max_top_k)
+
+            # 单库检索通道（传入单个目标）
+            if len(targets) == 1:
+                resolved_single = self._resolve_vault_path(targets[0])
+                indexer = self._indexer_for({"vault_path": resolved_single})
+                indexer.sync()
+                results = indexer.search(query, top_k, bool(use_rerank), filters=search_filters, dedupe=bool(dedupe))
+                return _text_content({"chunks": [chunk.to_dict() for chunk in results]})
+
+            # 未指定目标时的默认单库处理
+            if not targets:
+                entries = self.registry.load()
+                if len(entries) == 1 and entries[0].solo:
+                    raise ValueError(
+                        f"vault '{entries[0].name}' is solo (excluded from global search); "
+                        "pass an explicit vault_path to search it"
+                    )
+                if len(entries) == 1:
+                    indexer = self._indexer_for({"vault_path": entries[0].path})
+                    indexer.sync()
+                    results = indexer.search(query, top_k, bool(use_rerank), filters=search_filters, dedupe=bool(dedupe))
+                    return _text_content({"chunks": [chunk.to_dict() for chunk in results]})
+
+            # 跨库检索（Scoped 定向多库 或 全局盲搜）
+            return _text_content(self._fanout_search(
+                query, top_k, bool(use_rerank), bool(group_by_vault), search_filters, bool(dedupe),
+                target_vaults=targets if targets else None
+            ))
+
+        indexer = self._indexer_for(arguments)
+        indexer.sync()
+        if name == "kb_list_files":
+            return _text_content({"files": indexer.list_files()})
         if name == "kb_read":
             source = str(arguments.get("source", "")).strip()
             if not source:

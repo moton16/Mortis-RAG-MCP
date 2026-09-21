@@ -361,3 +361,19 @@ class VaultRegistry:
             if normalize_vault_key(entry.path) == target:
                 return entry
         return None
+
+    def get_by_name(self, name: str) -> list[VaultEntry]:
+        """按知识库显示名（name）不区分大小写查找条目。
+
+        可能存在多库重名，故返回列表：
+        - 长度为 1：精准匹配
+        - 长度 > 1：重名歧义，由上层提示调用方
+        - 长度 == 0：未命中
+        """
+        target = str(name or "").strip().lower()
+        if not target:
+            return []
+        with self._lock:
+            entries = self.load()
+            return [e for e in entries if e.name.strip().lower() == target]
+

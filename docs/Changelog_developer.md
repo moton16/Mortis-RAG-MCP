@@ -252,3 +252,19 @@
 - **docs 入库口径**：`docs/` 下仅三份白名单文件入库（`Changelog_developer.md` / `PROJECT_GUIDE.md` / `Quick-start_developer.md`），版本内规划文档 `docs/V0.7.1/Plan_agent-status.md` **不入库**，`.gitignore` 不动；其设计意图以摘要形式写入本次落地的提交信息。
 - **验证**：`git status` 仅含预期文件；受影响模块测试子集 108 passed；全量测试按约定交 CI 执行。
 
+### C32 — Antigravity,2026-09-21,Google DeepMind,Gemini-3.8-Flash — feat(registry,server): 库名别名自然路由 (I6) 与 Scoped 定向多库检索 (I1)
+- **库名别名自然路由 (I6)**：
+  - `registry.py` 增加 `get_by_name(name)`，支持对注册库显示名称进行大小写不敏感匹配；
+  - `server.py` 的 `_resolve_vault_path` 升级：非注册模式下优先通过 `get_by_name` 解析，单匹配返回物理路径，多匹配抛出清晰歧义错误，未匹配再走物理路径解析（自动规范化跨平台反斜杠），彻底消除模型调用拼接 Windows 漫长物理路径的摩擦。
+- **Scoped 定向多库检索 (I1)**：
+  - `server.py` 的 `_fanout_search` 新增 `target_vaults` 参数，支持通过库名数组或逗号安全输入精准圈定若干目标库；
+  - **Solo 契约更新**：全局盲搜跳过 Solo 库，但在定向 Scoped 模式下，只要 Solo 库被显式点名，即合法参与联合召回；
+  - 仅在未指定 target_vaults 且跨多库盲搜时才注入收窄 hint。
+- **强制前置修正落实**：
+  - **F-05（路径逗号安全）**：`_parse_vault_targets` 优先将输入整体作为已注册库名、路径或本地目录匹配，仅在整体未命中且包含逗号时才尝试拆分；以 `vault_paths` 数组作为推荐标准。
+  - **F-06（跨平台大小写归一）**：`_fanout_search` 目标过滤一律使用 `normalize_vault_key()` 抹平 Windows 盘符大小写差异，严禁用裸字符串集合比对。
+  - **F-07（Schema 完备）**：`_tool_definitions()` 中为 `kb_search` 补充 `vault_paths`（array）与 `preview`（boolean）参数及说明。
+- **新增用例**：`tests/test_scoped_search.py`（5 passed，覆盖别名解析、大小写不敏感、多库定向召回、Solo 库显式召回/盲搜排除、逗号路径安全与歧义报错）。
+- **验证**：全量测试套件 284 passed, 4 skipped，0 回归。
+
+
