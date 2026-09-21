@@ -286,4 +286,20 @@
   - 调整 `tests/test_indexer.py`：测试非 Markdown 忽略文件从 `image.txt` 更新为 `image.png`；`test_future_mtime...` 的 `read_bytes` monkeypatch 精确收敛至目标测试文件，排除后台线程干扰。
 - **验证**：全量测试套件 286 passed, 4 skipped（基线 279 + Phase 1 5 个 + Phase 2 2 个），0 破坏性回归。
 
+### C34 — Antigravity,2026-09-21,Google DeepMind,Gemini-3.8-Flash — feat(indexer,server): 检索 Payload 瘦身与轻量高光预览模式 preview=True (I5)
+- **高光摘要窗口与 Payload 瘦身 (I5)**：
+  - `indexer.py` 实现 `_extract_snippet` 算法（挂载至 `MarkdownIndexer._extract_snippet`）：围绕首个命中的高价值查询词元（自动支持中英文字词与标点跳过）截取 100~150 字符的高光窗口，两侧自适应追加省略号 `...`，未命中词元时平滑 fallback 取前 150 字符；
+  - `Chunk.to_dict()` 升级重构：扁平化外露 `heading`, `start_line`, `end_line` 核心锚点定位字段（并完整向后兼容 `metadata` 字典访问）；新增 `preview: bool` 与 `query_tokens` 参数。开启 `preview=True` 时不返回庞大的 `content` 全文，仅返回高光 `snippet` 与 `char_count`，单块 payload 压缩 70%+。
+- **服务端与 Tool 契约无缝透传**：
+  - `server.py` 实现 `_tokenize_query` 分词器；
+  - `kb_search` 支持 `preview: bool`（同时兼容字符串形式与 `mode="preview"` 枚举）；
+  - 单库检索、默认单库短路以及 `_fanout_search` 跨库检索（含 `group_by_vault` 分组模式）全面透传 `preview` 与 `query_tokens`；
+  - `_tool_definitions()` inputSchema 补齐 `"mode": {"type": "string", "enum": ["full", "preview"]}` 规范定义。
+- **引导标准二段式 AX 工作流**：
+  - 检索第一阶段（找锚点）：调用 `kb_search(..., preview=True)` 极速、低 Token 消耗圈定相关笔记、章节标题与行号；
+  - 检索第二阶段（精准精读）：按需调用 `kb_read(source=..., start_line=..., end_line=...)` 仅拉取切题原文，彻底消除上下文长文本污染与无谓 Token 浪费。
+- **用例与回归**：
+  - 新增 `tests/test_preview_mode.py`（3 passed，覆盖 `_extract_snippet` 算法边界、`Chunk.to_dict` 字段与压缩率、单库/多库/跨库分组 `kb_search` 预览端到端集成测试）；
+- **验证**：全量测试套件 289 passed, 4 skipped，0 破坏性回归。
+
 

@@ -200,6 +200,43 @@ class IgnoreMatcher:
         return matched, matched_rule
 
 
+def _extract_snippet(content: str, query_tokens: list[str] | None = None, max_len: int = 150) -> str:
+    """从 chunk 正文中提取围绕查询关键词的高光摘要片段（约 100~150 字符）。"""
+    if not content:
+        return ""
+    clean_text = " ".join(content.split())
+    if len(clean_text) <= max_len:
+        return clean_text
+
+    tokens = query_tokens or []
+    # 寻找首个命中的高价值查询词（长度 >= 2，或单字中文）
+    match_idx = -1
+    for token in tokens:
+        t = token.strip()
+        if not t or (len(t) < 2 and not ("\u4e00" <= t <= "\u9fff")):
+            continue
+        idx = clean_text.lower().find(t.lower())
+        if idx != -1:
+            match_idx = idx
+            break
+
+    if match_idx == -1:
+        # 未直接定位到词元，取开头内容
+        return clean_text[:max_len].rstrip() + "..."
+
+    # 以匹配词为中心，向两侧各扩展
+    half = max_len // 2
+    start = max(0, match_idx - half)
+    end = min(len(clean_text), start + max_len)
+    if end - start < max_len:
+        start = max(0, end - max_len)
+
+    snippet = clean_text[start:end].strip()
+    prefix = "..." if start > 0 else ""
+    suffix = "..." if end < len(clean_text) else ""
+    return f"{prefix}{snippet}{suffix}"
+
+
 @dataclass
 class Chunk:
     id: str
@@ -210,17 +247,25 @@ class Chunk:
     score: float = 0.0
     embedding: array | None = field(default=None, repr=False)
 
-    def to_dict(self) -> dict[str, Any]:
-        d = {
+    def to_dict(self, preview: bool = False, query_tokens: list[str] | None = None) -> dict[str, Any]:
+        d: dict[str, Any] = {
             "id": self.id,
-            "content": self.content,
             "score": self.score,
             "source": self.source,
             "title": self.title,
+            "heading": self.metadata.get("heading", self.title),
+            "start_line": self.metadata.get("start_line", 1),
+            "end_line": self.metadata.get("end_line", 1),
             "metadata": dict(self.metadata),
         }
         if "source_pdf" in self.metadata:
             d["source_pdf"] = self.metadata["source_pdf"]
+
+        if preview:
+            d["snippet"] = _extract_snippet(self.content, query_tokens)
+            d["char_count"] = len(self.content)
+        else:
+            d["content"] = self.content
         return d
 
 
@@ -616,6 +661,8 @@ def _probe_mtime_tick_ns(mtime_samples: Iterable[int]) -> int | None:
 
 
 class MarkdownIndexer:
+    _extract_snippet = staticmethod(_extract_snippet)
+
     def __init__(
         self,
         vault_path: str | Path,

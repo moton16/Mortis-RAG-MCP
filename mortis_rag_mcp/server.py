@@ -3,6 +3,7 @@ from __future__ import annotations
 import atexit
 import json
 import os
+import re
 import sys
 import threading
 from argparse import ArgumentParser
@@ -106,6 +107,12 @@ def _search_filter(arguments: dict[str, Any], max_limit: int = 200) -> SearchFil
     )
 
 
+def _tokenize_query(query: str) -> list[str]:
+    if not query:
+        return []
+    return [t.strip() for t in re.findall(r"[\w\u4e00-\u9fff]+", query) if t.strip()]
+
+
 def _json_result(request_id: Any, result: Any) -> dict[str, Any]:
     return {"jsonrpc": "2.0", "id": request_id, "result": result}
 
@@ -200,6 +207,7 @@ def _tool_definitions() -> list[dict[str, Any]]:
                 "vault_path": {"type": "string", "description": "可选，已注册知识库的名称或绝对路径；缺省时跨全部非 solo 注册库检索"},
                 "vault_paths": {"type": "array", "items": {"type": "string"}, "description": "可选，知识库名称或绝对路径数组；用于定向组合检索指定的若干个库（Scoped Multi-Vault）"},
                 "preview": {"type": "boolean", "default": False, "description": "可选，轻量预览模式：设为 true 时仅返回高光摘要与行号区间，不返回全文，有效节约模型上下文"},
+                "mode": {"type": "string", "enum": ["full", "preview"], "default": "full", "description": "可选，检索结果呈现模式：'full'（默认，返回完整正文 content）或 'preview'（轻量高光预览，仅返回 snippet 与行号区间）"},
                 "group_by_vault": {"type": "boolean", "default": False, "description": "可选，仅跨库检索（不传 vault_path）时生效：结果按知识库分组返回 groups，每组取 top_k 条"},
                 "path_prefix": {"type": "string", "description": "可选，只保留 source 以该前缀开头的 chunk（source 是库内相对 posix 路径）。用户提到具体课程名/文件夹名/主题目录时，用它把检索限定在该子树，如 '教材/'、'数字电路/'"},
                 "tags": {"type": "array", "items": {"type": "string"}, "description": "可选，frontmatter 标签过滤：命中任一标签即保留（大小写不敏感，自动去掉 '#' 前缀）"},
@@ -707,6 +715,7 @@ class VaultMcpServer:
         filters: SearchFilter | None = None,
         dedupe: bool = True,
         target_vaults: list[str] | None = None,
+        preview: bool = False,
     ) -> dict[str, Any]:
         """Search across registered vaults (either globally or scoped to target_vaults), merge and rerank once.
 
@@ -829,6 +838,7 @@ class VaultMcpServer:
         else:
             start, end = 0, max(0, top_k)
 
+        query_tokens = _tokenize_query(query)
         if group_by_vault:
             # 分组模式：保持融合后的组内顺序，按库切桶；组顺序取各组最高分降序。
             # 分页在这里是"每组各翻一页"——全局先切一刀会让低分库整组消失，
@@ -839,7 +849,7 @@ class VaultMcpServer:
                 if group is None:
                     group = {"vault": entry.path, "vault_name": entry.name, "chunks": []}
                     buckets[entry.path] = group
-                data = chunk.to_dict()
+                data = chunk.to_dict(preview=preview, query_tokens=query_tokens)
                 data["vault"] = entry.path
                 data["vault_name"] = entry.name
                 group["chunks"].append(data)
@@ -863,7 +873,7 @@ class VaultMcpServer:
 
         out_chunks = []
         for entry, chunk in pairs:
-            data = chunk.to_dict()
+            data = chunk.to_dict(preview=preview, query_tokens=query_tokens)
             data["vault"] = entry.path
             data["vault_name"] = entry.name
             out_chunks.append(data)
@@ -952,7 +962,16 @@ class VaultMcpServer:
             dedupe = arguments.get("dedupe", True)
             if isinstance(dedupe, str):
                 dedupe = dedupe.strip().lower() not in {"0", "false", "no", "off"}
+            preview_val = arguments.get("preview", False)
+            if isinstance(preview_val, str):
+                preview = preview_val.strip().lower() in {"1", "true", "yes", "on"}
+            else:
+                preview = bool(preview_val)
+            if arguments.get("mode") == "preview":
+                preview = True
+
             search_filters = _search_filter(arguments, self.config.max_top_k)
+            query_tokens = _tokenize_query(query)
 
             # 单库检索通道（传入单个目标）
             if len(targets) == 1:
@@ -960,7 +979,7 @@ class VaultMcpServer:
                 indexer = self._indexer_for({"vault_path": resolved_single})
                 indexer.sync()
                 results = indexer.search(query, top_k, bool(use_rerank), filters=search_filters, dedupe=bool(dedupe))
-                return _text_content({"chunks": [chunk.to_dict() for chunk in results]})
+                return _text_content({"chunks": [chunk.to_dict(preview=preview, query_tokens=query_tokens) for chunk in results]})
 
             # 未指定目标时的默认单库处理
             if not targets:
@@ -974,12 +993,13 @@ class VaultMcpServer:
                     indexer = self._indexer_for({"vault_path": entries[0].path})
                     indexer.sync()
                     results = indexer.search(query, top_k, bool(use_rerank), filters=search_filters, dedupe=bool(dedupe))
-                    return _text_content({"chunks": [chunk.to_dict() for chunk in results]})
+                    return _text_content({"chunks": [chunk.to_dict(preview=preview, query_tokens=query_tokens) for chunk in results]})
 
             # 跨库检索（Scoped 定向多库 或 全局盲搜）
             return _text_content(self._fanout_search(
                 query, top_k, bool(use_rerank), bool(group_by_vault), search_filters, bool(dedupe),
-                target_vaults=targets if targets else None
+                target_vaults=targets if targets else None,
+                preview=preview,
             ))
 
         indexer = self._indexer_for(arguments)
