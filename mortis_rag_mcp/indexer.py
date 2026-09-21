@@ -731,6 +731,13 @@ class MarkdownIndexer:
         self._indexing = False
         self._sync_failures = 0
         self._stopping = False
+        self._sync_state: str = "idle"
+        self._sync_progress: dict[str, Any] = {
+            "files_done": 0,
+            "files_total": 0,
+            "chunks_done": 0,
+            "chunks_total": 0,
+        }
         self._chunks_cache_path: Path | None = None
         self._vectors_cache_path: Path | None = None
         self._fts_cache_path: Path | None = None
@@ -1046,6 +1053,31 @@ class MarkdownIndexer:
         with self._sync_lock:
             return self._sync_locked()
 
+    def try_sync_with_guard(self, timeout: float = 1.5) -> bool:
+        """带超时的同步尝试，兼顾冷启动防假死真守护 (F-03/04)。
+
+        原则：
+        1. 锁被后台持有（正在构建）时，在 timeout 内无法获取锁，直接返回 False；
+        2. 锁空闲时，如果检测到尚未完成首次同步（last_sync is None 且配置了重度 embedding）：
+           禁止前台主线程阻塞承担几十秒的 embedding 计算，后台启动异步构建并立即返回 False；
+        3. 正常增量状态下，在持有锁时快速执行增量对账并返回 True。
+        """
+        if self.last_sync is None and self.config.embedding.mode == "external":
+            if not self._sync_lock.locked():
+                threading.Thread(target=self._run_sync_quietly, daemon=True, name="vault-init").start()
+            return False
+
+        acquired = self._sync_lock.acquire(timeout=timeout)
+        if not acquired:
+            return False
+        try:
+            if self.last_sync is None and self.config.embedding.mode == "external":
+                return False
+            self._sync_locked()
+            return True
+        finally:
+            self._sync_lock.release()
+
     def _effective_margin_ns(self) -> int:
         """本次库实际使用的可信余量：max(下限, 2 × 探测到的刻度)。
 
@@ -1203,6 +1235,13 @@ class MarkdownIndexer:
         return False
 
     def _sync_locked(self) -> list[Chunk]:
+        self._sync_state = "scanning"
+        try:
+            return self._sync_locked_impl()
+        finally:
+            self._sync_state = "idle"
+
+    def _sync_locked_impl(self) -> list[Chunk]:
         self.vault_path.mkdir(parents=True, exist_ok=True)
         failed_before = dict(self.failed_files)
         found: set[str] = set()
@@ -1273,6 +1312,8 @@ class MarkdownIndexer:
 
         # Text layer: changed files update the index even if embedding fails
         # afterwards, so lexical search still works without vectors.
+        if changed:
+            self._sync_state = "fts"
         for source, signature, chunks, fast_sig, verified_at_ns in changed:
             old_chunks = self._chunks.get(source)
             self._chunks[source] = chunks
@@ -1304,6 +1345,7 @@ class MarkdownIndexer:
         # cache was invalidated (model/dimension change) this re-embeds the whole
         # corpus while reusing the text chunks; when only a few files changed it
         # embeds just those chunks.
+        self._sync_state = "embedding"
         embed_did_work = self._embed_missing()
         # Disk-backed mode: persist newly embedded vectors and release RAM.
         self._flush_vectors_to_disk()
@@ -1503,6 +1545,12 @@ class MarkdownIndexer:
             # 复用到已有向量的 chunk 也需要落盘，否则下轮重新花钱重算。
             return reused > 0 or self.failed_files != failed_before
         pending_chunks = [chunk for chunks in pending.values() for chunk in chunks]
+        self._sync_progress = {
+            "files_done": 0,
+            "files_total": len(pending),
+            "chunks_done": 0,
+            "chunks_total": len(pending_chunks),
+        }
 
         if self.config.embedding.mode != "external":
             for source, chunks in pending.items():
@@ -1515,6 +1563,9 @@ class MarkdownIndexer:
                 else:
                     # 补向量成功即撤销旧失败记录，否则持久化文件会永久撒谎。
                     self.failed_files.pop(source, None)
+                finally:
+                    self._sync_progress["files_done"] += 1
+                    self._sync_progress["chunks_done"] += len(chunks)
             return self._embedding_changed_state(pending_chunks, failed_before, reused)
 
         max_workers = self.config.cache.embedding_max_workers
@@ -1527,6 +1578,9 @@ class MarkdownIndexer:
                     self.failed_files[source] = str(exc)
                 else:
                     self.failed_files.pop(source, None)
+                finally:
+                    self._sync_progress["files_done"] += 1
+                    self._sync_progress["chunks_done"] += len(chunks)
             return self._embedding_changed_state(pending_chunks, failed_before, reused)
 
         failures: dict[str, str] = {}
@@ -1537,10 +1591,14 @@ class MarkdownIndexer:
             }
             for future in as_completed(future_map):
                 source = future_map[future]
+                chunks = pending.get(source, [])
                 try:
                     future.result()
                 except Exception as exc:
                     failures[source] = str(exc)
+                finally:
+                    self._sync_progress["files_done"] += 1
+                    self._sync_progress["chunks_done"] += len(chunks)
         for source in pending:
             if source in failures:
                 self.failed_files[source] = failures[source]
@@ -2438,12 +2496,48 @@ class MarkdownIndexer:
             lines.append(pattern)
             ignore_file_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
-        self.sync()
+        # 1. 内存即时极速剪枝与资源联动清理 (F-02)
+        matcher = IgnoreMatcher([pattern])
+        pruned_sources: list[str] = []
+        all_removed_ids: list[str] = []
+        with self._sync_lock:
+            for source in list(self._chunks.keys()):
+                ignored, _ = matcher.is_ignored(source, is_dir=False)
+                if ignored:
+                    chunk_list = self._chunks.pop(source, [])
+                    all_removed_ids.extend(c.id for c in chunk_list)
+                    self._signatures.pop(source, None)
+                    self._stat_cache.pop(source, None)
+                    self._stat_seen_ns.pop(source, None)
+                    self._stat_confirmations.pop(source, None)
+                    if hasattr(self, "fast_path_warnings"):
+                        self.fast_path_warnings.pop(source, None)
+                    self._fts_delete(source)
+                    pruned_sources.append(source)
+
+            if all_removed_ids:
+                try:
+                    self._vector_backend.delete_vectors(all_removed_ids)
+                    self._disk_vectors.difference_update(all_removed_ids)
+                except Exception:
+                    pass
+
+            for failed_source in list(self.failed_files.keys()):
+                if matcher.is_ignored(failed_source, is_dir=False)[0]:
+                    self.failed_files.pop(failed_source, None)
+
+            if pruned_sources or all_removed_ids:
+                self._save_cache()
+
+        # 2. 启动异步平滑对账（若有未同步事件，不阻塞前台返回）
+        threading.Thread(target=self._run_sync_quietly, daemon=True, name="exempt-sync").start()
+
         return {
             "success": True,
             "action": "add_pattern",
             "pattern": pattern,
             "vaultignore_path": str(ignore_file_path.resolve()),
+            "pruned_files_count": len(pruned_sources),
             "total_rules": len([l for l in lines if l.strip() and not l.strip().startswith("#")]),
         }
 

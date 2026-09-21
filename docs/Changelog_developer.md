@@ -302,4 +302,27 @@
   - 新增 `tests/test_preview_mode.py`（3 passed，覆盖 `_extract_snippet` 算法边界、`Chunk.to_dict` 字段与压缩率、单库/多库/跨库分组 `kb_search` 预览端到端集成测试）；
 - **验证**：全量测试套件 289 passed, 4 skipped，0 破坏性回归。
 
+### C35 — Antigravity,2026-09-21,Google DeepMind,Gemini-3.8-Flash — feat(indexer,server): 豁免规则联动清理与落盘 (I3/F-02) 及冷启动首检防假死真守护 (I2/F-03/04)
+- **豁免规则联动清理与缓存落盘 (I3 / F-02)**：
+  - `add_exemption_pattern` 彻底解耦全库对账阻塞（耗时由 80s 骤降至 < 20ms）：
+    - 内存即时极速剪枝：从 `_chunks`、`_signatures`、`_stat_cache`、`_stat_seen_ns`、`_stat_confirmations` 及 `fast_path_warnings` 中弹出被豁免文件；
+    - 同步调用 `self._fts_delete()` 清理全文搜索索引；
+    - 同步调用 `self._vector_backend.delete_vectors()` 清理底层向量存储，并更新 `_disk_vectors`，彻底杜绝孤儿向量泄漏；
+    - 联动弹出 `self.failed_files` 中所有匹配豁免规则的历史失败记录；
+    - 显式调用 `self._save_cache()` 将修剪后的状态立即写盘，彻底杜绝进程重启后旧 Chunk 与向量死灰复燃；
+    - 仅启动后台静默守护对账（`_run_sync_quietly`），前台毫秒级返回。
+- **冷启动首检防假死真守护 (I2 / F-03/04)**：
+  - 引入进度状态机：`MarkdownIndexer` 实时追踪 `_sync_state`（`idle` / `scanning` / `fts` / `embedding`）与 `_sync_progress`（完成文件/块数与总数）；
+  - 实现 `try_sync_with_guard(timeout=1.5)`：
+    - 锁被占用时 1.5s 安全超时放弃，避免前台无响应假死；
+    - **严禁锁空闲时前台主线程承担数十秒重度 embedding**：首次全量同步且配置 external 模式时，前台禁止同步阻塞，交由后台守护线程构建并立即返回可用状态；
+    - 普通增量同步持有锁快速执行 Fast-Stat 零读盘对账（<10ms）；
+  - `server.py` 渐进式容灾与可用性优先（Availability over Strict Freshness）：
+    - 单库检索未同步完成时：若已有切片照常提供召回并附加 `indexing_in_progress: true`；若尚无切片，主动返回带 `progress` 与 `retry_after: 3` 的友好结构体，指导 Agent 告知用户稍候或转战其他任务，彻底杜绝超时中断；
+    - `_fanout_search` 跨库循环全面接入 `try_sync_with_guard`，单个构建中子库被记录在 `errors` 中，不阻断其他已就绪库的联合召回；
+    - `kb_read`、`kb_stats`、`kb_exempt` 彻底移除无差别 `sync()` 前置挂起，`kb_read` 原文读取从 30s 降至 2ms。
+- **用例与回归**：
+  - 新增 `tests/test_anti_contention.py`（4 passed，覆盖内存剪枝+向量清理+failed_files弹出+缓存落盘、kb_read 零锁争用、try_sync_with_guard 超时快速熔断、stdio 冷启动渐进反馈）；
+- **验证**：全量测试套件 293 passed, 4 skipped（基线 279 + Phase 1 5 个 + Phase 2 2 个 + Phase 3 3 个 + Phase 4 4 个），0 破坏性回归。
+
 

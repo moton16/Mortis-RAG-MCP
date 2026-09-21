@@ -783,7 +783,10 @@ class VaultMcpServer:
         for entry in entries:
             try:
                 indexer = self._indexer_for({"vault_path": entry.path})
-                indexer.sync()
+                sync_ok = indexer.try_sync_with_guard(timeout=1.5)
+                if not sync_ok and len(indexer._chunks) == 0:
+                    errors[entry.path] = "indexing in progress"
+                    continue
                 chunks = indexer.search(query, per_vault_k, False, query_vector=query_vector, filters=per_vault_filters, dedupe=dedupe)
                 for chunk in chunks:
                     merged.append((entry, chunk))
@@ -977,9 +980,21 @@ class VaultMcpServer:
             if len(targets) == 1:
                 resolved_single = self._resolve_vault_path(targets[0])
                 indexer = self._indexer_for({"vault_path": resolved_single})
-                indexer.sync()
+                sync_ok = indexer.try_sync_with_guard(timeout=1.5)
+                if not sync_ok and len(indexer._chunks) == 0:
+                    return _text_content({
+                        "status": "indexing",
+                        "message": "知识库正在后台进行首次初始化构建与嵌入计算，请稍候...",
+                        "progress": indexer._sync_progress,
+                        "retry_after": 3,
+                        "chunks": [],
+                    })
                 results = indexer.search(query, top_k, bool(use_rerank), filters=search_filters, dedupe=bool(dedupe))
-                return _text_content({"chunks": [chunk.to_dict(preview=preview, query_tokens=query_tokens) for chunk in results]})
+                res_dict: dict[str, Any] = {"chunks": [chunk.to_dict(preview=preview, query_tokens=query_tokens) for chunk in results]}
+                if not sync_ok:
+                    res_dict["indexing_in_progress"] = True
+                    res_dict["indexing_progress"] = indexer._sync_progress
+                return _text_content(res_dict)
 
             # 未指定目标时的默认单库处理
             if not targets:
@@ -991,9 +1006,21 @@ class VaultMcpServer:
                     )
                 if len(entries) == 1:
                     indexer = self._indexer_for({"vault_path": entries[0].path})
-                    indexer.sync()
+                    sync_ok = indexer.try_sync_with_guard(timeout=1.5)
+                    if not sync_ok and len(indexer._chunks) == 0:
+                        return _text_content({
+                            "status": "indexing",
+                            "message": "知识库正在后台进行首次初始化构建与嵌入计算，请稍候...",
+                            "progress": indexer._sync_progress,
+                            "retry_after": 3,
+                            "chunks": [],
+                        })
                     results = indexer.search(query, top_k, bool(use_rerank), filters=search_filters, dedupe=bool(dedupe))
-                    return _text_content({"chunks": [chunk.to_dict(preview=preview, query_tokens=query_tokens) for chunk in results]})
+                    res_dict = {"chunks": [chunk.to_dict(preview=preview, query_tokens=query_tokens) for chunk in results]}
+                    if not sync_ok:
+                        res_dict["indexing_in_progress"] = True
+                        res_dict["indexing_progress"] = indexer._sync_progress
+                    return _text_content(res_dict)
 
             # 跨库检索（Scoped 定向多库 或 全局盲搜）
             return _text_content(self._fanout_search(
@@ -1003,8 +1030,8 @@ class VaultMcpServer:
             ))
 
         indexer = self._indexer_for(arguments)
-        indexer.sync()
         if name == "kb_list_files":
+            indexer.try_sync_with_guard(timeout=1.0)
             return _text_content({"files": indexer.list_files()})
         if name == "kb_read":
             source = str(arguments.get("source", "")).strip()
