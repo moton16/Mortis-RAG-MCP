@@ -347,3 +347,8 @@
   - `CHANGELOG_user.md`：补齐 `[0.7.2]` 条目，声明新增库名直呼、多库定向 `vault_paths`、轻量预览模式 `preview=true`、纯文本 `.txt` 原生收录、构建进度感知与毫秒级豁免；声明 solo 库语义调整；如实披露首轮增量分块重算（免费）与章节行识别重新 embedding（若有）的升级成本。
   - `README.md` 与 `README_EN.md`：同步徽章为 `Version-0.7.2`，核心特性增补库名直呼/多库定向、轻量预览二段式精读、纯文本 `.txt` 原生收录说明，常用工具表同步更新 `kb_search` 参数。
   - `QUICKSTART_user.md`：增设「0.2 0.7.2 新用法速查」与常用工具表更新，指引新用法与避免死等纪律。
+
+### C38 — moton16,2026-09-21,Antigravity,Gemini 3.8 Flash — fix(server): vault_paths 字符串形态不再静默回落全局盲搜（F-01 收口）
+- **修复 Scoped 检索静默扩权**：`server.py` 的 `_parse_vault_targets` 增强对 `vault_paths` 字符串形态（如 `"VaultA, VaultB"`）的兼容支持，按逗号切分并去除空白；若显式传入 `vault_paths` 但为空字符串、空数组或全空白，严格抛出清晰的 `ValueError` 报错，杜绝因类型不匹配静默降级为全库盲搜的高危扩权缺陷。
+- **用例补充**：在 `tests/test_scoped_search.py` 中新增 `test_vault_paths_as_comma_string_is_scoped` 与 `test_vault_paths_empty_string_errors`（验证逗号字符串精准圈定 2 库、空值报错拦截）。
+

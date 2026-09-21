@@ -446,11 +446,22 @@ class VaultMcpServer:
         仅在整体未命中且包含逗号时才尝试拆分；以 vault_paths 数组作为推荐标准。
         """
         raw_list: list[str] = []
-        if "vault_paths" in arguments and isinstance(arguments["vault_paths"], (list, tuple)):
-            for item in arguments["vault_paths"]:
-                s = str(item).strip()
-                if s:
-                    raw_list.append(s)
+        if "vault_paths" in arguments:
+            vp = arguments.get("vault_paths")
+            if vp:
+                if isinstance(vp, (list, tuple)):
+                    for item in vp:
+                        s = str(item).strip()
+                        if s:
+                            raw_list.append(s)
+                else:
+                    # F-05 同款逗号安全：字符串形态按逗号拆分，绝不静默回落全局检索
+                    raw_list.extend(p.strip() for p in str(vp).split(",") if p.strip())
+            if not raw_list:
+                raise ValueError(
+                    "vault_paths is empty; pass at least one vault name or absolute path, "
+                    "or omit it to search all non-solo vaults"
+                )
         elif "vault_path" in arguments and arguments["vault_path"]:
             val = arguments["vault_path"]
             if isinstance(val, (list, tuple)):

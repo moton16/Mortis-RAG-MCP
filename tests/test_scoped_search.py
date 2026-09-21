@@ -190,3 +190,60 @@ def test_invalid_vault_name_error(tmp_path):
     err = err_body["error"]
     assert "neither a registered vault name nor an absolute path" in err
     assert "'MyVault'" in err
+
+
+def test_vault_paths_as_comma_string_is_scoped(tmp_path):
+    # vault_paths="A,B" 必须只搜 A/B，且返回 searched 长度为 2
+    v1 = tmp_path / "v1"
+    v2 = tmp_path / "v2"
+    v3 = tmp_path / "v3"
+    v1.mkdir()
+    v2.mkdir()
+    v3.mkdir()
+    (v1 / "a.md").write_text("# A\nshared keyword alpha", encoding="utf-8")
+    (v2 / "b.md").write_text("# B\nshared keyword beta", encoding="utf-8")
+    (v3 / "c.md").write_text("# C\nshared keyword gamma", encoding="utf-8")
+
+    config = tmp_path / "app.toml"
+    config.write_text('mode = "static"\n', encoding="utf-8")
+
+    requests = [
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "kb_init", "arguments": {"path": str(v1), "name": "V1"}}},
+        {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "kb_init", "arguments": {"path": str(v2), "name": "V2"}}},
+        {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "kb_init", "arguments": {"path": str(v3), "name": "V3"}}},
+        {"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": "kb_search", "arguments": {"query": "keyword", "vault_paths": "V1, V2"}}},
+    ]
+    responses = _run_stdio(config, requests)
+    r5 = json.loads(responses[4]["result"]["content"][0]["text"])
+    assert len(r5["searched"]) == 2
+    sources = {c["source"] for c in r5["chunks"]}
+    assert "a.md" in sources
+    assert "b.md" in sources
+    assert "c.md" not in sources
+
+
+def test_vault_paths_empty_string_errors(tmp_path):
+    # vault_paths="" 或 [] 必须 ValueError，不得回落全局
+    v1 = tmp_path / "v1"
+    v1.mkdir()
+    (v1 / "a.md").write_text("# A\ncontent", encoding="utf-8")
+
+    config = tmp_path / "app.toml"
+    config.write_text('mode = "static"\n', encoding="utf-8")
+
+    requests = [
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "kb_init", "arguments": {"path": str(v1), "name": "V1"}}},
+        {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "kb_search", "arguments": {"query": "content", "vault_paths": ""}}},
+        {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "kb_search", "arguments": {"query": "content", "vault_paths": []}}},
+    ]
+    responses = _run_stdio(config, requests)
+    assert responses[2]["result"]["isError"] is True
+    err3 = json.loads(responses[2]["result"]["content"][0]["text"])
+    assert "vault_paths is empty" in err3["error"]
+
+    assert responses[3]["result"]["isError"] is True
+    err4 = json.loads(responses[3]["result"]["content"][0]["text"])
+    assert "vault_paths is empty" in err4["error"]
+
