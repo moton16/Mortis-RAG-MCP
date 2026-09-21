@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/moton16/Mortis-RAG-MCP/actions/workflows/ci.yml/badge.svg)](https://github.com/moton16/Mortis-RAG-MCP/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Version: 0.7.1](https://img.shields.io/badge/Version-0.7.1-blue.svg)](CHANGELOG_user.md)
+[![Version: 0.7.2](https://img.shields.io/badge/Version-0.7.2-blue.svg)](CHANGELOG_user.md)
 
 English | [简体中文](README.md)
 
@@ -14,6 +14,9 @@ English | [简体中文](README.md)
 ## 🌟 Key Features
 
 - 📂 **Zero Hardcoded Paths**: Attach any local folder as a knowledge base using `kb_init`. Persistent user-level registry without modifying configs or locking to fixed directories.
+- 📚 **Vault Alias & Multi-Vault Scoped Search (0.7.2)**: Query vaults by their registered friendly names (e.g. `vault_path="MyNotes"`) without writing long absolute paths. Target multiple vaults at once via `vault_paths`.
+- 🔍 **Lightweight Preview & Two-Stage AX (0.7.2)**: Use `preview=true` to retrieve compact highlighted snippets and line numbers (saving 70%+ tokens), then pinpoint details with `kb_read`.
+- 📄 **Native Plain-Text .txt Ingestion (0.7.2)**: Plain text `.txt` files are indexed alongside Markdown, with built-in chapter heading recognition.
 - 🔍 **Agent Trust Anchor, No Pre-flight Checks (0.7.1)**: One command (`python -m mortis_rag_mcp --doctor`) writes a local environment receipt (`STATUS.md`). Once an agent sees ✅, it **skips every environment / dependency / API-key pre-flight check** and queries your notes immediately instead of probing first. If something is actually broken, the receipt points to that single command — and a failed check never turns into a retry loop.
 - 📄 **Document Parsing & Ingestion (0.7.0)**: Automatically converts PDF, Word, PPT, Excel, and images into Markdown for seamless retrieval. Parsed files reside cleanly in `.mortis-parsed/` without modifying or polluting source documents.
 - 🎯 **Intelligent Vault Routing (0.7.0)**: Add a natural-language description to each vault. AI agents pick the most relevant knowledge base automatically, cutting down noise and boosting response speed.
@@ -105,7 +108,7 @@ The knowledge base is indexed in the background. You can now search conversation
 | `kb_init_solo` | Register/convert an isolated private vault (excluded from global fan-out) |
 | `kb_list` | List all registered knowledge bases and their statuses |
 | `kb_describe` | Set vault natural language description for intelligent AI routing (0.7.0) |
-| `kb_search` | Hybrid semantic and keyword search (cross-vault or targeted) |
+| `kb_search` | Hybrid semantic and keyword search (cross-vault, targeted vault/multi-vault, path filters, pagination, and preview mode) |
 | `kb_read` | Read raw note content by file path or line range |
 | `kb_ingest` | Ingest and parse PDF / Office documents into Markdown (0.7.0) |
 | `kb_remove` | Safely remove a vault from the registry (never deletes local files) |

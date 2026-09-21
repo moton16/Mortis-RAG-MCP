@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/moton16/Mortis-RAG-MCP/actions/workflows/ci.yml/badge.svg)](https://github.com/moton16/Mortis-RAG-MCP/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Version: 0.7.1](https://img.shields.io/badge/Version-0.7.1-blue.svg)](CHANGELOG_user.md)
+[![Version: 0.7.2](https://img.shields.io/badge/Version-0.7.2-blue.svg)](CHANGELOG_user.md)
 
 [English](README_EN.md) | 简体中文
 
@@ -14,6 +14,9 @@
 ## 🌟 核心特性
 
 - 📂 **自由挂载，零路径绑定**：通过 `kb_init` 一键挂载任意本地文件夹为知识库，配置持久化保存，不绑定死路径，换电脑或多库管理极简。
+- 📚 **库名直呼与多库定向（0.7.2）**：检索时可直接传库名（如 `vault_path="我的笔记"`）而无需拼接 Windows 漫长物理路径；支持通过 `vault_paths` 数组同时指定多个目标库定向检索。
+- 🔍 **轻量预览与二段式精读（0.7.2）**：支持 `preview=true` 极速返回高光切片与行号，降低 70%+ Token 消耗，正文配合 `kb_read` 按需精准精读。
+- 📄 **纯文本 .txt 原生收录（0.7.2）**：纯文本 `.txt`（小说/分卷/资料）与 Markdown 享有同等索引地位，支持小说章节标题自动识别。
 - 🔍 **Agent 信任锚，免预检开箱即搜（0.7.1）**：一条 `python -m mortis_rag_mcp --doctor` 生成本机环境凭证（`STATUS.md`）。AI 助手读到 ✅ 即**不再做任何环境/依赖/key 预检**，首次提问就直接检索，省掉每次调用前的反复试探；真出问题才提示你跑那一条命令，且失败不会陷入重试死循环。
 - 📄 **文档智能解析与摄取（0.7.0）**：支持将知识库内的 PDF、Word、PPT、Excel 与图片等文件自动转换为 Markdown 纳入搜索；解析文件单独存放，原笔记与源文件零修改、零污染。
 - 🎯 **智能定向路由（0.7.0）**：支持为知识库添加一句话自然语言描述，AI 检索时按意图精准选库，大幅减少无关库干扰，回答更快更准。
@@ -105,7 +108,7 @@ enabled = true
 | `kb_init_solo` | 注册/转换为私密独立库（不参与跨库全局搜索） |
 | `kb_list` | 查看已注册的全部知识库列表与状态 |
 | `kb_describe` | 设置知识库自然语言描述，引导 AI 精准定向检索（0.7.0） |
-| `kb_search` | 语义与关键词混合检索（支持跨库、指定库、目录过滤与分页） |
+| `kb_search` | 语义与关键词混合检索（支持跨库、指定库/多库定向、目录过滤、分页与 preview 预览模式） |
 | `kb_read` | 快速按文件路径或行号读取原文笔记 |
 | `kb_ingest` | 摄取并解析知识库内的 PDF / Office 文档（0.7.0，按需开启） |
 | `kb_remove` | 从注册表移除知识库（安全操作，不删除本地实际文件） |

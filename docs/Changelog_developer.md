@@ -339,3 +339,11 @@
 - **全量测试与评测双重验收**：
   - 全量单测套件：`uv run --with pytest pytest tests/ -q` 跑出 **293 passed, 4 skipped in 20.16s**（包含 Phase 1~4 新增的 14 个高严苛对抗用例全部通过，0 破坏性回归）；
   - 黄金检索评测集：`scripts/eval_search.py --golden tests/eval/golden_queries.json --k 5` 评测结果 **Hit@5: 100.0%, MRR@5: 1.000**，检索质量零衰退。
+
+### C37 — moton16,2026-09-21,Antigravity,Gemini 3.8 Flash — chore(release): 版本号 bump 至 0.7.2 + 版本一致性守卫 + 用户侧四处文档同步
+- **版本号升级**：`pyproject.toml` 与 `mortis_rag_mcp/server.py`（`SERVER_INFO`）统一由 `0.7.1` bump 至 `0.7.2`。
+- **版本一致性守卫**：新增 `tests/test_version_sync.py`，静态校验 `pyproject.toml`、`SERVER_INFO` 以及 `CHANGELOG_user.md` 之间的版本强一致性，防漏发漏改。
+- **用户侧文档同步**：
+  - `CHANGELOG_user.md`：补齐 `[0.7.2]` 条目，声明新增库名直呼、多库定向 `vault_paths`、轻量预览模式 `preview=true`、纯文本 `.txt` 原生收录、构建进度感知与毫秒级豁免；声明 solo 库语义调整；如实披露首轮增量分块重算（免费）与章节行识别重新 embedding（若有）的升级成本。
+  - `README.md` 与 `README_EN.md`：同步徽章为 `Version-0.7.2`，核心特性增补库名直呼/多库定向、轻量预览二段式精读、纯文本 `.txt` 原生收录说明，常用工具表同步更新 `kb_search` 参数。
+  - `QUICKSTART_user.md`：增设「0.2 0.7.2 新用法速查」与常用工具表更新，指引新用法与避免死等纪律。

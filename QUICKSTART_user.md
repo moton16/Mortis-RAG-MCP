@@ -17,6 +17,17 @@
 3. **一键体检（新增）**：`python -m mortis_rag_mcp --doctor` 会在终端打印体检报告并写入 `~/.mortis_rag_mcp/STATUS.md`。AI 助手读到 ✅ 就不再重复预检环境（不查 venv、不点依赖、不探活 API），直接检索。
 4. **若要退回 0.7.1 之前的老版本**：必须把 `~/.mortis_rag_mcp` **和** `~/.mortis_rag_mcp_cache` **两个**目录都手工改回旧名——只改前一个，库列表会回来但缓存全部失效、所有笔记要重新嵌入（用付费 embedding 会重新计费）。完整说明见 [CHANGELOG_user.md](CHANGELOG_user.md) 的「回退须知」。
 
+### 0.2 0.7.2 新用法速查
+
+v0.7.2 带来了更自然便捷的检索与交互体验：
+
+1. **库名直呼**：`kb_search` 的 `vault_path` 支持直接传知识库显示名称（如 `vault_path="我的笔记"`），不用再费力拼装 Windows 漫长路径。
+2. **多库定向圈选**：支持通过 `vault_paths=["知识库A", "知识库B"]` 一次性圈选多个目标库联合检索；即使是被设为私密独立库（solo）的知识库，只要在此显式点名即可参与联合召回。
+3. **二段式精准精读（省 Token 模式）**：
+   - 第一步（找锚点）：调用 `kb_search(..., preview=true)`，检索仅返回高光摘要窗口、行号与字符数，单块 Token 消耗降低 70%+；
+   - 第二步（按需精读）：根据命中结果的 `source`、`start_line` 与 `end_line`，按需调用 `kb_read` 读取切题正文，告别全篇冗余注入。
+4. **构建防假死与进度感知**：首次建库或后台构建期间若返回 `status: "indexing"`，会携带构建进度信息，稍候片刻等待后台构建即可，不再发生前台卡死。
+
 ## 1. 安装
 
 ```powershell
@@ -125,8 +136,8 @@ Copy-Item .\skills\mortis-rag-mcp\SKILL.md "$env:USERPROFILE\.workbuddy\skills\m
 | 注册独立库（不参与全局检索） | `kb_init_solo {path, name?}`（0.6.0） |
 | 看有哪些库 | `kb_list` |
 | 设置库描述（引导定向选库） | `kb_describe {vault_path, description}`（0.7.0） |
-| 搜索（跨库） | `kb_search {query}` |
-| 搜索（指定库） | `kb_search {query, vault_path}` |
+| 搜索（跨库） | `kb_search {query, preview?}` |
+| 搜索（指定库/多库定向） | `kb_search {query, vault_path? vault_paths? preview?}`（0.7.2） |
 | 只搜某目录 / 某标签 / 某时间段 | `kb_search {query, path_prefix? tags? mtime_after? mtime_before?}`（0.5.0） |
 | 翻页 | `kb_search {query, offset, limit}`（0.5.0） |
 | 「这个库更重要」 | `kb_set_weight {vault_path, weight}` + 可选 `kb_search {group_by_vault: true}`（0.5.0） |
