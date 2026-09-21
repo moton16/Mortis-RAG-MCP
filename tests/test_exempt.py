@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from mortis_rag_mcp.config import AppConfig
@@ -146,6 +147,10 @@ def test_kb_exempt_api(tmp_path):
     # Remove pattern
     rem_res = indexer.remove_exemption_pattern("b.md")
     assert rem_res["success"] is True
+    for _ in range(50):
+        if len(indexer.all_chunks()) == 2:
+            break
+        time.sleep(0.02)
     assert len(indexer.all_chunks()) == 2
 
     # Set file exemption via frontmatter
@@ -161,6 +166,10 @@ def test_kb_exempt_api(tmp_path):
     # Unexempt file
     unset_res = indexer.set_file_exemption("a.md", exempt=False, method="frontmatter")
     assert unset_res["success"] is True
+    for _ in range(50):
+        if len(indexer.all_chunks()) == 2:
+            break
+        time.sleep(0.02)
     assert len(indexer.all_chunks()) == 2
 
 

@@ -151,3 +151,102 @@ def test_kb_search_cold_start_progressive_feedback(tmp_path):
 
     r4 = json.loads(responses[3]["result"]["content"][0]["text"])
     assert "重要资产内容" in r4["content"]
+
+
+def test_remove_exemption_pattern_is_non_blocking(tmp_path, monkeypatch):
+    vault = tmp_path / "vault_remove"
+    vault.mkdir(parents=True)
+    (vault / "note.md").write_text("# Note\ncontent", encoding="utf-8")
+    config = AppConfig(vault_path=str(vault), embedding=EmbeddingConfig(mode="static", dimension=4))
+    indexer = MarkdownIndexer(vault, config)
+    indexer.sync()
+    indexer.add_exemption_pattern("note.md")
+
+    def _fail_sync():
+        raise AssertionError("Foreground sync should not be called")
+
+    monkeypatch.setattr(indexer, "sync", _fail_sync)
+
+    t0 = time.perf_counter()
+    res = indexer.remove_exemption_pattern("note.md")
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+
+    assert res["success"] is True
+    assert res["removed"] is True
+    assert res["sync"] == "background"
+    assert elapsed_ms < 50, f"remove_exemption_pattern 耗时过长: {elapsed_ms:.2f}ms"
+
+
+def test_set_file_exemption_is_non_blocking(tmp_path, monkeypatch):
+    vault = tmp_path / "vault_set_exempt"
+    vault.mkdir(parents=True)
+    (vault / "note.md").write_text("# Note\ncontent", encoding="utf-8")
+    config = AppConfig(vault_path=str(vault), embedding=EmbeddingConfig(mode="static", dimension=4))
+    indexer = MarkdownIndexer(vault, config)
+    indexer.sync()
+
+    def _fail_sync():
+        raise AssertionError("Foreground sync should not be called")
+
+    monkeypatch.setattr(indexer, "sync", _fail_sync)
+
+    # 1. exempt=True 方向
+    t0 = time.perf_counter()
+    res_true = indexer.set_file_exemption("note.md", exempt=True, method="frontmatter")
+    elapsed_true_ms = (time.perf_counter() - t0) * 1000
+    assert res_true["success"] is True
+    assert res_true["sync"] == "background"
+    assert elapsed_true_ms < 50, f"set_file_exemption(True) 耗时过长: {elapsed_true_ms:.2f}ms"
+
+    # 2. exempt=False 方向
+    t0 = time.perf_counter()
+    res_false = indexer.set_file_exemption("note.md", exempt=False, method="frontmatter")
+    elapsed_false_ms = (time.perf_counter() - t0) * 1000
+    assert res_false["success"] is True
+    assert res_false["sync"] == "background"
+    assert elapsed_false_ms < 50, f"set_file_exemption(False) 耗时过长: {elapsed_false_ms:.2f}ms"
+
+
+def test_prune_ignored_sources_clears_all_layers(tmp_path):
+    vault = tmp_path / "vault_prune"
+    vault.mkdir(parents=True)
+    (vault / "doc1.md").write_text("# Doc 1\nalpha content", encoding="utf-8")
+    (vault / "doc2.md").write_text("# Doc 2\nbeta content", encoding="utf-8")
+    config = AppConfig(vault_path=str(vault), embedding=EmbeddingConfig(mode="static", dimension=4))
+    indexer = MarkdownIndexer(vault, config)
+    indexer.sync()
+
+    assert "doc1.md" in indexer._chunks
+    assert "doc2.md" in indexer._chunks
+    doc1_chunk_ids = [c.id for c in indexer._chunks["doc1.md"]]
+    assert len(doc1_chunk_ids) > 0
+
+    # 模拟各类时序与观测状态
+    indexer._signatures["doc1.md"] = (12345, 100, 12345)
+    indexer._stat_cache["doc1.md"] = (12345, 100)
+    indexer._stat_seen_ns["doc1.md"] = 123456789
+    indexer._stat_confirmations["doc1.md"] = 1
+    indexer.fast_path_warnings["doc1.md"] = "warning"
+    indexer.failed_files["doc1.md"] = "previous error"
+
+    from mortis_rag_mcp.indexer import IgnoreMatcher
+    matcher = IgnoreMatcher(["doc1.md"])
+    pruned = indexer._prune_ignored_sources(matcher)
+
+    assert "doc1.md" in pruned
+    assert "doc1.md" not in indexer._chunks
+    assert "doc1.md" not in indexer._signatures
+    assert "doc1.md" not in indexer._stat_cache
+    assert "doc1.md" not in indexer._stat_seen_ns
+    assert "doc1.md" not in indexer._stat_confirmations
+    assert "doc1.md" not in indexer.fast_path_warnings
+    assert "doc1.md" not in indexer.failed_files
+
+    if hasattr(indexer._vector_backend, "list_ids"):
+        backend_ids = set(indexer._vector_backend.list_ids())
+        for cid in doc1_chunk_ids:
+            assert cid not in backend_ids
+
+    # doc2 保持完整
+    assert "doc2.md" in indexer._chunks
+

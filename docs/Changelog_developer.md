@@ -352,3 +352,12 @@
 - **修复 Scoped 检索静默扩权**：`server.py` 的 `_parse_vault_targets` 增强对 `vault_paths` 字符串形态（如 `"VaultA, VaultB"`）的兼容支持，按逗号切分并去除空白；若显式传入 `vault_paths` 但为空字符串、空数组或全空白，严格抛出清晰的 `ValueError` 报错，杜绝因类型不匹配静默降级为全库盲搜的高危扩权缺陷。
 - **用例补充**：在 `tests/test_scoped_search.py` 中新增 `test_vault_paths_as_comma_string_is_scoped` 与 `test_vault_paths_empty_string_errors`（验证逗号字符串精准圈定 2 库、空值报错拦截）。
 
+### C39 — moton16,2026-09-21,Antigravity,Gemini 3.8 Flash — fix(indexer): kb_exempt 剩余 3 个动作解除全量同步阻塞（I3 收口）
+- **公共剪枝函数抽取与复用**：`indexer.py` 抽出 `_prune_ignored_sources(matcher)`，统一集中清理 `_chunks`、`_signatures`、`_stat_cache`、`_stat_seen_ns`、`_stat_confirmations`、`fast_path_warnings`、FTS 全文索引、向量后端存储以及 `failed_files`，并即时落盘缓存 `_save_cache()`。
+- **解除剩余 3 个豁免动作的前台阻塞**：
+  - `remove_exemption_pattern`：更新规则文件后直接返回，仅启动后台静默线程 `_run_sync_quietly` 补齐索引，前台耗时 < 20ms，返回体追加 `"sync": "background"`（无变更为 `"noop"`）；
+  - `set_file_exemption`：`exempt=True` 时写文件并即时清理内存态（`_prune_ignored_sources`），`exempt=False` 时写文件，统一交由后台线程补齐，彻底告别原 `self.sync()` 在大库上数十秒的长阻塞；
+  - `add_exemption_pattern` 改为复用 `_prune_ignored_sources`，返回体透传 `"sync": "background"`。
+- **用例补充**：在 `tests/test_anti_contention.py` 中新增 `test_remove_exemption_pattern_is_non_blocking`、`test_set_file_exemption_is_non_blocking` 与 `test_prune_ignored_sources_clears_all_layers`；同步调优 `tests/test_exempt.py` 的轮询等待；`CHANGELOG_user.md` 移除已知限制节。
+
+

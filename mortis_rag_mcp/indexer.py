@@ -2496,38 +2496,56 @@ class MarkdownIndexer:
             lines.append(pattern)
             ignore_file_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
-        # 1. 内存即时极速剪枝与资源联动清理 (F-02)
-        matcher = IgnoreMatcher([pattern])
-        pruned_sources: list[str] = []
-        all_removed_ids: list[str] = []
+    def _prune_ignored_sources(self, matcher: IgnoreMatcher) -> list[str]:
+        """按豁免规则即时剪除内存态（含 0.7.1 全部时序观测状态）。"""
+        pruned: list[str] = []
+        removed_ids: list[str] = []
         with self._sync_lock:
             for source in list(self._chunks.keys()):
-                ignored, _ = matcher.is_ignored(source, is_dir=False)
-                if ignored:
-                    chunk_list = self._chunks.pop(source, [])
-                    all_removed_ids.extend(c.id for c in chunk_list)
-                    self._signatures.pop(source, None)
-                    self._stat_cache.pop(source, None)
-                    self._stat_seen_ns.pop(source, None)
-                    self._stat_confirmations.pop(source, None)
-                    if hasattr(self, "fast_path_warnings"):
-                        self.fast_path_warnings.pop(source, None)
-                    self._fts_delete(source)
-                    pruned_sources.append(source)
-
-            if all_removed_ids:
+                if not matcher.is_ignored(source, is_dir=False)[0]:
+                    continue
+                for c in self._chunks.pop(source, []):
+                    removed_ids.append(c.id)
+                self._signatures.pop(source, None)
+                self._stat_cache.pop(source, None)
+                self._stat_seen_ns.pop(source, None)
+                self._stat_confirmations.pop(source, None)
+                if hasattr(self, "fast_path_warnings"):
+                    self.fast_path_warnings.pop(source, None)
+                self._fts_delete(source)
+                pruned.append(source)
+            if removed_ids:
                 try:
-                    self._vector_backend.delete_vectors(all_removed_ids)
-                    self._disk_vectors.difference_update(all_removed_ids)
+                    self._vector_backend.delete_vectors(removed_ids)
+                    self._disk_vectors.difference_update(removed_ids)
                 except Exception:
                     pass
-
             for failed_source in list(self.failed_files.keys()):
                 if matcher.is_ignored(failed_source, is_dir=False)[0]:
                     self.failed_files.pop(failed_source, None)
-
-            if pruned_sources or all_removed_ids:
+            if pruned or removed_ids:
                 self._save_cache()
+        return pruned
+
+    def add_exemption_pattern(self, pattern: str) -> dict[str, Any]:
+        pattern = pattern.strip()
+        if not pattern:
+            raise ValueError("pattern must not be empty")
+        ignore_file_path = self.vault_path / self.config.ignore_file
+        lines: list[str] = []
+        if ignore_file_path.exists():
+            try:
+                lines = ignore_file_path.read_text(encoding="utf-8").splitlines()
+            except Exception:
+                lines = []
+
+        if pattern not in [l.strip() for l in lines]:
+            lines.append(pattern)
+            ignore_file_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        # 1. 内存即时极速剪枝与资源联动清理 (F-02)
+        matcher = IgnoreMatcher([pattern])
+        pruned_sources = self._prune_ignored_sources(matcher)
 
         # 2. 启动异步平滑对账（若有未同步事件，不阻塞前台返回）
         threading.Thread(target=self._run_sync_quietly, daemon=True, name="exempt-sync").start()
@@ -2539,6 +2557,7 @@ class MarkdownIndexer:
             "vaultignore_path": str(ignore_file_path.resolve()),
             "pruned_files_count": len(pruned_sources),
             "total_rules": len([l for l in lines if l.strip() and not l.strip().startswith("#")]),
+            "sync": "background",
         }
 
     def remove_exemption_pattern(self, pattern: str) -> dict[str, Any]:
@@ -2547,14 +2566,25 @@ class MarkdownIndexer:
             raise ValueError("pattern must not be empty")
         ignore_file_path = self.vault_path / self.config.ignore_file
         if not ignore_file_path.exists():
-            return {"success": True, "action": "remove_pattern", "pattern": pattern, "removed": False}
+            return {
+                "success": True,
+                "action": "remove_pattern",
+                "pattern": pattern,
+                "removed": False,
+                "remaining_rules": 0,
+                "sync": "noop",
+            }
 
         lines = ignore_file_path.read_text(encoding="utf-8").splitlines()
         new_lines = [l for l in lines if l.strip() != pattern]
         removed = len(new_lines) < len(lines)
         if removed:
             ignore_file_path.write_text("\n".join(new_lines) + ("\n" if new_lines else ""), encoding="utf-8")
-            self.sync()
+            # I3：与重对账解耦，前台毫秒级返回；新可见文件由后台线程补进索引
+            threading.Thread(target=self._run_sync_quietly, daemon=True, name="exempt-sync").start()
+            sync_state = "background"
+        else:
+            sync_state = "noop"
 
         return {
             "success": True,
@@ -2562,6 +2592,7 @@ class MarkdownIndexer:
             "pattern": pattern,
             "removed": removed,
             "remaining_rules": len([l for l in new_lines if l.strip() and not l.strip().startswith("#")]),
+            "sync": sync_state,
         }
 
     def check_exemption(self, source: str) -> dict[str, Any]:
@@ -2679,13 +2710,16 @@ class MarkdownIndexer:
                 new_lines = lines
 
         path.write_text("\n".join(new_lines) + ("\n" if new_lines else ""), encoding="utf-8")
-        self.sync()
+        if exempt:
+            self._prune_ignored_sources(IgnoreMatcher([source_posix]))
+        threading.Thread(target=self._run_sync_quietly, daemon=True, name="exempt-sync").start()
         return {
             "success": True,
             "action": "exempt_file" if exempt else "unexempt_file",
             "source": source_posix,
             "method": "frontmatter",
             "is_exempt": exempt,
+            "sync": "background",
         }
 
     def purge_cache(self) -> bool:
