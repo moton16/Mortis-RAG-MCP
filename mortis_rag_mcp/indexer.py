@@ -75,8 +75,37 @@ _SHORT_STOPWORDS = frozenset({
     "a", "an", "at", "be", "by", "do", "go", "he", "if", "in", "is", "it",
     "me", "my", "no", "of", "on", "or", "so", "to", "up", "we", "us", "am"
 })
-# wiki 嵌入只有在图片扩展名时才当图片处理：![[另一篇笔记]] 不是图片。
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp", ".avif"}
+_INDEXABLE_TEXT_EXTS = frozenset({".md", ".txt"})
+_CHAPTER_HEADING_RE = re.compile(
+    r"^\s*(第[0-9一二三四五六七八九十百千]+[章回节卷]|Chapter\s+[0-9]+)\s*(.*)$",
+    re.IGNORECASE,
+)
+
+
+def _is_chapter_heading(line: str) -> tuple[bool, str]:
+    """检测单行是否为网络小说/书籍的章节标题。
+
+    门禁规则（F-09）：
+    1. 行长门禁：去除首尾空格后长度 <= 60 字符，超长的一律视为正文段落；
+    2. 标点门禁：标题不能以句末标点（如 '。'、'！'、'？'、'；'、'…'）结尾；
+       也不能包含逗号（'，'、','）、分号（'；'、';'）或对话引号（'“'、'”'、'"'）；
+    3. 正则匹配：匹配『第X章/回/节/卷 标题』或『Chapter X Title』。
+    """
+    s = line.strip()
+    if not s or len(s) > 60:
+        return False, ""
+    if s.endswith(("。", "！", "？", "!", "?", "；", ";", "…")):
+        return False, ""
+    if any(p in s for p in ("，", ",", "；", ";", "“", "”", '"')):
+        return False, ""
+    m = _CHAPTER_HEADING_RE.match(s)
+    if not m:
+        return False, ""
+    prefix = m.group(1).strip()
+    suffix = m.group(2).strip()
+    heading_title = f"{prefix} {suffix}".strip() if suffix else prefix
+    return True, heading_title
 
 _CACHE_MAGIC = b"VMCPC"
 _CACHE_VERSION = 1
@@ -790,7 +819,7 @@ class MarkdownIndexer:
             # 「开启会全量重嵌」实际完全没生效。
             "inject_image_captions": bool(self.config.inject_image_captions),
             "table_guard": True,
-            "chunker": 4,
+            "chunker": 5,
         }
 
     def _vectors_meta(self) -> dict[str, Any]:
@@ -1567,7 +1596,8 @@ class MarkdownIndexer:
                         continue
                     stack.append(path)
                     continue
-                if entry.name.lower().endswith(".md") and not self._ignored_name(entry.name):
+                suffix = path.suffix.lower()
+                if suffix in _INDEXABLE_TEXT_EXTS and not self._ignored_name(entry.name):
                     source = self._source(path)
                     ignored, _ = matcher.is_ignored(source, is_dir=False)
                     if not ignored:
@@ -1577,7 +1607,9 @@ class MarkdownIndexer:
     @staticmethod
     def _ignored_name(name: str) -> bool:
         lower = name.lower()
-        return name.startswith("~") or lower.endswith((".tmp.md", ".swp.md", ".swo.md"))
+        return name.startswith("~") or lower.endswith(
+            (".tmp.md", ".swp.md", ".swo.md", ".tmp.txt", ".swp.txt", ".swo.txt")
+        )
 
     def _source(self, path: Path) -> str:
         return path.relative_to(self.vault_path).as_posix()
@@ -1616,11 +1648,20 @@ class MarkdownIndexer:
                     fence_len = 0
             in_fence = fence_char is not None
             in_table = offset in in_table_lines
-            match = _HEADING_RE.match(line) if (not in_fence and not in_table) else None
-            if match:
+            heading_text: str | None = None
+            if not in_fence and not in_table:
+                match = _HEADING_RE.match(line)
+                if match:
+                    heading_text = self._clean_heading(match.group(2))
+                else:
+                    is_ch, ch_title = _is_chapter_heading(line)
+                    if is_ch:
+                        heading_text = ch_title
+
+            if heading_text is not None:
                 if any(l.strip() for l in current_lines):
                     sections.append((current_heading, current_start, current_lines))
-                current_heading = self._clean_heading(match.group(2))
+                current_heading = heading_text
                 current_start = line_number
                 current_lines = [line]
             else:
@@ -2227,27 +2268,64 @@ class MarkdownIndexer:
 
     def stats(self) -> dict[str, Any]:
         exempt_count = 0
+        unsupported_counts: dict[str, int] = {}
         if self.vault_path.exists():
             matcher = self._ignore_matcher()
-            for path in self.vault_path.rglob("*.md"):
-                if not path.is_file() or self._ignored_name(path.name):
+            stack = [self.vault_path]
+            while stack:
+                directory = stack.pop()
+                try:
+                    entries = list(os.scandir(directory))
+                except OSError:
                     continue
-                source = self._source(path)
-                if matcher.is_ignored(source, is_dir=False)[0]:
-                    exempt_count += 1
-                else:
+                for entry in entries:
                     try:
-                        raw = path.read_bytes()
-                        lines = raw.decode("utf-8-sig", errors="ignore").splitlines()
-                        _, tags, properties = self._frontmatter(lines)
-                        if self._is_frontmatter_exempt(tags, properties)[0]:
+                        is_dir = entry.is_dir()
+                    except OSError:
+                        continue
+                    path = Path(entry.path)
+                    if is_dir:
+                        # 跳过系统级/隐藏目录及缓存目录，但允许进入普通用户目录统计豁免文件
+                        if (
+                            entry.name.startswith(".")
+                            or self._ignored_name(entry.name)
+                            or entry.name == "node_modules"
+                            or (
+                                self.config.cache.placement == "vault"
+                                and self.config.cache.subdir
+                                and entry.name == self.config.cache.subdir
+                            )
+                        ):
+                            continue
+                        stack.append(path)
+                        continue
+                    if self._ignored_name(entry.name):
+                        continue
+                    suffix = path.suffix.lower()
+                    source = self._source(path)
+                    if matcher.is_ignored(source, is_dir=False)[0]:
+                        if suffix in _INDEXABLE_TEXT_EXTS:
                             exempt_count += 1
-                    except Exception:
-                        pass
+                        continue
+                    if suffix in _INDEXABLE_TEXT_EXTS:
+                        if suffix == ".md":
+                            try:
+                                raw = path.read_bytes()
+                                lines = raw.decode("utf-8-sig", errors="ignore").splitlines()
+                                _, tags, properties = self._frontmatter(lines)
+                                if self._is_frontmatter_exempt(tags, properties)[0]:
+                                    exempt_count += 1
+                            except Exception:
+                                pass
+                    elif not entry.name.startswith((".", "~")):
+                        ext = suffix.lstrip(".")
+                        if ext:
+                            unsupported_counts[ext] = unsupported_counts.get(ext, 0) + 1
         return {
             "files": len(self._chunks),
             "chunks": len(self.all_chunks()),
             "exempt_files": exempt_count,
+            "skipped_unsupported": unsupported_counts,
             "failed_files": dict(self.failed_files),
             "last_sync": self.last_sync,
             "embedding": {"mode": self.config.embedding.mode, "model": self.config.embedding.model, "dimension": self.config.embedding.dimension},
@@ -2563,7 +2641,7 @@ class MarkdownIndexer:
                         self._fts_upsert(source, chunks)
             return result
 
-    _READABLE_SUFFIXES = {".md", ".markdown"}
+    _READABLE_SUFFIXES = {".md", ".markdown", ".txt"}
 
     # ------------------------------------------------------------------ snapshot
 
@@ -3033,7 +3111,7 @@ class MarkdownIndexer:
             stripped = pattern.strip().strip("/").lower()
             if stripped and (lower == stripped or lower.startswith(stripped + "/")):
                 return False
-        return lower.endswith(".md")
+        return any(lower.endswith(ext) for ext in _INDEXABLE_TEXT_EXTS)
 
     def _run_sync_quietly(self) -> None:
         """sync() 的守护包装：监听线程里的任何异常都不能把线程打死。

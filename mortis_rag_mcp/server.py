@@ -276,14 +276,15 @@ def _text_content(value: Any) -> dict[str, Any]:
 _EXCLUDED_SCAN_DIRS = {".git", "node_modules", ".venv", ".trash", ".obsidian", ".stversions", ".stfolder", ".DS_Store"}
 
 
-def _count_vault_docs(vault_path: str | Path, output_dirname: str = ".mortis-parsed") -> tuple[int, int]:
-    """统计 vault 内的 Markdown 笔记数与可摄取文档数。
+def _count_vault_docs(vault_path: str | Path, output_dirname: str = ".mortis-parsed") -> tuple[int, int, dict[str, int]]:
+    """统计 vault 内的文本笔记数（.md/.txt）、可摄取文档数与跳过的未收录格式。
     使用 scandir 剪枝遍历，排除 .git/node_modules/产物目录 (D8b, D17)。
     """
     vpath = Path(vault_path).expanduser().resolve()
     out_name = (output_dirname or ".mortis-parsed").strip("/\\ ")
     md_count = 0
     doc_count = 0
+    unsupported: dict[str, int] = {}
     entries = [vpath]
     while entries:
         curr = entries.pop()
@@ -296,16 +297,23 @@ def _count_vault_docs(vault_path: str | Path, output_dirname: str = ".mortis-par
                                 continue
                             entries.append(Path(entry.path))
                         elif entry.is_file(follow_symlinks=False):
+                            if entry.name.startswith((".", "~")):
+                                continue
                             name_lower = entry.name.lower()
-                            if name_lower.endswith((".md", ".markdown")):
+                            suffix = Path(name_lower).suffix
+                            if suffix in {".md", ".markdown", ".txt"}:
                                 md_count += 1
-                            elif Path(name_lower).suffix in INGEST_EXTS:
+                            elif suffix in INGEST_EXTS:
                                 doc_count += 1
+                            else:
+                                ext = suffix.lstrip(".")
+                                if ext:
+                                    unsupported[ext] = unsupported.get(ext, 0) + 1
                     except OSError:
                         continue
         except OSError:
             continue
-    return md_count, doc_count
+    return md_count, doc_count, unsupported
 
 
 class VaultMcpServer:
@@ -536,7 +544,7 @@ class VaultMcpServer:
             entry = self.registry.add(resolved, name_arg, description=desc, persist=False)
         indexer = self._indexer_for({"vault_path": entry.path})
         threading.Thread(target=indexer.sync, daemon=True, name="vault-init").start()
-        md_files, doc_files = _count_vault_docs(entry.path, self.config.ingest.output_dirname)
+        md_files, doc_files, unsupported = _count_vault_docs(entry.path, self.config.ingest.output_dirname)
         res = {
             "registered": True,
             "path": entry.path,
@@ -546,6 +554,8 @@ class VaultMcpServer:
             "md_files": md_files,
             "ingestible_docs": doc_files,
         }
+        if unsupported:
+            res["skipped_unsupported"] = unsupported
         if doc_files and not self.config.ingest.enabled:
             res["hint"] = (
                 f"检测到 {doc_files} 个 PDF/Office 文档。PDF 摄取层默认未启用；"
@@ -583,7 +593,7 @@ class VaultMcpServer:
                 entry = self.registry.add(resolved, name_arg, solo=True, persist=False)
             indexer = self._indexer_for({"vault_path": entry.path})
             threading.Thread(target=indexer.sync, daemon=True, name="vault-init").start()
-            md_files, doc_files = _count_vault_docs(entry.path, self.config.ingest.output_dirname)
+            md_files, doc_files, unsupported = _count_vault_docs(entry.path, self.config.ingest.output_dirname)
             res = {
                 "solo": True,
                 "registered": True,
@@ -593,6 +603,8 @@ class VaultMcpServer:
                 "md_files": md_files,
                 "ingestible_docs": doc_files,
             }
+            if unsupported:
+                res["skipped_unsupported"] = unsupported
             if doc_files and not self.config.ingest.enabled:
                 res["hint"] = (
                     f"检测到 {doc_files} 个 PDF/Office 文档。PDF 摄取层默认未启用；"

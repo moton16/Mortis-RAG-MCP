@@ -265,6 +265,25 @@
   - **F-06（跨平台大小写归一）**：`_fanout_search` 目标过滤一律使用 `normalize_vault_key()` 抹平 Windows 盘符大小写差异，严禁用裸字符串集合比对。
   - **F-07（Schema 完备）**：`_tool_definitions()` 中为 `kb_search` 补充 `vault_paths`（array）与 `preview`（boolean）参数及说明。
 - **新增用例**：`tests/test_scoped_search.py`（5 passed，覆盖别名解析、大小写不敏感、多库定向召回、Solo 库显式召回/盲搜排除、逗号路径安全与歧义报错）。
-- **验证**：全量测试套件 284 passed, 4 skipped，0 回归。
+
+### C33 — Antigravity,2026-09-21,Google DeepMind,Gemini-3.8-Flash — feat(indexer,server): 纯文本 .txt 原生收录与未收录资产感知 (I4) 对齐 3元组 Fast-Stat
+- **纯文本 .txt 原生收录 (I4)**：
+  - `indexer.py` 常量扩展 `_INDEXABLE_TEXT_EXTS = frozenset({".md", ".txt"})`，统一由 `_markdown_files()` 扫描收集与 `_fs_event_matters()` 变更监听；
+  - `_chunk_file()` 接入纯文本分块支持，统一分块与 FTS 索引流程。
+- **网文/小说章节标题门禁 (F-09)**：
+  - 引入 `_CHAPTER_HEADING_RE` 与 `_is_chapter_heading()`，支持网文章节标题（如 `第一章 ...`、`Chapter 1 ...`）；
+  - 落实严格门禁：单行去除首尾空格后长度 <= 60 字符（超长直接视为正文段落）、标题不能以句末标点（`。`、`！`、`？`、`；`、`…`）结尾且不能包含逗号/分号/引号，彻底杜绝小说正文对话或长句误判为标题；
+  - 分块判定中同步补齐 `not in_table` 门禁。
+- **缓存版本跃迁 (F-10)**：
+  - `_chunks_meta()` 中 `"chunker"` 升级至 5，强制旧版本分块缓存自然失效重建，确保新章节标题与 `.txt` 产物结构稳定。
+- **沙箱与豁免安全 (F-01)**：
+  - `_READABLE_SUFFIXES` 扩充包含 `{".md", ".markdown", ".txt"}`，确保 `kb_read` 原文读取 `.txt` 文件时合法放行，不触发沙箱越界拦截。
+- **未收录资产与 Fast-Stat 对齐 (F-08)**：
+  - `stats()` 方法重构：返回字典新增 `skipped_unsupported` 扩展名字典；目录遍历优化，跳过系统隐藏/缓存目录（`.git`, `node_modules`, `.obsidian`, `.trash` 等），但深入用户自定义忽略目录（如 `private/`），保证被豁免的 `.txt` / `.md` 正常累加到 `exempt_files`；
+  - `server.py` 的 `_count_vault_docs` 升级为返回 `(md_count, doc_count, unsupported_dict)` 3元组；`_kb_init` 与 `_kb_init_solo` 的返回 payload 完整透传 `skipped_unsupported` 统计。
+- **用例与回归**：
+  - 新增 `tests/test_txt_indexing.py`（覆盖 `.txt` 分块、章节标题识别、严格门禁长句防误判、`kb_read` 读取、`skipped_unsupported` 统计）；
+  - 调整 `tests/test_indexer.py`：测试非 Markdown 忽略文件从 `image.txt` 更新为 `image.png`；`test_future_mtime...` 的 `read_bytes` monkeypatch 精确收敛至目标测试文件，排除后台线程干扰。
+- **验证**：全量测试套件 286 passed, 4 skipped（基线 279 + Phase 1 5 个 + Phase 2 2 个），0 破坏性回归。
 
 

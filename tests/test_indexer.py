@@ -283,7 +283,7 @@ def test_future_mtime_entry_regains_zero_read_after_bounded_rechecks(tmp_path, m
     real_read_bytes = Path.read_bytes
     monkeypatch.setattr(
         Path, "read_bytes",
-        lambda self, *a, **k: (reads.append(str(self)), real_read_bytes(self, *a, **k))[1],
+        lambda self, *a, **k: (reads.append(str(self)) if self.resolve() == note.resolve() else None, real_read_bytes(self, *a, **k))[1],
     )
 
     # 上限内：每轮都必须精确校验（宁可多读不可漏检），复核计数跨墙钟累计
@@ -337,7 +337,7 @@ def test_ignores_obsidian_temp_and_non_markdown_files(tmp_path):
     (tmp_path / ".obsidian").mkdir()
     (tmp_path / ".obsidian" / "ignored.md").write_text("ignored", encoding="utf-8")
     (tmp_path / "draft.tmp.md").write_text("ignored", encoding="utf-8")
-    (tmp_path / "image.txt").write_text("ignored", encoding="utf-8")
+    (tmp_path / "image.png").write_bytes(b"ignored")
     (tmp_path / "ok.md").write_text("# OK\nkept", encoding="utf-8")
     indexer = MarkdownIndexer(tmp_path, AppConfig(embedding=EmbeddingConfig(mode="static", dimension=4)))
 
