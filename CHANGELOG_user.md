@@ -3,6 +3,16 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 与
 [Semantic Versioning](https://semver.org/lang/zh-CN/)。提交信息为 Conventional Commits。
 
+## [0.7.3] - 2026-09-22
+
+### Fixed
+
+- **多库与 solo 独立库定向参数解析健壮性（GitHub Issue #2）**：
+  - 修复客户端通过 MCP `call_tool` 传递 CamelCase 驼峰命名（如 `vaultPath`、`vaultPaths`）、JSON 序列化字符串或单层嵌套包装（`input`/`args`）时参数未能正确生效的缺陷；
+  - 修复多库环境下调用 `kb_stats(vault_path="...")` 误报 `multiple vaults registered` 的异常；
+  - 修复定向检索 solo 独立库时，因被误判为全局盲搜而被加入 `excluded_solo` 跳过检索的缺陷；
+  - 库名匹配支持自动剥离首尾引号与前后斜杠，并在自定义名称未命中时自动回退匹配物理目录名。
+
 ## [0.7.2] - 2026-09-21
 
 > **升级须知（必读）**：

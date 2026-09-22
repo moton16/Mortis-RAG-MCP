@@ -17,7 +17,7 @@ from .indexer import Chunk, MarkdownIndexer, SearchFilter, dedupe_by_content_has
 from .ingest import IngestManager, INGEST_EXTS
 from .registry import VaultEntry, VaultRegistry, normalize_vault_key, registry_path
 
-SERVER_INFO = {"name": "mortis-rag-mcp", "version": "0.7.2", "title": "Mortis'RAG MCP"}
+SERVER_INFO = {"name": "mortis-rag-mcp", "version": "0.7.3", "title": "Mortis'RAG MCP"}
 
 SERVER_INSTRUCTIONS = (
     "本服务器提供本地 Markdown 知识库检索。路由纪律："

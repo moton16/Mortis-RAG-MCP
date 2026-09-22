@@ -391,3 +391,10 @@
 - **用例补充**：
   - 在 `tests/test_scoped_search.py` 中新增 6 组端到端回归用例：`test_solo_vault_kb_stats_and_scoped_search_issue2`、`test_tools_call_arguments_as_json_string`、`test_tools_call_camel_case_keys`、`test_tools_call_flat_params_and_input_nesting`、`test_vault_paths_null_with_valid_vault_path`、`test_vault_name_trailing_slash_and_basename`。
 
+### C43 — moton16,2026-09-22,Antigravity,Gemini 3.8 Flash — chore(release): 版本号 bump 至 0.7.3 + 用户侧与开发者文档同步
+- **版本号升级**：`pyproject.toml` 与 `mortis_rag_mcp/server.py`（`SERVER_INFO`）统一由 `0.7.2` bump 至 `0.7.3`。
+- **文档同步**：
+  - `CHANGELOG_user.md`：新增 `[0.7.3]` 条目，明确记录 GitHub Issue #2 的缺陷修复；
+  - `README.md` 与 `README_EN.md`：同步版本徽章至 `Version-0.7.3`。
+- **验证**：全量回归单测（含版本对齐测试 `test_version_sync.py`）全量通过。
+
