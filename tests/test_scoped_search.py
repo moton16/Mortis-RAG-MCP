@@ -247,3 +247,176 @@ def test_vault_paths_empty_string_errors(tmp_path):
     err4 = json.loads(responses[3]["result"]["content"][0]["text"])
     assert "vault_paths is empty" in err4["error"]
 
+
+def test_issue2_minimal_reproduction(tmp_path):
+    # 复现 Issue #2：多库环境下（含 solo 库）通过 MCP 传入 vault_path 必须精准命中
+    vault_a = tmp_path / "vault_a"
+    vault_b = tmp_path / "vault_b"
+    vault_a.mkdir()
+    vault_b.mkdir()
+    (vault_a / "a.md").write_text("# A\nshared keyword alpha", encoding="utf-8")
+    (vault_b / "b.md").write_text("# B\nshared keyword beta in solo", encoding="utf-8")
+
+    config = tmp_path / "app.toml"
+    config.write_text('mode = "static"\n', encoding="utf-8")
+
+    requests = [
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "kb_init", "arguments": {"path": str(vault_a), "name": "vault_a"}}},
+        {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "kb_init_solo", "arguments": {"path": str(vault_b), "name": "vault_b"}}},
+        # 用例 1: 定向查询 solo 库状态，不得误抛 multiple vaults registered
+        {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "kb_stats", "arguments": {"vault_path": "vault_b"}}},
+        # 用例 2: 定向检索 solo 库，不得静默降级为全局盲搜，solo 库不得被加入 excluded_solo
+        {"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": "kb_search", "arguments": {"query": "beta", "vault_path": "vault_b"}}},
+    ]
+    responses = _run_stdio(config, requests)
+
+    # 用例 1 验证
+    r4 = responses[3]["result"]
+    assert r4.get("isError") is not True
+    stats = json.loads(r4["content"][0]["text"])
+    assert stats["files"] == 1
+
+    # 用例 2 验证：单库命中 b.md，未排除 solo
+    r5 = responses[4]["result"]
+    assert r5.get("isError") is not True
+    search_res = json.loads(r5["content"][0]["text"])
+    chunks = search_res.get("chunks", [])
+    assert len(chunks) > 0
+    assert all(c["source"] == "b.md" for c in chunks)
+    assert search_res.get("excluded_solo") is None
+
+
+def test_tools_call_arguments_as_json_string(tmp_path):
+    # 兼容客户端/网关将 arguments 传为 JSON 字符串
+    vault = tmp_path / "my_vault"
+    vault.mkdir()
+    (vault / "note.md").write_text("# Note\nhello world content", encoding="utf-8")
+
+    config = tmp_path / "app.toml"
+    config.write_text('mode = "static"\n', encoding="utf-8")
+
+    requests = [
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+            "name": "kb_init",
+            "arguments": json.dumps({"path": str(vault), "name": "MyVault"})
+        }},
+        {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
+            "name": "kb_stats",
+            "arguments": json.dumps({"vault_path": "MyVault"})
+        }},
+        {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {
+            "name": "kb_search",
+            "arguments": json.dumps({"query": "world", "vault_path": "MyVault"})
+        }},
+    ]
+    responses = _run_stdio(config, requests)
+
+    assert responses[1]["result"].get("isError") is not True
+    assert responses[2]["result"].get("isError") is not True
+    assert responses[3]["result"].get("isError") is not True
+    res3 = json.loads(responses[3]["result"]["content"][0]["text"])
+    assert len(res3["chunks"]) > 0
+
+
+def test_tools_call_camel_case_keys(tmp_path):
+    # 兼容客户端传递 CamelCase 键名（vaultPath, vaultPaths 等）
+    v1 = tmp_path / "v1"
+    v2 = tmp_path / "v2"
+    v1.mkdir()
+    v2.mkdir()
+    (v1 / "a.md").write_text("# A\ncontent a", encoding="utf-8")
+    (v2 / "b.md").write_text("# B\ncontent b", encoding="utf-8")
+
+    config = tmp_path / "app.toml"
+    config.write_text('mode = "static"\n', encoding="utf-8")
+
+    requests = [
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "kb_init", "arguments": {"path": str(v1), "name": "VaultOne"}}},
+        {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "kb_init", "arguments": {"path": str(v2), "name": "VaultTwo"}}},
+        # camelCase vaultPath
+        {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "kb_stats", "arguments": {"vaultPath": "VaultOne"}}},
+        # camelCase vaultPath in kb_search
+        {"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": "kb_search", "arguments": {"query": "content", "vaultPath": "VaultOne"}}},
+        # camelCase vaultPaths in kb_search
+        {"jsonrpc": "2.0", "id": 6, "method": "tools/call", "params": {"name": "kb_search", "arguments": {"query": "content", "vaultPaths": ["VaultOne", "VaultTwo"]}}},
+    ]
+    responses = _run_stdio(config, requests)
+
+    assert responses[3]["result"].get("isError") is not True
+    r5 = json.loads(responses[4]["result"]["content"][0]["text"])
+    assert all(c["source"] == "a.md" for c in r5["chunks"])
+    r6 = json.loads(responses[5]["result"]["content"][0]["text"])
+    assert len(r6["searched"]) == 2
+
+
+def test_tools_call_flat_params_and_input_nesting(tmp_path):
+    # 兼容扁平 params 与 input 嵌套包装
+    vault = tmp_path / "v"
+    vault.mkdir()
+    (vault / "note.md").write_text("# Note\nflat test", encoding="utf-8")
+
+    config = tmp_path / "app.toml"
+    config.write_text('mode = "static"\n', encoding="utf-8")
+
+    requests = [
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "kb_init", "arguments": {"path": str(vault), "name": "FlatVault"}}},
+        # 扁平传参（无 arguments 外层）
+        {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "kb_stats", "vault_path": "FlatVault"}},
+        # input 包装传参
+        {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "kb_stats", "input": {"vault_path": "FlatVault"}}},
+        # flat params kb_search
+        {"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": "kb_search", "query": "flat", "vault_path": "FlatVault"}},
+    ]
+    responses = _run_stdio(config, requests)
+    assert responses[1]["result"].get("isError") is not True
+    assert responses[2]["result"].get("isError") is not True
+    assert responses[3]["result"].get("isError") is not True
+    assert responses[4]["result"].get("isError") is not True
+
+
+def test_vault_paths_null_with_valid_vault_path(tmp_path):
+    # 当客户端或 LLM 同时传递 vault_paths: null 和 vault_path 时，优先尊重 vault_path
+    vault = tmp_path / "v"
+    vault.mkdir()
+    (vault / "note.md").write_text("# Note\nnull test", encoding="utf-8")
+
+    config = tmp_path / "app.toml"
+    config.write_text('mode = "static"\n', encoding="utf-8")
+
+    requests = [
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "kb_init", "arguments": {"path": str(vault), "name": "TestV"}}},
+        {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "kb_search", "arguments": {"query": "null", "vault_path": "TestV", "vault_paths": None}}},
+        {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "kb_search", "arguments": {"query": "null", "vault_path": "TestV", "vault_paths": ""}}},
+    ]
+    responses = _run_stdio(config, requests)
+    assert responses[2]["result"].get("isError") is not True
+    assert responses[3]["result"].get("isError") is not True
+
+
+def test_vault_name_trailing_slash_and_basename(tmp_path):
+    # 库名带尾部斜杠，或直接使用物理文件夹名（即使注册了别名）
+    vault = tmp_path / "PhysicsVault"
+    vault.mkdir()
+    (vault / "note.md").write_text("# Physics\nquantum mechanics", encoding="utf-8")
+
+    config = tmp_path / "app.toml"
+    config.write_text('mode = "static"\n', encoding="utf-8")
+
+    requests = [
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "kb_init", "arguments": {"path": str(vault), "name": "物理库"}}},
+        # 带尾部斜杠 "物理库/"
+        {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "kb_stats", "arguments": {"vault_path": "物理库/"}}},
+        # 回退匹配实际目录名 "PhysicsVault"
+        {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "kb_stats", "arguments": {"vault_path": "PhysicsVault"}}},
+    ]
+    responses = _run_stdio(config, requests)
+    assert responses[2]["result"].get("isError") is not True
+    assert responses[3]["result"].get("isError") is not True
+
+

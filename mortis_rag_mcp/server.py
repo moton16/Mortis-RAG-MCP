@@ -113,6 +113,46 @@ def _tokenize_query(query: str) -> list[str]:
     return [t.strip() for t in re.findall(r"[\w\u4e00-\u9fff]+", query) if t.strip()]
 
 
+def _camel_to_snake(name: str) -> str:
+    return re.sub(r'(?<!^)(?=[A-Z])', '_', name).lower()
+
+
+def _normalize_call_arguments(raw_arguments: Any) -> dict[str, Any]:
+    """归一化工具入参：兼容 JSON 字符串、嵌套包装（input/args 等）与驼峰命名。"""
+    args = raw_arguments
+    if isinstance(args, str):
+        s = args.strip()
+        if s.startswith("{") and s.endswith("}"):
+            try:
+                parsed = json.loads(s)
+                if isinstance(parsed, dict):
+                    args = parsed
+                else:
+                    return {}
+            except Exception:
+                return {}
+        else:
+            return {}
+    if not isinstance(args, dict):
+        return {}
+
+    # 单层嵌套解包：适配常见外层包装（input, arguments, params, parameters, args）
+    if len(args) == 1:
+        k, v = next(iter(args.items()))
+        if k in {"input", "arguments", "params", "parameters", "args"} and isinstance(v, dict):
+            args = v
+
+    normalized: dict[str, Any] = {}
+    for k, v in args.items():
+        k_str = str(k)
+        snake_k = _camel_to_snake(k_str)
+        if k_str not in normalized:
+            normalized[k_str] = v
+        if snake_k not in normalized:
+            normalized[snake_k] = v
+    return normalized
+
+
 def _json_result(request_id: Any, result: Any) -> dict[str, Any]:
     return {"jsonrpc": "2.0", "id": request_id, "result": result}
 
@@ -401,14 +441,15 @@ class VaultMcpServer:
             raise ValueError("vault identifier is required; call kb_list to see registered vaults")
 
         if not for_registration:
-            # 1. 优先尝试名称/别名匹配
-            named_matches = self.registry.get_by_name(raw)
+            # 1. 优先尝试名称/别名匹配（兼容带尾部斜杠的情形）
+            clean_name = raw.rstrip("/\\")
+            named_matches = self.registry.get_by_name(clean_name)
             if len(named_matches) == 1:
                 return named_matches[0].path
             elif len(named_matches) > 1:
                 options = "\n".join(f"  - {e.name}: {e.path}" for e in named_matches)
                 raise ValueError(
-                    f"ambiguous vault name '{raw}' matches multiple vaults:\n{options}\n"
+                    f"ambiguous vault name '{clean_name}' matches multiple vaults:\n{options}\n"
                     "Please specify the explicit physical path instead."
                 )
 
@@ -446,47 +487,55 @@ class VaultMcpServer:
         仅在整体未命中且包含逗号时才尝试拆分；以 vault_paths 数组作为推荐标准。
         """
         raw_list: list[str] = []
-        if "vault_paths" in arguments:
-            vp = arguments.get("vault_paths")
-            if vp:
-                if isinstance(vp, (list, tuple)):
-                    for item in vp:
-                        s = str(item).strip()
-                        if s:
-                            raw_list.append(s)
-                else:
-                    # F-05 同款逗号安全：字符串形态按逗号拆分，绝不静默回落全局检索
-                    raw_list.extend(p.strip() for p in str(vp).split(",") if p.strip())
-            if not raw_list:
+        has_vault_paths_key = "vault_paths" in arguments
+        vp = arguments.get("vault_paths") if has_vault_paths_key else None
+        if vp:
+            if isinstance(vp, (list, tuple)):
+                for item in vp:
+                    s = str(item).strip()
+                    if s:
+                        raw_list.append(s)
+            else:
+                # F-05 同款逗号安全：字符串形态按逗号拆分，绝不静默回落全局检索
+                raw_list.extend(p.strip() for p in str(vp).split(",") if p.strip())
+
+        # 若显式传入了 vault_paths 键但解析为空：
+        # 若同时传入了有效的单库参数（vault_path/vault/vault_name/path），优先走单库通道；
+        # 否则严格抛出 ValueError 杜绝静默回落全局盲搜（C38 F-01 守卫）。
+        if has_vault_paths_key and not raw_list:
+            single_val = arguments.get("vault_path") or arguments.get("vault") or arguments.get("vault_name") or arguments.get("path")
+            if not single_val:
                 raise ValueError(
                     "vault_paths is empty; pass at least one vault name or absolute path, "
                     "or omit it to search all non-solo vaults"
                 )
-        elif "vault_path" in arguments and arguments["vault_path"]:
-            val = arguments["vault_path"]
-            if isinstance(val, (list, tuple)):
-                raw_list.extend(str(x).strip() for x in val if str(x).strip())
-            else:
-                s = str(val).strip()
-                if s:
-                    # F-05: 优先整体探测
-                    is_whole_match = False
-                    if self.registry.get_by_name(s):
-                        is_whole_match = True
-                    elif self.registry.get(s) is not None:
-                        is_whole_match = True
-                    else:
-                        try:
-                            if Path(s).expanduser().is_dir():
-                                is_whole_match = True
-                        except Exception:
-                            pass
 
-                    if is_whole_match or ("," not in s):
-                        raw_list.append(s)
-                    else:
-                        parts = [p.strip() for p in s.split(",") if p.strip()]
-                        raw_list.extend(parts)
+        if not raw_list:
+            val = arguments.get("vault_path") or arguments.get("vault") or arguments.get("vault_name") or arguments.get("path")
+            if val:
+                if isinstance(val, (list, tuple)):
+                    raw_list.extend(str(x).strip() for x in val if str(x).strip())
+                else:
+                    s = str(val).strip()
+                    if s:
+                        # F-05: 优先整体探测
+                        is_whole_match = False
+                        if self.registry.get_by_name(s):
+                            is_whole_match = True
+                        elif self.registry.get(s) is not None:
+                            is_whole_match = True
+                        else:
+                            try:
+                                if Path(s).expanduser().is_dir():
+                                    is_whole_match = True
+                            except Exception:
+                                pass
+
+                        if is_whole_match or ("," not in s):
+                            raw_list.append(s)
+                        else:
+                            parts = [p.strip() for p in s.split(",") if p.strip()]
+                            raw_list.extend(parts)
 
         seen = set()
         deduped = []
@@ -509,7 +558,13 @@ class VaultMcpServer:
         raise ValueError(f"multiple vaults registered; pass an explicit vault_path:\n{listed}")
 
     def _indexer_for(self, arguments: dict[str, Any]) -> MarkdownIndexer:
-        raw = str(arguments.get("vault_path") or "").strip()
+        raw = str(
+            arguments.get("vault_path")
+            or arguments.get("vault")
+            or arguments.get("vault_name")
+            or arguments.get("path")
+            or ""
+        ).strip()
         if not raw:
             raw = self._default_vault_path()
         vault_path = self._resolve_vault_path(raw)
@@ -647,7 +702,13 @@ class VaultMcpServer:
         }
 
     def _kb_remove(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        raw = str(arguments.get("path", "")).strip()
+        raw = str(
+            arguments.get("path")
+            or arguments.get("vault_path")
+            or arguments.get("vault")
+            or arguments.get("vault_name")
+            or ""
+        ).strip()
         if not raw:
             raise ValueError("path is required for kb_remove")
         purge = bool(arguments.get("purge_cache", False))
@@ -676,7 +737,13 @@ class VaultMcpServer:
         }
 
     def _kb_describe(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        raw = str(arguments.get("vault_path", "")).strip()
+        raw = str(
+            arguments.get("vault_path")
+            or arguments.get("vault")
+            or arguments.get("vault_name")
+            or arguments.get("path")
+            or ""
+        ).strip()
         desc = str(arguments.get("description", "")).strip()
         if not raw or not desc:
             raise ValueError("vault_path and description are required for kb_describe")
@@ -704,8 +771,14 @@ class VaultMcpServer:
         action = str(arguments.get("action", "")).strip()
         if action not in {"submit", "status", "pending"}:
             raise ValueError("action must be one of: submit, status, pending")
-        vault = self._resolve_vault_path(str(arguments.get("vault_path", "")).strip()
-                                         or self._default_vault_path())
+        target_raw = (
+            arguments.get("vault_path")
+            or arguments.get("vault")
+            or arguments.get("vault_name")
+            or arguments.get("path")
+            or ""
+        )
+        vault = self._resolve_vault_path(str(target_raw).strip() or self._default_vault_path())
         manager = self._ingest_manager_for(vault)
         if action == "pending":
             return {"pending": manager.scan_pending()}
@@ -901,10 +974,8 @@ class VaultMcpServer:
         return res
 
     def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        # 防御：某些客户端会把工具名/畸形数据当 arguments 透传（如逐字符拆分的 dict），
-        # 这里归一化为空 dict，避免被当作 vault_path 等参数误解析。
-        if not isinstance(arguments, dict):
-            arguments = {}
+        # 归一化入参（防卫畸形数据、反序列化 JSON 字符串、解包嵌套、驼峰映射）
+        arguments = _normalize_call_arguments(arguments)
         if name == "kb_init":
             return _text_content(self._kb_init(arguments))
         if name == "kb_init_solo":
@@ -920,7 +991,14 @@ class VaultMcpServer:
         if name == "kb_set_weight":
             # 统一走 _resolve_vault_path：此前直接按原始字符串查注册表，
             # 相对路径会按 stdio 服务进程的任意 CWD 解析，行为不可预测。
-            vault_path = self._resolve_vault_path(str(arguments.get("vault_path") or "").strip())
+            target_raw = (
+                arguments.get("vault_path")
+                or arguments.get("vault")
+                or arguments.get("vault_name")
+                or arguments.get("path")
+                or ""
+            )
+            vault_path = self._resolve_vault_path(str(target_raw).strip())
             if "weight" not in arguments:
                 raise ValueError("weight is required for kb_set_weight")
             try:
@@ -1040,72 +1118,73 @@ class VaultMcpServer:
                 preview=preview,
             ))
 
-        indexer = self._indexer_for(arguments)
-        if name == "kb_list_files":
-            indexer.try_sync_with_guard(timeout=1.0)
-            return _text_content({"files": indexer.list_files()})
-        if name == "kb_read":
-            source = str(arguments.get("source", "")).strip()
-            if not source:
-                raise ValueError("source is required for kb_read")
-            heading = arguments.get("heading")
-            start_line = _parse_int(arguments.get("start_line"))
-            end_line = _parse_int(arguments.get("end_line"))
-            if start_line is not None and start_line < 1:
-                raise ValueError("start_line must be >= 1")
-            if end_line is not None and start_line is not None and end_line < start_line:
-                raise ValueError("end_line must be >= start_line")
-            if heading and start_line is None and end_line is None:
-                matches = [chunk for chunk in indexer.all_chunks() if chunk.source == source and chunk.metadata.get("heading") == heading]
-                if not matches:
-                    raise ValueError(f"heading not found: {heading}")
-                start_line = min(chunk.metadata["start_line"] for chunk in matches)
-                end_line = max(chunk.metadata["end_line"] for chunk in matches)
-            text = indexer.read(source, start_line, end_line)
-            # 无范围时整篇塞进单个 text 块会撑爆模型上下文/客户端消息上限，
-            # 给一个保守上限并明确告知被截断，引导调用方用 start_line 续读。
-            truncated = False
-            if len(text) > 20000:
-                text = text[:20000]
-                truncated = True
-            return _text_content({
-                "source": source,
-                "start_line": start_line,
-                "end_line": end_line,
-                "content": text,
-                "truncated": truncated,
-            })
-        if name == "kb_stats":
-            indexer.try_sync_with_guard(timeout=1.0)
-            return _text_content(indexer.stats())
-        if name == "kb_exempt":
-            action = str(arguments.get("action", "list")).strip()
-            pattern = str(arguments.get("pattern", "")).strip()
-            source = str(arguments.get("source", "")).strip()
-            method = str(arguments.get("method", "frontmatter")).strip()
-            if action == "list":
-                return _text_content(indexer.get_exemptions())
-            if action == "add_pattern":
-                if not pattern:
-                    raise ValueError("pattern is required for add_pattern")
-                return _text_content(indexer.add_exemption_pattern(pattern))
-            if action == "remove_pattern":
-                if not pattern:
-                    raise ValueError("pattern is required for remove_pattern")
-                return _text_content(indexer.remove_exemption_pattern(pattern))
-            if action == "exempt_file":
+        if name in {"kb_list_files", "kb_read", "kb_stats", "kb_exempt"}:
+            indexer = self._indexer_for(arguments)
+            if name == "kb_list_files":
+                indexer.try_sync_with_guard(timeout=1.0)
+                return _text_content({"files": indexer.list_files()})
+            if name == "kb_read":
+                source = str(arguments.get("source", "")).strip()
                 if not source:
-                    raise ValueError("source is required for exempt_file")
-                return _text_content(indexer.set_file_exemption(source, exempt=True, method=method))
-            if action == "unexempt_file":
-                if not source:
-                    raise ValueError("source is required for unexempt_file")
-                return _text_content(indexer.set_file_exemption(source, exempt=False, method=method))
-            if action == "check":
-                if not source:
-                    raise ValueError("source is required for check")
-                return _text_content(indexer.check_exemption(source))
-            raise ValueError(f"unknown action for kb_exempt: {action}")
+                    raise ValueError("source is required for kb_read")
+                heading = arguments.get("heading")
+                start_line = _parse_int(arguments.get("start_line"))
+                end_line = _parse_int(arguments.get("end_line"))
+                if start_line is not None and start_line < 1:
+                    raise ValueError("start_line must be >= 1")
+                if end_line is not None and start_line is not None and end_line < start_line:
+                    raise ValueError("end_line must be >= start_line")
+                if heading and start_line is None and end_line is None:
+                    matches = [chunk for chunk in indexer.all_chunks() if chunk.source == source and chunk.metadata.get("heading") == heading]
+                    if not matches:
+                        raise ValueError(f"heading not found: {heading}")
+                    start_line = min(chunk.metadata["start_line"] for chunk in matches)
+                    end_line = max(chunk.metadata["end_line"] for chunk in matches)
+                text = indexer.read(source, start_line, end_line)
+                # 无范围时整篇塞进单个 text 块会撑爆模型上下文/客户端消息上限，
+                # 给一个保守上限并明确告知被截断，引导调用方用 start_line 续读。
+                truncated = False
+                if len(text) > 20000:
+                    text = text[:20000]
+                    truncated = True
+                return _text_content({
+                    "source": source,
+                    "start_line": start_line,
+                    "end_line": end_line,
+                    "content": text,
+                    "truncated": truncated,
+                })
+            if name == "kb_stats":
+                indexer.try_sync_with_guard(timeout=1.0)
+                return _text_content(indexer.stats())
+            if name == "kb_exempt":
+                action = str(arguments.get("action", "list")).strip()
+                pattern = str(arguments.get("pattern", "")).strip()
+                source = str(arguments.get("source", "")).strip()
+                method = str(arguments.get("method", "frontmatter")).strip()
+                if action == "list":
+                    return _text_content(indexer.get_exemptions())
+                if action == "add_pattern":
+                    if not pattern:
+                        raise ValueError("pattern is required for add_pattern")
+                    return _text_content(indexer.add_exemption_pattern(pattern))
+                if action == "remove_pattern":
+                    if not pattern:
+                        raise ValueError("pattern is required for remove_pattern")
+                    return _text_content(indexer.remove_exemption_pattern(pattern))
+                if action == "exempt_file":
+                    if not source:
+                        raise ValueError("source is required for exempt_file")
+                    return _text_content(indexer.set_file_exemption(source, exempt=True, method=method))
+                if action == "unexempt_file":
+                    if not source:
+                        raise ValueError("source is required for unexempt_file")
+                    return _text_content(indexer.set_file_exemption(source, exempt=False, method=method))
+                if action == "check":
+                    if not source:
+                        raise ValueError("source is required for check")
+                    return _text_content(indexer.check_exemption(source))
+                raise ValueError(f"unknown action for kb_exempt: {action}")
         raise ValueError(f"unknown tool: {name}")
 
     def handle(self, request: dict[str, Any]) -> dict[str, Any] | None:
@@ -1125,9 +1204,23 @@ class VaultMcpServer:
         if method == "tools/list":
             return _json_result(request_id, {"tools": _tool_definitions()})
         if method == "tools/call":
-            params = request.get("params") or {}
+            params = request.get("params")
+            if not isinstance(params, dict):
+                params = {}
+            tool_name = str(params.get("name") or request.get("name") or "").strip()
+            raw_args = params.get("arguments")
+            if raw_args is None:
+                for alt in ("input", "args", "parameters"):
+                    if alt in params:
+                        raw_args = params[alt]
+                        break
+            if raw_args is None and "arguments" in request:
+                raw_args = request.get("arguments")
+            if raw_args is None:
+                flat = {k: v for k, v in params.items() if k != "name"}
+                raw_args = flat if flat else {}
             try:
-                return _json_result(request_id, self.call_tool(str(params.get("name", "")), params.get("arguments") or {}))
+                return _json_result(request_id, self.call_tool(tool_name, raw_args))
             except (ValueError, TypeError, OSError) as exc:
                 # MCP 规范：工具执行失败应以 CallToolResult{isError:true} 返回，
                 # 模型看到错误内容可以自我纠正（比如先 kb_init 再重试）。此前

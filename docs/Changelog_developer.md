@@ -377,3 +377,17 @@
 - **用例补充**：
   - 在 `tests/test_preview_mode.py` 中新增 `test_snippet_centers_on_chinese_keyword`（验证 500 字前置干扰段落后精准聚焦中文关键词）与 `test_snippet_handles_single_cjk_char_query`（单字中文兜底与越界安全）；
   - 在 `tests/test_anti_contention.py` 中新增 `test_sync_progress_state_machine`（验证 `phase` 流转与扫描进度计数实时性）。
+
+### C42 — moton16,2026-09-22,Antigravity,Gemini 3.8 Flash — fix(server,registry): 修复多库/solo场景定向检索与状态查询参数失效缺陷（GitHub Issue #2）
+- **修复 MCP 客户端传参协议反序列化与多层解包**：
+  - 在 `server.py:handle` 中兼容处理部分客户端/网关以 `input`、`args`、`parameters` 或顶层扁平参数传递的情况，彻底杜绝无 `arguments` 外层或层级嵌套导致参数丢失；
+  - 在 `server.py:call_tool` 与 `_normalize_call_arguments` 中支持 JSON 字符串形态的 `arguments`（如 `"{\"vault_path\": ...}"`），杜绝因 `not isinstance(arguments, dict)` 直接被重置置空的 bug；
+  - 新增 `_camel_to_snake` 转换，全面兼容客户端常用的 CamelCase 参数名（如 `vaultPath`、`vaultPaths`、`pathPrefix` 等）；
+  - 修复 `_parse_vault_targets` 优先级冲突：当 `vault_paths` 显式传入为 `None`、`""` 或空结构体时，不再拦截报错，而是平滑回退识别 `vault_path`。
+- **强化库名解析与单库工具健壮性**：
+  - `registry.py:get_by_name` 支持剥离首尾引号与前后斜杠（`.strip("\"'").rstrip("/\\")`），并在未能通过自定义名称命中时，自动回退匹配物理路径目录名称（`Path(e.path).name`）；
+  - `_indexer_for` 以及各单库工具（`_kb_remove`、`_kb_describe`、`_kb_ingest`、`kb_set_weight`）参数提取增加 `vault`、`vault_name`、`path` 等别名兜底；
+  - 彻底解决多库环境下调用 `kb_stats(vault_path="...")` 误报 `multiple vaults registered` 以及调用 `kb_search` 定向检索 solo 库失败并误将其加入 `excluded_solo` 的问题。
+- **用例补充**：
+  - 在 `tests/test_scoped_search.py` 中新增 6 组端到端回归用例：`test_solo_vault_kb_stats_and_scoped_search_issue2`、`test_tools_call_arguments_as_json_string`、`test_tools_call_camel_case_keys`、`test_tools_call_flat_params_and_input_nesting`、`test_vault_paths_null_with_valid_vault_path`、`test_vault_name_trailing_slash_and_basename`。
+
