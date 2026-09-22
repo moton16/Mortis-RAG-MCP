@@ -363,17 +363,22 @@ class VaultRegistry:
         return None
 
     def get_by_name(self, name: str) -> list[VaultEntry]:
-        """按知识库显示名（name）不区分大小写查找条目。
+        """按知识库显示名（name）或文件夹名不区分大小写查找条目。
 
         可能存在多库重名，故返回列表：
         - 长度为 1：精准匹配
         - 长度 > 1：重名歧义，由上层提示调用方
         - 长度 == 0：未命中
         """
-        target = str(name or "").strip().lower()
+        target = str(name or "").strip().strip("\"'").rstrip("/\\").lower()
         if not target:
             return []
         with self._lock:
             entries = self.load()
-            return [e for e in entries if e.name.strip().lower() == target]
+            # 优先匹配注册显示名 entry.name
+            matches = [e for e in entries if e.name.strip().rstrip("/\\").lower() == target]
+            if not matches:
+                # 回退匹配实际物理目录名称 Path(e.path).name
+                matches = [e for e in entries if Path(e.path).name.strip().rstrip("/\\").lower() == target]
+            return matches
 
