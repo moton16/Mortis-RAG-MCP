@@ -291,3 +291,18 @@
 >   - 新增 `tests/test_chunking_seam.py`（3 个测试：re-export 符号完备性、monkeypatch 可达性、Facade 薄委托方法签名兼容）。
 > - **验证**：全量单测增至 **325 passed, 4 skipped**（基线 322 + 3 接缝，`PYTEST_EXIT=0`）；金测 `test_golden_v073.py` 严格相等；eval **Hit@5 100.0% / MRR@5 1.000**。
 
+### C48 — moton16,2026-09-27,Antigravity,Gemini 3.8 Flash — refactor(indexer): v0.8.0 P3c 提取 _indexer/sync_engine（Eng协议边界与锁序同一性保障）
+> **代码改动概况**：
+> - `mortis_rag_mcp/_indexer/sync_engine.py` 落地（D7 用户裁决最高风险项受控切除）：
+>   - 核心自由函数 `run_sync(owner)` 承接 `_sync_locked_impl` 增量同步对账主逻辑（前置条件：调用方已持 `_sync_lock`）；
+>   - 辅助纯函数与向量处理逻辑搬移：`ensure_disk_vectors_migrated`、`flush_vectors_to_disk`、`chunk_has_vector`、`reuse_vectors_by_content_hash`、`embed_missing`、`embedding_changed_state`、`embed_one_file`、`_to_emb`；
+>   - 状态管理严格遵守 Eng B.3 协议：22 个可变状态属性留守主类实例，引擎经 `owner.*` 访问并就地变异；运行时零反向依赖 Facade（仅 TYPE_CHECKING 导入）。
+> - `mortis_rag_mcp/indexer.py` Facade 关键边界留守与瘦身：
+>   - 行数由 2647 行降至 2289 行（净减 358 行）；
+>   - 坚守 Facade 留守底线：`sync()`/`try_sync_with_guard()` 锁获取与首启线程不变；全部 `_cache_lock` 获取点不变；Fast-Stat 判据族与 `_fts_*` 家族不变；
+>   - 原位保留 `_sync_locked_impl`、`_ensure_disk_vectors_migrated`、`_flush_vectors_to_disk`、`_chunk_has_vector`、`_reuse_vectors_by_content_hash`、`_embed_missing`、`_embedding_changed_state`、`_embed_one_file` 薄委托方法。
+> - 专项回归测试守护：
+>   - 新增 `tests/test_sync_engine.py`（4 个测试：`owner._chunks` 与 `_stat_cache` 就地变异字典同一性断言、`_sync_lock -> _cache_lock` 严格锁序拦截断言、线程名契约校验、薄委托兼容调用）。
+> - **验证**：全量单测增至 **329 passed, 4 skipped**（基线 325 + 4 P3c 专项，`PYTEST_EXIT=0`）；eval **Hit@5 100.0% / MRR@5 1.000**；金测 `test_golden_v073.py` 严格相等。
+
+
