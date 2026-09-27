@@ -973,219 +973,241 @@ class VaultMcpServer:
             )
         return res
 
+    # v0.8.0 Phase 1：call_tool 由巨型 if 链改为显式路由表（15 个 kb_* 工具 → 处理方法）。
+    # 工具名、参数语义、返回结构与 unknown-tool 报错行为完全不变（MCP 协议契约）。
+    _TOOL_ROUTE_TABLE: dict[str, str] = {
+        "kb_init": "_kb_init",
+        "kb_init_solo": "_kb_init_solo",
+        "kb_remove": "_kb_remove",
+        "kb_describe": "_kb_describe",
+        "kb_list": "_kb_list",
+        "kb_ingest": "_kb_ingest",
+        "kb_set_weight": "_kb_set_weight",
+        "kb_rebuild": "_kb_rebuild",
+        "kb_export": "_kb_export",
+        "kb_import": "_kb_import",
+        "kb_search": "_kb_search",
+        "kb_list_files": "_kb_list_files",
+        "kb_read": "_kb_read",
+        "kb_stats": "_kb_stats",
+        "kb_exempt": "_kb_exempt",
+    }
+
     def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         # 归一化入参（防卫畸形数据、反序列化 JSON 字符串、解包嵌套、驼峰映射）
         arguments = _normalize_call_arguments(arguments)
-        if name == "kb_init":
-            return _text_content(self._kb_init(arguments))
-        if name == "kb_init_solo":
-            return _text_content(self._kb_init_solo(arguments))
-        if name == "kb_remove":
-            return _text_content(self._kb_remove(arguments))
-        if name == "kb_describe":
-            return _text_content(self._kb_describe(arguments))
-        if name == "kb_list":
-            return _text_content(self._list_vaults())
-        if name == "kb_ingest":
-            return _text_content(self._kb_ingest(arguments))
-        if name == "kb_set_weight":
-            # 统一走 _resolve_vault_path：此前直接按原始字符串查注册表，
-            # 相对路径会按 stdio 服务进程的任意 CWD 解析，行为不可预测。
-            target_raw = (
-                arguments.get("vault_path")
-                or arguments.get("vault")
-                or arguments.get("vault_name")
-                or arguments.get("path")
-                or ""
-            )
-            vault_path = self._resolve_vault_path(str(target_raw).strip())
-            if "weight" not in arguments:
-                raise ValueError("weight is required for kb_set_weight")
-            try:
-                weight = float(arguments["weight"])
-            except (TypeError, ValueError):
-                raise ValueError(f"weight must be a number in (0, 100]: {arguments['weight']}")
-            entry = self.registry.set_weight(vault_path, weight)
-            return _text_content({"path": entry.path, "name": entry.name, "weight": entry.weight})
-        if name == "kb_rebuild":
-            indexer = self._indexer_for(arguments)
-            indexer.rebuild()
-            return _text_content(indexer.stats())
-        if name == "kb_export":
-            indexer = self._indexer_for(arguments)
-            out_path = str(arguments.get("out_path", "")).strip()
-            if not out_path:
-                raise ValueError("out_path is required for kb_export")
-            # 信任边界：out_path 直通 tmp.replace(out)，此前零校验 —— 被提示
-            # 注入或跑偏的 LLM 可以用 zip 字节原子覆盖任意用户可写文件（文档、
-            # 配置、.ssh/authorized_keys）。对比 kb_read 特意做了 _safe_path
-            # 沙箱，这里至少要做到：绝对路径 + .zip 后缀 + 不静默覆盖。
-            out = Path(out_path).expanduser()
-            if not out.is_absolute():
-                raise ValueError("out_path must be an absolute path for kb_export")
-            if out.suffix.lower() != ".zip":
-                raise ValueError("out_path must end with .zip for kb_export")
-            if out.exists():
-                overwrite = str(arguments.get("overwrite", "")).strip().lower()
-                if overwrite not in {"1", "true", "yes", "on"}:
-                    raise ValueError(
-                        f"out_path already exists: {out}; pass overwrite=true to replace it"
-                    )
-            return _text_content(indexer.export_snapshot(out))
-        if name == "kb_import":
-            indexer = self._indexer_for(arguments)
-            snapshot = str(arguments.get("snapshot", "")).strip()
-            if not snapshot:
-                raise ValueError("snapshot is required for kb_import")
-            force = arguments.get("force", False)
-            if isinstance(force, str):
-                force = force.strip().lower() in {"1", "true", "yes", "on"}
-            return _text_content(indexer.import_snapshot(snapshot, force=bool(force)))
-        if name == "kb_search":
-            targets = self._parse_vault_targets(arguments)
-            query = str(arguments.get("query", ""))
-            top_k = _parse_top_k(arguments.get("top_k", 10), self.config.max_top_k)
-            use_rerank = arguments.get("use_rerank", True)
-            if isinstance(use_rerank, str):
-                use_rerank = use_rerank.strip().lower() in {"1", "true", "yes", "on"}
-            group_by_vault = arguments.get("group_by_vault", False)
-            if isinstance(group_by_vault, str):
-                group_by_vault = group_by_vault.strip().lower() in {"1", "true", "yes", "on"}
-            dedupe = arguments.get("dedupe", True)
-            if isinstance(dedupe, str):
-                dedupe = dedupe.strip().lower() not in {"0", "false", "no", "off"}
-            preview_val = arguments.get("preview", False)
-            if isinstance(preview_val, str):
-                preview = preview_val.strip().lower() in {"1", "true", "yes", "on"}
-            else:
-                preview = bool(preview_val)
-            if arguments.get("mode") == "preview":
-                preview = True
+        handler_name = self._TOOL_ROUTE_TABLE.get(name)
+        if handler_name is None:
+            raise ValueError(f"unknown tool: {name}")
+        return _text_content(getattr(self, handler_name)(arguments))
 
-            search_filters = _search_filter(arguments, self.config.max_top_k)
-            query_tokens = _tokenize_query(query)
+    def _kb_list(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        return self._list_vaults()
 
-            # 单库检索通道（传入单个目标）
-            if len(targets) == 1:
-                resolved_single = self._resolve_vault_path(targets[0])
-                indexer = self._indexer_for({"vault_path": resolved_single})
+    def _kb_set_weight(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        # 统一走 _resolve_vault_path：此前直接按原始字符串查注册表，
+        # 相对路径会按 stdio 服务进程的任意 CWD 解析，行为不可预测。
+        target_raw = (
+            arguments.get("vault_path")
+            or arguments.get("vault")
+            or arguments.get("vault_name")
+            or arguments.get("path")
+            or ""
+        )
+        vault_path = self._resolve_vault_path(str(target_raw).strip())
+        if "weight" not in arguments:
+            raise ValueError("weight is required for kb_set_weight")
+        try:
+            weight = float(arguments["weight"])
+        except (TypeError, ValueError):
+            raise ValueError(f"weight must be a number in (0, 100]: {arguments['weight']}")
+        entry = self.registry.set_weight(vault_path, weight)
+        return {"path": entry.path, "name": entry.name, "weight": entry.weight}
+    def _kb_rebuild(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        indexer = self._indexer_for(arguments)
+        indexer.rebuild()
+        return indexer.stats()
+
+    def _kb_export(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        indexer = self._indexer_for(arguments)
+        out_path = str(arguments.get("out_path", "")).strip()
+        if not out_path:
+            raise ValueError("out_path is required for kb_export")
+        # 信任边界：out_path 直通 tmp.replace(out)，此前零校验 —— 被提示
+        # 注入或跑偏的 LLM 可以用 zip 字节原子覆盖任意用户可写文件（文档、
+        # 配置、.ssh/authorized_keys）。对比 kb_read 特意做了 _safe_path
+        # 沙箱，这里至少要做到：绝对路径 + .zip 后缀 + 不静默覆盖。
+        out = Path(out_path).expanduser()
+        if not out.is_absolute():
+            raise ValueError("out_path must be an absolute path for kb_export")
+        if out.suffix.lower() != ".zip":
+            raise ValueError("out_path must end with .zip for kb_export")
+        if out.exists():
+            overwrite = str(arguments.get("overwrite", "")).strip().lower()
+            if overwrite not in {"1", "true", "yes", "on"}:
+                raise ValueError(
+                    f"out_path already exists: {out}; pass overwrite=true to replace it"
+                )
+        return indexer.export_snapshot(out)
+
+    def _kb_import(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        indexer = self._indexer_for(arguments)
+        snapshot = str(arguments.get("snapshot", "")).strip()
+        if not snapshot:
+            raise ValueError("snapshot is required for kb_import")
+        force = arguments.get("force", False)
+        if isinstance(force, str):
+            force = force.strip().lower() in {"1", "true", "yes", "on"}
+        return indexer.import_snapshot(snapshot, force=bool(force))
+    def _kb_search(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        targets = self._parse_vault_targets(arguments)
+        query = str(arguments.get("query", ""))
+        top_k = _parse_top_k(arguments.get("top_k", 10), self.config.max_top_k)
+        use_rerank = arguments.get("use_rerank", True)
+        if isinstance(use_rerank, str):
+            use_rerank = use_rerank.strip().lower() in {"1", "true", "yes", "on"}
+        group_by_vault = arguments.get("group_by_vault", False)
+        if isinstance(group_by_vault, str):
+            group_by_vault = group_by_vault.strip().lower() in {"1", "true", "yes", "on"}
+        dedupe = arguments.get("dedupe", True)
+        if isinstance(dedupe, str):
+            dedupe = dedupe.strip().lower() not in {"0", "false", "no", "off"}
+        preview_val = arguments.get("preview", False)
+        if isinstance(preview_val, str):
+            preview = preview_val.strip().lower() in {"1", "true", "yes", "on"}
+        else:
+            preview = bool(preview_val)
+        if arguments.get("mode") == "preview":
+            preview = True
+
+        search_filters = _search_filter(arguments, self.config.max_top_k)
+        query_tokens = _tokenize_query(query)
+
+        # 单库检索通道（传入单个目标）
+        if len(targets) == 1:
+            resolved_single = self._resolve_vault_path(targets[0])
+            indexer = self._indexer_for({"vault_path": resolved_single})
+            sync_ok = indexer.try_sync_with_guard(timeout=1.5)
+            if not sync_ok and len(indexer._chunks) == 0:
+                return {
+                    "status": "indexing",
+                    "message": "知识库正在后台进行首次初始化构建与嵌入计算，请稍候...",
+                    "progress": indexer._sync_progress,
+                    "retry_after": 3,
+                    "chunks": [],
+                }
+            results = indexer.search(query, top_k, bool(use_rerank), filters=search_filters, dedupe=bool(dedupe))
+            res_dict: dict[str, Any] = {"chunks": [chunk.to_dict(preview=preview, query_tokens=query_tokens) for chunk in results]}
+            if not sync_ok:
+                res_dict["indexing_in_progress"] = True
+                res_dict["indexing_progress"] = indexer._sync_progress
+            return res_dict
+
+        # 未指定目标时的默认单库处理
+        if not targets:
+            entries = self.registry.load()
+            if len(entries) == 1 and entries[0].solo:
+                raise ValueError(
+                    f"vault '{entries[0].name}' is solo (excluded from global search); "
+                    "pass an explicit vault_path to search it"
+                )
+            if len(entries) == 1:
+                indexer = self._indexer_for({"vault_path": entries[0].path})
                 sync_ok = indexer.try_sync_with_guard(timeout=1.5)
                 if not sync_ok and len(indexer._chunks) == 0:
-                    return _text_content({
+                    return {
                         "status": "indexing",
                         "message": "知识库正在后台进行首次初始化构建与嵌入计算，请稍候...",
                         "progress": indexer._sync_progress,
                         "retry_after": 3,
                         "chunks": [],
-                    })
+                    }
                 results = indexer.search(query, top_k, bool(use_rerank), filters=search_filters, dedupe=bool(dedupe))
-                res_dict: dict[str, Any] = {"chunks": [chunk.to_dict(preview=preview, query_tokens=query_tokens) for chunk in results]}
+                res_dict = {"chunks": [chunk.to_dict(preview=preview, query_tokens=query_tokens) for chunk in results]}
                 if not sync_ok:
                     res_dict["indexing_in_progress"] = True
                     res_dict["indexing_progress"] = indexer._sync_progress
-                return _text_content(res_dict)
+                return res_dict
 
-            # 未指定目标时的默认单库处理
-            if not targets:
-                entries = self.registry.load()
-                if len(entries) == 1 and entries[0].solo:
-                    raise ValueError(
-                        f"vault '{entries[0].name}' is solo (excluded from global search); "
-                        "pass an explicit vault_path to search it"
-                    )
-                if len(entries) == 1:
-                    indexer = self._indexer_for({"vault_path": entries[0].path})
-                    sync_ok = indexer.try_sync_with_guard(timeout=1.5)
-                    if not sync_ok and len(indexer._chunks) == 0:
-                        return _text_content({
-                            "status": "indexing",
-                            "message": "知识库正在后台进行首次初始化构建与嵌入计算，请稍候...",
-                            "progress": indexer._sync_progress,
-                            "retry_after": 3,
-                            "chunks": [],
-                        })
-                    results = indexer.search(query, top_k, bool(use_rerank), filters=search_filters, dedupe=bool(dedupe))
-                    res_dict = {"chunks": [chunk.to_dict(preview=preview, query_tokens=query_tokens) for chunk in results]}
-                    if not sync_ok:
-                        res_dict["indexing_in_progress"] = True
-                        res_dict["indexing_progress"] = indexer._sync_progress
-                    return _text_content(res_dict)
+        # 跨库检索（Scoped 定向多库 或 全局盲搜）
+        return self._fanout_search(
+            query, top_k, bool(use_rerank), bool(group_by_vault), search_filters, bool(dedupe),
+            target_vaults=targets if targets else None,
+            preview=preview,
+        )
 
-            # 跨库检索（Scoped 定向多库 或 全局盲搜）
-            return _text_content(self._fanout_search(
-                query, top_k, bool(use_rerank), bool(group_by_vault), search_filters, bool(dedupe),
-                target_vaults=targets if targets else None,
-                preview=preview,
-            ))
+    def _kb_list_files(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        indexer = self._indexer_for(arguments)
+        indexer.try_sync_with_guard(timeout=1.0)
+        return {"files": indexer.list_files()}
 
-        if name in {"kb_list_files", "kb_read", "kb_stats", "kb_exempt"}:
-            indexer = self._indexer_for(arguments)
-            if name == "kb_list_files":
-                indexer.try_sync_with_guard(timeout=1.0)
-                return _text_content({"files": indexer.list_files()})
-            if name == "kb_read":
-                source = str(arguments.get("source", "")).strip()
-                if not source:
-                    raise ValueError("source is required for kb_read")
-                heading = arguments.get("heading")
-                start_line = _parse_int(arguments.get("start_line"))
-                end_line = _parse_int(arguments.get("end_line"))
-                if start_line is not None and start_line < 1:
-                    raise ValueError("start_line must be >= 1")
-                if end_line is not None and start_line is not None and end_line < start_line:
-                    raise ValueError("end_line must be >= start_line")
-                if heading and start_line is None and end_line is None:
-                    matches = [chunk for chunk in indexer.all_chunks() if chunk.source == source and chunk.metadata.get("heading") == heading]
-                    if not matches:
-                        raise ValueError(f"heading not found: {heading}")
-                    start_line = min(chunk.metadata["start_line"] for chunk in matches)
-                    end_line = max(chunk.metadata["end_line"] for chunk in matches)
-                text = indexer.read(source, start_line, end_line)
-                # 无范围时整篇塞进单个 text 块会撑爆模型上下文/客户端消息上限，
-                # 给一个保守上限并明确告知被截断，引导调用方用 start_line 续读。
-                truncated = False
-                if len(text) > 20000:
-                    text = text[:20000]
-                    truncated = True
-                return _text_content({
-                    "source": source,
-                    "start_line": start_line,
-                    "end_line": end_line,
-                    "content": text,
-                    "truncated": truncated,
-                })
-            if name == "kb_stats":
-                indexer.try_sync_with_guard(timeout=1.0)
-                return _text_content(indexer.stats())
-            if name == "kb_exempt":
-                action = str(arguments.get("action", "list")).strip()
-                pattern = str(arguments.get("pattern", "")).strip()
-                source = str(arguments.get("source", "")).strip()
-                method = str(arguments.get("method", "frontmatter")).strip()
-                if action == "list":
-                    return _text_content(indexer.get_exemptions())
-                if action == "add_pattern":
-                    if not pattern:
-                        raise ValueError("pattern is required for add_pattern")
-                    return _text_content(indexer.add_exemption_pattern(pattern))
-                if action == "remove_pattern":
-                    if not pattern:
-                        raise ValueError("pattern is required for remove_pattern")
-                    return _text_content(indexer.remove_exemption_pattern(pattern))
-                if action == "exempt_file":
-                    if not source:
-                        raise ValueError("source is required for exempt_file")
-                    return _text_content(indexer.set_file_exemption(source, exempt=True, method=method))
-                if action == "unexempt_file":
-                    if not source:
-                        raise ValueError("source is required for unexempt_file")
-                    return _text_content(indexer.set_file_exemption(source, exempt=False, method=method))
-                if action == "check":
-                    if not source:
-                        raise ValueError("source is required for check")
-                    return _text_content(indexer.check_exemption(source))
-                raise ValueError(f"unknown action for kb_exempt: {action}")
-        raise ValueError(f"unknown tool: {name}")
+    def _kb_read(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        indexer = self._indexer_for(arguments)
+        source = str(arguments.get("source", "")).strip()
+        if not source:
+            raise ValueError("source is required for kb_read")
+        heading = arguments.get("heading")
+        start_line = _parse_int(arguments.get("start_line"))
+        end_line = _parse_int(arguments.get("end_line"))
+        if start_line is not None and start_line < 1:
+            raise ValueError("start_line must be >= 1")
+        if end_line is not None and start_line is not None and end_line < start_line:
+            raise ValueError("end_line must be >= start_line")
+        if heading and start_line is None and end_line is None:
+            matches = [chunk for chunk in indexer.all_chunks() if chunk.source == source and chunk.metadata.get("heading") == heading]
+            if not matches:
+                raise ValueError(f"heading not found: {heading}")
+            start_line = min(chunk.metadata["start_line"] for chunk in matches)
+            end_line = max(chunk.metadata["end_line"] for chunk in matches)
+        text = indexer.read(source, start_line, end_line)
+        # 无范围时整篇塞进单个 text 块会撑爆模型上下文/客户端消息上限，
+        # 给一个保守上限并明确告知被截断，引导调用方用 start_line 续读。
+        truncated = False
+        if len(text) > 20000:
+            text = text[:20000]
+            truncated = True
+        return {
+            "source": source,
+            "start_line": start_line,
+            "end_line": end_line,
+            "content": text,
+            "truncated": truncated,
+        }
+
+    def _kb_stats(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        indexer = self._indexer_for(arguments)
+        indexer.try_sync_with_guard(timeout=1.0)
+        return indexer.stats()
+
+    def _kb_exempt(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        indexer = self._indexer_for(arguments)
+        action = str(arguments.get("action", "list")).strip()
+        pattern = str(arguments.get("pattern", "")).strip()
+        source = str(arguments.get("source", "")).strip()
+        method = str(arguments.get("method", "frontmatter")).strip()
+        if action == "list":
+            return indexer.get_exemptions()
+        if action == "add_pattern":
+            if not pattern:
+                raise ValueError("pattern is required for add_pattern")
+            return indexer.add_exemption_pattern(pattern)
+        if action == "remove_pattern":
+            if not pattern:
+                raise ValueError("pattern is required for remove_pattern")
+            return indexer.remove_exemption_pattern(pattern)
+        if action == "exempt_file":
+            if not source:
+                raise ValueError("source is required for exempt_file")
+            return indexer.set_file_exemption(source, exempt=True, method=method)
+        if action == "unexempt_file":
+            if not source:
+                raise ValueError("source is required for unexempt_file")
+            return indexer.set_file_exemption(source, exempt=False, method=method)
+        if action == "check":
+            if not source:
+                raise ValueError("source is required for check")
+            return indexer.check_exemption(source)
+        raise ValueError(f"unknown action for kb_exempt: {action}")
 
     def handle(self, request: dict[str, Any]) -> dict[str, Any] | None:
         method = request.get("method")

@@ -201,27 +201,21 @@ def split_table_into_chunks(tbl_lines: list[str], chunk_size: int) -> list[tuple
                     break
 
     items: list[tuple[int, str]] = []
-    if len(tbl_lines) == 1 and ("</tr>" in tbl_lines[0].lower() or "<tr" in tbl_lines[0].lower()):
-        # 单行多 row 表格 (D5)
-        line = tbl_lines[0]
+    for idx, line in enumerate(tbl_lines):
         cleaned = _TABLE_OPEN_TAG.sub("", line)
         cleaned = _TABLE_CLOSE_TAG.sub("", cleaned)
-        raw_rows = re.split(r"(?<=</tr>)", cleaned, flags=re.IGNORECASE)
-        for r in raw_rows:
-            if r.strip():
-                items.append((0, r.strip()))
-    else:
-        for idx, line in enumerate(tbl_lines):
-            cleaned = _TABLE_OPEN_TAG.sub("", line)
-            cleaned = _TABLE_CLOSE_TAG.sub("", cleaned)
-            if cleaned.strip():
-                if cleaned.lower().count("<tr") > 1 and "</tr>" in cleaned.lower():
-                    raw_rows = re.split(r"(?<=</tr>)", cleaned, flags=re.IGNORECASE)
-                    for r in raw_rows:
-                        if r.strip():
-                            items.append((idx, r.strip()))
-                else:
-                    items.append((idx, cleaned.strip()))
+        if not cleaned.strip():
+            continue
+        if cleaned.lower().count("<tr") > 1 and "</tr>" in cleaned.lower():
+            # 行内多 <tr>（含整个表格压缩成单行的 D5 形态）：按 </tr> 边界拆行。
+            # 注：原 v0.7.3 的「单行特例分支」与这里的通用分支输出逐字一致，
+            # 属冗余分支，已删除——金标准测试（tests/test_tables_golden.py）守护。
+            raw_rows = re.split(r"(?<=</tr>)", cleaned, flags=re.IGNORECASE)
+            for r in raw_rows:
+                if r.strip():
+                    items.append((idx, r.strip()))
+        else:
+            items.append((idx, cleaned.strip()))
 
     if not items:
         return [(0, max(0, len(tbl_lines) - 1), ["<table>", "</table>"])]
@@ -249,8 +243,7 @@ def split_table_into_chunks(tbl_lines: list[str], chunk_size: int) -> list[tuple
         current_chars = 0
 
     for line_no, row_str in items:
-        is_continuation = bool(chunks)
-        budget = chunk_size - overhead - (header_overhead if is_continuation else 0)
+        budget = chunk_size - overhead - (header_overhead if chunks else 0)
         budget = max(100, budget)
 
         if len(row_str) <= budget:

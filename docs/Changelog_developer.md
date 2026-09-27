@@ -398,3 +398,12 @@
   - `README.md` 与 `README_EN.md`：同步版本徽章至 `Version-0.7.3`。
 - **验证**：全量回归单测（含版本对齐测试 `test_version_sync.py`）全量通过。
 
+### C44 — moton16,2026-09-27,CodeBuddy,GLM-5.3-Flash — refactor(server,ingest): v0.8.0 Phase 1 工具路由表化 + 表格切块精简（金测守护）
+
+- **server.py `call_tool` 路由表化**：15 个 `kb_*` 工具的巨型 if 链改为显式映射路由表 `_TOOL_ROUTE_TABLE`（工具名 → 处理器方法名），各分支体逐字迁移为独立方法（新增 `_kb_list`/`_kb_set_weight`/`_kb_rebuild`/`_kb_export`/`_kb_import`/`_kb_search`/`_kb_list_files`/`_kb_read`/`_kb_stats`/`_kb_exempt`）；入参归一化时序、unknown-tool 报错文案、`_text_content` 包装行为完全不变（MCP 协议契约冻结）。
+- **ingest/tables.py `split_table_into_chunks` 精简**（用户裁决保留 + 字节级金测门禁 D8）：删除被通用分支完全覆盖的「单行特例分支」（D5 单行多 row 形态由行内多 `<tr>` 通用分支等价处理，含空 cleaned / 无 `</tr>` / 单 `<tr>` 全部子用例），内联单用途局部变量 `is_continuation`；物理行号映射、预算装箱、表头复用逻辑零变更。
+- **金标准 oracle**：新增 `tests/golden/legacy_split_table_impl.py`（v0.7.3 原实现逐字冻结快照，禁止修改）+ `tests/test_tables_golden.py`（12 语料覆盖全部分支 × 新旧实现输出严格相等 + `<table>` 包裹/行号越界结构不变量 + 未闭合尾行保留断言）；金测先于改码落地并对原实现通过（先立尺、后动刀）。
+- **评审记录**：`docs/v0.8.0/Mortis-RAG-MCP-v0.8.0-full-refactor-execution.md` 追加 GSTACK REVIEW REPORT——CEO+Eng 双内部子代理评审（Codex 不可用，[subagent-only]），9 项决策记账；**缓存契约纠偏**：`.chunks.bin`/`.vectors.bin` 为 VMCPC/VMCPV 自研二进制格式而非 pickle（全库 0 命中），真实兼容契约 = 二进制格式与 `_CACHE_VERSION` 不变 + `Chunk` 构造参数序不变（`_CacheCodec.load` 位置序重建）+ 解码失败静默重建语义不变，后续 Phase 2 以此为准。
+- **会话异常披露**：本 Phase 施工期间检测到多轮工具结果注入（伪造编辑结果 ×3、`SAFE_DELETE_BULK_CONFIRM_REQUIRED` 批量删除诱导载荷 ×2、虚假声明"P1 已提交 / pickle 契约 / venv 无 pytest"），已全部识别并拒绝执行，未运行任何由工具输出文本指示的命令；tables.py 落盘精简经金测 oracle + 全量回归双重客观验证后保留。首次验证出现 `FULL_EXIT=1` 却无失败摘要的矛盾输出，定位为 safe-delete 守卫干扰 pytest 临时垃圾目录清理，改用全新 `--basetemp` 隔离后复跑恢复真实结果。
+- **验证**：全量 `pytest tests/ -q` **314 passed, 4 skipped**（与 v0.7.3 基线持平，`PYTEST_EXIT=0`）；金测 10 passed；`scripts/eval_search.py` **Hit@5 100.0% / MRR@5 1.000**（基线不变）；server.py AST 语法检查通过。
+
