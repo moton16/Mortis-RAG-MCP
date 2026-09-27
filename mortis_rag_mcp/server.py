@@ -15,6 +15,7 @@ from typing import Any
 from .config import load_config, resolve_config_path
 from .indexer import Chunk, MarkdownIndexer, SearchFilter, dedupe_by_content_hash, rerank_chunks
 from .ingest import IngestManager, INGEST_EXTS
+from ._server import dispatch_search as _dispatch_search, fanout_search as _fanout_search_impl
 from .registry import VaultEntry, VaultRegistry, normalize_vault_key, registry_path
 
 SERVER_INFO = {"name": "mortis-rag-mcp", "version": "0.7.3", "title": "Mortis'RAG MCP"}
@@ -801,177 +802,17 @@ class VaultMcpServer:
         target_vaults: list[str] | None = None,
         preview: bool = False,
     ) -> dict[str, Any]:
-        """Search across registered vaults (either globally or scoped to target_vaults), merge and rerank once.
-
-        group_by_vault=True 时返回按库分组的结果（每组 top_k 条），否则平铺返回。
-        filters 的过滤条件对每个库分别生效，分页（offset/limit）只在最后合并
-        排序后的全局结果上做一次——否则各库各翻一页，合并出来的顺序没有意义。
-        """
-        per_vault_k = max(top_k, 20)
-        # 单库检索只吃过滤条件，不吃分页：分页留到全局合并之后。
-        per_vault_filters: SearchFilter | None = None
-        if filters is not None:
-            per_vault_filters = SearchFilter(
-                path_prefix=filters.path_prefix,
-                tags=filters.tags,
-                mtime_after=filters.mtime_after,
-                mtime_before=filters.mtime_before,
-            )
-        all_entries = self.registry.load()
-        vault_name_map = {entry.path: entry.name for entry in all_entries}
-
-        target_keys: set[str] | None = None
-        if target_vaults is not None and len(target_vaults) > 0:
-            target_keys = {normalize_vault_key(self._resolve_vault_path(t)) for t in target_vaults}
-
-        entries: list[VaultEntry] = []
-        excluded_solo: list[str] = []
-
-        for entry in all_entries:
-            if not Path(entry.path).is_dir():
-                continue
-            entry_key = normalize_vault_key(entry.path)
-            if target_keys is not None:
-                # 定向多库检索（Scoped Multi-Vault）：显式包含的 solo 库允许合法参与检索
-                if entry_key in target_keys:
-                    entries.append(entry)
-            else:
-                # 全局盲搜：跳过所有 solo 库并汇报
-                if entry.solo:
-                    excluded_solo.append(entry.path)
-                else:
-                    entries.append(entry)
-
-        if not entries:
-            if target_keys is not None:
-                raise ValueError(f"none of the requested vaults could be searched: {target_vaults}")
-            if excluded_solo and len(excluded_solo) == len(all_entries):
-                raise ValueError(
-                    "no searchable vaults: all registered vaults are solo (excluded from global search); "
-                    "pass an explicit vault_path or vault_paths to search"
-                )
-            raise ValueError("no readable registered vaults; call kb_init first")
-        merged: list[tuple[VaultEntry, Chunk]] = []
-        searched: list[str] = []
-        errors: dict[str, str] = {}
-
-        # Embed the query exactly once for the whole fan-out.
-        query_vector = None
-        if self.config.embedding.mode == "external":
-            try:
-                first = self._indexer_for({"vault_path": entries[0].path})
-                query_vector = first.embedding_provider.embed([query])[0]
-            except Exception as exc:
-                errors["_query_embedding"] = str(exc)
-
-        for entry in entries:
-            try:
-                indexer = self._indexer_for({"vault_path": entry.path})
-                sync_ok = indexer.try_sync_with_guard(timeout=1.5)
-                if not sync_ok and len(indexer._chunks) == 0:
-                    errors[entry.path] = "indexing in progress"
-                    continue
-                chunks = indexer.search(query, per_vault_k, False, query_vector=query_vector, filters=per_vault_filters, dedupe=dedupe)
-                for chunk in chunks:
-                    merged.append((entry, chunk))
-                searched.append(entry.path)
-            except Exception as exc:
-                errors[entry.path] = str(exc)
-
-        # 库级权重：分数乘以该库 weight 后再参与全局排序。
-        # 使用 replace 生成打分副本，避免污染 indexer 内存常驻对象。
-        merged = [
-            (entry, replace(chunk, score=chunk.score * entry.weight))
-            for entry, chunk in merged
-        ]
-
-        merged.sort(key=lambda pair: (-pair[1].score, pair[1].source, pair[1].metadata["chunk_index"]))
-        pairs = merged
-        # 跨库再去重一次：同一份内容可能躺在两个库里（比如一个库是另一个的备份）。
-        if dedupe:
-            pairs = dedupe_by_content_hash(pairs, chunk_of=lambda pair: pair[1])
-        if use_rerank and merged:
-            provider = None
-            for indexer in list(self._indexers.values()):
-                if indexer.reranker_provider is not None:
-                    provider = indexer.reranker_provider
-                    break
-            if provider is not None:
-                # rerank 的候选池必须来自去重+加权后的 pairs，而不是未去重的
-                # merged：否则 449-472 行的去重被这条路径整体撤销（默认
-                # use_rerank=True 时两个卖点在默认路径上互相抵消）。
-                pool = [chunk for _, chunk in pairs]
-                reranked = rerank_chunks(query, pool, provider, cap=self.config.rerank_cap)
-                origin_map: dict[str, list[VaultEntry]] = {}
-                for entry, chunk in pairs:
-                    origin_map.setdefault(chunk.id, []).append(entry)
-                new_pairs = []
-                for chunk in reranked:
-                    entries = origin_map.get(chunk.id)
-                    if entries:
-                        new_pairs.append((entries.pop(0), chunk))
-                    elif pairs:
-                        new_pairs.append((pairs[0][0], chunk))
-                pairs = new_pairs
-                # rerank 覆盖了 chunk.score，把库级权重乘回去，否则 465-466 行
-                # 的加权在这条路径上失效。
-                pairs = [
-                    (entry, replace(chunk, score=chunk.score * entry.weight))
-                    for entry, chunk in pairs
-                ]
-
-        if filters is not None:
-            start, end = filters.page_slice(top_k)
-        else:
-            start, end = 0, max(0, top_k)
-
-        query_tokens = _tokenize_query(query)
-        if group_by_vault:
-            # 分组模式：保持融合后的组内顺序，按库切桶；组顺序取各组最高分降序。
-            # 分页在这里是"每组各翻一页"——全局先切一刀会让低分库整组消失，
-            # 那不是分组检索要的语义。offset/limit 缺省时等价于原来的 top_k 截断。
-            buckets: dict[str, dict[str, Any]] = {}
-            for entry, chunk in pairs:
-                group = buckets.get(entry.path)
-                if group is None:
-                    group = {"vault": entry.path, "vault_name": entry.name, "chunks": []}
-                    buckets[entry.path] = group
-                data = chunk.to_dict(preview=preview, query_tokens=query_tokens)
-                data["vault"] = entry.path
-                data["vault_name"] = entry.name
-                group["chunks"].append(data)
-            for group in buckets.values():
-                group["chunks"] = group["chunks"][start:end]
-            # 切片后桶可能空了，直接丢掉（max 不接受空序列）。
-            groups = sorted(
-                (group for group in buckets.values() if group["chunks"]),
-                key=lambda group: -max(chunk["score"] for chunk in group["chunks"]),
-            )
-            res: dict[str, Any] = {"groups": groups, "searched": searched, "errors": errors, "excluded_solo": excluded_solo}
-            if len(searched) > 1 and not target_vaults:
-                names = [vault_name_map.get(s, Path(s).name) for s in searched]
-                res["hint"] = (
-                    f"本次检索横跨 {len(searched)} 个库：{names}。若用户问题指向特定库或目录，"
-                    "下次请传 vault_path 或 path_prefix 定向检索，精度更高、噪音更少。"
-                )
-            return res
-
-        pairs = pairs[start:end]
-
-        out_chunks = []
-        for entry, chunk in pairs:
-            data = chunk.to_dict(preview=preview, query_tokens=query_tokens)
-            data["vault"] = entry.path
-            data["vault_name"] = entry.name
-            out_chunks.append(data)
-        res = {"chunks": out_chunks, "searched": searched, "errors": errors, "excluded_solo": excluded_solo}
-        if len(searched) > 1 and not target_vaults:
-            names = [vault_name_map.get(s, Path(s).name) for s in searched]
-            res["hint"] = (
-                f"本次检索横跨 {len(searched)} 个库：{names}。若用户问题指向特定库或目录，"
-                "下次请传 vault_path 或 path_prefix 定向检索，精度更高、噪音更少。"
-            )
-        return res
+        return _fanout_search_impl(
+            self,
+            query=query,
+            top_k=top_k,
+            use_rerank=use_rerank,
+            group_by_vault=group_by_vault,
+            filters=filters,
+            dedupe=dedupe,
+            target_vaults=target_vaults,
+            preview=preview,
+        )
 
     # v0.8.0 Phase 1：call_tool 由巨型 if 链改为显式路由表（15 个 kb_* 工具 → 处理方法）。
     # 工具名、参数语义、返回结构与 unknown-tool 报错行为完全不变（MCP 协议契约）。
@@ -1060,81 +901,7 @@ class VaultMcpServer:
             force = force.strip().lower() in {"1", "true", "yes", "on"}
         return indexer.import_snapshot(snapshot, force=bool(force))
     def _kb_search(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        targets = self._parse_vault_targets(arguments)
-        query = str(arguments.get("query", ""))
-        top_k = _parse_top_k(arguments.get("top_k", 10), self.config.max_top_k)
-        use_rerank = arguments.get("use_rerank", True)
-        if isinstance(use_rerank, str):
-            use_rerank = use_rerank.strip().lower() in {"1", "true", "yes", "on"}
-        group_by_vault = arguments.get("group_by_vault", False)
-        if isinstance(group_by_vault, str):
-            group_by_vault = group_by_vault.strip().lower() in {"1", "true", "yes", "on"}
-        dedupe = arguments.get("dedupe", True)
-        if isinstance(dedupe, str):
-            dedupe = dedupe.strip().lower() not in {"0", "false", "no", "off"}
-        preview_val = arguments.get("preview", False)
-        if isinstance(preview_val, str):
-            preview = preview_val.strip().lower() in {"1", "true", "yes", "on"}
-        else:
-            preview = bool(preview_val)
-        if arguments.get("mode") == "preview":
-            preview = True
-
-        search_filters = _search_filter(arguments, self.config.max_top_k)
-        query_tokens = _tokenize_query(query)
-
-        # 单库检索通道（传入单个目标）
-        if len(targets) == 1:
-            resolved_single = self._resolve_vault_path(targets[0])
-            indexer = self._indexer_for({"vault_path": resolved_single})
-            sync_ok = indexer.try_sync_with_guard(timeout=1.5)
-            if not sync_ok and len(indexer._chunks) == 0:
-                return {
-                    "status": "indexing",
-                    "message": "知识库正在后台进行首次初始化构建与嵌入计算，请稍候...",
-                    "progress": indexer._sync_progress,
-                    "retry_after": 3,
-                    "chunks": [],
-                }
-            results = indexer.search(query, top_k, bool(use_rerank), filters=search_filters, dedupe=bool(dedupe))
-            res_dict: dict[str, Any] = {"chunks": [chunk.to_dict(preview=preview, query_tokens=query_tokens) for chunk in results]}
-            if not sync_ok:
-                res_dict["indexing_in_progress"] = True
-                res_dict["indexing_progress"] = indexer._sync_progress
-            return res_dict
-
-        # 未指定目标时的默认单库处理
-        if not targets:
-            entries = self.registry.load()
-            if len(entries) == 1 and entries[0].solo:
-                raise ValueError(
-                    f"vault '{entries[0].name}' is solo (excluded from global search); "
-                    "pass an explicit vault_path to search it"
-                )
-            if len(entries) == 1:
-                indexer = self._indexer_for({"vault_path": entries[0].path})
-                sync_ok = indexer.try_sync_with_guard(timeout=1.5)
-                if not sync_ok and len(indexer._chunks) == 0:
-                    return {
-                        "status": "indexing",
-                        "message": "知识库正在后台进行首次初始化构建与嵌入计算，请稍候...",
-                        "progress": indexer._sync_progress,
-                        "retry_after": 3,
-                        "chunks": [],
-                    }
-                results = indexer.search(query, top_k, bool(use_rerank), filters=search_filters, dedupe=bool(dedupe))
-                res_dict = {"chunks": [chunk.to_dict(preview=preview, query_tokens=query_tokens) for chunk in results]}
-                if not sync_ok:
-                    res_dict["indexing_in_progress"] = True
-                    res_dict["indexing_progress"] = indexer._sync_progress
-                return res_dict
-
-        # 跨库检索（Scoped 定向多库 或 全局盲搜）
-        return self._fanout_search(
-            query, top_k, bool(use_rerank), bool(group_by_vault), search_filters, bool(dedupe),
-            target_vaults=targets if targets else None,
-            preview=preview,
-        )
+        return _dispatch_search(self, arguments)
 
     def _kb_list_files(self, arguments: dict[str, Any]) -> dict[str, Any]:
         indexer = self._indexer_for(arguments)
