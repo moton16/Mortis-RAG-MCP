@@ -419,3 +419,12 @@
 - **手术安全**：机械切除脚本带 **25 项边界锚点断言**（任何一行与读取快照不符即中止，杜绝静默错切），切除后 AST 语法检查通过；`models.py` 内容抽验与迁移源逐字一致。
 - **验证**：全量 `pytest tests/ -q` **320 passed, 4 skipped**（基线 314 + 新增 6，`FULL_EXIT=0`）；`scripts/eval_search.py` **Hit@5 100.0% / MRR@5 1.000**（基线不变）；金测快照 5 文件 11 chunks 与改造前逐字一致。
 
+### C46 — moton16,2026-09-27,CodeBuddy,GLM-5.3-Flash — refactor(indexer): v0.8.0 P3a 提取 _indexer/scanning（monkeypatch 接缝保持）
+
+- **`_indexer/scanning.py` 落地**：`IgnoreMatcher` / `_probe_mtime_tick_ns` / Fast-Stat 常量块（margin/tick/future 三组及论证注释）+ `scandir_indexable_files` / `ignored_name` / `source_rel` 纯函数（`_markdown_files` 逻辑逐字迁移，`_INDEXABLE_TEXT_EXTS` 以参数注入避免反向依赖）。
+- **indexer.py 3127 → 2975**：断言锚点式切除（18 项边界断言）；原位插入 **Facade 包装函数** `_probe_mtime_tick_ns`（D2 决策：包装是**唯一调用路径**，测试补丁 `indexer._probe_mtime_tick_ns` 在调用时被 `_finalize_mtime_tick_probe` 解析观察到）+ `_markdown_files`/`_ignored_name`/`_source` 薄委托方法。
+- **判据族留守 Facade**（Eng 协议）：`_effective_margin_ns`/`_finalize_mtime_tick_probe`/`_record_confirmation`/`_note_fast_path_warning`/`_fast_path_is_trustworthy` 操作实例状态（`_stat_seen_ns`/`_stat_confirmations`）且为 `test_indexer.py` 实例级锚点；常量经 re-export 保持 `from mortis_rag_mcp.indexer import _FUTURE_MTIME_RECHECK_LIMIT` 兼容。
+- **接缝回归测试** `tests/test_facade_seam.py` ×2：① 补丁 Facade 模块属性 → sync 全流程中探测调用路径观察到补丁（2s 粗刻度 → `_fast_path_disabled_reason` fail-closed 触发断言，杜绝 vacuous pass）；② 未补丁时包装委托 scanning 真实实现（gcd 语义断言）。
+- **自查修复**：scanning.py 补 `import math`（迁移函数体引用 `math.gcd`，导入区为新写而非迁移，初版遗漏）。
+- **验证**：全量 **322 passed, 4 skipped**（314 基线 + 6 P2 + 2 接缝，`PYTEST_EXIT=0`）；eval **Hit@5 100.0% / MRR@5 1.000**（基线不变）；切除行数算术闭合（3127 − 171 切 + 19 插桩 = 2975）。
+
