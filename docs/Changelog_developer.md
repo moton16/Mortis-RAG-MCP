@@ -322,5 +322,25 @@
 >   - 新增 `tests/test_search_oracle.py`（9 个测试：常驻 Chunk `score` 原地不修改断言、SearchEngine 与 Facade 产物 `(id, score, source)` 严格恒等、server 端到端委托校验、向后兼容静态方法测试）。
 > - **验证**：全量单测增至 **338 passed, 4 skipped**（基线 329 + 9 P4 专项，`PYTEST_EXIT=0`）；eval **Hit@5 100.0% / MRR@5 1.000**；金测 `test_golden_v073.py` 严格相等。
 
+### C50 — moton16,2026-09-27,Antigravity,Gemini 3.8 Flash — refactor(indexer): v0.8.0 Phase 5 提取 _indexer/snapshot + exemptions + watch（生命周期解耦与死代码清理）
+> **代码改动概况**：
+> - `mortis_rag_mcp/_indexer/snapshot.py` 落地：
+>   - 搬迁快照打包与恢复引擎：`export_snapshot`、`_export_snapshot_locked`、`import_snapshot`、`_import_snapshot_locked`、`_import_chunks_member`、`_import_vectors_bin_member`、`_import_vectors_sqlite_member`、`_decode_member`、`_replace_live_file`、`_recreate_fts`；
+>   - 常量与安全门禁：`_SNAPSHOT_FORMAT`、`_SNAPSHOT_VERSION`、`_SNAPSHOT_MEMBERS` 白名单精确匹配（天然防御 Zip Slip 穿越）、解压炸弹与压缩比上限拦截、SQLite 向量后端异常安全回滚。
+> - `mortis_rag_mcp/_indexer/exemptions.py` 落地：
+>   - 搬迁豁免规则管理：`iter_vault_text_files`、`get_exemptions`、`_prune_ignored_sources`、`add_exemption_pattern`（唯一活版本）、`remove_exemption_pattern`、`check_exemption`、`set_file_exemption`；
+>   - 状态联动清理：集中清理 `_chunks`、`_signatures`、`_stat_cache`、`_stat_seen_ns`、`_stat_confirmations`、`fast_path_warnings`、FTS、向量记录及 `failed_files`；
+>   - 剔除历史遗留缺陷：彻底删除原 `indexer.py:1120` 无 return 的死代码版 `add_exemption_pattern`，锁定返回 dict（含 `sync: background`）活版本契约。
+> - `mortis_rag_mcp/_indexer/watch.py` 落地：
+>   - 搬迁目录事件监听与防抖调度控制器：`start_watching`、`stop_watching`、`_start_fs_scheduler`、`_fs_scheduler_loop`、`_on_fs_events`、`_fs_event_matters`、`_run_sync_quietly`、`_native_watch_loop`、`_watch_loop`、`_quick_signatures`；
+>   - 调度常驻与线程名契约：保持 "vault-watch-native"、"vault-fs-debounce"、"exempt-sync" 线程名不变；优雅停启无孤儿线程残留。
+> - `mortis_rag_mcp/indexer.py` 终极瘦身：
+>   - 行数由 2035 行降至 1238 行（净减 797 行，累计较 v0.7.3 3487 行降低 64.5%）；
+>   - 原位保留薄委托方法与常量 re-export，保留线程名契约锚点。
+> - 生命周期专项回归测试：
+>   - 新增 `tests/test_p5_lifecycle.py`（3 个测试：快照导入 Zip Slip 路径穿越白名单拦截、豁免增删返回值契约与 8 项状态级联清理、Watcher 启动与优雅停启无孤儿线程）。
+> - **验证**：全量单测增至 **341 passed, 4 skipped**（基线 338 + 3 P5 专项，`PYTEST_EXIT=0`）；eval **Hit@5 100.0% / MRR@5 1.000**；金测 `test_golden_v073.py` 与缓存 roundtrip 严格恒等。
+
+
 
 

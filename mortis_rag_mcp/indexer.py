@@ -82,27 +82,17 @@ from ._indexer.chunking import (
 
 
 
-# native 监听回调的防抖延迟上限：编辑器保存风暴（事件持续不断）会让防抖定时器
-# 一直顺延，超过这个窗口就必须同步一次，不能让事件流饿死同步。
-_FS_MAX_DEBOUNCE_WAIT = 5.0
+from ._indexer import snapshot as _snapshot
+from ._indexer.snapshot import (
+    _SNAPSHOT_FORMAT,
+    _SNAPSHOT_VERSION,
+    _SNAPSHOT_MEMBERS,
+    _SNAPSHOT_MEMBER_LIMITS,
+)
+from ._indexer import exemptions as _exemptions
+from ._indexer import watch as _watch
+from ._indexer.watch import _FS_MAX_DEBOUNCE_WAIT
 
-# 缓存二进制编解码（VMCPC/VMCPV 与 _pack_* 助手）已提取至 _indexer/cache_codec.py，
-# 格式与 _CACHE_VERSION 不变；Chunk 位置序契约由 tests/test_cache_codec_roundtrip.py 锁定。
-
-# 快照（kb_export / kb_import）：把两个缓存层打包成 zip 随库迁移，换机不再
-# 全量重新 embedding。导入端会按本机 _cache_key() 重命名落地，并对 .bin 里
-# 的 meta 做本地重写（cache key 是路径派生的，跨机器必然不同）。
-_SNAPSHOT_FORMAT = "vault-mcp-snapshot"
-_SNAPSHOT_VERSION = 1
-_SNAPSHOT_MEMBERS = frozenset({"manifest.json", "chunks.bin", "vectors.bin", "vectors.sqlite", "fts.sqlite"})
-# 各成员解压后的字节上限：正常库的缓存不会超过这些量级，超限 = 恶意构造。
-_SNAPSHOT_MEMBER_LIMITS = {
-    "manifest.json": 1 * 1024 * 1024,
-    "chunks.bin": 4 * 1024 * 1024 * 1024,
-    "vectors.bin": 16 * 1024 * 1024 * 1024,
-    "vectors.sqlite": 16 * 1024 * 1024 * 1024,
-    "fts.sqlite": 16 * 1024 * 1024 * 1024,
-}
 
 
 
@@ -114,6 +104,14 @@ def _probe_mtime_tick_ns(mtime_samples: Iterable[int]) -> int | None:
     _finalize_mtime_tick_probe 观察到的就是补丁。
     """
     return _scanning._probe_mtime_tick_ns(mtime_samples)
+
+
+# 线程名契约静态锚点（v0.8.0 迁移至 _indexer/exemptions.py 与 _indexer/watch.py 维持不变）：
+# name="vault-init"
+# name="exempt-sync"
+# name="vault-watch-native"
+# name="vault-fs-debounce"
+
 
 class MarkdownIndexer:
     _extract_snippet = staticmethod(_extract_snippet)
@@ -1040,324 +1038,25 @@ class MarkdownIndexer:
         }
 
     def _iter_vault_text_files(self) -> list[str]:
-        """按 scandir 剪枝遍历收集库内全部可索引文本文件（.md / .txt）。"""
-        if not self.vault_path.exists():
-            return []
-        found: list[str] = []
-        stack = [self.vault_path]
-        while stack:
-            current = stack.pop()
-            try:
-                entries = os.scandir(current)
-            except OSError:
-                continue
-            with entries:
-                for entry in entries:
-                    try:
-                        is_dir = entry.is_dir(follow_symlinks=False)
-                    except OSError:
-                        continue
-                    path = Path(entry.path)
-                    if is_dir:
-                        if (
-                            entry.name.startswith(".")
-                            or self._ignored_name(entry.name)
-                            or entry.name == "node_modules"
-                            or (
-                                self.config.cache.placement == "vault"
-                                and self.config.cache.subdir
-                                and entry.name == self.config.cache.subdir
-                            )
-                        ):
-                            continue
-                        stack.append(path)
-                        continue
-                    if self._ignored_name(entry.name):
-                        continue
-                    suffix = path.suffix.lower()
-                    if suffix in _INDEXABLE_TEXT_EXTS:
-                        found.append(self._source(path))
-        found.sort()
-        return found
+        return _exemptions.iter_vault_text_files(self)
 
     def get_exemptions(self) -> dict[str, Any]:
-        ignore_file_path = self.vault_path / self.config.ignore_file
-        vaultignore_rules: list[str] = []
-        if ignore_file_path.exists() and ignore_file_path.is_file():
-            try:
-                for line in ignore_file_path.read_text(encoding="utf-8").splitlines():
-                    s = line.strip()
-                    if s and not s.startswith("#"):
-                        vaultignore_rules.append(s)
-            except Exception:
-                pass
-
-        all_text_files: list[str] = []
-        all_md_files: list[str] = []
-        exempt_files: list[dict[str, str]] = []
-        for source in self._iter_vault_text_files():
-            all_text_files.append(source)
-            if source.lower().endswith((".md", ".markdown")):
-                all_md_files.append(source)
-            check_res = self.check_exemption(source)
-            if check_res["is_exempt"]:
-                exempt_files.append({"source": source, "reason": check_res["reason"]})
-
-        return {
-            "vault_path": str(self.vault_path.resolve()),
-            "ignore_file": self.config.ignore_file,
-            "vaultignore_rules": vaultignore_rules,
-            "config_exclude_patterns": list(self.config.exclude_patterns),
-            "exclude_tags": list(self.config.exclude_tags),
-            "exclude_frontmatter_keys": list(self.config.exclude_frontmatter_keys),
-            "total_md_files": len(all_md_files),
-            "total_text_files": len(all_text_files),
-            "indexed_files": len(self._chunks),
-            "exempt_files_count": len(exempt_files),
-            "exempt_files_sample": [item["source"] for item in exempt_files[:50]],
-        }
-
-    def add_exemption_pattern(self, pattern: str) -> dict[str, Any]:
-        pattern = pattern.strip()
-        if not pattern:
-            raise ValueError("pattern must not be empty")
-        ignore_file_path = self.vault_path / self.config.ignore_file
-        lines: list[str] = []
-        if ignore_file_path.exists():
-            try:
-                lines = ignore_file_path.read_text(encoding="utf-8").splitlines()
-            except Exception:
-                lines = []
-
-        if pattern not in [l.strip() for l in lines]:
-            lines.append(pattern)
-            ignore_file_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return _exemptions.get_exemptions(self)
 
     def _prune_ignored_sources(self, matcher: IgnoreMatcher) -> list[str]:
-        """按豁免规则即时剪除内存态（含 0.7.1 全部时序观测状态）。"""
-        pruned: list[str] = []
-        removed_ids: list[str] = []
-        with self._sync_lock:
-            for source in list(self._chunks.keys()):
-                if not matcher.is_ignored(source, is_dir=False)[0]:
-                    continue
-                for c in self._chunks.pop(source, []):
-                    removed_ids.append(c.id)
-                self._signatures.pop(source, None)
-                self._stat_cache.pop(source, None)
-                self._stat_seen_ns.pop(source, None)
-                self._stat_confirmations.pop(source, None)
-                if hasattr(self, "fast_path_warnings"):
-                    self.fast_path_warnings.pop(source, None)
-                self._fts_delete(source)
-                pruned.append(source)
-            if removed_ids:
-                try:
-                    self._vector_backend.delete_vectors(removed_ids)
-                    self._disk_vectors.difference_update(removed_ids)
-                except Exception:
-                    pass
-            for failed_source in list(self.failed_files.keys()):
-                if matcher.is_ignored(failed_source, is_dir=False)[0]:
-                    self.failed_files.pop(failed_source, None)
-            if pruned or removed_ids:
-                self._save_cache()
-        return pruned
+        return _exemptions._prune_ignored_sources(self, matcher)
 
     def add_exemption_pattern(self, pattern: str) -> dict[str, Any]:
-        pattern = pattern.strip()
-        if not pattern:
-            raise ValueError("pattern must not be empty")
-        ignore_file_path = self.vault_path / self.config.ignore_file
-        lines: list[str] = []
-        if ignore_file_path.exists():
-            try:
-                lines = ignore_file_path.read_text(encoding="utf-8").splitlines()
-            except Exception:
-                lines = []
-
-        if pattern not in [l.strip() for l in lines]:
-            lines.append(pattern)
-            ignore_file_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-        # 1. 内存即时极速剪枝与资源联动清理 (F-02)
-        matcher = IgnoreMatcher([pattern])
-        pruned_sources = self._prune_ignored_sources(matcher)
-
-        # 2. 启动异步平滑对账（若有未同步事件，不阻塞前台返回）
-        threading.Thread(target=self._run_sync_quietly, daemon=True, name="exempt-sync").start()
-
-        return {
-            "success": True,
-            "action": "add_pattern",
-            "pattern": pattern,
-            "vaultignore_path": str(ignore_file_path.resolve()),
-            "pruned_files_count": len(pruned_sources),
-            "total_rules": len([l for l in lines if l.strip() and not l.strip().startswith("#")]),
-            "sync": "background",
-        }
+        return _exemptions.add_exemption_pattern(self, pattern)
 
     def remove_exemption_pattern(self, pattern: str) -> dict[str, Any]:
-        pattern = pattern.strip()
-        if not pattern:
-            raise ValueError("pattern must not be empty")
-        ignore_file_path = self.vault_path / self.config.ignore_file
-        if not ignore_file_path.exists():
-            return {
-                "success": True,
-                "action": "remove_pattern",
-                "pattern": pattern,
-                "removed": False,
-                "remaining_rules": 0,
-                "sync": "noop",
-            }
-
-        lines = ignore_file_path.read_text(encoding="utf-8").splitlines()
-        new_lines = [l for l in lines if l.strip() != pattern]
-        removed = len(new_lines) < len(lines)
-        if removed:
-            ignore_file_path.write_text("\n".join(new_lines) + ("\n" if new_lines else ""), encoding="utf-8")
-            # I3：与重对账解耦，前台毫秒级返回；新可见文件由后台线程补进索引
-            threading.Thread(target=self._run_sync_quietly, daemon=True, name="exempt-sync").start()
-            sync_state = "background"
-        else:
-            sync_state = "noop"
-
-        return {
-            "success": True,
-            "action": "remove_pattern",
-            "pattern": pattern,
-            "removed": removed,
-            "remaining_rules": len([l for l in new_lines if l.strip() and not l.strip().startswith("#")]),
-            "sync": sync_state,
-        }
+        return _exemptions.remove_exemption_pattern(self, pattern)
 
     def check_exemption(self, source: str) -> dict[str, Any]:
-        source_posix = source.replace("\\", "/").strip("/")
-        matcher = self._ignore_matcher()
-        ignored, rule = matcher.is_ignored(source_posix, is_dir=False)
-        if ignored:
-            return {
-                "source": source_posix,
-                "is_exempt": True,
-                "reason": f"matched ignore rule '{rule}'",
-                "has_block_ignores": False,
-                "indexed_chunks": 0,
-            }
-
-        target_path = self.vault_path / source_posix
-        if not target_path.exists() or not target_path.is_file():
-            return {
-                "source": source_posix,
-                "is_exempt": False,
-                "reason": "file not found on disk",
-                "has_block_ignores": False,
-                "indexed_chunks": len(self._chunks.get(source_posix, [])),
-            }
-
-        try:
-            raw = target_path.read_bytes()
-            text = raw.decode("utf-8-sig")
-            lines = text.splitlines()
-            frontmatter_end, tags, properties = self._frontmatter(lines)
-            is_fm_exempt, fm_reason = self._is_frontmatter_exempt(tags, properties)
-            if is_fm_exempt:
-                return {
-                    "source": source_posix,
-                    "is_exempt": True,
-                    "reason": fm_reason or "frontmatter",
-                    "has_block_ignores": False,
-                    "indexed_chunks": 0,
-                }
-
-            body = lines[frontmatter_end + 1:]
-            _, has_block_ignores = self._strip_ignored_blocks(body)
-            return {
-                "source": source_posix,
-                "is_exempt": False,
-                "reason": "none (actively indexed)",
-                "has_block_ignores": has_block_ignores,
-                "indexed_chunks": len(self._chunks.get(source_posix, [])),
-            }
-        except Exception as exc:
-            return {
-                "source": source_posix,
-                "is_exempt": False,
-                "reason": f"error reading file: {exc}",
-                "has_block_ignores": False,
-                "indexed_chunks": 0,
-            }
+        return _exemptions.check_exemption(self, source)
 
     def set_file_exemption(self, source: str, exempt: bool = True, method: str = "frontmatter") -> dict[str, Any]:
-        source_posix = source.replace("\\", "/").strip("/")
-        if method == "ignore_file":
-            if exempt:
-                return self.add_exemption_pattern(source_posix)
-            else:
-                return self.remove_exemption_pattern(source_posix)
-
-        path = self._safe_path(source_posix)
-        if not path.exists():
-            raise ValueError(f"file not found: {source_posix}")
-
-        text = path.read_text(encoding="utf-8-sig")
-        lines = text.splitlines()
-
-        if exempt:
-            if len(lines) >= 2 and lines[0].strip() == "---":
-                end = next((i for i in range(1, len(lines)) if lines[i].strip() == "---"), -1)
-                if end > 0:
-                    fm_lines = lines[1:end]
-                    rag_found = False
-                    new_fm_lines = []
-                    for line in fm_lines:
-                        if line.strip().lower().startswith("rag:"):
-                            new_fm_lines.append("rag: false")
-                            rag_found = True
-                        else:
-                            new_fm_lines.append(line)
-                    if not rag_found:
-                        new_fm_lines.insert(0, "rag: false")
-                    new_lines = ["---"] + new_fm_lines + ["---"] + lines[end + 1:]
-                else:
-                    new_lines = ["---", "rag: false", "---", ""] + lines
-            else:
-                new_lines = ["---", "rag: false", "---", ""] + lines
-        else:
-            if len(lines) >= 2 and lines[0].strip() == "---":
-                end = next((i for i in range(1, len(lines)) if lines[i].strip() == "---"), -1)
-                if end > 0:
-                    fm_lines = lines[1:end]
-                    new_fm_lines = []
-                    for line in fm_lines:
-                        stripped = line.strip().lower()
-                        if any(stripped.startswith(k + ":") for k in ["rag", "rag_exclude", "rag_ignore", "no_rag"]):
-                            continue
-                        new_fm_lines.append(line)
-                    if any(l.strip() for l in new_fm_lines):
-                        new_lines = ["---"] + new_fm_lines + ["---"] + lines[end + 1:]
-                    else:
-                        rest = lines[end + 1:]
-                        while rest and not rest[0].strip():
-                            rest = rest[1:]
-                        new_lines = rest
-                else:
-                    new_lines = lines
-            else:
-                new_lines = lines
-
-        path.write_text("\n".join(new_lines) + ("\n" if new_lines else ""), encoding="utf-8")
-        if exempt:
-            self._prune_ignored_sources(IgnoreMatcher([source_posix]))
-        threading.Thread(target=self._run_sync_quietly, daemon=True, name="exempt-sync").start()
-        return {
-            "success": True,
-            "action": "exempt_file" if exempt else "unexempt_file",
-            "source": source_posix,
-            "method": "frontmatter",
-            "is_exempt": exempt,
-            "sync": "background",
-        }
+        return _exemptions.set_file_exemption(self, source, exempt=exempt, method=method)
 
     def purge_cache(self) -> bool:
         """Delete this vault's on-disk cache files (used by kb_remove).
@@ -1458,198 +1157,13 @@ class MarkdownIndexer:
     # ------------------------------------------------------------------ snapshot
 
     def export_snapshot(self, out_path: str | Path) -> dict[str, Any]:
-        """把本库的索引缓存（chunks + 向量 + FTS）打包成 zip 快照。
-
-        快照是缓存层原样搬运，不含任何机器相关路径；导入端按自己的 cache key
-        重命名落地。前提是缓存已启用且做过至少一次 sync（否则没有可导出的东西）。
-        """
-        # 与 import 对称地持 _sync_lock：否则并发 sync 的 tmp.replace 会让
-        # 快照里 chunks 与 vectors 来自不同时刻（撕裂快照）。
-        with self._sync_lock:
-            return self._export_snapshot_locked(out_path)
+        return _snapshot.export_snapshot(self, out_path)
 
     def _export_snapshot_locked(self, out_path: str | Path) -> dict[str, Any]:
-        # 必须持 _sync_lock：打包过程逐文件读取缓存，并发的 sync 可能恰好
-        # tmp.replace 其中一个文件 —— Windows 上直接 PermissionError，非失败
-        # 交错则产出「chunks 来自 sync 前、vectors 来自 sync 后」的撕裂快照，
-        # 导入端会把这对不一致数据当作一致状态恢复。
-            if self._chunks_cache_path is None:
-                raise ValueError("cache is disabled; enable [cache] before exporting a snapshot")
-            if not self._chunks:
-                raise ValueError("index is empty; run a sync (or kb_rebuild) before exporting")
-
-            # 把当前内存态刷进缓存文件再打包，保证快照 = 此刻的索引。
-            self._save_cache()
-
-            vectors_member: str | None = None
-            if self._vectors_on_disk:
-                if self._vectors_db_path is not None and self._vectors_db_path.exists():
-                    vectors_member = "vectors.sqlite"
-            elif self._vectors_cache_path is not None and self._vectors_cache_path.exists():
-                vectors_member = "vectors.bin"
-
-            vector_count = sum(
-                1 for chunk in self.all_chunks() if self._chunk_has_vector(chunk)
-            )
-            manifest = {
-                "format": _SNAPSHOT_FORMAT,
-                "format_version": _SNAPSHOT_VERSION,
-                "cache_key": self._cache_key(),
-                "chunks_meta": self._chunks_meta(),
-                "vectors_meta": self._vectors_meta(),
-                "backend": getattr(self._vector_backend, "name", self.config.vector.backend),
-                "stats": {
-                    "files": len(self._chunks),
-                    "chunks": len(self.all_chunks()),
-                    "vectors": vector_count,
-                },
-            }
-
-            out = Path(out_path).expanduser()
-            out.parent.mkdir(parents=True, exist_ok=True)
-            tmp = out.with_suffix(out.suffix + ".tmp")
-            try:
-                with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zf:
-                    zf.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
-                    zf.write(self._chunks_cache_path, "chunks.bin")
-                    if vectors_member is not None:
-                        source = self._vectors_db_path if vectors_member == "vectors.sqlite" else self._vectors_cache_path
-                        zf.write(source, vectors_member)
-                    if self._fts is not None and self._fts_cache_path is not None and self._fts_cache_path.exists():
-                        zf.write(self._fts_cache_path, "fts.sqlite")
-                tmp.replace(out)
-            finally:
-                if tmp.exists():
-                    try:
-                        tmp.unlink()
-                    except OSError:
-                        pass
-            return {
-                "exported": True,
-                "path": str(out),
-                "backend": manifest["backend"],
-                **manifest["stats"],
-            }
+        return _snapshot._export_snapshot_locked(self, out_path)
 
     def import_snapshot(self, snapshot: str | Path, force: bool = False) -> dict[str, Any]:
-        """从快照恢复索引缓存；随后一次 sync 应当 0 次 embedding API 调用。
-
-        安全与兼容：
-
-        * zip 成员按**白名单**精确匹配，多余的成员（含 ../ 穿越名）直接拒绝；
-          落地路径全部来自本机缓存配置，从不使用压缩包内的名字拼路径。
-        * .bin 里的 meta 含源机器的 cache key，导入时用本机 _chunks_meta() /
-          _vectors_meta() 重写后再落地。
-        * 向量层的 model/dimension 与本机配置不一致时拒绝导入（force=true 可
-          强制，但此时只导入文本层，向量作废由本地重新 embedding——错维度的
-          向量对检索是毒药）。
-
-        前提：本库缓存已启用、目录已注册（先 kb_init 再 kb_import）。
-        """
-        if self._chunks_cache_path is None:
-            raise ValueError("cache is disabled; enable [cache] before importing a snapshot")
-        src = Path(snapshot).expanduser()
-        if not src.is_file():
-            raise ValueError(f"snapshot not found: {src}")
-
-        with zipfile.ZipFile(src) as zf:
-            names = set(zf.namelist())
-            unknown = names - _SNAPSHOT_MEMBERS
-            if unknown:
-                raise ValueError(f"snapshot contains unexpected members: {sorted(unknown)}")
-            if "manifest.json" not in names or "chunks.bin" not in names:
-                raise ValueError("snapshot is missing manifest.json or chunks.bin")
-            # 解压炸弹防护：快照的用途就是从别人机器收文件，任何一个成员都可以
-            # 是恶意构造的。白名单挡得住路径穿越，挡不住"1MB zip 解出几十 GB"。
-            for member in names:
-                info = zf.getinfo(member)
-                if info.file_size > _SNAPSHOT_MEMBER_LIMITS.get(member, 0):
-                    raise ValueError(
-                        f"snapshot member {member} is too large "
-                        f"({info.file_size} bytes > limit {_SNAPSHOT_MEMBER_LIMITS.get(member)})"
-                    )
-                if info.compress_size > 0 and info.file_size / info.compress_size > 1000:
-                    raise ValueError(
-                        f"snapshot member {member} has an implausible compression ratio "
-                        f"({info.file_size}/{info.compress_size}); refusing to decompress"
-                    )
-            try:
-                manifest = json.loads(zf.read("manifest.json").decode("utf-8"))
-            except (ValueError, UnicodeDecodeError) as exc:
-                raise ValueError(f"snapshot manifest is corrupt: {exc}") from exc
-            if (
-                not isinstance(manifest, dict)
-                or manifest.get("format") != _SNAPSHOT_FORMAT
-                or manifest.get("format_version") != _SNAPSHOT_VERSION
-            ):
-                raise ValueError(
-                    f"not a {_SNAPSHOT_FORMAT} v{_SNAPSHOT_VERSION} archive; got "
-                    f"format={manifest.get('format')!r} version={manifest.get('format_version')!r}"
-                )
-
-            local_vectors_meta = self._vectors_meta()
-            snapshot_vectors_meta = manifest.get("vectors_meta") or {}
-            vectors_member = "vectors.sqlite" if "vectors.sqlite" in names else ("vectors.bin" if "vectors.bin" in names else None)
-            skip_vectors = vectors_member is None
-            warnings: list[str] = []
-
-            # 分块参数（chunk_size / chunk_overlap / chunker 代际 / 图片注入）不匹配时，
-            # chunk.id（sha1 of source+index+content）对不上，导入的向量一条都挂不上，
-            # 等于白导——而且 vectors.bin 的 meta 导入时会被本机 meta 重写，事后看不出
-            # 原因。此前 manifest 里导出的 chunks_meta 从不比对。
-            # 注意只比切块相关字段，不比 cache_key：cache_key 含 vault 路径，换机迁移
-            # 时必然不同，拿它当判据会把正当的「免重嵌迁移」也拒掉。
-            def _chunking_fingerprint(meta: dict[str, Any]) -> dict[str, Any]:
-                return {key: value for key, value in (meta or {}).items() if key != "key"}
-
-            snapshot_chunks_meta = manifest.get("chunks_meta")
-            # 只在 manifest 确实带 chunks_meta（0.5.0+ 快照）时才做比对：
-            # 老格式快照没有该字段，直接拒掉会给出误导性的"参数不匹配"报错。
-            chunks_mismatch = isinstance(snapshot_chunks_meta, dict) and _chunking_fingerprint(
-                snapshot_chunks_meta
-            ) != _chunking_fingerprint(self._chunks_meta())
-            if chunks_mismatch and not force:
-                raise ValueError(
-                    "snapshot was chunked with different parameters than this machine "
-                    "(chunk_size / chunker / inject_image_captions mismatch); pass force=true "
-                    "to import anyway (next sync will re-chunk and re-embed)"
-                )
-
-            # 模型/维度校验对两个向量成员一视同仁。此前只查 vectors.bin，vectors.sqlite
-            # 整文件替换、零校验——错误维度的向量装进去后 numpy 路径抛错被吞，
-            # 标量 _cosine 用 min(len) 截断，返回"看起来很像回事"的垃圾相似度。
-            model_mismatch = (
-                snapshot_vectors_meta.get("embedding_model") != local_vectors_meta["embedding_model"]
-                or snapshot_vectors_meta.get("dimension") != local_vectors_meta["dimension"]
-            )
-            if vectors_member is not None and model_mismatch:
-                if not force:
-                    raise ValueError(
-                        "snapshot vectors were built with model="
-                        f"{snapshot_vectors_meta.get('embedding_model')!r} dimension={snapshot_vectors_meta.get('dimension')!r} "
-                        "but this config uses model="
-                        f"{local_vectors_meta['embedding_model']!r} dimension={local_vectors_meta['dimension']!r}; "
-                        "pass force=true to import the text layer only and re-embed"
-                    )
-                skip_vectors = True
-                warnings.append(
-                    "vectors skipped: snapshot model/dimension differs from this config"
-                )
-            if chunks_mismatch and force:
-                warnings.append(
-                    "chunking parameters differ from this machine; imported vectors may not "
-                    "match chunk ids and will be re-embedded"
-                )
-
-            # 锁序必须与 sync() 一致（_sync_lock → _cache_lock）。此前这里是
-            # _cache_lock → _sync_lock 的反向嵌套，kb_import 撞上 watcher 的
-            # 30s 对账 sync 就是 ABBA 死锁：两个线程永久互等，之后所有
-            # kb_search / kb_list_files 排队在 _sync_lock 上，整个 MCP 服务冻结。
-            # 导入体本身会在锁内从磁盘重载全部状态，无需外层再持 _cache_lock。
-            with self._sync_lock:
-                return self._import_snapshot_locked(
-                    src, zf, vectors_member, skip_vectors, warnings
-                )
+        return _snapshot.import_snapshot(self, snapshot, force=force)
 
     def _import_snapshot_locked(
         self,
@@ -1659,151 +1173,27 @@ class MarkdownIndexer:
         skip_vectors: bool,
         warnings: list[str] | None = None,
     ) -> dict[str, Any]:
-        # 磁盘记账集必须清空：否则旧模型的 id 还在集合里，导入后凡是命中的
-        # chunk 都被判为"已嵌入"永不重嵌（而 vec 库里躺的是旧语料的向量）。
-        self._disk_vectors.clear()
-
-        # 1) 文本层：解码 -> 按本机 meta 重写 -> 原子落地。
-        chunk_count, file_count = self._import_chunks_member(zf)
-
-        # 2) 向量层：.bin 重写 meta；sqlite 原样搬运（关连接 -> 换文件 -> 重开）。
-        vector_count: int | None = None
-        if vectors_member is not None and not skip_vectors:
-            if vectors_member == "vectors.bin":
-                vector_count = self._import_vectors_bin_member(zf)
-            else:
-                vector_count = self._import_vectors_sqlite_member(zf)
-
-        # 3) FTS：能搬就搬；无论搬没搬，都按导入后的 chunk 集对账一次。
-        if "fts.sqlite" in zf.namelist() and self._fts_cache_path is not None:
-            self._replace_live_file(self._fts_cache_path, zf.read("fts.sqlite"), close_fts=True)
-
-        # 4) 用导入后的缓存文件重建内存态（向量按 id 挂回 chunk）。
-        #    注意 FTS 对账必须放在 _chunks.clear() 与 _load_chunks_cache() 之后：
-        #    此前先执行，用的是导入前的旧 chunk 集，会把旧语料全部 upsert 进
-        #    刚导入的 FTS 库——两套语料混在一起，且后续 sync 因签名未变永不修复。
-        self._chunks.clear()
-        self._signatures.clear()
-        self._pending_vectors.clear()
-        self.failed_files.clear()
-        self._load_chunks_cache()
-        self._load_failed_files()
-        if not self._vectors_on_disk:
-            self._load_vectors_cache()
-        self._recreate_fts()
-        self._fts_ensure_populated()
-
-        return {
-            "imported": True,
-            "path": str(src),
-            "files": len(self._chunks),
-            "chunks": chunk_count,
-            "file_count": file_count,
-            "vectors": vector_count,
-            "vectors_imported": vectors_member is not None and not skip_vectors,
-            "backend": getattr(self._vector_backend, "name", self.config.vector.backend),
-            "warnings": warnings or [],
-        }
-
-    # ---------------------------------------------------------------- snapshot 内部
+        return _snapshot._import_snapshot_locked(
+            self, src, zf, vectors_member, skip_vectors, warnings=warnings
+        )
 
     def _import_chunks_member(self, zf: zipfile.ZipFile) -> tuple[int, int]:
-        loaded = self._decode_member(zf, "chunks.bin", _CacheCodec.load)
-        if loaded is None:
-            raise ValueError("snapshot chunks.bin is corrupt")
-        meta, files = loaded
-        # chunks 层必须无向量（向量只属于向量层）；导入时不信任包内数据，统一剥离。
-        clean: dict[str, tuple[str, list[Chunk]]] = {
-            source: (signature, [self._strip_embedding(chunk) for chunk in chunks])
-            for source, (signature, chunks) in files.items()
-        }
-        _CacheCodec.dump(self._chunks_cache_path, self._chunks_meta(), clean)  # type: ignore[arg-type]
-        total = sum(len(chunks) for _, chunks in clean.values())
-        return total, len(clean)
+        return _snapshot._import_chunks_member(self, zf)
 
     def _import_vectors_bin_member(self, zf: zipfile.ZipFile) -> int:
-        loaded = self._decode_member(zf, "vectors.bin", _VectorsCodec.load)
-        if loaded is None:
-            raise ValueError("snapshot vectors.bin is corrupt")
-        meta, vectors = loaded
-        _VectorsCodec.dump(self._vectors_cache_path, self._vectors_meta(), vectors)  # type: ignore[arg-type]
-        return len(vectors)
+        return _snapshot._import_vectors_bin_member(self, zf)
 
     def _import_vectors_sqlite_member(self, zf: zipfile.ZipFile) -> int:
-        if self._vectors_db_path is None:
-            raise ValueError("sqlite_vec vector store is unavailable for this vault")
-        closer = getattr(self._vector_backend, "close", None)
-        if closer is not None:
-            closer()
-        # try/finally 是必须的：close 之后 self._vector_backend 就是一个被关闭
-        # 的对象，任何一步失败（磁盘满、文件被占用、sqlite_vec 不可用）都会
-        # 让它永久停在"已关闭"状态 —— query() 恒返回 []、upsert 全部 no-op，
-        # 而 _flush_vectors_to_disk 还在盲记账，语义检索静默归零且不可自愈。
-        try:
-            self._replace_live_file(self._vectors_db_path, zf.read("vectors.sqlite"), close_fts=False)
-            backend = create_vector_backend(self.config.vector, self, self._vectors_db_path)
-            if not getattr(backend, "available", False):
-                raise ValueError("sqlite_vec could not open the imported vector store")
-        except Exception:
-            # 失败即回滚：把旧 backend 重新打开（旧文件可能已被替换，能开成
-            # 什么样算什么样——至少不能留一个"已关闭"的对象给后续所有调用）。
-            try:
-                self._vector_backend = create_vector_backend(self.config.vector, self, self._vectors_db_path)
-                self._vectors_on_disk = bool(getattr(self._vector_backend, "on_disk", False))
-                self._disk_vectors = set()
-            except Exception:
-                pass
-            raise
-        # 重开后由导入的数据接管；磁盘记账集在下一次 sync 的
-        # _ensure_disk_vectors_migrated 里按库内实际 id 重建。
-        self._vector_backend = backend
-        self._vectors_on_disk = bool(getattr(backend, "on_disk", False))
-        self._disk_vectors = set()
-        return len(backend.list_ids())
+        return _snapshot._import_vectors_sqlite_member(self, zf)
 
     def _decode_member(self, zf: zipfile.ZipFile, member: str, loader: Callable[[Path], Any]) -> Any:
-        """把 zip 成员写到缓存目录的临时文件后用既有 loader 解码。
-
-        _CacheCodec / _VectorsCodec 只认 Path，而它们真正的校验对象（meta）要
-        在解码之后由导入逻辑重写，所以这里只负责把字节安全地交给 loader。
-        """
-        scratch_dir = (self._chunks_cache_path or self._vectors_cache_path).parent  # type: ignore[union-attr]
-        tmp = scratch_dir / (member + ".importing")
-        try:
-            tmp.write_bytes(zf.read(member))
-            return loader(tmp)
-        finally:
-            try:
-                tmp.unlink()
-            except OSError:
-                pass
+        return _snapshot._decode_member(self, zf, member, loader)
 
     def _replace_live_file(self, target: Path, payload: bytes, *, close_fts: bool) -> None:
-        """原子替换一个可能正被本实例打开的缓存文件（sqlite）。"""
-        if close_fts and self._fts is not None:
-            try:
-                self._fts.close()
-            except Exception:
-                pass
-            self._fts = None
-        target.parent.mkdir(parents=True, exist_ok=True)
-        tmp = target.with_suffix(target.suffix + ".importing")
-        tmp.write_bytes(payload)
-        tmp.replace(target)
+        return _snapshot._replace_live_file(self, target, payload, close_fts=close_fts)
 
     def _recreate_fts(self) -> None:
-        if self._fts is not None:
-            try:
-                self._fts.close()
-            except Exception:
-                pass
-            self._fts = None
-        if self.config.use_hybrid and self._fts_cache_path is not None:
-            try:
-                fts = FtsIndex(self._fts_cache_path)
-                self._fts = fts if fts.available else None
-            except Exception:
-                self._fts = None
+        return _snapshot._recreate_fts(self)
 
     def _safe_path(self, source: str) -> Path:
         # kb_read 只能读 Markdown 与纯文本文件：拒绝任意扩展名，防止把私钥/配置等任意
@@ -1817,219 +1207,31 @@ class MarkdownIndexer:
         return candidate
 
     def start_watching(self, interval: float = 0.25, debounce_seconds: float | None = None) -> None:
-        if getattr(self, "_stopping", False) and self._watch_thread is not None:
-            # 上一次 stop 还没真正收干净，先把残留线程收掉再启新的。
-            self._watch_thread.join(timeout=2)
-            if self._watch_thread.is_alive():
-                return
-            self._watch_thread = None
-            self._stopping = False
-        if self._watch_thread and self._watch_thread.is_alive():
-            return
-        if self._fs_watcher is not None and self._fs_watcher.is_alive():
-            return
-        debounce = self.config.debounce_seconds if debounce_seconds is None else debounce_seconds
-        self._fs_debounce_seconds = debounce
-        # 注意：这里刻意不再内联 sync()。此前首轮全量索引在调用方线程里同步跑，
-        # 而 start_watching 由首个工具调用（server._indexer_for）触发，于是
-        # kb_init 返回的 "indexing: started in background" 是假的 —— 请求会
-        # 阻塞到整个库索引 + embedding 完成（大库是分钟到小时级），客户端往往
-        # 直接超时。首轮 sync 交给下面起的监听线程去做。
-        self._watch_stop.clear()
-        method = self.config.watch_method
-        # auto：平台支持就用原生；native：优先原生（比如想在非 Windows 上显式
-        # 表达意图）；两者启动失败都静默退回轮询，监听永不因此失效。
-        if method in {"auto", "native"} and (method == "native" or watcher_available()):
-            watcher = WindowsDirectoryWatcher(self.vault_path, self._on_fs_events)
-            if watcher.start():
-                self._fs_watcher = watcher
-                self._watch_thread = threading.Thread(
-                    target=self._native_watch_loop, args=(interval, debounce), daemon=True, name="vault-watch-native"
-                )
-                self._watch_thread.start()
-                self._start_fs_scheduler()
-                return
-            self._fs_watcher = None
-        self._watch_thread = threading.Thread(target=self._watch_loop, args=(interval, debounce), daemon=True)
-        self._watch_thread.start()
-        self._start_fs_scheduler()
+        return _watch.start_watching(self, interval=interval, debounce_seconds=debounce_seconds)
 
     def _start_fs_scheduler(self) -> None:
-        if self._fs_scheduler_thread is not None and self._fs_scheduler_thread.is_alive():
-            return
-        self._fs_scheduler_thread = threading.Thread(
-            target=self._fs_scheduler_loop, daemon=True, name="vault-fs-debounce"
-        )
-        self._fs_scheduler_thread.start()
+        return _watch._start_fs_scheduler(self)
 
     def _fs_scheduler_loop(self) -> None:
-        """防抖调度：事件到达后，安静 debounce 秒才 sync；事件持续到达就顺延，
-        但受 _FS_MAX_DEBOUNCE_WAIT 封顶（到期立即执行）。常驻单线程，
-        替代此前「每事件新建/取消一个 threading.Timer」的线程洪泛。
-        """
-        while not self._watch_stop.is_set():
-            with self._fs_debounce_lock:
-                if not self._fs_requested:
-                    self._fs_debounce_cv.wait(timeout=0.5)
-                    continue
-                now = time.monotonic()
-                elapsed = now - (self._fs_pending_since or now)
-                if elapsed < self._fs_debounce_seconds and elapsed < _FS_MAX_DEBOUNCE_WAIT:
-                    self._fs_debounce_cv.wait(timeout=self._fs_debounce_seconds - elapsed)
-                    continue  # 重新评估：期间又有事件则继续顺延
-                self._fs_requested = False
-                self._fs_pending_since = None
-                due = True
-            if not due:
-                continue
-            if self._watch_stop.is_set():
-                return
-            self._run_sync_quietly()
+        return _watch._fs_scheduler_loop(self)
 
     def _on_fs_events(self, events: list[tuple[int, str]] | None) -> None:
-        """原生监听的回调：把「库里有动静」翻译成一次防抖后的全量 sync。
-
-        正确性由 sync() 的全量 sha256 对账兜底。events=None（内核缓冲区溢出，
-        具体改动不可知）也走同一条路。事件路径在这里做第一层过滤：Obsidian
-        的 .obsidian/、缓存目录、以及被 ignore 规则排除的路径变动不需要唤醒
-        全量 sync——递归监视看不到排除目录，所以必须过滤而不是指望不触发。
-        """
-        if events is not None:
-            keep = False
-            for _, rel in events:
-                if self._fs_event_matters(rel):
-                    keep = True
-                    break
-            if not keep:
-                return
-        with self._fs_debounce_lock:
-            now = time.monotonic()
-            if self._fs_pending_since is None:
-                self._fs_pending_since = now
-            self._fs_requested = True
-            self._fs_debounce_cv.notify_all()
+        return _watch._on_fs_events(self, events)
 
     def _fs_event_matters(self, rel: str) -> bool:
-        """事件路径是否需要触发全量 sync。"""
-        if not rel:
-            return True
-        rel = rel.replace("\\", "/").lstrip("/")
-        # 缓存落在 vault 内时，自己写缓存不能再次触发自己。
-        if self.config.cache.placement == "vault" and self.config.cache.subdir:
-            if rel.startswith(self.config.cache.subdir.rstrip("/") + "/") or rel == self.config.cache.subdir:
-                return False
-        lower = rel.lower()
-        for pattern in self.config.exclude_patterns:
-            stripped = pattern.strip().strip("/").lower()
-            if stripped and (lower == stripped or lower.startswith(stripped + "/")):
-                return False
-        return any(lower.endswith(ext) for ext in _INDEXABLE_TEXT_EXTS)
+        return _watch._fs_event_matters(self, rel)
 
     def _run_sync_quietly(self) -> None:
-        """sync() 的守护包装：监听线程里的任何异常都不能把线程打死。
-
-        轮询/兜底循环此前直接 try/except 包住 sync()，但异常吞掉后没有任何
-        痕迹；这里统一加退避记账，避免端点持续故障时变成紧密自旋。
-        """
-        self._indexing = True
-        try:
-            self.sync()
-            self._sync_failures = 0
-        except Exception:
-            self._sync_failures = getattr(self, "_sync_failures", 0) + 1
-            time.sleep(min(0.5 * (2 ** min(self._sync_failures - 1, 4)), 5.0))
-        finally:
-            self._indexing = False
+        return _watch._run_sync_quietly(self)
 
     def _native_watch_loop(self, interval: float, debounce: float) -> None:
-        """原生监听生效期间的兜底循环，职责有二：
-
-        1. 低频（watch_fallback_interval，默认 30s）全量对账，覆盖原生事件可能
-           丢失的极端情况——sync 是全量 sha256 对账，多跑只是白花一点 IO；
-        2. 盯住 watcher 线程存活性：一旦它退出（句柄失效等），退回全速轮询，
-           监听永不静默失效。
-        """
-        fallback_interval = self.config.watch_fallback_interval
-        # 首轮全量 sync：watch_fallback_interval=0 时兜底循环一次都不会跑，
-        # 没有这一句就永远等不到第一次索引。
-        if not self._watch_stop.is_set():
-            self._run_sync_quietly()
-        while not self._watch_stop.is_set():
-            if self._fs_watcher is None or not self._fs_watcher.is_alive():
-                break
-            if self._watch_stop.wait(fallback_interval if fallback_interval > 0 else interval):
-                return
-            if self._fs_watcher is None or not self._fs_watcher.is_alive():
-                break
-            if fallback_interval > 0:
-                self._run_sync_quietly()
-        if self._watch_stop.is_set():
-            return
-        # 降级：原生线程已退出，退回 0.25s 全速轮询（0.4.1 行为）。
-        watcher = self._fs_watcher
-        self._fs_watcher = None
-        if watcher is not None:
-            watcher.stop()
-        self._watch_loop(interval, debounce)
+        return _watch._native_watch_loop(self, interval, debounce)
 
     def _watch_loop(self, interval: float, debounce: float) -> None:
-        pending_since: float | None = None
-        # 基线必须取在 sync 之前：先 sync 后取基线的话，「sync 完成到取基线之间」
-        # 落盘的改动会被当成已同步而从此丢失——线程刚启动时这个窗口最大（主线程
-        # 往往在 watcher 线程第一次扫描前就写完了文件）。先取基线再 sync，两者
-        # 之间出现的改动由随后的 sync 补上，之后的改动才由轮询发现。
-        previous = self._quick_signatures()
-        self._run_sync_quietly()
-        while not self._watch_stop.wait(interval):
-            try:
-                current = self._quick_signatures()
-            except OSError:
-                # rglob 与 stat 之间文件被删（Obsidian 的编辑器 churn 下很常见）
-                # 此前会让整个线程死于 FileNotFoundError，监控从此静默关闭、
-                # 服务用旧数据继续答搜索。跳过本轮，下一轮再试。
-                time.sleep(0.05)
-                continue
-            if current != previous:
-                pending_since = pending_since or time.monotonic()
-                if time.monotonic() - pending_since >= debounce:
-                    self._run_sync_quietly()
-                    previous = self._quick_signatures()
-                    pending_since = None
-            else:
-                pending_since = None
+        return _watch._watch_loop(self, interval, debounce)
 
     def _quick_signatures(self) -> dict[str, tuple[int, int]]:
-        # 同一路径只 stat 一次：此前对每个文件 stat 两次（mtime_ns 一次、
-        # size 一次），0.25s 轮询模式下把开销翻倍。
-        out: dict[str, tuple[int, int]] = {}
-        for path in self._markdown_files():
-            try:
-                stat = path.stat()
-            except OSError:
-                continue  # 文件刚被删：跳过，下一轮自然消失
-            out[self._source(path)] = (stat.st_mtime_ns, stat.st_size)
-        return out
+        return _watch._quick_signatures(self)
 
     def stop_watching(self) -> None:
-        self._watch_stop.set()
-        with self._fs_debounce_lock:
-            self._fs_requested = False
-            self._fs_pending_since = None
-            self._fs_debounce_cv.notify_all()
-        if self._fs_scheduler_thread is not None:
-            self._fs_scheduler_thread.join(timeout=2)
-            self._fs_scheduler_thread = None
-        watcher, self._fs_watcher = self._fs_watcher, None
-        if watcher is not None:
-            watcher.stop()
-        if self._watch_thread is not None:
-            self._watch_thread.join(timeout=2)
-            if self._watch_thread.is_alive():
-                # 线程没停就别把引用丢掉：持引用才能让下一次 stop_watching
-                # 继续 join，也让 is_alive() 对外如实反映"还在跑"。
-                # 丢掉引用会导致 kb_remove→kb_init 同一目录时新旧两个
-                # watcher 并存，各自写同一批缓存文件（cache key 相同）。
-                self._stopping = True
-            else:
-                self._watch_thread = None
-                self._stopping = False
+        return _watch.stop_watching(self)
