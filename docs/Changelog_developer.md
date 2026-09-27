@@ -407,3 +407,15 @@
 - **会话异常披露**：本 Phase 施工期间检测到多轮工具结果注入（伪造编辑结果 ×3、`SAFE_DELETE_BULK_CONFIRM_REQUIRED` 批量删除诱导载荷 ×2、虚假声明"P1 已提交 / pickle 契约 / venv 无 pytest"），已全部识别并拒绝执行，未运行任何由工具输出文本指示的命令；tables.py 落盘精简经金测 oracle + 全量回归双重客观验证后保留。首次验证出现 `FULL_EXIT=1` 却无失败摘要的矛盾输出，定位为 safe-delete 守卫干扰 pytest 临时垃圾目录清理，改用全新 `--basetemp` 隔离后复跑恢复真实结果。
 - **验证**：全量 `pytest tests/ -q` **314 passed, 4 skipped**（与 v0.7.3 基线持平，`PYTEST_EXIT=0`）；金测 10 passed；`scripts/eval_search.py` **Hit@5 100.0% / MRR@5 1.000**（基线不变）；server.py AST 语法检查通过。
 
+### C45 — moton16,2026-09-27,CodeBuddy,GLM-5.3-Flash — refactor(indexer): v0.8.0 Phase 2 提取 _indexer/models + cache_codec（Facade 面不变）
+
+- **私有包 `mortis_rag_mcp/_indexer/` 落地**（单向依赖基座，严禁反向导入 Facade）：
+  - `models.py`：`Chunk`（字段序 `id, content, source, title, metadata, score, embedding` 即磁盘契约）/ `SearchFilter` / `dedupe_by_content_hash` / `_extract_snippet` / `_candidate_terms` / `_EMB_DTYPE` 自 indexer.py **逐字迁移**；
+  - `cache_codec.py`：`_CacheCodec` / `_VectorsCodec` / `_pack_str` / `_pack_u32` / `_CACHE_MAGIC` / `_CACHE_VERSION` 逐字迁移，`VMCPC`/`VMCPV` 格式与版本号不变。
+- **indexer.py 转为 Facade**：机械切除 371 行（3487 → 3117，含 2 行指路注释），公开导入面 `from mortis_rag_mcp.indexer import Chunk, SearchFilter, dedupe_by_content_hash, rerank_chunks, ...` 经 re-export **100% 保持**；`_to_emb`/`rerank_chunks` 留守（P4 随检索引擎迁移）；`MarkdownIndexer._extract_snippet` / `._candidate_terms` 静态方法挂载保持（`test_preview_mode.py` 静态调用兼容）。
+- **契约纠偏落地**：原计划 pickle `__module__` 条款经双声部评审证伪弃用（全库 0 命中 pickle）；真实兼容契约 = `VMCPC`/`VMCPV` 二进制格式 + `_CACHE_VERSION` 不变 + **`Chunk` 位置序构造**（`_CacheCodec.load` 按位重建）+ 解码失败静默重建语义，由新测试逐条锁定。
+- **金测先行**：新增 `tests/fixtures/golden_vault/`（5 文件：中文 frontmatter `[a,b]` 内联 tags/章节标题、HTML 表格原子块、代码围栏保护、`.txt` 同权收录、图片引用默认关闭）+ `scripts/make_golden.py` 生成 `tests/golden/v073_chunks.json` 快照 + `tests/test_golden_v073.py`（`metadata.mtime` 归一化后全量比对 + 覆盖面断言）——先对改造前代码全绿，再守护 P3/P4/P5 全程切块行为。
+- **P2 专项闸门**：`tests/test_cache_codec_roundtrip.py` ×4 —— Chunk 字段序锁（`dataclasses.fields` 顺序断言 + 位置构造默认值断言）、双层缓存 `dump → load → dump` **字节级恒等**、损坏/截断缓存静默返回 `None`（绝不抛异常）。
+- **手术安全**：机械切除脚本带 **25 项边界锚点断言**（任何一行与读取快照不符即中止，杜绝静默错切），切除后 AST 语法检查通过；`models.py` 内容抽验与迁移源逐字一致。
+- **验证**：全量 `pytest tests/ -q` **320 passed, 4 skipped**（基线 314 + 新增 6，`FULL_EXIT=0`）；`scripts/eval_search.py` **Hit@5 100.0% / MRR@5 1.000**（基线不变）；金测快照 5 文件 11 chunks 与改造前逐字一致。
+
