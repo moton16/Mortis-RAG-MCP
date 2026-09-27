@@ -18,7 +18,7 @@ from .ingest import IngestManager, INGEST_EXTS
 from ._server import dispatch_search as _dispatch_search, fanout_search as _fanout_search_impl
 from .registry import VaultEntry, VaultRegistry, normalize_vault_key, registry_path
 
-SERVER_INFO = {"name": "mortis-rag-mcp", "version": "0.7.3", "title": "Mortis'RAG MCP"}
+SERVER_INFO = {"name": "mortis-rag-mcp", "version": "0.8.0", "title": "Mortis'RAG MCP"}
 
 SERVER_INSTRUCTIONS = (
     "本服务器提供本地 Markdown 知识库检索。路由纪律："

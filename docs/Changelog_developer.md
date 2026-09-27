@@ -341,6 +341,24 @@
 >   - 新增 `tests/test_p5_lifecycle.py`（3 个测试：快照导入 Zip Slip 路径穿越白名单拦截、豁免增删返回值契约与 8 项状态级联清理、Watcher 启动与优雅停启无孤儿线程）。
 > - **验证**：全量单测增至 **341 passed, 4 skipped**（基线 338 + 3 P5 专项，`PYTEST_EXIT=0`）；eval **Hit@5 100.0% / MRR@5 1.000**；金测 `test_golden_v073.py` 与缓存 roundtrip 严格恒等。
 
+### C51 — moton16,2026-09-27,Antigravity,Gemini 3.8 Flash — chore & docs: v0.8.0 收口、Facade 导出面冻结、全量文档同步与版本发版
+> **代码改动概况**：
+> - 接口与错误边界全面收口：
+>   - 确认 `_normalize_call_arguments` 保持为 15 个工具入参归一与数值夹取的唯一合法入口；
+>   - 审计全库无裸 `except Exception: pass` 吞异常逻辑，关键降级点（FTS、向量后端、reranker）返回明确回退与可观测记录；
+>   - `_safe_path` 严格执行后缀白名单与 root 越界拦截 fail-closed。
+> - Facade 导出面冻结测试：
+>   - 新增 `tests/test_facade_freeze.py`（4 个测试：`mortis_rag_mcp.__all__` 严格维持 7 项不变、Facade 公开 API 与 30+ 历史测试锚点全员在场、MarkdownIndexer 核心方法契约完整、私有子模块 `_indexer/` 与 `_server/` 运行时零反向导入 Facade）。
+> - 全量文档体系同步：
+>   - `docs/PROJECT_GUIDE.md`：第 4.5 节重构为 Facade 与私有子包体系说明，订正各模块行数；第 15 节追加 v0.8.0 架构解耦重构专章；
+>   - `docs/Quick-start_developer.md`：更新第 1、2、5 节仓库地图与模块职责表；
+>   - `CHANGELOG_user.md`：遵循用户规范，以纯大白话记录 v0.8.0 架构、并发与稳定性升级，严禁技术黑话。
+> - 版本号发布 Bump（v0.8.0）：
+>   - `mortis_rag_mcp/server.py`：`SERVER_INFO.version` bump 0.7.3 -> 0.8.0；
+>   - `pyproject.toml`：`project.version` bump 0.7.3 -> 0.8.0（保留工作区 extras 改动）。
+> - **验证**：全量单测增至 **345 passed, 4 skipped**（基线 341 + 4 冻结专项，`PYTEST_EXIT=0`）；eval **Hit@5 100.0% / MRR@5 1.000**；金测与缓存 roundtrip 严格恒等。
+
+
 
 
 

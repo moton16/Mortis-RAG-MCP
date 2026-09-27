@@ -10,7 +10,7 @@
 ## 1. 30 秒版：这是什么
 
 Mortis'RAG MCP 是一个**本地 Markdown 知识库 RAG 服务器**，通过 MCP 协议（stdio +
-换行分隔 JSON-RPC，协议版本 `2025-06-18`）向 AI agent 提供 13 个 `kb_*` 工具：
+换行分隔 JSON-RPC，协议版本 `2025-06-18`）向 AI agent 提供 15 个 `kb_*` 工具：
 注册任意文件夹为知识库 → 后台增量索引（切块 + embedding + FTS）→ 三路混合检索
 （FTS5 BM25 + 向量余弦 + bigram 词法，RRF 融合）→ rerank → 返回结构化 chunks。
 
@@ -27,20 +27,33 @@ Mortis'RAG MCP 是一个**本地 Markdown 知识库 RAG 服务器**，通过 MCP
 
 ```
 Mortis-RAG-MCP/
-├── mortis_rag_mcp/          # 包本体（~5700 行）
+├── mortis_rag_mcp/          # 包本体（~5800 行，v0.8.0 模块化拆分架构）
 │   ├── __main__.py          # 入口：python -m mortis_rag_mcp --serve-mcp-stdio
 │   ├── config.py            # 配置加载（390 行）
 │   ├── registry.py          # 用户级知识库注册表（304 行）
-│   ├── server.py            # MCP 协议层 + 15 个工具 handler（1000+ 行）
+│   ├── server.py            # MCP 协议层 + 15 个公开工具路由表与轻量入口（1126 行）
+│   ├── _server/             # 服务端路由与跨库编排私有包
+│   │   ├── search_dispatch.py # 单库/Scoped/全局检索路由与入参规范化
+│   │   └── fanout.py          # 跨库候选聚合、权重计算、去重、rerank、全局/分组分页
+│   ├── indexer.py           # MarkdownIndexer Facade、向后兼容 re-export 与生命周期（1238 行）
+│   ├── _indexer/            # 索引器核心实现私有包
+│   │   ├── models.py        # Chunk、SearchFilter 数据模型与纯去重逻辑
+│   │   ├── cache_codec.py   # _CacheCodec、_VectorsCodec 二进制编解码持久化
+│   │   ├── chunking.py      # 切块算法、正则与表格保护
+│   │   ├── scanning.py      # 目录遍历、IgnoreMatcher 规则匹配与 Fast-Stat 对账判据
+│   │   ├── sync_engine.py   # run_sync 增量同步引擎与并发 embedding 处理
+│   │   ├── search.py        # SearchEngine 单库只读检索（FTS5/向量/三路 RRF/rerank）
+│   │   ├── snapshot.py      # 快照打包导出、校验导入恢复与 Zip Slip 安全防护
+│   │   ├── exemptions.py    # 豁免规则维护与八项状态级联清理
+│   │   └── watch.py         # 文件系统 watcher 监听与防抖生命周期调度
 │   ├── ingest/              # PDF/Office 异步摄取与表格处理（worker, mineru, tables）
-│   ├── indexer.py           # 索引与检索核心（2787 行，全项目的心脏）
 │   ├── providers.py         # embedding / reranker HTTP 封装（230 行）
 │   ├── fts.py               # FTS5 SQLite 封装（149 行）
 │   ├── vector.py            # 向量后端：memory / sqlite_vec（367 行）
 │   └── fsnotify.py          # Windows ReadDirectoryChangesW 原生监听（557 行）
 ├── config/app.toml.example  # 配置模板（app.toml 本体被 gitignore）
 ├── skills/mortis-rag-mcp/   # 配套 agent skill（教 AI 怎么用这套工具）
-├── tests/                   # pytest，22 个文件 185+ 用例
+├── tests/                   # pytest，340+ 测试用例
 ├── docs/
 │   ├── Quick-start_developer.md    # 本文件
 │   ├── Changelog_developer.md      # 每次 commit 的技术变更流水
@@ -149,8 +162,10 @@ stdin 一行 JSON → handle() → method=="tools/call"
 | `config.py` | TOML 加载、`${ENV_VAR}` 插值、配置链 `--app-config` > `MORTIS_RAG_CONFIG` > `VAULT_MCP_CONFIG` > `~/.mortis_rag_mcp/config.toml` > `~/.vault_mcp/config.toml` > 默认 | `load_config()` | 新配置项必须给默认值 + example 文件同步加注释；`AppConfig.vault_path` 会被 `__post_init__` 特殊处理 |
 | `registry.py` | vaults.toml 读写（**原子写 tmp+replace**，跨进程排他锁 Windows `msvcrt.locking`/POSIX `fcntl.flock`） | `VaultRegistry.add/remove/set_weight/set_solo` | 字符串字段序列化必须 `json.dumps`（曾有 LLM 传入的引号毁掉整个注册表的 bug）；新字段要在 `load()` 里给老文件回退值 |
 | `doctor.py` | 环境自检与 Agent 信任锚（`STATUS.md` / `status.json`）生成器 | `doctor.run()` | 零第三方依赖，探活复用 `providers.py`；核心项门禁防假 VALID；Windows 冲突 4 次退避原子写 |
-| `server.py` | 协议层 + 工具分发 + fan-out + CLI --doctor | `call_tool()` / `main()` | 新工具 = schema + 分发 + handler 三处；fan-out 的分页只能在全局合并后做一次（逐库分页再合并顺序无意义） |
-| `indexer.py` | 切块、缓存、增量、检索、豁免、快照、watcher | `sync()` / `search()` | ① 改切块逻辑必须同步 `_cache_meta()` 加代际键，否则旧缓存不失效；② 常驻 `Chunk` 对象不许原地改 `score`（用 `dataclasses.replace` 产副本，曾有并发脏读 bug）；③ `_safe_path()` 防路径逃逸，读文件必经它 |
+| `server.py` | 协议层 + 15 个公开工具路由表与轻量入口 | `call_tool()` / `main()` | 15 个工具显式映射表路由；所有入参统一走 `_normalize_call_arguments()` 归一化；检索分发委托至 `_server/` |
+| `_server/` | 服务端跨库编排与检索分发私有包 | `dispatch_search()` / `fanout_search()` | 活实例契约（直读 `_indexers`，禁快照化）；跨库 embedding 全局仅计算一次；库级权重在 rerank 完成后乘回 |
+| `indexer.py` | MarkdownIndexer Facade 稳定入口、声明周期入口与向后兼容 re-export | `sync()` / `search()` | 保留向后兼容薄委托与历史测试打桩点；`__init__.__all__` 严格维持 7 项；锁获取时序固定为 `_sync_lock -> _cache_lock` |
+| `_indexer/` | 索引与检索引擎核心实现私有包 | 各子模块独立导出 | 仅自底向上依赖，严禁运行时反向导入 Facade；数据模型 `Chunk` 字段顺序与 `VMCPC/VMCPV` 二进制协议严格锁定；常驻 Chunk 禁止原地修改 score |
 | `providers.py` | embedding/reranker HTTP（重试、退避、batch 切分、static 兜底） | `create_*_provider()` | 429 必须尊重 `Retry-After`；其余 4xx 不重试 |
 | `fts.py` | FTS5 trigram 索引 | `FtsIndex.search()` | trigram 对 <3 字符天然跳过（短词由 indexer 的 bigram 词法路兜底）；`source` 列是 UNINDEXED，`path_prefix` 下推只减候选 |
 | `vector.py` | 向量后端 Protocol + memory（numpy）+ sqlite_vec（磁盘） | `create_vector_backend()` | sqlite_vec 操作有 `_serialized` 装饰器串行化；首次切换自动从旧缓存迁移 |

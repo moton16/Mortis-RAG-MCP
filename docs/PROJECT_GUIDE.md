@@ -6,11 +6,11 @@
 
 ## 在这里，你才需要详细描述每次commit的代码逻辑、技术框架的更改，请标明提交commit人员的GitHub账户名，如果是agent执行的，请一并标出是什么agent处理的。如editor:moton16,codex.
 
-> \\\\\\\*\\\\\\\*版本\\\\\\\*\\\\\\\*：对应 v0.7.1（2026-09-17）。0.7.1 变更：Agent 信任锚（STATUS.md / doctor.py）+ 用户数据目录无损原子迁移（`~/.vault_mcp*` → `~/.mortis_rag_mcp*`，新名优先、旧名独占原子迁移、永久回退）+ 放行前终审修复（信任锚头行转义、Fast-Stat 余量按实际刻度推导、签名纳入 `st_ctime_ns`）。
+> **版本**：对应 v0.8.0（2026-09-27）。v0.8.0 变更：代码架构全链路解耦重构（`indexer.py` 与 `server.py` 瘦身下沉为稳定 Facade + `_indexer/` 与 `_server/` 私有子包落地），删除历史死代码，加固生命周期与错误边界，保持 100% 公开 API、MCP 协议、二进制缓存与检索语义兼容。
 >
-> ⚠️ \\\\\\\*\\\\\\\*数据目录与包名迁移说明（v0.7.1）\\\\\\\*\\\\\\\*：Python 包目录已完成换名 `mortis_rag_mcp`，v0.7.1 同步完成了用户数据根目录更名 `~/.mortis_rag_mcp`（缓存 `~/.mortis_rag_mcp_cache`）与环境变量 `MORTIS_RAG_*`，同时保持对旧路径 `~/.vault_mcp*` 与 `VAULT_MCP_*` 的零破坏原子迁移与只读回退支持。
-> \\\\\\\*\\\\\\\*读者\\\\\\\*\\\\\\\*：任何要查阅、二次开发或改进本项目的开发者。读完本文应能：理解项目全貌与每个模块的职责、独立搭建开发环境、按本文的 how-to 完成常见改动、知道改动会牵动哪些缓存/测试/文档。
-> \\\\\\\*\\\\\\\*相关文档\\\\\\\*\\\\\\\*：用户向导见 \\\\\\\[README.md](../README.md)（中文主页） / \\\\\\\[README_EN.md](../README_EN.md)；快速开始见 \\\\\\\[QUICKSTART_user.md](../QUICKSTART_user.md)；版本变更见 \\\\\\\[CHANGELOG_user.md](../CHANGELOG_user.md)；AI 调用技巧见 \\\\\\\[skills/mortis-rag-mcp/SKILL.md](../skills/mortis-rag-mcp/SKILL.md)。
+> ⚠️ **数据目录与包名迁移说明（v0.7.1+）**：Python 包目录已完成换名 `mortis_rag_mcp`，数据根目录为 `~/.mortis_rag_mcp`（缓存 `~/.mortis_rag_mcp_cache`）与环境变量 `MORTIS_RAG_*`，保持对旧路径 `~/.vault_mcp*` 与 `VAULT_MCP_*` 的零破坏原子迁移与只读回退支持。
+> **读者**：任何要查阅、二次开发或改进本项目的开发者。读完本文应能：理解项目全貌与每个模块的职责、独立搭建开发环境、按本文的 how-to 完成常见改动、知道改动会牵动哪些缓存/测试/文档。
+> **相关文档**：用户向导见 [README.md](../README.md)（中文主页） / [README_EN.md](../README_EN.md)；快速开始见 [QUICKSTART_user.md](../QUICKSTART_user.md)；版本变更见 [CHANGELOG_user.md](../CHANGELOG_user.md)；AI 调用技巧见 [skills/mortis-rag-mcp/SKILL.md](../skills/mortis-rag-mcp/SKILL.md)。
 
 \---
 
@@ -259,9 +259,20 @@ embedding（static 哈希 / 外部 API，按文件并发）     ←—— 向量
   * 任何异常都吞掉返回空结果，但 `upsert\\\\\\\_vectors` 失败时**必须返回实际落盘集合**（可能为空集）而不是 None——None 会被 indexer 当成"全部成功"记账，chunk 从此被认为已有向量、永不重嵌。
 * `create\\\\\\\_vector\\\\\\\_backend`：配置 sqlite\_vec 但 import/加载失败 → 静默回退 memory。
 
-### 4.5 `indexer.py`（约 3145 行）—— 核心：切块、同步、缓存、检索
+### 4.5 `indexer.py`（Facade 入口，约 1238 行）与 `_indexer/` 私有核心包
 
-这是项目最大最核心的模块，分几块讲。
+在 v0.8.0 之前，`indexer.py` 是超过 3400 行的单体大文件。v0.8.0 采用 **私有实现包 + 稳定 Facade** 架构，将切块、扫描、同步引擎、检索、缓存、快照、豁免、监听等子系统彻底拆解至 `mortis_rag_mcp/_indexer/`，`indexer.py` 转变为职责清晰、零破坏向后兼容的 Facade 入口，原位保留薄委托与历史打桩 re-export。
+
+各子模块职责划分如下：
+* **`_indexer/models.py`**：`Chunk`、`SearchFilter` 数据结构与纯内存函数（`dedupe_by_content_hash`、`_extract_snippet`、`_candidate_terms`）。`Chunk` 字段顺序与 `__module__` 兼容性严格冻结。
+* **`_indexer/cache_codec.py`**：`_CacheCodec`（文本层 `chunks.bin`）与 `_VectorsCodec`（向量层 `vectors.bin`）的二进制编解码器，维护 `VMCPC`/`VMCPV` v1 二进制协议。
+* **`_indexer/chunking.py`**：Markdown/TXT 标题分块、代码围栏保护、表格原子保护、frontmatter 提取与豁免检测、图片图注注入（`_inject_image_notes`）。
+* **`_indexer/scanning.py`**：`scandir` 目录剪枝遍历、`IgnoreMatcher` 规则匹配、Fast-Stat 对账判据与微秒级 mtime 探测（`_probe_mtime_tick_ns`）。
+* **`_indexer/sync_engine.py`**：`run_sync(owner)` 增量同步引擎，承接两阶段对账、多线程并发 embedding 处理与磁盘向量迁移；前置要求持有 `_sync_lock`。
+* **`_indexer/search.py`**：只读单库检索引擎 `SearchEngine`，集中承接 `_fts_query`、`_hybrid_rank` 三路 RRF 融合、`_semantic_rank` 向量召回、过滤、去重与 `rerank_chunks`。常驻 Chunk 对象的 `score` 严格不可变。
+* **`_indexer/snapshot.py`**：快照导出打包与校验恢复，内置 Zip Slip 绝对物理白名单拦截、解压炸弹与压缩比上限防御、SQLite 向量后端安全重开与回滚。
+* **`_indexer/exemptions.py`**：`.vaultignore` 规则与 frontmatter 豁免维护、移除死代码、联动极速剪枝 8 项内存与缓存状态、后台异步重对账。
+* **`_indexer/watch.py`**：Windows 原生目录监听 `WindowsDirectoryWatcher` 与轮询回退、常驻防抖调度线程（条件变量调度，避免 Timer 洪泛）、优雅停启与生命周期管理。
 
 #### 4.5.1 基础数据结构
 
@@ -1006,5 +1017,45 @@ python -m pytest -q                       # 应全绿
 
 * 新增 `tests/test\_solo\_vault.py`（5 个 stdio 集成）：fan-out 排除 + excluded\_solo + 显式可搜；已注册库转 solo 幂等（switched true/false）；单库 solo 全局检索拒绝；全 solo 报错文案；remove→init 取消 solo。
 * `test\_registry.py` 新增 5 个单测：solo roundtrip、legacy v2 无字段回退 False、脏值容错、set\_solo 落盘与可逆、未注册报错。
-* 旧引用同步：test\_multivault（kb\_vaults→kb\_list）、test\_registry\_server（kb\_unregister→kb\_remove 及 removed 断言、kb\_vaults→kb\_list）、test\_mcp\_stdio（kb\_list→kb\_list\_files、tools 清单加 kb\_list\_files）、test\_subvaults（函数改名 + solo 默认 False 断言）。
+* 旧引用同步：test_multivault（kb_vaults→kb_list）、test_registry_server（kb_unregister→kb_remove 及 removed 断言、kb_vaults→kb_list）、test_mcp_stdio（kb_list→kb_list_files、tools 清单加 kb_list_files）、test_subvaults（函数改名 + solo 默认 False 断言）。
+
+---
+
+### v0.8.0（2026-09-27）—— 架构解耦重构（稳定 Facade + 私有核心包）
+
+#### editor:moton16,Antigravity,Gemini 3.8 Flash
+
+**设计初衷与核心目标**：
+* 随着功能迭代，`indexer.py` 膨胀至 3487 行，`server.py` 膨胀至 1360 行，单体过大且职责高度耦合。
+* 本次重构为纯逻辑架构层重构（无新功能变更），旨在解耦单体、收口参数流转与错误边界，对外保持 100% 的公开 API、MCP 协议、缓存格式（`VMCPC`/`VMCPV`）与检索语义兼容。
+
+**代码架构改造（六阶段落地）**：
+1. **Phase 1（server 路由表化 + 表格精简）**：
+   * `server.py` 的 `call_tool` 分支重构为显式 `_TOOL_ROUTE_TABLE` 路由表映射（15 个工具映射到独立方法）；
+   * `ingest/tables.py` 精简冗余单行特例分支，新增字节级金测保障。
+2. **Phase 2（数据模型与缓存编解码解耦）**：
+   * 建立 `mortis_rag_mcp/_indexer/` 私有实现包，逐字迁移 `models.py` 与 `cache_codec.py`；
+   * 锁定 `Chunk` 字段顺序与 `_CACHE_VERSION`，守护 `VMCPC`/`VMCPV` 二进制协议兼容。
+3. **Phase 3（切块算法、目录扫描与同步引擎解耦）**：
+   * 提取 `_indexer/chunking.py`（纯函数化切块与表格保护）与 `_indexer/scanning.py`（目录遍历与 Fast-Stat）；
+   * Facade 建立显式包装函数以保留历史测试 monkeypatch 接缝（`_probe_mtime_tick_ns` 等）；
+   * 提取 `_indexer/sync_engine.py` 自由函数 `run_sync(owner)`，前置固定 `_sync_lock`，就地变异 22 项状态，Facade 留守 `_cache_lock` 获取点与 Fast-Stat 判据族。
+4. **Phase 4（单库检索引擎与服务端跨库 Fan-out 解耦）**：
+   * 提取 `_indexer/search.py` 构造只读 `SearchEngine`，集中承接三路 RRF、向量召回与重排；常驻 Chunk 对象的 `score` 严格不可变；
+   * 提取 `_server/search_dispatch.py` 与 `_server/fanout.py`，承接全局/Scoped 跨库聚合、单次 query embedding 与权重乘回。
+5. **Phase 5（快照、豁免与 Watcher 解耦）**：
+   * 提取 `_indexer/snapshot.py`（白名单 Zip Slip 防护、解压炸弹防御、SQLite 安全重开回滚）；
+   * 提取 `_indexer/exemptions.py`（清理历史死代码 `add_exemption_pattern`，级联清理 8 项内存与缓存状态）；
+   * 提取 `_indexer/watch.py`（目录监听与防抖生命周期，维持线程名契约）。
+   * `indexer.py` 从 3487 行终极精简至 1238 行（净减 64.5%）。
+6. **Phase 6（收口、导出面冻结与发版）**：
+   * 错误边界审计与 fail-closed 复核；
+   * 新增 `tests/test_facade_freeze.py` 固化 `__all__` 7 项不变与子模块禁止反向导入规则；
+   * 全量文档更新与版本 Bump 至 0.8.0。
+
+**验证门禁**：
+* 全量测试用例扩充至 **345 passed, 4 skipped**（基线 314 passed，净增 31 个专项金测与生命周期回归用例）；
+* 检索评估 **Hit@5 100.0% / MRR@5 1.000** 零回退；
+* 缓存 round-trip 与金测 oracle 100% 严格恒等。
+
 
