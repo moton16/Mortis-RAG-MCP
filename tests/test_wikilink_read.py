@@ -337,9 +337,18 @@ def test_stdio_wikilink_read(tmp_path: Path):
     app_toml = tmp_path / "app.toml"
     app_toml.write_text('mode = "static"\n', encoding="utf-8")
 
-    requests = [
+    # kb_init 的 sync 在后台线程执行，kb_read 在首建完成前短名寻址会查空 _chunks。
+    # 拆成两个 stdio 会话：第二会话的 kb_stats 走 try_sync_with_guard，在锁空闲时
+    # 同步完成首建，消除对后台线程时序的依赖（CI 慢解释器上曾稳定复现竞态）。
+    init_requests = [
         {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
         {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "kb_init", "arguments": {"path": str(vault), "name": "WikiVault"}}},
+    ]
+    _run_stdio(app_toml, init_requests)
+
+    requests = [
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "kb_stats", "arguments": {"vault_path": "WikiVault"}}},
         {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "kb_read", "arguments": {"source": "[[AgentDesign]]", "vault_path": "WikiVault"}}},
     ]
     responses = _run_stdio(app_toml, requests)

@@ -967,6 +967,9 @@ class VaultMcpServer:
 
     def _kb_read(self, arguments: dict[str, Any]) -> dict[str, Any]:
         indexer = self._indexer_for(arguments)
+        # 与 kb_search/kb_stats 同款冷启动守护：锁空闲时同步完成首建/增量对账，
+        # 避免后台首建未完成时短名寻址查空 _chunks 而误报 FileNotFound。
+        indexer.try_sync_with_guard(timeout=1.5)
         raw_source = arguments.get("source")
         source = str(raw_source).strip() if raw_source is not None else ""
         raw_chunk_id = arguments.get("chunk_id")
