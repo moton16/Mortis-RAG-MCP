@@ -208,7 +208,7 @@ def hybrid_rank(
             fused[chunk_id] = fused.get(chunk_id, 0.0) + 1.0 / (_RRF_K + rank)
 
     ranked = [replace(by_id[chunk_id], score=fused[chunk_id]) for chunk_id in fused if chunk_id in by_id]
-    ranked.sort(key=lambda chunk: (-chunk.score, chunk.source, chunk.metadata["chunk_index"]))
+    ranked.sort(key=lambda chunk: (-chunk.score, chunk.source, int(chunk.metadata.get("chunk_index") or 0)))
     return ranked
 
 
@@ -388,7 +388,7 @@ def search_single_vault(
                 if chunk_id not in existing_ids and chunk_id in by_id:
                     ranked.append(replace(by_id[chunk_id], score=floor_score))
 
-    ranked.sort(key=lambda chunk: (-chunk.score, chunk.source, chunk.metadata["chunk_index"]))
+    ranked.sort(key=lambda chunk: (-chunk.score, chunk.source, int(chunk.metadata.get("chunk_index") or 0)))
 
     # 第 3 层召回保障：融合排序后、与 filters.matches 同阶段执行硬过滤；rerank 之后不再过滤
     if clean_terms:

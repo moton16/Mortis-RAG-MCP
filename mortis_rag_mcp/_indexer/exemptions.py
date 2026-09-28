@@ -207,6 +207,22 @@ def check_exemption(owner: MarkdownIndexer, source: str) -> dict[str, Any]:
             "indexed_chunks": 0,
         }
 
+    # 后缀先单独判一次：_safe_path 对「库外路径」与「后缀不受支持」都抛 ValueError，
+    # 两者折叠成同一响应会把库内真实存在的 .json/.canvas/.pdf 报成"文件不存在"——
+    # 对模型是假事实（"为什么这个文件没被索引"会得到错误结论）。单列后缀这一支，
+    # 库外路径仍与不存在同响应，不泄露任何区分信息。
+    if Path(source_posix).suffix.lower() not in owner._READABLE_SUFFIXES:
+        return {
+            "source": source_posix,
+            "is_exempt": False,
+            "reason": (
+                "unsupported source type for exemption check "
+                f"(only {', '.join(sorted(owner._READABLE_SUFFIXES))} can be inspected)"
+            ),
+            "has_block_ignores": False,
+            "indexed_chunks": len(owner._chunks.get(source_posix, [])),
+        }
+
     # source 来自 MCP 工具参数（LLM 直控），必须过 _safe_path 沙箱再落盘探测：
     # 否则 "../" 或绝对路径会变成 vault 外文件的存在性 oracle（与 set_file_exemption 对齐）。
     # _safe_path 以抛 ValueError 表达拒绝，这里统一折叠为 None 走「未找到」同一响应，

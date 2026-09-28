@@ -198,6 +198,21 @@ def test_check_exemption_rejects_paths_outside_vault(tmp_path):
     # 库内文件不受影响，正常回报
     assert indexer.check_exemption("inside.md")["reason"] == "none (actively indexed)"
 
+    # 库内真实存在但后缀不受支持：必须与「不存在」区分开，否则是给模型的假事实
+    # （"这个文件为什么没被索引" 会得到"磁盘上没这个文件"）。
+    for name in ("paper.pdf", "board.canvas"):
+        (vault / name).write_bytes(b"not markdown at all")
+        unsupported = indexer.check_exemption(name)
+        assert unsupported["is_exempt"] is False
+        assert "unsupported source type" in unsupported["reason"]
+        assert set(unsupported.keys()) == {
+            "source",
+            "is_exempt",
+            "reason",
+            "has_block_ignores",
+            "indexed_chunks",
+        }
+
 
 def test_stdio_kb_exempt_tool(tmp_path):
     vault = tmp_path / "vault"

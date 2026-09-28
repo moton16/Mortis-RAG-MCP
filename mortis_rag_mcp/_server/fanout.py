@@ -311,7 +311,7 @@ def fanout_search(
         for entry, chunk in merged
     ]
 
-    merged.sort(key=lambda pair: (-pair[1].score, pair[1].source, pair[1].metadata["chunk_index"]))
+    merged.sort(key=lambda pair: (-pair[1].score, pair[1].source, int(pair[1].metadata.get("chunk_index") or 0)))
     pairs = merged
     # 跨库再去重一次：同一份内容可能躺在两个库里（比如一个库是另一个的备份）。
     if dedupe:
