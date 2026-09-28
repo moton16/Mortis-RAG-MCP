@@ -92,10 +92,10 @@
 
 |依赖|安装|作用|缺失时行为|
 |-|-|-|-|
-|`numpy`|`pip install numpy`|`\\\\\\\_semantic\\\\\\\_rank` 批量矩阵余弦（约一个数量级加速）|回退逐条标量 `\\\\\\\_cosine`|
-|`sqlite-vec >= 0.1.9`|`pip install "mortis-rag-mcp\\\\\\\[vec]"`|`\\\\\\\[vector] backend = "sqlite\\\\\\\_vec"` 磁盘向量库（向量不驻留 RAM，13k×1024 维约省 55MB）|自动回退 memory 后端|
+|`numpy`|`pip install numpy`（等价 `pip install "mortis-rag-mcp[accel]"`）|`_semantic_rank` 批量矩阵余弦（约一个数量级加速）|回退逐条标量 `_cosine`|
+|`sqlite-vec >= 0.1.9`|`pip install "mortis-rag-mcp[vec]"`|`[vector] backend = "sqlite_vec"` 磁盘向量库（向量不驻留 RAM，13k×1024 维约省 55MB）|自动回退 memory 后端|
 
-> 注意：`numpy` 连 optional-dependencies 都没声明——它是"装了就快、没装也对"的软依赖，`\\\\\\\_semantic\\\\\\\_rank` 里 try-import。sqlite-vec 则是声明的 extra `vec`。
+> 注意：两者都是 `pyproject.toml` 声明的 extra（`accel` / `vec`），**建议按需安装**（一次装齐：`pip install "mortis-rag-mcp[accel,vec]"`）；同为"装了更好、没装也对"的软依赖——numpy 缺失时 `_semantic_rank` 的 try-import 自动回退逐条标量余弦，sqlite-vec 缺失/未启用时自动回退 memory 后端，核心功能不受任何影响。
 
 ### 2.4 外部服务（全部可选）
 
