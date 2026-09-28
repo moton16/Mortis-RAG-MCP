@@ -1199,8 +1199,14 @@ class MarkdownIndexer:
     def _decode_member(self, zf: zipfile.ZipFile, member: str, loader: Callable[[Path], Any]) -> Any:
         return _snapshot._decode_member(self, zf, member, loader)
 
-    def _replace_live_file(self, target: Path, payload: bytes, *, close_fts: bool) -> None:
-        return _snapshot._replace_live_file(self, target, payload, close_fts=close_fts)
+    def _replace_live_file(self, target: Path, staged: Path, *, close_fts: bool) -> None:
+        return _snapshot._replace_live_file(self, target, staged, close_fts=close_fts)
+
+    def _stream_member(self, zf: zipfile.ZipFile, member: str, dest: Path | Any) -> int:
+        return _snapshot._stream_member(zf, member, dest)
+
+    def _validate_vector_sqlite(self, path: Path, dimension: int | None) -> None:
+        return _snapshot._validate_vector_sqlite(path, dimension)
 
     def _recreate_fts(self) -> None:
         return _snapshot._recreate_fts(self)

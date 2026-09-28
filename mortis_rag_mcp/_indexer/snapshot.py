@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import io
 import json
+import re
+import sqlite3
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable, TYPE_CHECKING
 import zipfile
@@ -20,14 +24,24 @@ if TYPE_CHECKING:
 _SNAPSHOT_FORMAT = "vault-mcp-snapshot"
 _SNAPSHOT_VERSION = 1
 _SNAPSHOT_MEMBERS = frozenset({"manifest.json", "chunks.bin", "vectors.bin", "vectors.sqlite", "fts.sqlite"})
-# 各成员解压后的字节上限：正常库的缓存不会超过这些量级，超限 = 恶意构造。
+_MB = 1024 * 1024
+# 各成员的字节上限：正常库的缓存不会超过这些量级，超限 = 恶意构造。
+# 上限即「单次导入的驻留内存/磁盘上限」——取 1~2GB 而不是 GB 级的两位数，
+# 否则一个 16MB 的 zip（声明 16GB、比率 993 仍过闸）就能把服务吃光内存：
+# 声明值本身是攻击者可控字段，真正兜底的是这个量级 + 流式读取预算。
 _SNAPSHOT_MEMBER_LIMITS = {
-    "manifest.json": 1 * 1024 * 1024,
-    "chunks.bin": 4 * 1024 * 1024 * 1024,
-    "vectors.bin": 16 * 1024 * 1024 * 1024,
-    "vectors.sqlite": 16 * 1024 * 1024 * 1024,
-    "fts.sqlite": 16 * 1024 * 1024 * 1024,
+    "manifest.json": 1 * _MB,
+    "chunks.bin": 1024 * _MB,
+    "vectors.bin": 1024 * _MB,
+    "vectors.sqlite": 2048 * _MB,
+    "fts.sqlite": 2048 * _MB,
 }
+# 合计预算：5 个成员各自卡在上限仍能凑出两位数 GB。
+_SNAPSHOT_TOTAL_LIMIT = 4096 * _MB
+# zip 头里的 file_size/compress_size 同属攻击者可控：比率门限只挡「小包大解」。
+# 真实缓存里 sqlite 约 2~5x、.bin 自身已 zlib 压缩（≈1x），100 已足够宽松。
+_MAX_COMPRESSION_RATIO = 100
+_MEMBER_READ_BLOCK = 1 * _MB
 
 
 def export_snapshot(owner: MarkdownIndexer, out_path: str | Path) -> dict[str, Any]:
@@ -118,6 +132,12 @@ def import_snapshot(owner: MarkdownIndexer, snapshot: str | Path, force: bool = 
     * 向量层的 model/dimension 与本机配置不一致时拒绝导入（force=true 可
       强制，但此时只导入文本层，向量作废由本地重新 embedding——错维度的
       向量对检索是毒药）。
+    * manifest 是**声明**，payload 才是事实：两个向量成员都按实际内容复验维度
+      （.bin 逐条长度、.sqlite 读 vec0 表的 float[N]），不匹配直接拒绝。
+    * 包内 chunk 的 signature 一律丢弃：本机 sync 的"内容未变"判据就是它，
+      信任它等于让投毒正文躲过重读。代价是导入后首次 sync 重读全部文件重算
+      签名（内容未变的切片仍按 content_hash 复用快照向量，不产生 embedding）。
+    * 成员读取按真实字节数记账：zip 头声明的尺寸是攻击者可控字段，不能当上限。
 
     前提：本库缓存已启用、目录已注册（先 kb_init 再 kb_import）。
     """
@@ -136,20 +156,28 @@ def import_snapshot(owner: MarkdownIndexer, snapshot: str | Path, force: bool = 
             raise ValueError("snapshot is missing manifest.json or chunks.bin")
         # 解压炸弹防护：快照的用途就是从别人机器收文件，任何一个成员都可以
         # 是恶意构造的。白名单挡得住路径穿越，挡不住"1MB zip 解出几十 GB"。
+        declared_total = 0
         for member in names:
             info = zf.getinfo(member)
-            if info.file_size > _SNAPSHOT_MEMBER_LIMITS.get(member, 0):
+            limit = _SNAPSHOT_MEMBER_LIMITS.get(member, 0)
+            if info.file_size > limit:
                 raise ValueError(
                     f"snapshot member {member} is too large "
-                    f"({info.file_size} bytes > limit {_SNAPSHOT_MEMBER_LIMITS.get(member)})"
+                    f"({info.file_size} bytes > limit {limit})"
                 )
-            if info.compress_size > 0 and info.file_size / info.compress_size > 1000:
+            if info.compress_size > 0 and info.file_size / info.compress_size > _MAX_COMPRESSION_RATIO:
                 raise ValueError(
                     f"snapshot member {member} has an implausible compression ratio "
                     f"({info.file_size}/{info.compress_size}); refusing to decompress"
                 )
+            declared_total += info.file_size
+        if declared_total > _SNAPSHOT_TOTAL_LIMIT:
+            raise ValueError(
+                f"snapshot declares {declared_total} bytes across members, "
+                f"above the {_SNAPSHOT_TOTAL_LIMIT} byte budget"
+            )
         try:
-            manifest = json.loads(zf.read("manifest.json").decode("utf-8"))
+            manifest = json.loads(_read_member_bytes(zf, "manifest.json").decode("utf-8"))
         except (ValueError, UnicodeDecodeError) as exc:
             raise ValueError(f"snapshot manifest is corrupt: {exc}") from exc
         if (
@@ -238,6 +266,10 @@ def _import_snapshot_locked(
     # 磁盘记账集必须清空：否则旧模型的 id 还在集合里，导入后凡是命中的
     # chunk 都被判为"已嵌入"永不重嵌（而 vec 库里躺的是旧语料的向量）。
     owner._disk_vectors.clear()
+    # 补挂池同样先清空——它是给"文本层将被重建，但向量还能按 id 复用"用的；
+    # 放在这里清而不是放在第 4 步，是为了让文本层的向量导入（第 2 步）能把
+    # 导入的向量放进池里（见 _import_vectors_bin_member）。
+    owner._pending_vectors.clear()
 
     # 1) 文本层：解码 -> 按本机 meta 重写 -> 原子落地。
     chunk_count, file_count = _import_chunks_member(owner, zf)
@@ -252,7 +284,8 @@ def _import_snapshot_locked(
 
     # 3) FTS：能搬就搬；无论搬没搬，都按导入后的 chunk 集对账一次。
     if "fts.sqlite" in zf.namelist() and owner._fts_cache_path is not None:
-        _replace_live_file(owner, owner._fts_cache_path, zf.read("fts.sqlite"), close_fts=True)
+        staged = _stage_member(zf, "fts.sqlite", owner._fts_cache_path)
+        _replace_live_file(owner, owner._fts_cache_path, staged, close_fts=True)
 
     # 4) 用导入后的缓存文件重建内存态（向量按 id 挂回 chunk）。
     #    注意 FTS 对账必须放在 _chunks.clear() 与 _load_chunks_cache() 之后：
@@ -260,10 +293,15 @@ def _import_snapshot_locked(
     #    刚导入的 FTS 库——两套语料混在一起，且后续 sync 因签名未变永不修复。
     owner._chunks.clear()
     owner._signatures.clear()
-    owner._pending_vectors.clear()
     owner.failed_files.clear()
     owner._load_chunks_cache()
     owner._load_failed_files()
+    # 包内 signature 不可信：它是"源机器算好的文件摘要"，而本机 sync 的增量判据
+    # 正是它（run_sync: source in _signatures → 快路径/跳过）。不丢弃的话，构造
+    # 快照的人只要填上目标文件的真实 sha256，投毒正文就能永远躲过重读。清空后
+    # 首次 sync 必然重读全部文件重算签名：内容未变的切片按 content_hash 复用
+    # 快照向量（0 次 embedding 的性质不变），内容对不上的被磁盘真实内容替换。
+    owner._signatures.clear()
     if not owner._vectors_on_disk:
         owner._load_vectors_cache()
     _recreate_fts(owner)
@@ -289,7 +327,7 @@ def _import_chunks_member(owner: MarkdownIndexer, zf: zipfile.ZipFile) -> tuple[
     meta, files = loaded
     # chunks 层必须无向量（向量只属于向量层）；导入时不信任包内数据，统一剥离。
     clean: dict[str, tuple[str, list[Chunk]]] = {
-        source: (signature, [owner._strip_embedding(chunk) for chunk in chunks])
+        source: (signature, [_sanitize_chunk(owner, chunk) for chunk in chunks])
         for source, (signature, chunks) in files.items()
     }
     _CacheCodec.dump(owner._chunks_cache_path, owner._chunks_meta(), clean)  # type: ignore[arg-type]
@@ -302,13 +340,45 @@ def _import_vectors_bin_member(owner: MarkdownIndexer, zf: zipfile.ZipFile) -> i
     if loaded is None:
         raise ValueError("snapshot vectors.bin is corrupt")
     meta, vectors = loaded
+    # 包内 meta 由下一行用本机 meta 重写（cache key 派生自路径，换机必然不同），
+    # 所以维度只能按 payload 的实际长度校验：否则 manifest 只要声明得与本机一致，
+    # 错长度向量就会被盖上"本机身份"落地，检索侧的维度不一致只会静默给出 0.0
+    # 相似度（numpy 形状报错 → 回退 _cosine → min(len) 截断）。
+    dimension = _local_vector_dimension(owner)
+    if dimension is not None:
+        mismatched = [
+            chunk_id
+            for chunk_id, vector in vectors.items()
+            if vector is not None and len(vector) != dimension
+        ]
+        if mismatched:
+            raise ValueError(
+                f"snapshot vectors.bin carries {len(mismatched)} embedding(s) whose dimension "
+                f"is not {dimension} (first: {mismatched[0]!r}); refusing to import mismatched vectors"
+            )
+    vectors = {chunk_id: vector for chunk_id, vector in vectors.items() if vector is not None}
     _VectorsCodec.dump(owner._vectors_cache_path, owner._vectors_meta(), vectors)  # type: ignore[arg-type]
+    # 包内签名会被丢弃（见 _import_snapshot_locked），首次 sync 必然重建全部文本层。
+    # 这些向量按 chunk.id 放进"重建后补挂"池：内容未变的切片 id 不变 → 直接复用，
+    # 沿用 chunker 提升时同一条路径（tests/test_aliases.py 的铁律），0 次 embedding；
+    # 内容对不上的切片 id 不同 → 照常重嵌。内存后端才需要：磁盘后端的记账集由
+    # _ensure_disk_vectors_migrated 从 vec0 表重建，天然按 id 判"已有向量"。
+    owner._pending_vectors.update(vectors)
     return len(vectors)
 
 
 def _import_vectors_sqlite_member(owner: MarkdownIndexer, zf: zipfile.ZipFile) -> int:
     if owner._vectors_db_path is None:
         raise ValueError("sqlite_vec vector store is unavailable for this vault")
+    # 先落地到暂存文件再校验：payload 的 vec0 表声明维度就是检索时的真实维度，
+    # 而换进去之后 backend 的 CREATE ... IF NOT EXISTS 对已存在的表是 no-op，
+    # 本机维度只活在文件名里——不校验等于让 payload 借用本机身份。
+    staged = _stage_member(zf, "vectors.sqlite", owner._vectors_db_path)
+    try:
+        _validate_vector_sqlite(staged, _local_vector_dimension(owner))
+    except Exception:
+        _unlink_quietly(staged)
+        raise
     closer = getattr(owner._vector_backend, "close", None)
     if closer is not None:
         closer()
@@ -317,11 +387,12 @@ def _import_vectors_sqlite_member(owner: MarkdownIndexer, zf: zipfile.ZipFile) -
     # 让它永久停在"已关闭"状态 —— query() 恒返回 []、upsert 全部 no-op，
     # 而 _flush_vectors_to_disk 还在盲记账，语义检索静默归零且不可自愈。
     try:
-        _replace_live_file(owner, owner._vectors_db_path, zf.read("vectors.sqlite"), close_fts=False)
+        _replace_live_file(owner, owner._vectors_db_path, staged, close_fts=False)
         backend = create_vector_backend(owner.config.vector, owner, owner._vectors_db_path)
         if not getattr(backend, "available", False):
             raise ValueError("sqlite_vec could not open the imported vector store")
     except Exception:
+        _unlink_quietly(staged)
         # 失败即回滚：把旧 backend 重新打开（旧文件可能已被替换，能开成
         # 什么样算什么样——至少不能留一个"已关闭"的对象给后续所有调用）。
         try:
@@ -340,7 +411,7 @@ def _import_vectors_sqlite_member(owner: MarkdownIndexer, zf: zipfile.ZipFile) -
 
 
 def _decode_member(owner: MarkdownIndexer, zf: zipfile.ZipFile, member: str, loader: Callable[[Path], Any]) -> Any:
-    """把 zip 成员写到缓存目录的临时文件后用既有 loader 解码。
+    """把 zip 成员流式写到缓存目录的临时文件后用既有 loader 解码。
 
     _CacheCodec / _VectorsCodec 只认 Path，而它们真正的校验对象（meta）要
     在解码之后由导入逻辑重写，所以这里只负责把字节安全地交给 loader。
@@ -348,18 +419,21 @@ def _decode_member(owner: MarkdownIndexer, zf: zipfile.ZipFile, member: str, loa
     scratch_dir = (owner._chunks_cache_path or owner._vectors_cache_path).parent  # type: ignore[union-attr]
     tmp = scratch_dir / (member + ".importing")
     try:
-        tmp.write_bytes(zf.read(member))
+        _stream_member(zf, member, tmp)
         return loader(tmp)
     finally:
-        if tmp.exists():
-            try:
-                tmp.unlink()
-            except OSError:
-                pass
+        _unlink_quietly(tmp)
 
 
-def _replace_live_file(owner: MarkdownIndexer, target: Path, payload: bytes, *, close_fts: bool) -> None:
-    """原子替换一个可能正被本实例打开的缓存文件（sqlite）。"""
+def _stage_member(zf: zipfile.ZipFile, member: str, target: Path) -> Path:
+    """把成员流式解出到 target 旁的 .importing 暂存文件（带字节预算）。"""
+    tmp = target.with_suffix(target.suffix + ".importing")
+    _stream_member(zf, member, tmp)
+    return tmp
+
+
+def _replace_live_file(owner: MarkdownIndexer, target: Path, staged: Path, *, close_fts: bool) -> None:
+    """用已落地的暂存文件原子替换一个可能正被本实例打开的缓存文件（sqlite）。"""
     if close_fts and owner._fts is not None:
         try:
             owner._fts.close()
@@ -367,9 +441,159 @@ def _replace_live_file(owner: MarkdownIndexer, target: Path, payload: bytes, *, 
             pass
         owner._fts = None
     target.parent.mkdir(parents=True, exist_ok=True)
-    tmp = target.with_suffix(target.suffix + ".importing")
-    tmp.write_bytes(payload)
-    tmp.replace(target)
+    staged.replace(target)
+
+
+def _stream_member(zf: zipfile.ZipFile, member: str, dest: Path | Any) -> int:
+    """把 zip 成员按块写入 dest（Path 或文件对象），并施加字节预算。
+
+    zip 头里声明的 file_size 与 compress_size 都是攻击者可控字段，而
+    ``zf.read(member)`` 会在内存里一次性展开整个成员——两者都不能当上限用。
+    这里按真实读到的字节数记账，越界立刻中止（此时最多只多驻留一个块）。
+    """
+    limit = _SNAPSHOT_MEMBER_LIMITS.get(member, 0)
+    if isinstance(dest, Path):
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with dest.open("wb") as sink, zf.open(member) as src:
+                return _copy_member(src, sink, member, limit)
+        except Exception:
+            _unlink_quietly(dest)
+            raise
+    with zf.open(member) as src:
+        return _copy_member(src, dest, member, limit)
+
+
+def _copy_member(src: Any, sink: Any, member: str, limit: int) -> int:
+    """按块搬运并记账；超过成员上限立即中止。"""
+    written = 0
+    while True:
+        block = src.read(_MEMBER_READ_BLOCK)
+        if not block:
+            break
+        written += len(block)
+        if written > limit:
+            raise ValueError(
+                f"snapshot member {member} exceeds the {limit} byte limit while reading"
+            )
+        sink.write(block)
+    return written
+
+
+def _read_member_bytes(zf: zipfile.ZipFile, member: str) -> bytes:
+    buffer = io.BytesIO()
+    _stream_member(zf, member, buffer)
+    return buffer.getvalue()
+
+
+def _unlink_quietly(path: Path) -> None:
+    if not path.exists():
+        return
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
+def _local_vector_dimension(owner: MarkdownIndexer) -> int | None:
+    """本机配置的向量维度；拿不到（未配置维度）时返回 None = 跳过维度校验。"""
+    dimension = owner._vectors_meta().get("dimension")
+    if isinstance(dimension, int) and not isinstance(dimension, bool) and dimension > 0:
+        return dimension
+    return None
+
+
+_VEC0_DDL_PATTERN = re.compile(r"float\s*\[\s*(\d+)\s*\]", re.IGNORECASE)
+
+
+def _validate_vector_sqlite(path: Path, dimension: int | None) -> None:
+    """校验 payload 的 vec0 表声明维度与本机配置一致（换掉活动文件之前）。
+
+    表不存在 = 空库，重开时按本机维度建表，无风险；表存在则 payload 自带的
+    ``float[N]`` 决定检索时的真实维度（backend 的 ``CREATE ... IF NOT EXISTS``
+    对已存在的表是 no-op），与本机不一致就是毒向量，直接拒。
+
+    与 backend 一样先加载本地 sqlite_vec：vec0 是虚拟表，schema 解析需要模块
+    在位，否则连 sqlite_master 都读不出来。缺模块 / 读不出维度一律 fail-closed
+    ——"验不了"不能当成"没问题"。
+    """
+    if dimension is None or not path.exists():
+        return
+    try:
+        import sqlite_vec  # type: ignore
+    except Exception as exc:
+        raise ValueError(
+            f"sqlite_vec is required to verify a sqlite vector snapshot: {exc}"
+        ) from exc
+    try:
+        conn = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
+    except sqlite3.Error as exc:
+        raise ValueError(f"snapshot vectors.sqlite cannot be opened: {exc}") from exc
+    try:
+        conn.enable_load_extension(True)
+        sqlite_vec.load(conn)
+        conn.enable_load_extension(False)
+        row = conn.execute("SELECT sql FROM sqlite_master WHERE name = 'vec0_chunks'").fetchone()
+    except (sqlite3.Error, OSError) as exc:
+        raise ValueError(f"snapshot vectors.sqlite cannot be inspected: {exc}") from exc
+    finally:
+        conn.close()
+    if row is None or not row[0]:
+        return
+    match = _VEC0_DDL_PATTERN.search(str(row[0]))
+    if match is None:
+        raise ValueError("snapshot vectors.sqlite has an unrecognized vec0 schema")
+    declared = int(match.group(1))
+    if declared != dimension:
+        raise ValueError(
+            f"snapshot vectors.sqlite declares float[{declared}] but this config uses "
+            f"dimension={dimension}; refusing to install mismatched vectors"
+        )
+
+
+def _sanitize_chunk(owner: MarkdownIndexer, chunk: Chunk) -> Chunk:
+    """导入边界统一清洗切片：剥掉向量 + 规范化 metadata。
+
+    metadata 来自不可信快照，而下游对它既有硬索引（融合排序的 chunk_index、
+    kb_read 的行号）也有数值比较——结构畸形的切片会让整个检索工具报错，
+    而不是只影响那一条。
+    """
+    return owner._strip_embedding(replace(chunk, metadata=_normalize_chunk_metadata(chunk.metadata)))
+
+
+# 下游硬索引/数值比较依赖的字段：缺失即报错，不是"降级"，所以必须补默认值。
+_REQUIRED_INT_METADATA = {"start_line": 1, "end_line": 1, "chunk_index": 0}
+
+
+def _normalize_chunk_metadata(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        return dict(_REQUIRED_INT_METADATA)
+    meta: dict[str, Any] = {str(key): value for key, value in raw.items()}
+    for key, default in _REQUIRED_INT_METADATA.items():
+        try:
+            meta[key] = int(meta.get(key, default))
+        except (TypeError, ValueError):
+            meta[key] = default
+    if meta["end_line"] < meta["start_line"]:
+        meta["end_line"] = meta["start_line"]
+    if not isinstance(meta.get("content_hash"), str):
+        # 非字符串摘要会污染 sync 的向量复用映射（按 content_hash 建索引）。
+        meta.pop("content_hash", None)
+    if "heading" in meta and not isinstance(meta["heading"], str):
+        meta["heading"] = str(meta["heading"])
+    if "mtime" in meta and not isinstance(meta["mtime"], (int, float)):
+        meta.pop("mtime", None)
+    for key in ("tags", "aliases"):
+        value = meta.get(key)
+        if value is None:
+            meta.pop(key, None)
+        elif isinstance(value, str):
+            meta[key] = [value] if value.strip() else []
+        elif isinstance(value, (list, tuple)):
+            meta[key] = [str(item) for item in value if item is not None]
+        else:
+            meta.pop(key, None)
+    return meta
 
 
 def _recreate_fts(owner: MarkdownIndexer) -> None:
