@@ -100,3 +100,47 @@ def test_short_payload_after_zlib_returns_none_without_indexerror(tmp_path: Path
     boundary = tmp_path / "boundary.chunks.bin"
     boundary.write_bytes(zlib.compress(b"VMCPC\x01"))
     assert _CacheCodec.load(boundary) is None
+
+
+def test_tail_truncated_embedding_is_rejected(tmp_path: Path):
+    """尾部截断且字节数仍是 4 的倍数：``frombytes`` 不报错，必须由长度自校验拦下。
+
+    否则 load() 会成功返回一条"少了几维"的向量，缓存永不重建，而检索侧对
+    维度不一致只会回退成 0.0 相似度（静默错分值）。
+    """
+    vec_path = tmp_path / "tail.vectors.bin"
+    _VectorsCodec.dump(vec_path, {"key": "k", "dimension": 8}, {"id1": array("f", [1.0] * 8)})
+    vec_raw = zlib.decompress(vec_path.read_bytes())
+    vec_path.write_bytes(zlib.compress(vec_raw[:-4], 6))  # 末条 embedding 少 1 个 float
+    assert _VectorsCodec.load(vec_path) is None
+
+    chunk_path = tmp_path / "tail.chunks.bin"
+    files = {
+        "a.md": ("sig", [Chunk("id1", "内容", "a.md", "标题", {"chunk_index": 0}, embedding=array("f", [1.0] * 8))])
+    }
+    _CacheCodec.dump(chunk_path, {"key": "k"}, files)
+    chunk_raw = zlib.decompress(chunk_path.read_bytes())
+    chunk_path.write_bytes(zlib.compress(chunk_raw[:-4], 6))
+    assert _CacheCodec.load(chunk_path) is None
+
+
+def test_decompression_budget_is_enforced(tmp_path: Path, monkeypatch):
+    """解压上限生效：超限静默返回 None，而不是先把内存吃满。
+
+    上限是 2GB，真造那么大不现实——把上限压到载荷之下即可验证判据本身。
+    """
+    from mortis_rag_mcp._indexer import cache_codec
+
+    path = tmp_path / "budget.chunks.bin"
+    _CacheCodec.dump(
+        path,
+        {"key": "k"},
+        {"a.md": ("sig", [Chunk("id1", "内容" * 200, "a.md", "标题", {"chunk_index": 0})])},
+    )
+    raw = zlib.decompress(path.read_bytes())
+
+    monkeypatch.setattr(cache_codec, "_MAX_DECOMPRESSED_BYTES", len(raw) - 1)
+    assert _CacheCodec.load(path) is None, "超出解压上限的载荷必须被拒绝"
+
+    monkeypatch.setattr(cache_codec, "_MAX_DECOMPRESSED_BYTES", len(raw))
+    assert _CacheCodec.load(path) is not None, "恰好等于上限的载荷不得误伤"

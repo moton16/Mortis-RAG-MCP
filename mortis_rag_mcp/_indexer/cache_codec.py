@@ -24,6 +24,41 @@ from .models import Chunk, _EMB_DTYPE
 
 _CACHE_MAGIC = b"VMCPC"
 _CACHE_VERSION = 1
+# 解压上限：缓存文件会随 vault 分发（[cache] placement = "vault"），所以这条读
+# 路径必须自己兜住内存——"解压后有多大"不能由文件自己说了算。
+_MAX_DECOMPRESSED_BYTES = 2 * 1024 * 1024 * 1024
+_DECOMPRESS_BLOCK = 1 * 1024 * 1024
+
+
+def _decompress_bounded(path: Path) -> bytes | None:
+    """流式解压缓存文件并施加字节上限。
+
+    超限与格式错误一律返回 ``None``（本模块"解码失败即静默重建"的契约）：
+    解压前先按块读，避免为了解压再额外驻留一份压缩字节。
+    """
+    limit = _MAX_DECOMPRESSED_BYTES
+    engine = zlib.decompressobj()
+    out = bytearray()
+    try:
+        with path.open("rb") as src:
+            while True:
+                block = src.read(_DECOMPRESS_BLOCK)
+                if not block:
+                    break
+                remaining = limit - len(out)
+                if remaining <= 0:
+                    return None
+                out += engine.decompress(block, remaining)
+                if engine.unconsumed_tail:
+                    # 顶到上限而输入还没消化完 = 载荷超出上限，直接判失败，
+                    # 不给出"截断但看起来合法"的半份数据。
+                    return None
+        out += engine.flush()
+    except (OSError, zlib.error):
+        return None
+    if len(out) > limit:
+        return None
+    return bytes(out)
 
 
 def _pack_str(buf: bytearray, text: str) -> None:
@@ -72,9 +107,8 @@ class _CacheCodec:
     def load(path: Path) -> tuple[dict[str, Any], dict[str, tuple[str, list[Chunk]]]] | None:
         if not path.exists():
             return None
-        try:
-            raw = zlib.decompress(path.read_bytes())
-        except (OSError, zlib.error):
+        raw = _decompress_bounded(path)
+        if raw is None:
             return None
         # 长度判据必须与 magic 同句：magic 匹配但总长不足 6 字节的截断文件会让
         # 下方 raw[pos] 抛 IndexError，违反本模块「解码失败一律静默返回 None」契约。
@@ -128,6 +162,10 @@ class _CacheCodec:
                     if emb_len:
                         embedding = array(_EMB_DTYPE)
                         embedding.frombytes(raw[pos : pos + emb_len * 4])
+                        # 尾部截断但字节数是 4 的倍数时 frombytes 不报错，会静默产出
+                        # 短向量（挂到 chunk 上即"看起来像回事"的错分值），必须自校验。
+                        if len(embedding) != emb_len:
+                            return None
                         pos += emb_len * 4
                     chunks.append(Chunk(chunk_id, content, source, title, metadata, embedding=embedding))
                 files[source] = (signature, chunks)
@@ -169,9 +207,8 @@ class _VectorsCodec:
     def load(path: Path) -> tuple[dict[str, Any], dict[str, array]] | None:
         if not path.exists():
             return None
-        try:
-            raw = zlib.decompress(path.read_bytes())
-        except (OSError, zlib.error):
+        raw = _decompress_bounded(path)
+        if raw is None:
             return None
         # 同 _CacheCodec：截断文件不得抛 IndexError（静默返回 None 是契约）
         if raw[: len(_VectorsCodec._MAGIC)] != _VectorsCodec._MAGIC or len(raw) <= len(_VectorsCodec._MAGIC):
@@ -200,6 +237,9 @@ class _VectorsCodec:
                 if emb_len:
                     embedding = array(_EMB_DTYPE)
                     embedding.frombytes(raw[pos : pos + emb_len * 4])
+                    # 同 _CacheCodec：截断的尾部向量不得静默降级为短向量
+                    if len(embedding) != emb_len:
+                        return None
                     pos += emb_len * 4
                 vectors[chunk_id] = embedding
             return meta, vectors
