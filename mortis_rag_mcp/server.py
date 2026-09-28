@@ -7,13 +7,12 @@ import re
 import sys
 import threading
 from argparse import ArgumentParser
-from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from .config import load_config, resolve_config_path
-from .indexer import Chunk, MarkdownIndexer, SearchFilter, dedupe_by_content_hash, rerank_chunks
+from .indexer import Chunk, MarkdownIndexer, SearchFilter
 from .ingest import IngestManager, INGEST_EXTS
 from ._server import dispatch_search as _dispatch_search, fanout_search as _fanout_search_impl
 from .registry import VaultEntry, VaultRegistry, normalize_vault_key, registry_path

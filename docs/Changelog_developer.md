@@ -396,6 +396,28 @@
 > **验证**：`grep "0\.7\.3" README.md README_EN.md` 零命中（其余 0.7.3 命中均在 `CHANGELOG_user.md` 与 docs 历史条目内，按事实保留与卡内规则不动）；`grep "0\.7\.2" skills/mortis-rag-mcp/SKILL.md` 零命中；用项目自带 `config._read_toml()`（本机 `.venv` 为 Python 3.10、无 `tomllib`，自动走 fallback 子集解析器）断言 `extras == ['accel','vec']`、`accel == ['numpy>=1.24']`、`dependencies == []`。
 > **实装校验留白（如实记录）**：本机 `.venv` 未安装 numpy（实测 `ModuleNotFoundError`），故 `accel` 下限按保守 `>=1.24` 声明、不随意下调；`pip install -e ".[accel]"` 的实装验证未在本会话执行（避免改动使用者 venv 且本批最终回归交由 CI），留待 CI 安装阶段覆盖。
 
+### [FIX-6–FIX-8] — moton16,2026-09-28,CodeBuddy,Deepseek-V4.1-Flash — chore(cleanup): 清理 Facade 死导入与陈旧行号引用
+> **涵盖提交**：`chore(cleanup): 清理 Facade 死导入与陈旧行号引用`
+> **来源**：同批次维护性卡 M1 / M2 / M13。
+>
+> **代码改动概况（verify-then-delete，逐名词边界核验后才删）**：
+> - `mortis_rag_mcp/indexer.py`（M1，净减 10 行导入）：删除 Facade 瘦身遗留的 7 条整行死导入（`fnmatch`、`math`、`re`、`struct`、`zlib`、`from concurrent.futures import ThreadPoolExecutor, as_completed`、`from dataclasses import dataclass, field, replace`）与裸模块导入 `from . import fsnotify`；并从两条组合导入中摘除 `watcher_available`、`split_large_table`（同行的 `WindowsDirectoryWatcher`、`iter_table_blocks`、`split_table_into_chunks` 保留）。
+> - `mortis_rag_mcp/server.py`（M2）：删除 `from dataclasses import replace`，以及从 `.indexer` 导入的 `dedupe_by_content_hash`、`rerank_chunks`（`kb_search` 已迁 `_server/`，fanout 直接从 `_indexer` 导入）。
+> - `mortis_rag_mcp/_server/fanout.py`（M13）：`_measure_payload_bytes` docstring 的 `server.py:843` 陈旧行号引用改为 `server.py::_text_content`（引用函数名，勿钉行号——行号随重构持续腐烂正是本卡动机）。
+>
+> **核验依据（凭什么可删）**：`indexer.py` 内候选名的唯一命中即 import 行本身（`tmp.replace`/`source.replace` 是 `Path`/`str` 方法、注释里的 "re-embeds"/"re-written" 是英文单词，均不构成使用）；`server.py` 内 `replace` 的其余命中同理（`str.replace`、注释与错误文案）；包内无任何模块 `from .indexer import <候选名>`；`watcher_available` 由 `_indexer/watch.py:7` 直接从 `..fsnotify` 导入、`split_large_table` 由测试直接从 `ingest.tables` 导入，均不经 Facade；Facade 的 monkeypatch 接缝只有 `_inject_image_notes`（chunking）与 `_probe_mtime_tick_ns`（scanning），不在候选内；`indexer.py` 无 `__all__`；`test_facade_freeze.py` 冻结符号表不含任何候选。另核实被删的每个名字都由真正使用它的私有子模块自带导入（`re`→chunking/search、`struct`+`zlib`→cache_codec、`ThreadPoolExecutor`+`as_completed`→sync_engine、`fnmatch`+`math`→scanning、`dataclass`+`field`→models、`replace`→search），无运行期隐患。
+>
+> **验证**：`import mortis_rag_mcp.indexer, mortis_rag_mcp.server` 通过；导入面断言 `STILL_PRESENT_INDEXER=[]`、`STILL_PRESENT_SERVER=[]`（13+3 个被删名全部消失）且 `KEPT_OK=True`（Facade 保留导出面齐全）；`tests/test_facade_freeze.py + tests/test_facade_seam.py + tests/test_chunking_seam.py` 9 passed；lint 零新增。
+>
+> **本批次验证（三卡合计，按用户裁定不在本地跑全量、由 CI 承接最终回归）**：动手前基线双跑均为 **410 passed, 4 skipped**（与 C52 声称一致，无带病施工）；最终靶向门禁 10 文件 **56 passed**（`test_exempt`、`test_cache_codec_roundtrip`、`test_budget_bytes`、`test_facade_freeze`、`test_facade_seam`、`test_chunking_seam`、`test_p5_lifecycle`、`test_mcp_stdio`、`test_search_oracle`、`test_hybrid`），且在隔离配方下真实缓存目录文件数前后 **18153 → 18153 零变化**。
+>
+> **本批次偏差与上报（以磁盘实况为准；均未顺手修）**：
+> - **`Quick-start_developer.md` §7 的 `SAFE_DELETE_FAIL_CLOSED` 描述不成立**：全库 `*.py` grep 零命中该字符串，`purge_cache` / `rebuild` 走 `Path.unlink()`、不进系统回收站。该已知红用例的真实成因待独立排查。
+> - **`PROJECT_GUIDE.md` §2.3 的注记在 FIX-4 落地后过期**：其称「`numpy` 连 optional-dependencies 都没声明」，而本批已补 `accel` extra（§13.3「提供 accel / vec 额外可选依赖」反而成真）。卡内明示 PROJECT_GUIDE 无需改，故未改，仅记录两处口径留待后续版本对齐。
+> - **C52 条目所称「pyproject.toml 工作区 extras（accel/numpy）经审裁决暂保留」与提交历史不符**：`git log --all -S accel -- pyproject.toml` 零命中、HEAD 亦只有 `vec`，即 accel extra 从未进入任何提交；本批 FIX-4 才是首次落地。
+> - **测试隔离缺陷（不在本批 8 卡范围，仅上报不动）**：`config.py` 的 `DEFAULT_CACHE_DIR` 固定为 `~/.mortis_rag_mcp_cache` 且无环境变量可覆盖，而 `tests/test_exempt.py`、`tests/test_mcp_stdio.py` 等 stdio 用例的 app.toml 未写 `[cache] dir`（`test_registry_server.py`、`test_multivault.py`、`test_snapshot.py` 等则写了），这些用例会把临时库缓存写进使用者的真实缓存目录——本机实测累积 **18153** 个孤儿缓存文件；叠加 pytest 默认只保留 3 轮 `tmp_path`、更早整轮被改名 `garbage-*` 后整目录删除（实测单个目录 837~1262 文件），本机每跑一次全量即触发一次 500+ 文件的批量删除审核。另 `tests/test_budget_bytes.py` 的子进程 env 只设 `VAULT_MCP_REGISTRY`，宿主若导出 `MORTIS_RAG_REGISTRY`（新名优先）会压过测试自身隔离：本会话实测该陷阱令 `test_mcp_stdio.py` 两个用例假失败（`KeyError: 'description'`，真因是复用的注册表已存在、legacy `vault_path` 自动迁移被跳过），故本地验证统一改用「仅重定向 `HOME`/`USERPROFILE`、不导出任何 REGISTRY 变量、独立 `--basetemp` + `-p no:cacheprovider`」的隔离配方（修正后同批用例即全绿）。
+> - **本轮不做**：§4 明确清单（C3/C4/C5/C7/C8 与 46 条 informational）一律未动；`tests/test_subvaults.py` 的 rebuild 已知环境红未顺手修。
+
 
 
 

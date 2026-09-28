@@ -1,28 +1,20 @@
 from __future__ import annotations
 
-import fnmatch
 import hashlib
 import json
-import math
 import os
-import re
-import struct
 import threading
 import time
-import zlib
 import zipfile
 from array import array
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from .config import AppConfig
-from . import fsnotify
-from .fsnotify import WindowsDirectoryWatcher, watcher_available
+from .fsnotify import WindowsDirectoryWatcher
 from .fts import FtsIndex
 from .ingest import INGEST_EXTS
-from .ingest.tables import iter_table_blocks, split_large_table, split_table_into_chunks
+from .ingest.tables import iter_table_blocks, split_table_into_chunks
 from .providers import EmbeddingProvider, ProviderError, RerankerProvider, create_embedding_provider, create_reranker_provider
 from .vector import create_vector_backend
 # v0.8.0 P2：数据模型与缓存编解码提取至私有包 _indexer/（本文件转为 Facade）。

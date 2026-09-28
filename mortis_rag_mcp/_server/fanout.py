@@ -25,7 +25,7 @@ if TYPE_CHECKING:
 def _measure_payload_bytes(result: Any) -> int:
     """计量最终响应字符串的 UTF-8 字节数。
 
-    对齐 server.py:843 _text_content 包装后的最终序列化口径：
+    对齐 server.py::_text_content 包装后的最终序列化口径（引用函数名，勿钉行号）：
     json.dumps({"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False)}]}, ensure_ascii=False)
     """
     inner = json.dumps(result, ensure_ascii=False)
