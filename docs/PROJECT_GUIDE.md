@@ -124,7 +124,7 @@
 ┌──────────────────────────────────────────────────────────────────┐
 │ server.py  VaultMcpServer / serve\\\\\\\_stdio                          │
 │  ├─ 协议层：initialize / ping / tools/list / tools/call          │
-│  ├─ 13 个工具的分发 + 参数防御性解析 + fan-out 编排               │
+│  ├─ 15 个工具的分发 + 参数防御性解析 + fan-out 编排               │
 │  └─ \\\\\\\_indexers: {vault\\\\\\\_path → MarkdownIndexer}（双检锁缓存）      │
 └───────┬──────────────────────┬───────────────────────────────────┘
         │                      │
@@ -493,22 +493,24 @@ query 为空 → 直接返回（过滤+分页后）的 chunk 列表
 
 ## 六、MCP 工具 API 参考
 
-`tools/list` 返回 13 个工具。所有 `vault\\\\\\\_path` 参数均可省略：仅注册一个库时自动取它（该库为 solo 时 `kb\\\\\\\_search` 例外——直接报错，见 4.8）；多个库时必须显式（`kb\\\\\\\_search` 例外——缺省触发跨库 fan-out，solo 库除外）。
+`tools/list` 返回 15 个工具。所有 `vault\\\\\\\_path` 参数均可省略：仅注册一个库时自动取它（该库为 solo 时 `kb\\\\\\\_search` 例外——直接报错，见 4.8）；多个库时必须显式（`kb\\\\\\\_search` 例外——缺省触发跨库 fan-out，solo 库除外）。
 
 |工具|参数|语义|
 |-|-|-|
-|`kb\\\\\\\_init`|`path`(必), `name`?|注册知识库：写注册表 → 后台建索引 → 启动监听。幂等保护：重复注册报 `already registered`|
+|`kb\\\\\\\_init`|`path`(必), `name`?, `description`?|注册知识库：写注册表 → 后台建索引 → 启动监听。幂等保护：重复注册报 `already registered`|
 |`kb\\\\\\\_init\\\\\\\_solo`|`path`(必), `name`?|0.6.0 新增：注册/确保 solo 独立库（幂等三态）：未注册 → 注册为 solo 库；已注册普通库 → 原地转 solo（只改注册表布尔位，索引/缓存/watcher 不动）；已是 solo → 幂等确认。取消 solo 走 `kb\\\\\\\_remove` + `kb\\\\\\\_init`|
 |`kb\\\\\\\_remove`|`path`(必), `purge\\\\\\\_cache`=false|0.6.0 更名（原 `kb\\\\\\\_unregister`）：停监听 + 移除注册（不动文件夹本身）；`purge\\\\\\\_cache=true` 连磁盘缓存一起删|
 |`kb\\\\\\\_list`|无|0.6.0 更名（原 `kb\\\\\\\_vaults`）：列注册表：name/path/weight/**solo**/exists/indexed/files/last\_sync|
 |`kb\\\\\\\_set\\\\\\\_weight`|`vault\\\\\\\_path`(必), `weight`(必, (0,100])|库级检索权重，fan-out 分数放大系数，持久化进注册表|
+|`kb\\\\\\\_describe`|`vault\\\\\\\_path`(必), `description`(必)|设置/更新知识库描述（一句话说明库装什么，供检索路由定向选库用）|
+|`kb\\\\\\\_ingest`|`action`(必: submit/status/scan\_pending), `source`?, `force`?, `vault\\\\\\\_path`?|PDF/Office 异步解析摄取管理（MinerU 双通道 / 本地 PyMuPDF 兜底）|
 |`kb\\\\\\\_export`|`out\\\\\\\_path`(必, 绝对路径+.zip), `vault\\\\\\\_path`?, `overwrite`?|导出索引快照 zip；已存在须显式 `overwrite=true`|
 |`kb\\\\\\\_import`|`snapshot`(必), `force`=false, `vault\\\\\\\_path`?|从快照恢复；模型/维度/切块参数不符时拒绝，force 只导文本层并本地重嵌|
 |`kb\\\\\\\_rebuild`|`vault\\\\\\\_path`?|删缓存强制全量重建。**高危：全量重新 embedding，见 SKILL.md 限流警告**|
 |`kb\\\\\\\_list\\\\\\\_files`|`vault\\\\\\\_path`?|0.6.0 更名（原 `kb\\\\\\\_list`）：列已索引文件 `\\\\\\\[{source,title,chunks}]`|
-|`kb\\\\\\\_search`|`query`(必), `top\\\\\\\_k`=10, `use\\\\\\\_rerank`=true, `vault\\\\\\\_path`?, `path\\\\\\\_prefix`?, `tags`?, `mtime\\\\\\\_after`?, `mtime\\\\\\\_before`?, `offset`?, `limit`?, `group\\\\\\\_by\\\\\\\_vault`=false, `dedupe`=true|核心检索；fan-out 跳过 solo 库并在结果中列出，详见 4.5.5 / 4.8 fan-out|
-|`kb\\\\\\\_read`|`source`(必), `heading`? / `start\\\\\\\_line`?+`end\\\\\\\_line`?, `vault\\\\\\\_path`?|读原文（不调 LLM）；超 20000 字符截断并标 `truncated`|
-|`kb\\\\\\\_stats`|`vault\\\\\\\_path`?|files/chunks/exempt\_files/failed\_files/last\_sync/embedding/reranker/cache/use\_hybrid/fts\_enabled/vector\_backend|
+|`kb\\\\\\\_search`|`query`(必), `top\\\\\\\_k`=10, `use\\\\\\\_rerank`=true, `vault\\\\\\\_path`?, `path\\\\\\\_prefix`?, `tags`?, `mtime\\\\\\\_after`?, `mtime\\\\\\\_before`?, `offset`?, `limit`?, `group\\\\\\\_by\\\\\\\_vault`=false, `dedupe`=true, `budget\\\\\\\_bytes`?, `exact\\\\\\\_terms`?|核心检索；支持 budget_bytes 输出预算与 exact_terms 显式硬包含；fan-out 跳过 solo 库并在结果中列出|
+|`kb\\\\\\\_read`|`source`? 或 `chunk\\\\\\\_id`? (二选一), `expand\\\\\\\_lines`=30, `heading`? / `start\\\\\\\_line`?+`end\\\\\\\_line`?, `vault\\\\\\\_path`?|读原文（支持 Markdown 与 .txt；支持 chunk_id 原地展开与 [[双链短名]] 寻址；超 read_max_chars 字符截断并标 `truncated`）|
+|`kb\\\\\\\_stats`|`vault\\\\\\\_path`?|files/chunks/exempt\_files/failed\_files/last\_sync/embedding/reranker/cache/use\_hybrid/fts\_enabled/vector\_backend/accel|
 |`kb\\\\\\\_exempt`|`action`(必: list/add\_pattern/remove\_pattern/exempt\_file/unexempt\_file/check), `pattern`?, `source`?, `method`?(frontmatter\|ignore\_file), `vault\\\\\\\_path`?|私密/草稿内容豁免管理|
 
 **返回包裹**：所有结果经 `\\\\\\\_text\\\\\\\_content` 序列化为 `{"content":\\\\\\\[{"type":"text","text":"<json字符串>"}]}`——即 text 内容本身是 JSON 字符串，客户端需二次解析（MCP 惯例）。
@@ -781,13 +783,13 @@ python -m pytest -q                       # 应全绿
 
 1. **watcher 触发的是全量对账扫描**。原生事件已拿到具体路径，却只用来表达"有动静"；虽然 2026-09-04 引入了 Fast-Stat 轻量对账机制（`(st_mtime_ns, st_size)` 比对跳过磁盘读取与 SHA256，I/O 开销降至极低），但大库遍历目录树仍有调用开销。改进方向：把事件路径传给 sync 做定向变更更新，定期兜底全量扫描。
 2. ~~**注册表无跨进程文件锁**~~（**已于 2026-09-04 解决**）。通过 Windows `msvcrt.locking` 与 POSIX `fcntl.flock` 实现独占跨进程锁 `_process_file_lock`，配合 `threading.local()` 支持同线程安全重入，并引入唯一临时文件原子替换（PID+UUID）与读重试退避机制。
-3. **`numpy` 未声明为 extra**。它是重要的性能依赖（约一个数量级的检索差距）却只能靠用户自觉安装；文档之外无任何提示。改进方向：加 `accel = \\\\\\\["numpy"]` extra 并在 `kb\\\\\\\_stats` 报告是否生效。
+3. ~~**`numpy` 未声明为 extra 与加速状态不可见**~~（**已于 v0.8.0 解决**）。`kb_stats` 已增加 `accel: {"numpy": bool, "sqlite_vec": bool}` 状态报送，通过 `find_spec` 探测元数据不抢占 GIL；提供 `accel` / `vec` 额外可选依赖。
 4. **`mtime` 语义在首次建库后失真**。chunk 的 mtime 是"本次索引重建时刻"，只有文件再次变更才变准（CHANGELOG Known side effects 已声明）。改进方向：以文件系统 st\_mtime 为准（当前实现取的正是 stat 值，问题只在老缓存与重建场景）。
 5. **FTS trigram 对 <3 字符查询天然失明**。词法路已于 2026-09-04 深度优化短英文专业缩写（如 RC、AI、OS）：结合停用词过滤与单词边界正则 `\b` 提升词法分，消除子串假阳性（如 source 误中 rc）并确保专业词高召回。CJK 场景 2-gram 索引仍保留为中远期规划。
 6. **fan-out 时每库各自 rerank 候选上限内的内容合并后只 rerank 一次**，`rerank\\\\\\\_cap`(60) 会截断多库合并池——库越多，单库实际进入 rerank 的候选越少。可考虑按库配额或调大 cap。
 7. **静态 embedding 无语义质量**。对无 API key 的用户，检索退化为纯词法（这个是文档化的预期行为，但可以在 `kb\\\\\\\_stats` 里显式警告 mode=static）。
 8. **Windows 强绑定部分**：原生监听仅 Windows（非 Windows 自动轮询，功能正确但空转 CPU）；`path\\\\\\\_prefix` casefold 只在 `os.name == "nt"` 做。
-9. **`kb\\\\\\\_read` 的 20000 字符截断是硬编码**，未进配置。
+9. ~~**`kb\\\\\\\_read` 的 20000 字符截断是硬编码**~~（**已于 v0.8.0 解决**）。已提取进全局配置 `[index] read_max_chars`（默认 20000，取值范围 100~1000000），由各库 indexer 安全读取并截断。
 
 \---
 
@@ -1057,5 +1059,44 @@ python -m pytest -q                       # 应全绿
 * 全量测试用例扩充至 **345 passed, 4 skipped**（基线 314 passed，净增 31 个专项金测与生命周期回归用例）；
 * 检索评估 **Hit@5 100.0% / MRR@5 1.000** 零回退；
 * 缓存 round-trip 与金测 oracle 100% 严格恒等。
+
+---
+
+### v0.8.0 功能迭代（2026-09-28）—— 搜索精读闭环、预算控制与可观测性（C组合落地）
+
+#### editor:moton16,Antigravity,Gemini 3.8 Flash
+
+**目标与交付功能**：
+在 v0.8.0 架构重构基线上交付六大功能点（F1–F7.2），彻底打通 Agent 本地 RAG「检索 → 精读」闭环并加固安全与可观测性：
+1. **F1 `kb_read(chunk_id)` 原地展开**：
+   - 彻底解决命中后需拼接路径与手工换算行号的摩擦点；
+   - 内存 `all_chunks()` 短路查找目标切片，支持 `expand_lines` 夹取 `[0, 500]`（默认 30），并追加 `chunk_id` 回显；
+   - `chunk_id` 与 `start_line/end_line/heading` 互斥保护，未命中友好报错。
+2. **F3 `budget_bytes` 输出预算 + preview metadata 瘦身**：
+   - `kb_search` 引入 `budget_bytes` 输出预算硬熔断（夹取 `[500, 100000]`），逐条累计字节并在超限时截断，回显 `truncated` / `returned` / `next_offset`；
+   - `preview` 模式 metadata 深度瘦身（仅保留 `tags` 与 `mtime`，剔除冗余字段），实测单条预览瘦身 23.3%，大幅避免击穿宿主缓冲区。
+3. **F4 `exact_terms` 显式硬包含**：
+   - 支持专有名词/代号显式硬包含（AND 语义，不区分大小写，最多 8 项）；
+   - 三层召回保障机制：全库扫描构造 must 候选集并作为 Route D 注入 RRF 融合、非 hybrid 降级路径保底分追加、排序后与过滤条件同步硬过滤，彻底根除“只在 Top-K 内过滤导致漏召回”的系统性隐患。
+4. **F5a frontmatter `aliases` 别名检索参与**：
+   - 自动提取笔记 frontmatter 中的 `aliases`（支持列表与逗号分隔格式，兼容中文全角逗号 `，`）；
+   - 升级缓存代际 `chunker: 5 -> 6`，实现文本层平滑升级且向量按 id 复用（0 次重复 embedding）；
+   - 词法扫描路通过 `_lexical_haystack` 赋权别名命中。
+5. **F5b `kb_read` `[[双链]]` 短名寻址**：
+   - 支持在 `kb_read(source=...)` 中直接传入短名、`[[笔记名]]`、`[[笔记名|别名]]` 或 `[[笔记名#章节]]`；
+   - 自动在已索引切片库中按 stem 大小写不敏感匹配唯一笔记；多义匹配给出最多 5 个候选路径提示。
+6. **F6 独立可关闭的本地诊断日志**：
+   - 新增 `mortis_rag_mcp/diaglog.py` 标准库模块；
+   - 配置 `[diag]` 支持独立开启，严格执行 10 键脱敏白名单，支持 4 阶段埋点（`sync`/`retrieve`/`rerank`/`serialize`）与失败记账；
+   - 文件超限轮转与过期清理，并发线程写锁保护，写失败一律静默吞掉，绝对保证 stderr 纯净。
+7. **F7.1 & F7.2 配置与状态收尾**：
+   - `read_max_chars` 纳入 `[index]` 配置（默认 20000 字符，范围 100~1000000）；
+   - `kb_stats` 增加 `accel: {"numpy": bool, "sqlite_vec": bool}`，通过 `find_spec` 探测加速依赖状态。
+
+**验证门禁**：
+* 全量测试用例扩充至 **410 passed, 4 skipped**（净增 65 个测试用例）；
+* 检索评测 **Hit@5 100.0% / MRR@5 1.000** 零回退；
+* `tools/list` schema 体积严格受控（增量 5.5%，优于 ≤10% 门禁标准）。
+
 
 

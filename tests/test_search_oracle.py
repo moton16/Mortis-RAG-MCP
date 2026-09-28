@@ -1,7 +1,8 @@
 """P4 单库检索与 Fan-out 检索 oracle 等价测试。
 
 契约与安全闸门：
-1. 等价性：重构后单库检索与旧逻辑三元组 (id, score, order) 恒等；
+1. 等价性：重构后单库检索与 C44（v0.7.3）冻结旧实现（tests/golden/
+   legacy_search_impl.py，逐字快照）三元组 (id, score, order) 恒等；
 2. 不可变性：检索过程绝不原地修改 indexer 内部常驻 Chunk 对象的 score；
 3. 容错性：空查询、短缩写、CJK 多字滑窗、过滤条件、分页切片行为一致；
 4. 协议委托：server._kb_search 与 server._fanout_search 委托正常。
@@ -12,10 +13,10 @@ from array import array
 from pathlib import Path
 import pytest
 
-from mortis_rag_mcp.config import AppConfig, EmbeddingConfig
+from mortis_rag_mcp.config import AppConfig, CacheConfig, EmbeddingConfig
 from mortis_rag_mcp.indexer import MarkdownIndexer, SearchFilter, rerank_chunks
 from mortis_rag_mcp.server import VaultMcpServer
-from mortis_rag_mcp._indexer.search import SearchEngine
+from tests.golden.legacy_search_impl import LegacySearchOracle
 
 
 @pytest.fixture
@@ -43,9 +44,9 @@ def test_vault(tmp_path):
     return vault
 
 
-def test_chunk_score_never_mutated_in_place(test_vault):
+def test_chunk_score_never_mutated_in_place(test_vault, tmp_path):
     """断言检索过程绝不修改 all_chunks() 常驻对象的 score。"""
-    indexer = MarkdownIndexer(test_vault, AppConfig(embedding=EmbeddingConfig(mode="static", dimension=8)))
+    indexer = MarkdownIndexer(test_vault, AppConfig(embedding=EmbeddingConfig(mode="static", dimension=8), cache=CacheConfig(enabled=True, dir=str(tmp_path / "cache"))))
     indexer.sync()
 
     # 记录常驻 chunk 的初始 score
@@ -73,18 +74,28 @@ def test_chunk_score_never_mutated_in_place(test_vault):
         ("不存在的冷门关键词XYZ", 5, None, True),
     ],
 )
-def test_search_engine_and_facade_identical(test_vault, query, top_k, filters, dedupe):
-    """断言 SearchEngine.search 与 indexer.search 产物严格等价。"""
-    indexer = MarkdownIndexer(test_vault, AppConfig(embedding=EmbeddingConfig(mode="static", dimension=8)))
-    indexer.sync()
+def test_search_facade_matches_legacy_oracle(test_vault, tmp_path, query, top_k, filters, dedupe):
+    """断言 Facade 检索与 C44（v0.7.3）冻结旧实现产物严格恒等（真 oracle）。
 
+    对照方 tests/golden/legacy_search_impl.py 是重构前实现的逐字快照：
+    冻结算法 + 经 __getattr__ 穿透到同一活实例的状态，与 Facade 路径共享
+    同一份库内 chunk/FTS/向量状态，唯一变量是新实现的算法代码本身。
+    cache.enabled=True 使 FTS/RRF 混合路由真实开启（裸 AppConfig 编程构造
+    默认 enabled=False，会导致本测试静默退化为纯词法路径对照）。
+    """
+    indexer = MarkdownIndexer(test_vault, AppConfig(embedding=EmbeddingConfig(mode="static", dimension=8), cache=CacheConfig(enabled=True, dir=str(tmp_path / "cache"))))
+    indexer.sync()
+    # 硬断言混合路由真实开启：FTS 静默降级会让本测试退化为纯词法对照。
+    assert indexer._fts is not None and indexer._fts.available
+
+    oracle = LegacySearchOracle(indexer)
     facade_results = indexer.search(query, top_k=top_k, filters=filters, dedupe=dedupe)
-    engine_results = SearchEngine.search(indexer, query, top_k=top_k, filters=filters, dedupe=dedupe)
+    legacy_results = oracle.search(query, top_k=top_k, filters=filters, dedupe=dedupe)
 
     facade_triplets = [(c.id, round(c.score, 6), c.source) for c in facade_results]
-    engine_triplets = [(c.id, round(c.score, 6), c.source) for c in engine_results]
+    legacy_triplets = [(c.id, round(c.score, 6), c.source) for c in legacy_results]
 
-    assert facade_triplets == engine_triplets
+    assert facade_triplets == legacy_triplets
 
 
 def test_server_search_dispatch_delegation(test_vault, tmp_path, monkeypatch):

@@ -23,16 +23,21 @@ version: 5.2.0
 |---|---|---|
 | 1 | 用户提到具体库名/文件夹名/主题（如"数电"、"DateALive"） | **直接传库名**（无需拼漫长绝对路径）：`kb_search(query, vault_path="库名")`；指向子树再加 `path_prefix='目录/'` |
 | 2 | 用户需要联合检索多个特定库（如"数电与微机"、"主库+某特定独立库"） | **Scoped 多库检索**：传库名数组 `vault_paths=["数电", "微机"]`；被点名的 solo 库会合法参与联合召回 |
-| 3 | 大范围初步探索、泛搜或需要较多候选（`top_k >= 5`） | **开启预览模式**：`kb_search(query, ..., preview=True)`，体积压缩 70%+，获取高光摘要与精确行号锚点 |
-| 4 | 问题模糊、探索性（"我最近学过什么""哪都可能有"） | 不传 `vault_path` 全局盲搜（自动跳过 solo 库），根据结果 `vault`/`vault_name` 研判，下轮按 #1 定向 |
-| 5 | `kb_search` 返回 `status: "indexing"` | 知识库后台首次构建中。向用户汇报进度（`progress`），依据 `retry_after` 稍候或转战其他子任务，勿紧密自旋 |
-| 6 | 定位到高价值目标片段后需要精读原文上下文 | **二段式精读**：`kb_read(source, start_line, end_line, vault_path="库名")` 提取切题段落，严禁无范围全篇硬拉 |
+| 3 | 大范围初步探索、泛搜或需要较多候选（`top_k >= 5`） | **开启预览或预算**：`kb_search(query, ..., preview=True)`（体积压缩 70%+，获取高光摘要与精确行号）或 `budget_bytes=3500` 防宿主截断转储 |
+| 4 | 专有名词、代码符号、人名代号易被语义泛化稀释或未进入 Top-K | **显式硬包含**：`kb_search(query, exact_terms=["专有名词", "代号"])`（AND 语义，全库扫描保底召回） |
+| 5 | 问题模糊、探索性（"我最近学过什么""哪都可能有"） | 不传 `vault_path` 全局盲搜（自动跳过 solo 库），根据结果 `vault`/`vault_name` 研判，下轮按 #1 定向 |
+| 6 | `kb_search` 返回 `status: "indexing"` | 知识库后台首次构建中。向用户汇报进度（`progress`），依据 `retry_after` 稍候或转战其他子任务，勿紧密自旋 |
+| 7 | 搜索命中切片后需要精读上下文 | **切片原地展开（极力推荐）**：优先调用 `kb_read(chunk_id=c.id, expand_lines=30)` 原地展开，自动换算行号且防路径错误 |
+| 8 | 读到笔记内的双链引用（如 `[[计算机网络]]`、`[[架构#模块]]`）想深挖 | **双链短名直读**：直接调用 `kb_read(source="计算机网络")` 或 `kb_read(source="[[计算机网络]]")` 自动消歧寻址 |
+| 9 | 定位到特定章节或已知精确行号 | **区间精读**：`kb_read(source, start_line, end_line, vault_path="库名")` 或带 `heading`，超 `read_max_chars` 自动安全截断 |
 
 ## 反模式（禁止）
 
 - 禁止在条件 #1 命中时省略 `vault_path`"先看看"——定向永远先于试探。
 - 禁止费力拷贝 Windows 漫长物理路径传参——优先直接传人类可读库名（大小写不敏感自然解析）。
-- 禁止一次性大范围拉取完整 content 倾倒进主上下文——初筛务必善用 `preview=True`，后续由 `kb_read` 精准精读。
+- 禁止一次性大范围拉取完整 content 倾倒进主上下文——初筛务必善用 `preview=True` 或 `budget_bytes`，避免触发宿主转储。
+- 禁止在搜索拿到 `chunk_id` 后手工费力计算行区间——优先直接 `kb_read(chunk_id=...)` 原地展开。
+- 禁止在读到双链短名时因不知道具体目录路径而放弃——直接将短名作为 `source` 传入 `kb_read`。
 - 禁止对 solo 库（独立私密库）做无目标的全局盲搜并声称"没搜到"——需在 `vault_path` 或 `vault_paths` 中显式点名。
 - 禁止用 `kb_rebuild` 修少量失败文件；正确姿势是反复 `kb_stats`/`kb_search` 触发增量 sync。
   `kb_rebuild` = 全量重嵌（几百~几千次 API 调用，免费档必爆限流），仅在换模型/维度时用。
@@ -47,5 +52,6 @@ kb_set_weight / kb_exempt（毫秒级豁免私密）/ kb_rebuild（高危，见�
 
 - **格式支持**：Markdown（`.md`）与纯文本（`.txt` 小说/分卷资料）均为原生一等公民，享受同等分块、章节标题感知与检索待遇；未收录格式在 `kb_stats` 的 `skipped_unsupported` 中透明列出。
 - **混合检索**：FTS5 BM25 + 向量余弦 + bigram 词法三路 RRF + rerank。2 字中文与短英文缩写有兜底。
+- **别名感知**：原生识别笔记 frontmatter 中声明的 `aliases` 别名（支持缩写/简称/中文逗号），无需正文重复提及即可精准检索召回。
 - **配置链**：`--app-config` > `MORTIS_RAG_CONFIG` > `VAULT_MCP_CONFIG` > `~/.mortis_rag_mcp/config.toml` > `~/.vault_mcp/config.toml` > 内置默认。
 - **PDF 摄取层**：默认关闭。`kb_ingest` 报 disabled 时，引导用户在 config/app.toml 设 `[ingest] enabled=true` 重启后用。

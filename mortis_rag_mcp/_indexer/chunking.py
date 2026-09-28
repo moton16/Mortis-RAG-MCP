@@ -290,6 +290,7 @@ def new_chunk(
     lines: list[str],
     mtime: float | None = None,
     source_pdf: str | None = None,
+    aliases: list[str] | None = None,
 ) -> Chunk:
     content = "\n".join(lines).strip()
     identifier = hashlib.sha1(f"{source}\0{index}\0{content}".encode("utf-8")).hexdigest()
@@ -304,6 +305,19 @@ def new_chunk(
     }
     if source_pdf:
         meta["source_pdf"] = source_pdf
+    # 仅在 aliases 非空时写入 metadata，避免无别名笔记产生冗余 key 导致元数据膨胀与 v073 金测漂移
+    if aliases:
+        seen_aliases: set[str] = set()
+        clean_aliases: list[str] = []
+        for a in aliases:
+            if a is None or isinstance(a, bool):
+                continue
+            s = str(a).strip().strip("'\"").strip()
+            if s and s not in seen_aliases:
+                seen_aliases.add(s)
+                clean_aliases.append(s)
+        if clean_aliases:
+            meta["aliases"] = clean_aliases
     return Chunk(identifier, content, source, title, meta)
 
 
@@ -316,6 +330,7 @@ def make_chunks(
     chunk_overlap: int,
     mtime: float | None = None,
     source_pdf: str | None = None,
+    aliases: list[str] | None = None,
 ) -> list[Chunk]:
     result: list[Chunk] = []
     chunk_index = 0
@@ -346,6 +361,7 @@ def make_chunks(
                             current,
                             mtime,
                             source_pdf=source_pdf,
+                            aliases=aliases,
                         )
                     )
                     chunk_index += 1
@@ -373,6 +389,7 @@ def make_chunks(
                             tbl_lines,
                             mtime,
                             source_pdf=source_pdf,
+                            aliases=aliases,
                         )
                     )
                     chunk_index += 1
@@ -392,6 +409,7 @@ def make_chunks(
                                 chunk_lines,
                                 mtime,
                                 source_pdf=source_pdf,
+                                aliases=aliases,
                             )
                         )
                         chunk_index += 1
@@ -417,6 +435,7 @@ def make_chunks(
                             current,
                             mtime,
                             source_pdf=source_pdf,
+                            aliases=aliases,
                         )
                     )
                     chunk_index += 1
@@ -439,6 +458,7 @@ def make_chunks(
                                 current,
                                 mtime,
                                 source_pdf=source_pdf,
+                                aliases=aliases,
                             )
                         )
                         chunk_index += 1
@@ -461,6 +481,7 @@ def make_chunks(
                         current,
                         mtime,
                         source_pdf=source_pdf,
+                        aliases=aliases,
                     )
                 )
                 chunk_index += 1
@@ -486,6 +507,7 @@ def make_chunks(
                     current,
                     mtime,
                     source_pdf=source_pdf,
+                    aliases=aliases,
                 )
             )
             chunk_index += 1
@@ -511,6 +533,26 @@ def chunk_file(
     )
     if is_fm_exempt:
         return []
+    raw_aliases = properties.get("aliases")
+    aliases: list[str] = []
+    seen_aliases: set[str] = set()
+    if isinstance(raw_aliases, list):
+        for a in raw_aliases:
+            if a is None or isinstance(a, bool):
+                continue
+            s = str(a).strip().strip("'\"").strip()
+            if s and s not in seen_aliases:
+                seen_aliases.add(s)
+                aliases.append(s)
+    elif isinstance(raw_aliases, str):
+        # 兼容中文逗号（中文笔记常见）与英文逗号分隔，去空去重
+        parts = raw_aliases.replace("，", ",").split(",")
+        for item in parts:
+            s = item.strip().strip("'\"").strip()
+            if s and s not in seen_aliases:
+                seen_aliases.add(s)
+                aliases.append(s)
+
     body_start = frontmatter_end + 1
     body = lines[body_start:]
     body, _ = strip_ignored_blocks(body)
@@ -576,6 +618,7 @@ def chunk_file(
         chunk_overlap=getattr(config, "chunk_overlap", 120),
         mtime=mtime,
         source_pdf=properties.get("source_pdf"),
+        aliases=aliases if aliases else None,
     )
 
 

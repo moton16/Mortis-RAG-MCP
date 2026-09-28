@@ -72,7 +72,7 @@ AI agent (WorkBuddy/Codex/...)
 ┌─────────────────────────────────────────────┐
 │ server.py  VaultMcpServer                    │  协议层：initialize / tools/list /
 │  - _tool_definitions()  工具 schema          │  tools/call 分发、参数归一化、
-│  - call_tool()          13 个 handler        │  跨库 fan-out 合并、库级权重
+│  - call_tool()          15 个 handler        │  跨库 fan-out 合并、库级权重
 │  - _fanout_search()     跨库检索             │
 └──────┬───────────────────┬──────────────────┘
        │                   │

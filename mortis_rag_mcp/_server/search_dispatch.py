@@ -10,10 +10,54 @@ from __future__ import annotations
 
 from typing import Any, TYPE_CHECKING
 
-from .fanout import fanout_search
+from .fanout import fanout_search, apply_budget
 
 if TYPE_CHECKING:
     from mortis_rag_mcp.server import VaultMcpServer
+
+
+def _parse_budget_bytes(value: Any) -> int | None:
+    """防御式解析 budget_bytes：夹取到 [500, 100000]，非法值返回 None。"""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        fval = float(value)
+        import math
+        if math.isnan(fval) or math.isinf(fval):
+            return None
+        val = int(fval)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return max(500, min(100000, val))
+
+
+def _parse_exact_terms(value: Any) -> list[str] | None:
+    """防御式解析 exact_terms：去空去重、上限 8 条、每条 ≤100 字符。"""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        items: list[Any] = value.split(",")
+    elif isinstance(value, (list, tuple)):
+        items = list(value)
+    else:
+        return None
+    terms: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        # bool 在 Python 中是 int 子类，必须显式排除布尔值与 None
+        if item is None or isinstance(item, bool) or not isinstance(item, (str, int, float)):
+            continue
+        s = str(item).strip()
+        if not s:
+            continue
+        s = s[:100]
+        s_lower = s.lower()
+        if s_lower not in seen:
+            seen.add(s_lower)
+            terms.append(s)
+        if len(terms) >= 8:
+            break
+    return terms or None
 
 
 def dispatch_search(server: VaultMcpServer, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -42,6 +86,8 @@ def dispatch_search(server: VaultMcpServer, arguments: dict[str, Any]) -> dict[s
 
     search_filters = _search_filter(arguments, server.config.max_top_k)
     query_tokens = _tokenize_query(query)
+    budget_bytes = _parse_budget_bytes(arguments.get("budget_bytes"))
+    exact_terms = _parse_exact_terms(arguments.get("exact_terms"))
 
     # 单库检索通道（传入单个目标）
     if len(targets) == 1:
@@ -56,11 +102,20 @@ def dispatch_search(server: VaultMcpServer, arguments: dict[str, Any]) -> dict[s
                 "retry_after": 3,
                 "chunks": [],
             }
-        results = indexer.search(query, top_k, bool(use_rerank), filters=search_filters, dedupe=bool(dedupe))
+        results = indexer.search(
+            query,
+            top_k,
+            bool(use_rerank),
+            filters=search_filters,
+            dedupe=bool(dedupe),
+            exact_terms=exact_terms,
+        )
         res_dict: dict[str, Any] = {"chunks": [chunk.to_dict(preview=preview, query_tokens=query_tokens) for chunk in results]}
         if not sync_ok:
             res_dict["indexing_in_progress"] = True
             res_dict["indexing_progress"] = indexer._sync_progress
+        if budget_bytes is not None:
+            res_dict = apply_budget(res_dict, budget_bytes, orig_offset=search_filters.offset, preview=preview)
         return res_dict
 
     # 未指定目标时的默认单库处理
@@ -82,11 +137,20 @@ def dispatch_search(server: VaultMcpServer, arguments: dict[str, Any]) -> dict[s
                     "retry_after": 3,
                     "chunks": [],
                 }
-            results = indexer.search(query, top_k, bool(use_rerank), filters=search_filters, dedupe=bool(dedupe))
+            results = indexer.search(
+                query,
+                top_k,
+                bool(use_rerank),
+                filters=search_filters,
+                dedupe=bool(dedupe),
+                exact_terms=exact_terms,
+            )
             res_dict = {"chunks": [chunk.to_dict(preview=preview, query_tokens=query_tokens) for chunk in results]}
             if not sync_ok:
                 res_dict["indexing_in_progress"] = True
                 res_dict["indexing_progress"] = indexer._sync_progress
+            if budget_bytes is not None:
+                res_dict = apply_budget(res_dict, budget_bytes, orig_offset=search_filters.offset, preview=preview)
             return res_dict
 
     # 跨库检索（Scoped 定向多库 或 全局盲搜）
@@ -101,4 +165,6 @@ def dispatch_search(server: VaultMcpServer, arguments: dict[str, Any]) -> dict[s
         target_vaults=targets if targets else None,
         preview=preview,
         query_tokens=query_tokens,
+        budget_bytes=budget_bytes,
+        exact_terms=exact_terms,
     )

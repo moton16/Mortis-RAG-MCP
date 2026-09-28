@@ -318,6 +318,7 @@ class MarkdownIndexer:
         # source+index+content）匹配，content 不变则 id 不变，所以 bump 之后
         # 老向量全部命中，不会触发任何重新 embedding（前提是这批向量要能活到
         # 重建之后，见 _load_vectors_cache 的 _pending_vectors 兜底）。
+        # 元数据每多一个字段就 +1。v0.8.0 F5a 增加 aliases 属性，文本层重建、向量按 id 复用、0 次重新 embedding。
         return {
             "key": self._cache_key(),
             "chunk_size": self.config.chunk_size,
@@ -328,7 +329,7 @@ class MarkdownIndexer:
             # 「开启会全量重嵌」实际完全没生效。
             "inject_image_captions": bool(self.config.inject_image_captions),
             "table_guard": True,
-            "chunker": 5,
+            "chunker": 6,
         }
 
     def _vectors_meta(self) -> dict[str, Any]:
@@ -903,6 +904,8 @@ class MarkdownIndexer:
         query_vector: Iterable[float] | None = None,
         filters: SearchFilter | None = None,
         dedupe: bool = True,
+        *,
+        exact_terms: list[str] | None = None,
     ) -> list[Chunk]:
         return _search.search_single_vault(
             self,
@@ -912,6 +915,7 @@ class MarkdownIndexer:
             query_vector=query_vector,
             filters=filters,
             dedupe=dedupe,
+            exact_terms=exact_terms,
         )
 
     @staticmethod
@@ -1020,6 +1024,16 @@ class MarkdownIndexer:
                         ext = suffix.lstrip(".")
                         if ext:
                             unsupported_counts[ext] = unsupported_counts.get(ext, 0) + 1
+        # F7.2：报告可选加速依赖的存在性。使用 find_spec 仅探测元数据，
+        # 绝不真实 import（避免提前加载 C 扩展、抢占 GIL 或污染轻量测试环境）。
+        import importlib.util as _ilu
+
+        def _has_spec(name: str) -> bool:
+            try:
+                return _ilu.find_spec(name) is not None
+            except Exception:
+                return False
+
         return {
             "files": len(self._chunks),
             "chunks": len(self.all_chunks()),
@@ -1035,6 +1049,10 @@ class MarkdownIndexer:
             "use_hybrid": self.config.use_hybrid,
             "fts_enabled": self._fts is not None and self._fts.available,
             "vector_backend": getattr(self._vector_backend, "name", self.config.vector.backend),
+            "accel": {
+                "numpy": _has_spec("numpy"),
+                "sqlite_vec": _has_spec("sqlite_vec"),
+            },
         }
 
     def _iter_vault_text_files(self) -> list[str]:

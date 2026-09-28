@@ -138,6 +138,27 @@ def test_submodules_no_runtime_reverse_import_of_facade():
                         assert "indexer" not in alias.name, f"{py_file.name} imports {alias.name} at runtime"
                 elif isinstance(subnode, ast.ImportFrom):
                     mod = subnode.module or ""
-                    assert not mod.endswith("indexer") and mod != "indexer", (
-                        f"{py_file.name} imports from {mod} at runtime"
-                    )
+                    names = [alias.name for alias in subnode.names]
+                    if subnode.level == 0:
+                        # 绝对导入：模块路径指向 Facade（indexer / *.indexer）即违规。
+                        # 注意 ".indexer" 结尾判定不会误伤 "_indexer" 结尾的私有子包。
+                        assert mod != "indexer" and not mod.endswith(".indexer"), (
+                            f"{py_file.name} imports from {mod} at runtime"
+                        )
+                        if mod == "mortis_rag_mcp":
+                            # from mortis_rag_mcp import indexer —— 经包根反向导入 Facade。
+                            assert "indexer" not in names, (
+                                f"{py_file.name} imports indexer via mortis_rag_mcp at runtime"
+                            )
+                    else:
+                        # 相对导入：level 1 = 私有子包自身（安全）；
+                        # level >= 2 = mortis_rag_mcp 层，mod 为 "indexer" 即 Facade。
+                        if subnode.level >= 2:
+                            assert mod != "indexer", (
+                                f"{py_file.name} imports from {mod} at runtime"
+                            )
+                            if mod == "":
+                                # from .. import indexer —— 经包根反向导入 Facade。
+                                assert "indexer" not in names, (
+                                    f"{py_file.name} imports indexer via package root at runtime"
+                                )

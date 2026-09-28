@@ -7,6 +7,10 @@
 # kb_init 工具（注册表持久化在 ~/.mortis_rag_mcp/vaults.toml，兼容旧名 ~/.vault_mcp/vaults.toml）。
 # 因此这里没有 [vault].path —— 旧配置里的该项仍会被识别并自动迁移进注册表。
 
+# 提示：embedding/reranker 支持任意 OpenAI 兼容 HTTP 端点，不绑定特定云服务商。
+# 云端服务商（如 SiliconFlow、DeepSeek 等）或本地部署模型（如 Ollama http://localhost:11434/v1/embeddings、LM Studio、vLLM、Xinference 等）均可直接接入。
+# 注意事项：dimension 必须与模型实际输出维度严格一致；send_dimensions 仅在支持定长截断/MRL 维度裁剪的模型端点开启。
+
 [embedding]
 # static is deterministic/local and must not call an LLM or external model.
 # Set mode = "external" only when the external endpoint is available.
@@ -14,6 +18,7 @@ mode = "static"
 dimension = 384
 endpoint = "https://api.siliconflow.cn/v1/embeddings"
 model = "BAAI/bge-m3"
+# 是否向 API 发送 dimensions 参数（支持 MRL 裁剪的模型可开；标准定长端点请保持 false）。
 send_dimensions = false
 # Prefer environment interpolation over committing a secret.
 # api_key 为空时会自动回退读取环境变量 MORTIS_RAG_API_KEY（同时兼容 VAULT_MCP_API_KEY）。
@@ -57,6 +62,9 @@ watch_fallback_interval = 30.0
 # 混合检索：FTS5 BM25 + 向量余弦 + bigram 词法三路 RRF 融合（默认 true）。
 # 设为 false 完整还原旧「词法软信号 + 余弦」行为。需要 [cache] enabled = true。
 use_hybrid = true
+# kb_read 单次读取最大字符数截断阈值，防止拉取整篇大文档撑爆模型上下文或击穿宿主缓冲区。
+# 默认 20000 字符；防御范围 100 ~ 1000000。
+read_max_chars = 20000
 
 [vector]
 # 向量存储后端："memory"（默认，numpy 暴力扫描，零依赖）或
@@ -93,3 +101,20 @@ subdir = ".mcp_cache"
 enabled = false
 # api_key = "${MINERU_API_KEY}"
 # model_version = "vlm"
+
+# ── 本地诊断日志（默认关闭）────────────────────────────────
+# 开启后在本地输出结构化 jsonl 诊断日志，用于排查检索退化与阶段耗时。
+# 遵循严格隐私白名单（10 键）：仅记录 ts, corr_id, tool, stage, ms, result_count,
+# response_bytes, truncated, error_code, version。
+# 绝不记录：搜索关键词 query、正文/片段、文件名/路径、标签、别名、密钥、堆栈。
+[diag]
+enabled = false
+# 日志存储目录（写入 ~/.mortis_rag_mcp/diag.log，支持 ~ 展开与环境变量）
+dir = "~/.mortis_rag_mcp"
+# 单个日志文件最大字节（默认 1MB = 1048576，超限后轮转为 .1）
+max_bytes = 1048576
+# 轮转保留文件数（默认 2 个）
+files = 2
+# 历史日志最长保留天数（默认 7 天，过期惰性自动清理）
+retention_days = 7
+

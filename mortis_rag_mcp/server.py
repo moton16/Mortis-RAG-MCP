@@ -257,13 +257,18 @@ def _tool_definitions() -> list[dict[str, Any]]:
                 "offset": {"type": "integer", "minimum": 0, "default": 0, "description": "可选，跳过前 N 条结果（分页用）"},
                 "limit": {"type": "integer", "minimum": 1, "description": "可选，本页最多返回条数；缺省时用 top_k"},
                 "dedupe": {"type": "boolean", "default": True, "description": "可选，默认 true：正文完全相同的 chunk 只保留排在最前面的一条（重复备份/复制段落不再占多格 top_k）"},
+                "budget_bytes": {"type": "integer", "description": "可选，输出最大 UTF-8 字节预算（[500, 100000]），超限截断并标 truncated: true"},
+                "exact_terms": {"type": "array", "items": {"type": "string"}, "description": "可选，专有名词显式硬包含词表（AND 语义，不区分大小写，最多 8 条每条≤100 字符）"},
             }},
         },
         {
             "name": "kb_read",
             "description": "读取知识库原文（只读磁盘原文，不触发同步、不调用 embedding API；建议带上 start_line/end_line 限定范围避免一次拉全篇）。多库环境下建议显式传 vault_path（fan-out 结果中的 source 是库内相对路径）。",
-            "inputSchema": {"type": "object", "required": ["source"], "properties": {
-                "source": {"type": "string"}, "heading": {"type": "string"}, "start_line": {"type": "integer", "minimum": 1}, "end_line": {"type": "integer", "minimum": 1},
+            "inputSchema": {"type": "object", "required": [], "properties": {
+                "source": {"type": "string"},
+                "chunk_id": {"type": "string", "description": "可选，命中切片 ID（由 kb_search 返回），自动展开上下文；与 start_line/end_line/heading 互斥"},
+                "expand_lines": {"type": "integer", "default": 30, "minimum": 0, "maximum": 500, "description": "可选，配合 chunk_id 使用：切片前后各展开行数（默认 30，范围 0-500）"},
+                "heading": {"type": "string"}, "start_line": {"type": "integer", "minimum": 1}, "end_line": {"type": "integer", "minimum": 1},
                 "vault_path": {"type": "string", "description": vault_path_hint},
             }},
         },
@@ -835,12 +840,65 @@ class VaultMcpServer:
     }
 
     def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        # 归一化入参（防卫畸形数据、反序列化 JSON 字符串、解包嵌套、驼峰映射）
-        arguments = _normalize_call_arguments(arguments)
-        handler_name = self._TOOL_ROUTE_TABLE.get(name)
-        if handler_name is None:
-            raise ValueError(f"unknown tool: {name}")
-        return _text_content(getattr(self, handler_name)(arguments))
+        diag_cfg = getattr(self.config, "diag", None)
+        if not diag_cfg or not diag_cfg.enabled:
+            # 默认未开启诊断日志时走纯净路径，零额外开销与零副作用
+            arguments = _normalize_call_arguments(arguments)
+            handler_name = self._TOOL_ROUTE_TABLE.get(name)
+            if handler_name is None:
+                raise ValueError(f"unknown tool: {name}")
+            return _text_content(getattr(self, handler_name)(arguments))
+
+        import time
+        from . import diaglog
+
+        corr_id = diaglog.generate_corr_id()
+        t0 = time.perf_counter()
+        try:
+            arguments = _normalize_call_arguments(arguments)
+            handler_name = self._TOOL_ROUTE_TABLE.get(name)
+            if handler_name is None:
+                raise ValueError(f"unknown tool: {name}")
+            handler = getattr(self, handler_name)
+
+            raw_result = diaglog.instrument_call(
+                server=self,
+                tool_name=name,
+                corr_id=corr_id,
+                handler=handler,
+                arguments=arguments,
+                config=diag_cfg,
+            )
+
+            t_ser0 = time.perf_counter()
+            response = _text_content(raw_result)
+            ser_ms = round((time.perf_counter() - t_ser0) * 1000, 2)
+            resp_bytes = len(json.dumps(response, ensure_ascii=False).encode("utf-8"))
+            result_count = diaglog.extract_result_count(raw_result)
+            truncated = raw_result.get("truncated") if isinstance(raw_result, dict) else None
+
+            diaglog.record(
+                corr_id=corr_id,
+                tool=name,
+                stage="serialize",
+                ms=ser_ms,
+                result_count=result_count,
+                response_bytes=resp_bytes,
+                truncated=truncated,
+                config=diag_cfg,
+            )
+            return response
+        except Exception as exc:
+            total_ms = round((time.perf_counter() - t0) * 1000, 2)
+            diaglog.record(
+                corr_id=corr_id,
+                tool=name,
+                stage="fail",
+                ms=total_ms,
+                error_code=diaglog.classify_error(exc),
+                config=diag_cfg,
+            )
+            raise
 
     def _kb_list(self, arguments: dict[str, Any]) -> dict[str, Any]:
         return self._list_vaults()
@@ -910,36 +968,162 @@ class VaultMcpServer:
 
     def _kb_read(self, arguments: dict[str, Any]) -> dict[str, Any]:
         indexer = self._indexer_for(arguments)
-        source = str(arguments.get("source", "")).strip()
-        if not source:
-            raise ValueError("source is required for kb_read")
-        heading = arguments.get("heading")
-        start_line = _parse_int(arguments.get("start_line"))
-        end_line = _parse_int(arguments.get("end_line"))
-        if start_line is not None and start_line < 1:
-            raise ValueError("start_line must be >= 1")
-        if end_line is not None and start_line is not None and end_line < start_line:
-            raise ValueError("end_line must be >= start_line")
-        if heading and start_line is None and end_line is None:
-            matches = [chunk for chunk in indexer.all_chunks() if chunk.source == source and chunk.metadata.get("heading") == heading]
-            if not matches:
-                raise ValueError(f"heading not found: {heading}")
-            start_line = min(chunk.metadata["start_line"] for chunk in matches)
-            end_line = max(chunk.metadata["end_line"] for chunk in matches)
+        raw_source = arguments.get("source")
+        source = str(raw_source).strip() if raw_source is not None else ""
+        raw_chunk_id = arguments.get("chunk_id")
+        chunk_id = str(raw_chunk_id).strip() if raw_chunk_id is not None else ""
+
+        if not source and not chunk_id:
+            raise ValueError("source or chunk_id is required for kb_read")
+
+        if chunk_id:
+            # chunk_id 与 start_line/end_line/heading 互斥，避免入参歧义与非预期展开
+            has_start = _parse_int(arguments.get("start_line")) is not None
+            has_end = _parse_int(arguments.get("end_line")) is not None
+            has_heading = bool(str(arguments.get("heading") or "").strip())
+            if has_start or has_end or has_heading:
+                raise ValueError("chunk_id is mutually exclusive with start_line/end_line/heading")
+
+            raw_expand = arguments.get("expand_lines")
+            if raw_expand is None:
+                expand_lines = 30
+            else:
+                parsed_expand = _parse_int(raw_expand)
+                if parsed_expand is None:
+                    expand_lines = 30
+                else:
+                    expand_lines = max(0, min(parsed_expand, 500))
+
+            chunk = None
+            for c in indexer.all_chunks():
+                if c.id == chunk_id:
+                    chunk = c
+                    break
+            if chunk is None:
+                # 提示文件可能已修改导致 sha1 变化，引导调用方重新检索
+                raise ValueError(f"chunk_id not found: {chunk_id[:12]}…（文件可能已修改，请重新 kb_search 获取新 id）")
+
+            source = chunk.source
+            c_start = chunk.metadata.get("start_line", 1)
+            c_end = chunk.metadata.get("end_line", c_start)
+            try:
+                c_start_int = int(c_start)
+            except (TypeError, ValueError):
+                c_start_int = 1
+            try:
+                c_end_int = int(c_end)
+            except (TypeError, ValueError):
+                c_end_int = c_start_int
+            start_line = max(1, c_start_int - expand_lines)
+            end_line = c_end_int + expand_lines
+            is_chunk_read = True
+        else:
+            is_chunk_read = False
+            raw_heading = arguments.get("heading")
+            heading = str(raw_heading).strip() if raw_heading is not None and str(raw_heading).strip() != "" else None
+            start_line = _parse_int(arguments.get("start_line"))
+            end_line = _parse_int(arguments.get("end_line"))
+            if start_line is not None and start_line < 1:
+                raise ValueError("start_line must be >= 1")
+            if end_line is not None and start_line is not None and end_line < start_line:
+                raise ValueError("end_line must be >= start_line")
+
+            # F5b: 双链与短名寻址
+            # 1. 规范化输入：支持 Obsidian [[笔记名]]、[[笔记名|别名]]、[[笔记名#段落]] 语法
+            clean_source = source
+            orig_query = source
+            if clean_source.startswith("[[") and clean_source.endswith("]]"):
+                inner = clean_source[2:-2].strip()
+                # 管道别名语法：[[Target|Display Label]] -> 目标笔记为 Target
+                if "|" in inner:
+                    inner = inner.partition("|")[0].strip()
+                # 锚点语法：[[Target#Section]] -> 若未显式传 heading，则提取锚点作为 heading
+                # 注意避免误伤笔记文件名本身含有 # 的情形（如 C#教程.md）
+                if "#" in inner:
+                    inner_norm = inner.replace("\\", "/")
+                    target_direct = (indexer.vault_path / inner_norm).resolve()
+                    known_stems = {Path(s).stem.casefold() for s in indexer._chunks.keys()}
+                    if not (target_direct.is_file() or Path(inner_norm).stem.casefold() in known_stems):
+                        note_part, _, head_part = inner.partition("#")
+                        clean_source = note_part.strip()
+                        if heading is None and head_part.strip():
+                            heading = head_part.strip()
+                    else:
+                        clean_source = inner
+                else:
+                    clean_source = inner
+
+            norm_clean = clean_source.replace("\\", "/")
+
+            # 2. 检查直连文件是否存在（支持带后缀或已有完整路径但缺省 .md）
+            direct_file_path = None
+            try:
+                candidate_path = (indexer.vault_path / norm_clean).resolve()
+                if candidate_path.is_file() and candidate_path.suffix.lower() in indexer._READABLE_SUFFIXES:
+                    direct_file_path = norm_clean
+                elif ("/" in norm_clean or "\\" in norm_clean) and not candidate_path.suffix:
+                    # 仅在包含路径分隔符时尝试补常见扩展名（避免把根目录短名抢先直连导致漏判短名歧义）
+                    for sfx in indexer._READABLE_SUFFIXES:
+                        with_sfx = (indexer.vault_path / f"{norm_clean}{sfx}").resolve()
+                        if with_sfx.is_file():
+                            direct_file_path = f"{norm_clean}{sfx}"
+                            break
+            except Exception:
+                pass
+
+            if direct_file_path is not None:
+                source = direct_file_path
+            elif "/" not in norm_clean and "\\" not in norm_clean:
+                # 3. 短名寻址：在已索引文件集合中按 stem 大小写不敏感匹配
+                target_stem = Path(norm_clean).stem.casefold()
+                candidates = [s for s in sorted(indexer._chunks.keys()) if Path(s).stem.casefold() == target_stem]
+                if len(candidates) == 1:
+                    source = candidates[0]
+                elif len(candidates) > 1:
+                    raise ValueError(
+                        f"ambiguous note name '{orig_query}' matches multiple files: {', '.join(candidates[:5])}..."
+                    )
+                else:
+                    source = clean_source
+            else:
+                source = clean_source
+
+            if heading and start_line is None and end_line is None:
+                matches = [chunk for chunk in indexer.all_chunks() if chunk.source == source and chunk.metadata.get("heading") == heading]
+                if not matches:
+                    raise ValueError(f"heading not found: {heading}")
+                start_line = min(chunk.metadata["start_line"] for chunk in matches)
+                end_line = max(chunk.metadata["end_line"] for chunk in matches)
+
         text = indexer.read(source, start_line, end_line)
         # 无范围时整篇塞进单个 text 块会撑爆模型上下文/客户端消息上限，
-        # 给一个保守上限并明确告知被截断，引导调用方用 start_line 续读。
+        # 优先读取配置 [index] read_max_chars 并明确告知被截断，引导调用方用 start_line 续读。
+        read_max_chars = 20000
+        cfg = getattr(indexer, "config", None) or getattr(self, "config", None)
+        if cfg is not None:
+            idx_cfg = getattr(cfg, "index", None)
+            if idx_cfg is not None and getattr(idx_cfg, "read_max_chars", None):
+                try:
+                    c = int(idx_cfg.read_max_chars)
+                    if 100 <= c <= 1_000_000:
+                        read_max_chars = c
+                except (TypeError, ValueError, OverflowError):
+                    pass
+
         truncated = False
-        if len(text) > 20000:
-            text = text[:20000]
+        if len(text) > read_max_chars:
+            text = text[:read_max_chars]
             truncated = True
-        return {
+        result = {
             "source": source,
             "start_line": start_line,
             "end_line": end_line,
             "content": text,
             "truncated": truncated,
         }
+        if is_chunk_read:
+            result["chunk_id"] = chunk.id
+        return result
 
     def _kb_stats(self, arguments: dict[str, Any]) -> dict[str, Any]:
         indexer = self._indexer_for(arguments)

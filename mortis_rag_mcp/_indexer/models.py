@@ -105,7 +105,11 @@ class Chunk:
             "heading": self.metadata.get("heading", self.title),
             "start_line": self.metadata.get("start_line", 1),
             "end_line": self.metadata.get("end_line", 1),
-            "metadata": dict(self.metadata),
+            "metadata": (
+                {k: self.metadata[k] for k in ("tags", "mtime") if k in self.metadata}
+                if preview
+                else dict(self.metadata)
+            ),
         }
         if "source_pdf" in self.metadata:
             d["source_pdf"] = self.metadata["source_pdf"]

@@ -358,6 +358,17 @@
 >   - `pyproject.toml`：`project.version` bump 0.7.3 -> 0.8.0（保留工作区 extras 改动）。
 > - **验证**：全量单测增至 **345 passed, 4 skipped**（基线 341 + 4 冻结专项，`PYTEST_EXIT=0`）；eval **Hit@5 100.0% / MRR@5 1.000**；金测与缓存 roundtrip 严格恒等。
 
+### C52 — moton16,2026-09-27,CodeBuddy,GLM-5.3-Flash — fix(review): 终审修复——检索 oracle 冻结对照、sync 接缝回归 owner 路由、chunk 兜底对齐与反向导入守卫加固
+> **代码改动概况**：
+> - `tests/golden/legacy_search_impl.py` 落地：C44（v0.7.3）检索主路径逐字冻结（`search`/`_fts_query`/`_hybrid_rank`/`_query_tokens` + `_RRF_K` 等常量与 `dedupe_by_content_hash`/`rerank_chunks`），状态经 `__getattr__` 穿透到活实例（同 `legacy_split_table_impl.py` 模式）。
+> - `tests/test_search_oracle.py`：旗舰测试原为"Facade vs SearchEngine"——两条路径汇聚同一个 `search_single_vault`，结构上恒真（同义反复，守不住回归）。改为"Facade vs 冻结旧实现"真 oracle 对照；并开启 `cache.enabled=True` 使 FTS/RRF 混合路由真实纳入对照（裸 `AppConfig` 编程构造默认 `enabled=False`，旧测试静默退化为纯词法路径对照），辅以 FTS 硬断言防静默退化；score 不可变测试同步扩大覆盖面。
+> - `mortis_rag_mcp/_indexer/sync_engine.py`：13 处引擎直呼模块函数改回经 Facade 薄委托（`owner._embed_missing`/`_flush_vectors_to_disk`/`_ensure_disk_vectors_migrated`/`_chunk_has_vector`/`_reuse_vectors_by_content_hash`/`_embedding_changed_state`/`_embed_one_file`），对齐 C44 `self._` 调用形态与 `snapshot.py` 现状，monkeypatch 接缝在 sync 路径恢复可达；未打补丁时行为零变化。
+> - `mortis_rag_mcp/_indexer/chunking.py`：`chunk_file` 的 `getattr` 兜底 800/120 对齐 `AppConfig` 真实默认 1200/0，消除缺属性 config 时的静默错块潜伏差异（Facade 生产路径不可触达）。
+> - `tests/test_facade_freeze.py`：反向导入 AST 守卫补 `alias.name` 检查（`from mortis_rag_mcp import indexer` 不再漏报）并按 `level` 区分相对导入（`from ._indexer import` 不再被潜在误报）。
+> - pyproject.toml 工作区 extras（accel/numpy）：经审裁决暂保留，与 PROJECT_GUIDE 2.3 设计决策的矛盾文档补录留待后续版本处理。
+
+- **验证**：全量 `pytest tests/ -q` **345 passed, 4 skipped**（oracle 测试就地强化，总数与 C51 持平）；oracle 判别力抽检：FTS 开启下无扰动恒等、人为扰动冻结 `_RRF_K=59` 后分数立即分歧；`mortis_rag_mcp` 包内 sync 函数族直呼 grep 清零；受影响 6 测试文件单跑 25 passed；lint 零新增。
+
 
 
 

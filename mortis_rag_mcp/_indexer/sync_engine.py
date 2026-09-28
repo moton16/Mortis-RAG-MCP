@@ -55,7 +55,7 @@ def ensure_disk_vectors_migrated(owner: MarkdownIndexer) -> None:
             # Migrate the legacy .bin into the disk store once.
             if owner._vectors_cache_path is not None and owner._vectors_cache_path.exists():
                 owner._load_vectors_cache()
-            flush_vectors_to_disk(owner)
+            owner._flush_vectors_to_disk()
     except Exception:
         pass
 
@@ -106,7 +106,7 @@ def reuse_vectors_by_content_hash(owner: MarkdownIndexer) -> int:
             digest = chunk.metadata.get("content_hash")
             if not digest:
                 continue
-            if chunk_has_vector(owner, chunk):
+            if owner._chunk_has_vector(chunk):
                 donors.setdefault(digest, chunk)
             else:
                 missing.append(chunk)
@@ -185,7 +185,7 @@ def embedding_changed_state(
     """
     if reused > 0 or owner.failed_files != failed_before:
         return True
-    return any(chunk_has_vector(owner, chunk) for chunk in pending_chunks)
+    return any(owner._chunk_has_vector(chunk) for chunk in pending_chunks)
 
 
 def embed_missing(owner: MarkdownIndexer) -> bool:
@@ -203,12 +203,12 @@ def embed_missing(owner: MarkdownIndexer) -> bool:
     failed_files 持久化到磁盘只是为了跨进程重启的可观测性。
     """
     # 先做一轮内容哈希复用：已经算过的内容不再花钱重算一次。
-    reused = reuse_vectors_by_content_hash(owner)
+    reused = owner._reuse_vectors_by_content_hash()
 
     failed_before = dict(owner.failed_files)
     pending: dict[str, list[Chunk]] = {}
     for source, chunks in owner._chunks.items():
-        missing = [chunk for chunk in chunks if not chunk_has_vector(owner, chunk)]
+        missing = [chunk for chunk in chunks if not owner._chunk_has_vector(chunk)]
         if missing:
             pending[source] = missing
     if not pending:
@@ -237,14 +237,14 @@ def embed_missing(owner: MarkdownIndexer) -> bool:
             finally:
                 owner._sync_progress["files_done"] += 1
                 owner._sync_progress["chunks_done"] += len(chunks)
-        return embedding_changed_state(owner, pending_chunks, failed_before, reused)
+        return owner._embedding_changed_state(pending_chunks, failed_before, reused)
 
     max_workers = owner.config.cache.embedding_max_workers
     tasks = list(pending.items())
     if max_workers <= 1 or len(tasks) <= 1:
         for source, chunks in tasks:
             try:
-                embed_one_file(source, chunks, owner.embedding_provider)
+                owner._embed_one_file(source, chunks, owner.embedding_provider)
             except Exception as exc:
                 owner.failed_files[source] = str(exc)
             else:
@@ -252,12 +252,12 @@ def embed_missing(owner: MarkdownIndexer) -> bool:
             finally:
                 owner._sync_progress["files_done"] += 1
                 owner._sync_progress["chunks_done"] += len(chunks)
-        return embedding_changed_state(owner, pending_chunks, failed_before, reused)
+        return owner._embedding_changed_state(pending_chunks, failed_before, reused)
 
     failures: dict[str, str] = {}
     with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="vault-emb") as pool:
         future_map = {
-            pool.submit(embed_one_file, source, chunks, owner.embedding_provider): source
+            pool.submit(owner._embed_one_file, source, chunks, owner.embedding_provider): source
             for source, chunks in tasks
         }
         for future in as_completed(future_map):
@@ -275,7 +275,7 @@ def embed_missing(owner: MarkdownIndexer) -> bool:
             owner.failed_files[source] = failures[source]
         else:
             owner.failed_files.pop(source, None)
-    return embedding_changed_state(owner, pending_chunks, failed_before, reused)
+    return owner._embedding_changed_state(pending_chunks, failed_before, reused)
 
 
 def run_sync(owner: MarkdownIndexer) -> list[Chunk]:
@@ -384,7 +384,7 @@ def run_sync(owner: MarkdownIndexer) -> list[Chunk]:
 
     # Disk-backed mode: on first sync (or after a crash) make sure the
     # vector store matches the in-memory chunk set before embedding.
-    ensure_disk_vectors_migrated(owner)
+    owner._ensure_disk_vectors_migrated()
     # 文本层刚被重建过（chunker 版本提升 / 缓存损坏）时，把初始化阶段
     # 暂存的老向量挂回去，避免整个库重新 embedding。
     owner._attach_pending_vectors()
@@ -395,9 +395,9 @@ def run_sync(owner: MarkdownIndexer) -> list[Chunk]:
     # embeds just those chunks.
     owner._sync_state = "embedding"
     owner._sync_progress["phase"] = "embedding"
-    embed_did_work = embed_missing(owner)
+    embed_did_work = owner._embed_missing()
     # Disk-backed mode: persist newly embedded vectors and release RAM.
-    flush_vectors_to_disk(owner)
+    owner._flush_vectors_to_disk()
 
     removed: set[str] = set(owner._chunks) - found
     for source in removed:

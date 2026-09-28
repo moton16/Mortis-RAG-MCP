@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import json
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
@@ -19,6 +20,188 @@ from .._indexer.search import rerank_chunks
 
 if TYPE_CHECKING:
     from mortis_rag_mcp.server import VaultMcpServer
+
+
+def _measure_payload_bytes(result: Any) -> int:
+    """计量最终响应字符串的 UTF-8 字节数。
+
+    对齐 server.py:843 _text_content 包装后的最终序列化口径：
+    json.dumps({"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False)}]}, ensure_ascii=False)
+    """
+    inner = json.dumps(result, ensure_ascii=False)
+    outer = {"content": [{"type": "text", "text": inner}]}
+    return len(json.dumps(outer, ensure_ascii=False).encode("utf-8"))
+
+
+def apply_budget(
+    result: dict[str, Any],
+    budget_bytes: int | None,
+    orig_offset: int = 0,
+    preview: bool = False,
+) -> dict[str, Any]:
+    """根据 budget_bytes 预算对检索结果进行有界截断。"""
+    if budget_bytes is None:
+        return result
+
+    # 1. 平铺模式 (chunks)
+    if "chunks" in result:
+        all_chunks = list(result["chunks"])
+        test_res = dict(result)
+        test_res["truncated"] = False
+        test_res["returned"] = len(all_chunks)
+        test_res["next_offset"] = orig_offset + len(all_chunks)
+        if _measure_payload_bytes(test_res) <= budget_bytes:
+            return test_res
+
+        truncated_res = dict(result)
+        truncated_res["truncated"] = True
+
+        if not all_chunks:
+            truncated_res["chunks"] = []
+            truncated_res["returned"] = 0
+            truncated_res["next_offset"] = orig_offset
+            return truncated_res
+
+        # 检查首条是否超预算
+        c0 = dict(all_chunks[0])
+        truncated_res["chunks"] = [c0]
+        truncated_res["returned"] = 1
+        truncated_res["next_offset"] = orig_offset + 1
+
+        if _measure_payload_bytes(truncated_res) > budget_bytes:
+            # 首条即超预算：二分截断首条正文/摘要
+            target_field = "snippet" if preview and "snippet" in c0 else "content"
+            orig_text = str(c0.get(target_field, ""))
+            low, high = 0, len(orig_text)
+            best_len = 0
+            while low <= high:
+                mid = (low + high) // 2
+                c0[target_field] = orig_text[:mid]
+                truncated_res["chunks"] = [c0]
+                if _measure_payload_bytes(truncated_res) <= budget_bytes:
+                    best_len = mid
+                    low = mid + 1
+                else:
+                    high = mid - 1
+            c0[target_field] = orig_text[:best_len]
+            truncated_res["chunks"] = [c0]
+            truncated_res["returned"] = 1
+            truncated_res["next_offset"] = orig_offset + 1
+            return truncated_res
+
+        # 首条能放入，逐条追加其余 chunk 直至超预算
+        kept_chunks = [c0]
+        for chunk in all_chunks[1:]:
+            truncated_res["chunks"] = kept_chunks + [chunk]
+            truncated_res["returned"] = len(truncated_res["chunks"])
+            truncated_res["next_offset"] = orig_offset + len(truncated_res["chunks"])
+            if _measure_payload_bytes(truncated_res) <= budget_bytes:
+                kept_chunks.append(chunk)
+            else:
+                break
+
+        truncated_res["chunks"] = kept_chunks
+        truncated_res["returned"] = len(kept_chunks)
+        truncated_res["next_offset"] = orig_offset + len(kept_chunks)
+        return truncated_res
+
+    # 2. 分组模式 (groups)
+    if "groups" in result:
+        all_groups = result["groups"]
+        total_chunks = sum(len(g.get("chunks", [])) for g in all_groups)
+        test_res = dict(result)
+        test_res["truncated"] = False
+        test_res["returned"] = total_chunks
+        test_res["next_offset"] = orig_offset + total_chunks
+        if _measure_payload_bytes(test_res) <= budget_bytes:
+            return test_res
+
+        truncated_res = dict(result)
+        truncated_res["truncated"] = True
+
+        if total_chunks == 0:
+            truncated_res["groups"] = []
+            truncated_res["returned"] = 0
+            truncated_res["next_offset"] = orig_offset
+            return truncated_res
+
+        first_group = None
+        first_chunk = None
+        for g in all_groups:
+            if g.get("chunks"):
+                first_group = g
+                first_chunk = g["chunks"][0]
+                break
+
+        if first_group is None or first_chunk is None:
+            truncated_res["groups"] = []
+            truncated_res["returned"] = 0
+            truncated_res["next_offset"] = orig_offset
+            return truncated_res
+
+        c0 = dict(first_chunk)
+        g0 = dict(first_group)
+        g0["chunks"] = [c0]
+        truncated_res["groups"] = [g0]
+        truncated_res["returned"] = 1
+        truncated_res["next_offset"] = orig_offset + 1
+
+        if _measure_payload_bytes(truncated_res) > budget_bytes:
+            target_field = "snippet" if preview and "snippet" in c0 else "content"
+            orig_text = str(c0.get(target_field, ""))
+            low, high = 0, len(orig_text)
+            best_len = 0
+            while low <= high:
+                mid = (low + high) // 2
+                c0[target_field] = orig_text[:mid]
+                g0["chunks"] = [c0]
+                truncated_res["groups"] = [g0]
+                if _measure_payload_bytes(truncated_res) <= budget_bytes:
+                    best_len = mid
+                    low = mid + 1
+                else:
+                    high = mid - 1
+            c0[target_field] = orig_text[:best_len]
+            g0["chunks"] = [c0]
+            truncated_res["groups"] = [g0]
+            truncated_res["returned"] = 1
+            truncated_res["next_offset"] = orig_offset + 1
+            return truncated_res
+
+        kept_groups: list[dict[str, Any]] = []
+        total_returned = 0
+        budget_exhausted = False
+
+        for g in all_groups:
+            if budget_exhausted:
+                break
+            g_copy = dict(g)
+            g_chunks = g.get("chunks", [])
+            kept_in_group: list[dict[str, Any]] = []
+            for chunk in g_chunks:
+                cand_g = dict(g_copy)
+                cand_g["chunks"] = kept_in_group + [chunk]
+                cand_groups = [dict(kg) for kg in kept_groups] + [cand_g]
+
+                truncated_res["groups"] = cand_groups
+                truncated_res["returned"] = total_returned + 1
+                truncated_res["next_offset"] = orig_offset + truncated_res["returned"]
+                if _measure_payload_bytes(truncated_res) <= budget_bytes:
+                    kept_in_group.append(chunk)
+                    total_returned += 1
+                else:
+                    budget_exhausted = True
+                    break
+            if kept_in_group:
+                g_copy["chunks"] = kept_in_group
+                kept_groups.append(g_copy)
+
+        truncated_res["groups"] = kept_groups
+        truncated_res["returned"] = total_returned
+        truncated_res["next_offset"] = orig_offset + total_returned
+        return truncated_res
+
+    return result
 
 
 def fanout_search(
@@ -32,6 +215,9 @@ def fanout_search(
     target_vaults: list[str] | None = None,
     preview: bool = False,
     query_tokens: list[str] | None = None,
+    *,
+    budget_bytes: int | None = None,
+    exact_terms: list[str] | None = None,
 ) -> dict[str, Any]:
     """Search across registered vaults (either globally or scoped to target_vaults), merge and rerank once.
 
@@ -110,6 +296,7 @@ def fanout_search(
                 query_vector=query_vector,
                 filters=per_vault_filters,
                 dedupe=dedupe,
+                exact_terms=exact_terms,
             )
             for chunk in chunks:
                 merged.append((entry, chunk))
@@ -195,6 +382,8 @@ def fanout_search(
                 f"本次检索横跨 {len(searched)} 个库：{names}。若用户问题指向特定库或目录，"
                 "下次请传 vault_path 或 path_prefix 定向检索，精度更高、噪音更少。"
             )
+        if budget_bytes is not None:
+            res = apply_budget(res, budget_bytes, orig_offset=start, preview=preview)
         return res
 
     pairs = pairs[start:end]
@@ -212,4 +401,6 @@ def fanout_search(
             f"本次检索横跨 {len(searched)} 个库：{names}。若用户问题指向特定库或目录，"
             "下次请传 vault_path 或 path_prefix 定向检索，精度更高、噪音更少。"
         )
+    if budget_bytes is not None:
+        res = apply_budget(res, budget_bytes, orig_offset=start, preview=preview)
     return res

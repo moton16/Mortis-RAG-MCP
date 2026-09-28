@@ -34,6 +34,21 @@ def _to_emb(vectors: Iterable[float]) -> array:
     return array(_EMB_DTYPE, vectors)
 
 
+def _lexical_haystack(chunk: Chunk) -> str:
+    """为词法路检索构建匹配文本：正文 + aliases 别名追加（别名命中权重大于普通词）。"""
+    aliases = chunk.metadata.get("aliases")
+    if not aliases:
+        return chunk.content.lower()
+    clean_parts = [
+        str(a).lower().strip()
+        for a in aliases
+        if a is not None and not isinstance(a, bool) and str(a).strip()
+    ]
+    if not clean_parts:
+        return chunk.content.lower()
+    return f"{chunk.content.lower()} {' '.join(clean_parts)}"
+
+
 def rerank_chunks(query: str, ranked: list[Chunk], reranker_provider: Any, cap: int = 60) -> list[Chunk]:
     """Reorder `ranked` with the reranker provider (module-level so the server
     can rerank a merged multi-vault candidate pool with a single API call).
@@ -147,6 +162,8 @@ def hybrid_rank(
     fts: Any,
     rrf_per_route: int,
     path_prefix: str = "",
+    *,
+    exact_route: list[str] | None = None,
 ) -> list[Chunk]:
     """Three-route RRF fusion: FTS5 BM25 + vector cosine + bigram lexical.
 
@@ -177,6 +194,10 @@ def hybrid_rank(
     )
     if lexical_ordered:
         routes.append([chunk_id for chunk_id, _score in lexical_ordered[: rrf_per_route]])
+
+    # Route D: exact_terms must route
+    if exact_route:
+        routes.append(exact_route)
 
     if not routes:
         return []
@@ -221,6 +242,8 @@ def search_single_vault(
     query_vector: Iterable[float] | None = None,
     filters: SearchFilter | None = None,
     dedupe: bool = True,
+    *,
+    exact_terms: list[str] | None = None,
 ) -> list[Chunk]:
     """单库三路混合检索管线主逻辑。"""
     try:
@@ -229,8 +252,26 @@ def search_single_vault(
         top_k = 10
     query = query.strip()
     all_chunks = owner.all_chunks()
+
+    # 防御归一化 exact_terms：去空去重、单项截断 100 字符、最多 8 条
+    clean_terms: list[str] = []
+    if exact_terms:
+        raw_terms = exact_terms if isinstance(exact_terms, (list, tuple)) else str(exact_terms).split(",")
+        seen_terms: set[str] = set()
+        for t in raw_terms:
+            if t is None or isinstance(t, bool) or not isinstance(t, (str, int, float)):
+                continue
+            s = str(t).strip()[:100].lower()
+            if s and s not in seen_terms:
+                seen_terms.add(s)
+                clean_terms.append(s)
+            if len(clean_terms) >= 8:
+                break
+
     if not query:
         ranked = [replace(c, score=0.0) for c in all_chunks]
+        if clean_terms:
+            ranked = [chunk for chunk in ranked if all(term in _lexical_haystack(chunk) for term in clean_terms)]
         if dedupe:
             ranked = dedupe_by_content_hash(ranked)
         if filters is None:
@@ -269,12 +310,29 @@ def search_single_vault(
             acronym_regex = None
 
     lexical: dict[str, float] = {}
+    must_candidates: list[tuple[str, int, str, int]] = []
     for chunk in all_chunks:
-        haystack = chunk.content.lower()
+        haystack = _lexical_haystack(chunk)
         token_hits = sum(haystack.count(token) for token in regular_tokens)
         acronym_hits = len(acronym_regex.findall(chunk.content)) if acronym_regex is not None else 0
         exact_boost = 1 if query.lower() in haystack else 0
         lexical[chunk.id] = float(token_hits + acronym_hits * 5.0 + exact_boost * 10)
+        if clean_terms and all(term in haystack for term in clean_terms):
+            hits = sum(haystack.count(term) for term in clean_terms)
+            try:
+                c_idx = int(chunk.metadata.get("chunk_index") or 0)
+            except (TypeError, ValueError):
+                c_idx = 0
+            must_candidates.append((chunk.id, hits, chunk.source, c_idx))
+
+    # 第 1 层召回保障：全库扫描构造 must 候选集并作为 route D 传入 hybrid_rank
+    must: list[tuple[str, int]] = []
+    exact_route: list[str] | None = None
+    if must_candidates:
+        must_candidates.sort(key=lambda x: (-x[1], x[2], x[3]))
+        must_cap = max(owner.config.rrf_per_route, top_k)
+        must = [(cid, hits) for cid, hits, _, _ in must_candidates[:must_cap]]
+        exact_route = [cid for cid, _ in must]
 
     semantic_chunks: list[Chunk] = []
     semantic_snapshot: dict[str, float] = {}
@@ -304,6 +362,7 @@ def search_single_vault(
             owner._fts,
             owner.config.rrf_per_route,
             path_prefix=prefix,
+            exact_route=exact_route,
         )
     else:
         ranked = []
@@ -320,8 +379,20 @@ def search_single_vault(
                 for chunk in all_chunks
                 if lexical[chunk.id] > 0
             ]
+        # 第 2 层召回保障：非 hybrid 降级路径下，为 must 中未进入 ranked 的 chunk 追加固定保底分
+        if must:
+            by_id = {c.id: c for c in all_chunks}
+            existing_ids = {c.id for c in ranked}
+            floor_score = 1.0 / (_RRF_K + owner.config.rrf_per_route)
+            for chunk_id, _ in must:
+                if chunk_id not in existing_ids and chunk_id in by_id:
+                    ranked.append(replace(by_id[chunk_id], score=floor_score))
 
     ranked.sort(key=lambda chunk: (-chunk.score, chunk.source, chunk.metadata["chunk_index"]))
+
+    # 第 3 层召回保障：融合排序后、与 filters.matches 同阶段执行硬过滤；rerank 之后不再过滤
+    if clean_terms:
+        ranked = [chunk for chunk in ranked if all(term in _lexical_haystack(chunk) for term in clean_terms)]
 
     if filters is not None:
         ranked = [chunk for chunk in ranked if filters.matches(chunk)]
@@ -352,6 +423,8 @@ class SearchEngine:
         query_vector: Iterable[float] | None = None,
         filters: SearchFilter | None = None,
         dedupe: bool = True,
+        *,
+        exact_terms: list[str] | None = None,
     ) -> list[Chunk]:
         return search_single_vault(
             self.owner,
@@ -361,6 +434,7 @@ class SearchEngine:
             query_vector=query_vector,
             filters=filters,
             dedupe=dedupe,
+            exact_terms=exact_terms,
         )
 
     @classmethod
@@ -373,6 +447,8 @@ class SearchEngine:
         query_vector: Iterable[float] | None = None,
         filters: SearchFilter | None = None,
         dedupe: bool = True,
+        *,
+        exact_terms: list[str] | None = None,
     ) -> list[Chunk]:
         return search_single_vault(
             owner,
@@ -382,4 +458,5 @@ class SearchEngine:
             query_vector=query_vector,
             filters=filters,
             dedupe=dedupe,
+            exact_terms=exact_terms,
         )
