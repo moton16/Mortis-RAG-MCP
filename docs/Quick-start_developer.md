@@ -168,7 +168,7 @@ stdin 一行 JSON → handle() → method=="tools/call"
 | `_indexer/` | 索引与检索引擎核心实现私有包 | 各子模块独立导出 | 仅自底向上依赖，严禁运行时反向导入 Facade；数据模型 `Chunk` 字段顺序与 `VMCPC/VMCPV` 二进制协议严格锁定；常驻 Chunk 禁止原地修改 score |
 | `providers.py` | embedding/reranker HTTP（重试、退避、batch 切分、static 兜底） | `create_*_provider()` | 429 必须尊重 `Retry-After`；其余 4xx 不重试 |
 | `fts.py` | FTS5 trigram 索引 | `FtsIndex.search()` | trigram 对 <3 字符天然跳过（短词由 indexer 的 bigram 词法路兜底）；`source` 列是 UNINDEXED，`path_prefix` 下推只减候选 |
-| `vector.py` | 向量后端 Protocol + memory（numpy）+ sqlite_vec（磁盘） | `create_vector_backend()` | sqlite_vec 操作有 `_serialized` 装饰器串行化；首次切换自动从旧缓存迁移 |
+| `vector.py` | 向量后端 Protocol + memory + sqlite_vec（磁盘） | `create_vector_backend()` | sqlite_vec 操作有 `_serialized` 装饰器串行化；首次切换自动从旧缓存迁移；批量余弦（numpy 可选加速，缺 numpy 自动回退标量）在 `_indexer/search.py::semantic_rank` |
 | `fsnotify.py` | Windows 原生目录监听（ctypes + ReadDirectoryChangesW） | `WindowsDirectoryWatcher` | 纯 ctypes 手写 OVERLAPPED 结构，改结构体定义前先看 `_declare_prototypes`；事件经防抖调度线程（条件变量，不是 Timer 风暴） |
 
 ## 6. 缓存与状态文件布局
