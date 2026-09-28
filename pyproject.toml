@@ -16,6 +16,10 @@ dependencies = []
 # Optional disk-backed vector storage (sqlite-vec). Not required for core use;
 # enables [vector] backend = "sqlite_vec" to keep embeddings off RAM.
 vec = ["sqlite-vec>=0.1.9"]
+# Optional numeric acceleration: batched cosine in _indexer/search.py
+# (semantic_rank). Soft dependency — without numpy the code falls back to the
+# scalar loop automatically; never required for correctness.
+accel = ["numpy>=1.24"]
 
 [project.scripts]
 mortis-rag-mcp = "mortis_rag_mcp.__main__:main"

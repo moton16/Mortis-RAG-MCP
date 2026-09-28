@@ -43,7 +43,7 @@ python -m pip install -e .
 # 仍失败（如离线/构建隔离异常）再退而求其次：
 # python -m pip install -e . --no-build-isolation
 # 可选加速（批量余弦用 numpy）：
-# python -m pip install numpy
+# python -m pip install numpy   # 等价写法：python -m pip install "mortis-rag-mcp[accel]"
 # 可选：磁盘向量后端（向量不占内存，13k 切片约省 55MB RAM）：
 # python -m pip install "mortis-rag-mcp[vec]"   # 然后配置里开 [vector] backend = "sqlite_vec"
 ```

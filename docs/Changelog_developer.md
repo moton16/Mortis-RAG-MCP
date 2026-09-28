@@ -383,6 +383,19 @@
 >
 > **验证**：`tests/test_exempt.py` 7 passed、`tests/test_cache_codec_roundtrip.py` 5 passed；修复前复现对照——同一载荷走旧逻辑实测抛 `IndexError: index out of range`（`decompressed_len 5 / magic_match True`），修复后返回 `None`；lint 零新增。
 
+### [FIX-3–FIX-5] — moton16,2026-09-28,CodeBuddy,Deepseek-V4.1-Flash — chore(release): 徽章/SKILL 头部对齐 0.8.0 + 补 accel extra
+> **涵盖提交**：`chore(release): 徽章/SKILL 头部对齐 0.8.0 + 补 accel extra`
+> **来源**：同批次 Option A 修复卡 C6 / A1 / A2。
+>
+> **代码改动概况**：
+> - `README.md` / `README_EN.md`：版本徽章 `0.7.3` → `0.8.0`（仅第 5 行徽章；正文 v0.8.0 特性宣传本就正确，其余内容不动）。
+> - `pyproject.toml`：`[project.optional-dependencies]` 在 `vec` 之后补 `accel = ["numpy>=1.24"]`。PROJECT_GUIDE §13.3 早已声称「提供 accel / vec 额外可选依赖」，此前工作区 extras 经审裁决暂缓（见 C52 条目），本卡落地后该声明成真。`dependencies = []` 零运行时依赖红线不变：numpy 仍是「装了就快、没装也对」的软依赖（`_indexer/search.py` 内 try-import，缺失自动回退标量余弦）。
+> - `QUICKSTART_user.md`：用户侧 extras 安装段（原本已提 `mortis-rag-mcp[vec]`）按现有格式补 accel 一行，标注与裸 `pip install numpy` 等价；`README.md` / `README_EN.md` 未提 extras，按卡内规则不动。
+> - `skills/mortis-rag-mcp/SKILL.md`：头部标题版本 `0.7.2` → `0.8.0`。frontmatter `version: 5.2.0` 是 SKILL 文档规范版本号（Combo-C 未声明 bump），**刻意不动**；正文的 Combo-C 新参数（chunk_id/expand_lines、budget_bytes、exact_terms、aliases、.txt、双链、solo 语义、15 工具清单）此前已同步，本卡只修头部。
+>
+> **验证**：`grep "0\.7\.3" README.md README_EN.md` 零命中（其余 0.7.3 命中均在 `CHANGELOG_user.md` 与 docs 历史条目内，按事实保留与卡内规则不动）；`grep "0\.7\.2" skills/mortis-rag-mcp/SKILL.md` 零命中；用项目自带 `config._read_toml()`（本机 `.venv` 为 Python 3.10、无 `tomllib`，自动走 fallback 子集解析器）断言 `extras == ['accel','vec']`、`accel == ['numpy>=1.24']`、`dependencies == []`。
+> **实装校验留白（如实记录）**：本机 `.venv` 未安装 numpy（实测 `ModuleNotFoundError`），故 `accel` 下限按保守 `>=1.24` 声明、不随意下调；`pip install -e ".[accel]"` 的实装验证未在本会话执行（避免改动使用者 venv 且本批最终回归交由 CI），留待 CI 安装阶段覆盖。
+
 
 
 
