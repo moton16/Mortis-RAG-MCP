@@ -369,6 +369,20 @@
 
 - **验证**：全量 `pytest tests/ -q` **345 passed, 4 skipped**（oracle 测试就地强化，总数与 C51 持平）；oracle 判别力抽检：FTS 开启下无扰动恒等、人为扰动冻结 `_RRF_K=59` 后分数立即分歧；`mortis_rag_mcp` 包内 sync 函数族直呼 grep 清零；受影响 6 测试文件单跑 25 passed；lint 零新增。
 
+### [FIX-1–FIX-2] — moton16,2026-09-28,CodeBuddy,Deepseek-V4.1-Flash — fix(security): kb_exempt check 路径沙箱 + 缓存解码截断防御
+> **涵盖提交**：`fix(security): kb_exempt check 路径沙箱 + 缓存解码截断防御`
+> **来源**：v0.8.0 Combo-C `/review` 终审（54 findings）Option A 已批准修复范围的前两张卡（C1/C2）；施工指导 `docs/v0.8.0/Combo-C-review-handoff_developer.md` §3。
+>
+> **代码改动概况**：
+> - `mortis_rag_mcp/_indexer/exemptions.py`（C1 · P1 安全）：`check_exemption` 原以 `owner.vault_path / source_posix` 直拼接路径，而 `source` 来自 MCP 工具参数（LLM 直控），`../` 或绝对路径可探测 vault 外文件的存在性与豁免状态。现改为 `owner._safe_path(source_posix)` 沙箱（与该文件 `set_file_exemption` 早已存在的正确防线对齐），并把 `_safe_path` 的「抛 ValueError 拒绝」折叠为 `None`，与「文件不存在」走同一响应分支——**库外与不存在同响应，存在性 oracle 被封死**。响应键集（`source/is_exempt/reason/has_block_ignores/indexed_chunks`）保持不变，不加新键、不破坏 MCP 返回契约；`get_exemptions()` 对 scandir 派生的库内真实文件循环调用，行为零变化。
+> - `mortis_rag_mcp/_indexer/cache_codec.py`（C2 · P1 健壮性）：`_CacheCodec.load()` 与 `_VectorsCodec.load()` 的 `version = raw[pos]` 位于两段 try 之外，magic 匹配但总长不足 6 字节的截断文件会抛 `IndexError`，违反模块 docstring「解码失败（magic/版本/截断/损坏）一律静默返回 None」的契约。两处条件行各追加 `or len(raw) <= len(MAGIC)`，最小补丁、不动控制流。
+>
+> **测试**：
+> - `tests/test_exempt.py` 新增 `test_check_exemption_rejects_paths_outside_vault`：库外**真实存在**的文件（`../outside.md`）、绝对路径（`C:/x.md`）与 `../../outside.md` 三项均断言 `is_exempt=False` + `reason="file not found on disk"` + 响应键集冻结，库内文件仍正常回报。
+> - `tests/test_cache_codec_roundtrip.py` 新增 `test_short_payload_after_zlib_returns_none_without_indexerror`：两个 codec 各构造「解压后恰好 5 字节 = magic」的载荷（刻意用 `zlib.compress` 而非裸写 magic——后者会先撞 `zlib.error` 分支，测不到新增守卫），外加 magic+版本 6 字节的边界档。
+>
+> **验证**：`tests/test_exempt.py` 7 passed、`tests/test_cache_codec_roundtrip.py` 5 passed；修复前复现对照——同一载荷走旧逻辑实测抛 `IndexError: index out of range`（`decompressed_len 5 / magic_match True`），修复后返回 `None`；lint 零新增。
+
 
 
 

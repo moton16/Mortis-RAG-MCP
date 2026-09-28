@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import dataclasses
+import zlib
 from array import array
 from pathlib import Path
 
@@ -79,3 +80,23 @@ def test_corrupt_cache_silently_rebuilds(tmp_path: Path):
     truncated.write_bytes(raw[: len(raw) // 2])
     assert _CacheCodec.load(truncated) is None
     assert _VectorsCodec.load(bad) is None
+
+
+def test_short_payload_after_zlib_returns_none_without_indexerror(tmp_path: Path):
+    """C2 回归：magic 匹配但总长不足 6 字节的载荷不得抛 IndexError。
+
+    关键：载荷必须先通过 ``zlib.decompress``（直接写裸 ``b"VMCPC"`` 会先撞
+    zlib.error 分支，测不到新增的长度守卫），因此写 ``zlib.compress(...)``。
+    """
+    for name, magic, loader in (
+        ("short.chunks.bin", b"VMCPC", _CacheCodec.load),
+        ("short.vectors.bin", b"VMCPV", _VectorsCodec.load),
+    ):
+        path = tmp_path / name
+        path.write_bytes(zlib.compress(magic))  # 解压后恰好 5 字节 = magic
+        assert loader(path) is None
+
+    # 边界：magic + 版本字节（6 字节）恰好跨过长度守卫，版本对但 meta 缺失 → struct.error 兜底
+    boundary = tmp_path / "boundary.chunks.bin"
+    boundary.write_bytes(zlib.compress(b"VMCPC\x01"))
+    assert _CacheCodec.load(boundary) is None

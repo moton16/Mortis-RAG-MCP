@@ -207,8 +207,15 @@ def check_exemption(owner: MarkdownIndexer, source: str) -> dict[str, Any]:
             "indexed_chunks": 0,
         }
 
-    target_path = owner.vault_path / source_posix
-    if not target_path.exists() or not target_path.is_file():
+    # source 来自 MCP 工具参数（LLM 直控），必须过 _safe_path 沙箱再落盘探测：
+    # 否则 "../" 或绝对路径会变成 vault 外文件的存在性 oracle（与 set_file_exemption 对齐）。
+    # _safe_path 以抛 ValueError 表达拒绝，这里统一折叠为 None 走「未找到」同一响应，
+    # 保持响应键集不变；vault 外与不存在同响应 = 不泄露任何区分信息。
+    try:
+        target_path = owner._safe_path(source_posix)
+    except (ValueError, OSError):
+        target_path = None
+    if target_path is None or not target_path.exists() or not target_path.is_file():
         return {
             "source": source_posix,
             "is_exempt": False,

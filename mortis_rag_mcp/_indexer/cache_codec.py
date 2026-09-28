@@ -76,7 +76,9 @@ class _CacheCodec:
             raw = zlib.decompress(path.read_bytes())
         except (OSError, zlib.error):
             return None
-        if raw[: len(_CACHE_MAGIC)] != _CACHE_MAGIC:
+        # 长度判据必须与 magic 同句：magic 匹配但总长不足 6 字节的截断文件会让
+        # 下方 raw[pos] 抛 IndexError，违反本模块「解码失败一律静默返回 None」契约。
+        if raw[: len(_CACHE_MAGIC)] != _CACHE_MAGIC or len(raw) <= len(_CACHE_MAGIC):
             return None
         pos = len(_CACHE_MAGIC)
         version = raw[pos]
@@ -171,7 +173,8 @@ class _VectorsCodec:
             raw = zlib.decompress(path.read_bytes())
         except (OSError, zlib.error):
             return None
-        if raw[: len(_VectorsCodec._MAGIC)] != _VectorsCodec._MAGIC:
+        # 同 _CacheCodec：截断文件不得抛 IndexError（静默返回 None 是契约）
+        if raw[: len(_VectorsCodec._MAGIC)] != _VectorsCodec._MAGIC or len(raw) <= len(_VectorsCodec._MAGIC):
             return None
         pos = len(_VectorsCodec._MAGIC)
         version = raw[pos]
