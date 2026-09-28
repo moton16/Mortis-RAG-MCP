@@ -1,694 +1,108 @@
 from __future__ import annotations
 
-import fnmatch
 import hashlib
 import json
-import math
 import os
-import re
-import struct
 import threading
 import time
-import zlib
 import zipfile
 from array import array
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from .config import AppConfig
-from . import fsnotify
-from .fsnotify import WindowsDirectoryWatcher, watcher_available
+from .fsnotify import WindowsDirectoryWatcher
 from .fts import FtsIndex
 from .ingest import INGEST_EXTS
-from .ingest.tables import iter_table_blocks, split_large_table, split_table_into_chunks
+from .ingest.tables import iter_table_blocks, split_table_into_chunks
 from .providers import EmbeddingProvider, ProviderError, RerankerProvider, create_embedding_provider, create_reranker_provider
 from .vector import create_vector_backend
-
-_RRF_K = 60
-
-# Fast-Stat 可信判据的安全余量**下限**（纳秒）。文件时间戳并非真纳秒：Windows
-# 系统定时器最坏 15.6ms 才更新一次（实测 NTFS 刻度约 3ms，FAT32 达 2s），且
-# 时间戳可能因取整而超前于进程时钟（Windows CI 实测约 3% 概率，见 CI 诊断
-# racycount=1/30）。
-#
-# 注意这里是下限而非实际取值：实际余量由 _effective_margin_ns() 从**库所在
-# 文件系统探测到的真实刻度**推导（margin = max(下限, 2 × 刻度)）。固定 50ms
-# 曾在粗粒度文件系统上失守——当刻度 > 余量时，「登记之后发生的写入必然推动
-# mtime 前进」的归纳前提不成立（论证与反例见 _fast_path_is_trustworthy）。
-_MTIME_TRUST_MARGIN_NS = 50_000_000
-
-# 时间戳刻度探测（用于推导余量）。刻度估计取库内文件 mtime_ns 的最大公约数：
-# 真实刻度 T 的任何正整数倍都必然整除所有时间戳，故 gcd 只会**高估**刻度、
-# 绝不会低估；高估的方向是把余量调大（更保守、只多读盘），低估才会漏检，而
-# gcd 在数学上不可能低估。见 _probe_mtime_tick_ns()。
-_MTIME_TICK_PROBE_MIN_SAMPLES = 2   # 至少两个样本才有差值可比
-_MTIME_TICK_PROBE_MAX_SAMPLES = 64  # 单进程内最多保留的探测样本
-_MTIME_TICK_COARSE_NS = 50_000_000  # 刻度粗于此时直接禁用快速路径（fail-closed）
-
-# mtime 停在未来的条目（网络盘/共享盘时钟超前、备份还原、手工 touch）的复核
-# 上限：跨墙钟复核这么多次后签名仍未变，就接受它稳定并恢复零读盘，而不是因
-# 外部时钟偏移永久惩罚它（每轮重读+重哈希）。见 _fast_path_is_trustworthy。
-_FUTURE_MTIME_RECHECK_LIMIT = 2
-# 「跨墙钟」的最小间隔：两次内容级验证的进程时钟读数至少差这么多才算两次独立
-# 观测，否则同一毫秒内的连续 sync 会把复核计数刷满。
-_FUTURE_MTIME_MIN_OBSERVATION_GAP_NS = 1_000_000
-
-# native 监听回调的防抖延迟上限：编辑器保存风暴（事件持续不断）会让防抖定时器
-# 一直顺延，超过这个窗口就必须同步一次，不能让事件流饿死同步。
-_FS_MAX_DEBOUNCE_WAIT = 5.0
-
-_HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
-_WORD_RE = re.compile(r"[\w]+", re.UNICODE)
-_ASCII_RE = re.compile(r"[A-Za-z0-9_]+")
-_CJK_RE = re.compile(r"[\u4e00-\u9fff]+")
-
-_BLOCK_IGNORE_START = re.compile(r"^\s*<!--\s*(?:rag-ignore|rag:ignore|no-rag|norag)\s*-->", re.IGNORECASE)
-_BLOCK_IGNORE_END = re.compile(r"^\s*<!--\s*(?:/rag-ignore|/rag:ignore|/no-rag|/norag|end-rag-ignore)\s*-->", re.IGNORECASE)
-
-# 图片注入（inject_image_captions）：标准 Markdown 图片与 Obsidian wiki 图片嵌入。
-_MD_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\(\s*([^)\s]+)(?:\s+\"([^\"]*)\")?\s*\)")
-_WIKI_IMAGE_RE = re.compile(r"!\[\[([^\]|]+)(?:\|([^\]]*))?\]\]")
-_FENCE_START_RE = re.compile(r"^\s*(`{3,}|~{3,})")
-_FENCE_RE = _FENCE_START_RE
-_SHORT_STOPWORDS = frozenset({
-    "a", "an", "at", "be", "by", "do", "go", "he", "if", "in", "is", "it",
-    "me", "my", "no", "of", "on", "or", "so", "to", "up", "we", "us", "am"
-})
-_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp", ".avif"}
-_INDEXABLE_TEXT_EXTS = frozenset({".md", ".txt"})
-_CHAPTER_HEADING_RE = re.compile(
-    r"^\s*(第[0-9一二三四五六七八九十百千]+[章回节卷]|Chapter\s+[0-9]+)\s*(.*)$",
-    re.IGNORECASE,
+# v0.8.0 P2：数据模型与缓存编解码提取至私有包 _indexer/（本文件转为 Facade）。
+# 下方 re-export 保持 `from mortis_rag_mcp.indexer import ...` 公开导入面 100% 不变。
+from ._indexer.cache_codec import _CacheCodec, _VectorsCodec
+from ._indexer.models import (
+    Chunk,
+    SearchFilter,
+    _EMB_DTYPE,
+    _candidate_terms,
+    _extract_snippet,
+    dedupe_by_content_hash,
+)
+from ._indexer import scanning as _scanning
+from ._indexer.scanning import (
+    IgnoreMatcher,
+    _FUTURE_MTIME_MIN_OBSERVATION_GAP_NS,
+    _FUTURE_MTIME_RECHECK_LIMIT,
+    _MTIME_TICK_COARSE_NS,
+    _MTIME_TICK_PROBE_MAX_SAMPLES,
+    _MTIME_TICK_PROBE_MIN_SAMPLES,
+    _MTIME_TRUST_MARGIN_NS,
+)
+from ._indexer import sync_engine as _sync_engine
+from ._indexer import search as _search
+from ._indexer.search import (
+    _ASCII_RE,
+    _CJK_RE,
+    _RRF_K,
+    _SHORT_STOPWORDS,
+    _WORD_RE,
+    _to_emb,
+    cosine as _cosine_fn,
+    fts_query as _fts_query_fn,
+    hybrid_rank as _hybrid_rank_fn,
+    query_tokens as _query_tokens_fn,
+    rerank_chunks,
+    semantic_rank as _semantic_rank_fn,
+)
+from ._indexer import chunking as _chunking
+from ._indexer.chunking import (
+    _BLOCK_IGNORE_END,
+    _BLOCK_IGNORE_START,
+    _CHAPTER_HEADING_RE,
+    _FENCE_RE,
+    _FENCE_START_RE,
+    _HEADING_RE,
+    _IMAGE_EXTS,
+    _INDEXABLE_TEXT_EXTS,
+    _MD_IMAGE_RE,
+    _WIKI_IMAGE_RE,
+    _image_note,
+    _image_notes_for_line,
+    _inject_image_notes,
+    _is_chapter_heading,
 )
 
 
-def _is_chapter_heading(line: str) -> tuple[bool, str]:
-    """检测单行是否为网络小说/书籍的章节标题。
 
-    门禁规则（F-09）：
-    1. 行长门禁：去除首尾空格后长度 <= 60 字符，超长的一律视为正文段落；
-    2. 标点门禁：标题不能以句末标点（如 '。'、'！'、'？'、'；'、'…'）结尾；
-       也不能包含逗号（'，'、','）、分号（'；'、';'）或对话引号（'“'、'”'、'"'）；
-    3. 正则匹配：匹配『第X章/回/节/卷 标题』或『Chapter X Title』。
-    """
-    s = line.strip()
-    if not s or len(s) > 60:
-        return False, ""
-    if s.endswith(("。", "！", "？", "!", "?", "；", ";", "…")):
-        return False, ""
-    if any(p in s for p in ("，", ",", "；", ";", "“", "”", '"')):
-        return False, ""
-    m = _CHAPTER_HEADING_RE.match(s)
-    if not m:
-        return False, ""
-    prefix = m.group(1).strip()
-    suffix = m.group(2).strip()
-    heading_title = f"{prefix} {suffix}".strip() if suffix else prefix
-    return True, heading_title
-
-_CACHE_MAGIC = b"VMCPC"
-_CACHE_VERSION = 1
-
-# 快照（kb_export / kb_import）：把两个缓存层打包成 zip 随库迁移，换机不再
-# 全量重新 embedding。导入端会按本机 _cache_key() 重命名落地，并对 .bin 里
-# 的 meta 做本地重写（cache key 是路径派生的，跨机器必然不同）。
-_SNAPSHOT_FORMAT = "vault-mcp-snapshot"
-_SNAPSHOT_VERSION = 1
-_SNAPSHOT_MEMBERS = frozenset({"manifest.json", "chunks.bin", "vectors.bin", "vectors.sqlite", "fts.sqlite"})
-# 各成员解压后的字节上限：正常库的缓存不会超过这些量级，超限 = 恶意构造。
-_SNAPSHOT_MEMBER_LIMITS = {
-    "manifest.json": 1 * 1024 * 1024,
-    "chunks.bin": 4 * 1024 * 1024 * 1024,
-    "vectors.bin": 16 * 1024 * 1024 * 1024,
-    "vectors.sqlite": 16 * 1024 * 1024 * 1024,
-    "fts.sqlite": 16 * 1024 * 1024 * 1024,
-}
-
-# Embeddings are stored as float32 arrays (4 bytes/dim) instead of Python lists
-# to keep memory sane: 6157 chunks x 4096 dims would otherwise cost ~800MB.
-_EMB_DTYPE = "f"
+from ._indexer import snapshot as _snapshot
+from ._indexer.snapshot import (
+    _SNAPSHOT_FORMAT,
+    _SNAPSHOT_VERSION,
+    _SNAPSHOT_MEMBERS,
+    _SNAPSHOT_MEMBER_LIMITS,
+)
+from ._indexer import exemptions as _exemptions
+from ._indexer import watch as _watch
+from ._indexer.watch import _FS_MAX_DEBOUNCE_WAIT
 
 
-class IgnoreMatcher:
-    """Gitignore-style pattern matcher for vault exclusion rules."""
-
-    def __init__(self, patterns: Iterable[str]) -> None:
-        self.rules: list[tuple[bool, str, bool]] = []
-        for raw in patterns:
-            line = raw.strip()
-            if not line or line.startswith("#"):
-                continue
-            is_neg = False
-            if line.startswith("!"):
-                is_neg = True
-                line = line[1:].strip()
-            if not line:
-                continue
-            is_dir_only = line.endswith("/")
-            if is_dir_only:
-                line = line.rstrip("/")
-            self.rules.append((is_neg, line, is_dir_only))
-
-    def is_ignored(self, rel_path: str, is_dir: bool = False) -> tuple[bool, str | None]:
-        rel_posix = rel_path.replace("\\", "/").strip("/")
-        if not rel_posix:
-            return False, None
-
-        parts = rel_posix.split("/")
-        filename = parts[-1]
-
-        matched = False
-        matched_rule: str | None = None
-
-        for is_neg, pat, is_dir_only in self.rules:
-            hit = False
-            norm_pat = pat.replace("\\", "/").rstrip("/")
-            pat_lower = norm_pat.lower()
-            rel_lower = rel_posix.lower()
-            fn_lower = filename.lower()
-
-            if "/" not in norm_pat:
-                if fnmatch.fnmatchcase(fn_lower, pat_lower):
-                    if not is_dir_only or is_dir:
-                        hit = True
-                if not hit:
-                    for part in parts[:-1]:
-                        if fnmatch.fnmatchcase(part.lower(), pat_lower):
-                            hit = True
-                            break
-            else:
-                clean_pat = norm_pat.lstrip("/")
-                clean_pat_lower = clean_pat.lower()
-                if fnmatch.fnmatchcase(rel_lower, clean_pat_lower):
-                    hit = True
-                elif is_dir_only and (rel_lower == clean_pat_lower or rel_lower.startswith(clean_pat_lower + "/")):
-                    hit = True
-                elif not is_dir_only and rel_lower.startswith(clean_pat_lower + "/"):
-                    hit = True
-                elif "**" in clean_pat_lower and fnmatch.fnmatchcase(rel_lower, clean_pat_lower):
-                    hit = True
-
-            if hit:
-                if is_neg:
-                    matched = False
-                    matched_rule = None
-                else:
-                    matched = True
-                    matched_rule = norm_pat + ("/" if is_dir_only else "")
-
-        return matched, matched_rule
-
-
-def _candidate_terms(tokens: list[str]) -> list[str]:
-    """把查询词元展开成可用于定位的候选词：英文单词原样，中文按 2-gram 滑窗。"""
-    out: list[str] = []
-    for token in tokens or []:
-        t = token.strip()
-        if not t:
-            continue
-        if "\u4e00" <= t[0] <= "\u9fff":
-            if len(t) == 1:
-                out.append(t)
-                continue
-            out.extend(t[i:i + 2] for i in range(len(t) - 1))
-        elif len(t) >= 2:
-            out.append(t)
-    return out
-
-
-def _extract_snippet(content: str, query_tokens: list[str] | None = None, max_len: int = 150) -> str:
-    """从 chunk 正文中提取围绕查询关键词的高光摘要片段（约 100~150 字符）。"""
-    if not content:
-        return ""
-    clean_text = " ".join(content.split())
-    if len(clean_text) <= max_len:
-        return clean_text
-
-    tokens = query_tokens or []
-    # 寻找首个命中的高价值查询词（长度 >= 2，或单字中文）
-    match_idx = -1
-    for token in tokens:
-        t = token.strip()
-        if not t or (len(t) < 2 and not ("\u4e00" <= t <= "\u9fff")):
-            continue
-        idx = clean_text.lower().find(t.lower())
-        if idx != -1:
-            match_idx = idx
-            break
-
-    if match_idx == -1:
-        candidates = _candidate_terms(tokens)
-        best_term = None
-        best_count = 0
-        clean_text_lower = clean_text.lower()
-        for term in candidates:
-            cnt = clean_text_lower.count(term.lower())
-            if cnt > best_count:
-                best_count = cnt
-                best_term = term
-        if best_term is not None and best_count > 0:
-            match_idx = clean_text_lower.find(best_term.lower())
-
-    if match_idx == -1:
-        # 未直接定位到词元，取开头内容
-        return clean_text[:max_len].rstrip() + "..."
-
-    # 以匹配词为中心，向两侧各扩展
-    half = max_len // 2
-    start = max(0, match_idx - half)
-    end = min(len(clean_text), start + max_len)
-    if end - start < max_len:
-        start = max(0, end - max_len)
-
-    snippet = clean_text[start:end].strip()
-    prefix = "..." if start > 0 else ""
-    suffix = "..." if end < len(clean_text) else ""
-    return f"{prefix}{snippet}{suffix}"
-
-
-@dataclass
-class Chunk:
-    id: str
-    content: str
-    source: str
-    title: str
-    metadata: dict[str, Any]
-    score: float = 0.0
-    embedding: array | None = field(default=None, repr=False)
-
-    def to_dict(self, preview: bool = False, query_tokens: list[str] | None = None) -> dict[str, Any]:
-        d: dict[str, Any] = {
-            "id": self.id,
-            "score": self.score,
-            "source": self.source,
-            "title": self.title,
-            "heading": self.metadata.get("heading", self.title),
-            "start_line": self.metadata.get("start_line", 1),
-            "end_line": self.metadata.get("end_line", 1),
-            "metadata": dict(self.metadata),
-        }
-        if "source_pdf" in self.metadata:
-            d["source_pdf"] = self.metadata["source_pdf"]
-
-        if preview:
-            d["snippet"] = _extract_snippet(self.content, query_tokens)
-            d["char_count"] = len(self.content)
-        else:
-            d["content"] = self.content
-        return d
-
-
-@dataclass
-class SearchFilter:
-    """kb_search 的过滤条件与分页参数（全部可选）。
-
-    过滤统一在融合排序之后做（FTS 那一路的 path_prefix 只是减少候选量的 SQL
-    层下推），所以即使 FTS 索引缺失、或查询太短走不了 BM25，结果集依然正确——
-    下推只影响速度，不影响语义。
-    """
-
-    path_prefix: str = ""
-    tags: list[str] | None = None
-    mtime_after: float | None = None
-    mtime_before: float | None = None
-    offset: int = 0
-    limit: int | None = None
-
-    def matches(self, chunk: Chunk) -> bool:
-        """chunk 是否满足全部已设置的条件（未设置的条件一律放行）。"""
-        if self.path_prefix:
-            # 归一化后比较：source 恒为 posix 风格（'dir/file.md'），而 Windows
-            # 用户自然会传 '教材\\' 或大小写不同的 'notes/' —— 此前是裸
-            # startswith，两者都静默零召回（FTS 下推的 LIKE 对 ASCII 大小写
-            # 不敏感，比权威后过滤更宽松，掩盖了这个问题）。
-            prefix = self.path_prefix.replace("\\", "/").rstrip("/")
-            source = chunk.source
-            if os.name == "nt":
-                prefix = prefix.casefold()
-                source = source.casefold()
-            matched = False
-            if prefix and source.startswith(prefix):
-                matched = True
-            elif prefix:
-                # D14: 穿透 .mortis-parsed/ 产物目录，召回对应的 PDF 摄取文档
-                for parsed_dir in (".mortis-parsed/", ".mortis-parsed"):
-                    pdir = parsed_dir.casefold() if os.name == "nt" else parsed_dir
-                    if source.startswith(pdir):
-                        stripped = source[len(pdir):].lstrip("/")
-                        if stripped.startswith(prefix):
-                            matched = True
-                            break
-            if not matched:
-                return False
-        if self.tags:
-            wanted = {str(tag).lower().lstrip("#") for tag in self.tags if str(tag).strip()}
-            if wanted:
-                # 清洗规则与 _is_frontmatter_exempt 保持一致：小写 + 去 # 前缀。
-                have = {str(tag).lower().lstrip("#") for tag in chunk.metadata.get("tags") or []}
-                if not (wanted & have):
-                    return False
-        # 老缓存产生的 chunk 没有 mtime 字段，视为"时间未知"直接放行，
-        # 否则一次过滤条件就会让整个历史索引检索不到。
-        mtime = chunk.metadata.get("mtime")
-        if mtime is not None:
-            if self.mtime_after is not None and mtime < self.mtime_after:
-                return False
-            if self.mtime_before is not None and mtime > self.mtime_before:
-                return False
-        return True
-
-    def page_slice(self, default_limit: int) -> tuple[int, int]:
-        """分页区间 [start, end)：limit 未设置时回落到调用方的 top_k。"""
-        start = max(0, int(self.offset))
-        limit = self.limit if self.limit is not None else default_limit
-        return start, start + max(0, int(limit))
-
-
-def _pack_str(buf: bytearray, text: str) -> None:
-    data = text.encode("utf-8")
-    buf += struct.pack("<I", len(data))
-    buf += data
-
-
-def _pack_u32(buf: bytearray, value: int) -> None:
-    buf += struct.pack("<I", value)
-
-
-def _to_emb(vectors: Iterable[float]) -> array:
-    return array(_EMB_DTYPE, vectors)
-
-
-def dedupe_by_content_hash(items: list[Any], chunk_of: Callable[[Any], Chunk] | None = None) -> list[Any]:
-    """按 content_hash 保序去重：同一份内容只留排在最前面的那条。
-
-    items 默认就是 Chunk 列表；跨库 fan-out 传的是 (vault_entry, chunk) 元组，
-    用 chunk_of 把 chunk 取出来即可。没有 content_hash 的老 chunk 一律保留——
-    宁可多返回一条，也不能把内容未知的 chunk 误判成重复删掉。
-    """
-    extract = chunk_of if chunk_of is not None else (lambda item: item)
-    seen: set[str] = set()
-    kept: list[Any] = []
-    for item in items:
-        digest = extract(item).metadata.get("content_hash")
-        if digest is None:
-            kept.append(item)
-            continue
-        if digest in seen:
-            continue
-        seen.add(digest)
-        kept.append(item)
-    return kept
-
-
-def _image_note(alt: str, caption: str, path: str) -> str:
-    """一张图片对应的一行注入文本：`[图片: alt 图注 (文件名)]`。"""
-    name = Path(path.replace("\\", "/")).stem
-    descriptor = " ".join(part for part in (alt, caption) if part)
-    return f"[图片: {descriptor} ({name})]" if descriptor else f"[图片: {name}]"
-
-
-def _image_notes_for_line(line: str) -> list[str]:
-    """提取一行里的所有图片，返回要插入的注入行（没有图片则返回空列表）。"""
-    notes: list[str] = []
-    for match in _MD_IMAGE_RE.finditer(line):
-        alt = match.group(1).strip()
-        path = match.group(2)
-        title = (match.group(3) or "").strip()
-        notes.append(_image_note(alt, title, path))
-    for match in _WIKI_IMAGE_RE.finditer(line):
-        path = match.group(1).strip()
-        caption = (match.group(2) or "").strip()
-        if Path(path.replace("\\", "/")).suffix.lower() not in _IMAGE_EXTS:
-            continue
-        notes.append(_image_note("", caption, path))
-    return notes
-
-
-def _inject_image_notes(lines: list[str]) -> list[str]:
-    """把图片的 alt / 图注变成可检索的正文行（纯函数，不修改输入）。
-
-    Markdown 里的图片只有路径引用，alt 与图注（Obsidian 的 ``![[path|图注]]``）
-    原本不会进入 chunk 正文，语义检索不到「这张图讲了什么」。本函数在每张图片
-    所在行之后插入一行 ``[图片: alt 图注 (文件名)]``。
-
-    代价：chunk content 变了 → chunk.id 变了 → 全库重新 embedding。所以由
-    ``config.inject_image_captions`` 门控，默认必须关闭。代码块（``` / ~~~）
-    里的图片语法只是示例文本，不注入。
-    """
-    result: list[str] = []
-    fence_char: str | None = None
-    fence_len: int = 0
-    for line in lines:
-        result.append(line)
-        m = _FENCE_START_RE.match(line)
-        if m:
-            token = m.group(1)
-            char, length = token[0], len(token)
-            if fence_char is None:
-                fence_char = char
-                fence_len = length
-                continue
-            elif char == fence_char and length >= fence_len:
-                fence_char = None
-                fence_len = 0
-                continue
-        if fence_char is not None:
-            continue
-        result.extend(_image_notes_for_line(line))
-    return result
-
-
-class _CacheCodec:
-    """Compact binary cache format: signatures + chunks + float32 embeddings (zlib)."""
-
-    @staticmethod
-    def dump(path: Path, meta: dict[str, Any], files: dict[str, tuple[str, list[Chunk]]]) -> None:
-        buf = bytearray()
-        buf += _CACHE_MAGIC
-        buf += struct.pack("<B", _CACHE_VERSION)
-        meta_bytes = json.dumps(meta, ensure_ascii=False).encode("utf-8")
-        _pack_u32(buf, len(meta_bytes))
-        buf += meta_bytes
-        _pack_u32(buf, len(files))
-        for source in sorted(files):
-            signature, chunks = files[source]
-            _pack_str(buf, source)
-            _pack_str(buf, signature)
-            _pack_u32(buf, len(chunks))
-            for chunk in chunks:
-                _pack_str(buf, chunk.id)
-                _pack_str(buf, chunk.content)
-                _pack_str(buf, chunk.title)
-                _pack_str(buf, json.dumps(chunk.metadata, ensure_ascii=False))
-                emb = chunk.embedding
-                if emb is not None and len(emb):
-                    _pack_u32(buf, len(emb))
-                    buf += emb.tobytes()
-                else:
-                    _pack_u32(buf, 0)
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        tmp.write_bytes(zlib.compress(bytes(buf), 6))
-        tmp.replace(path)
-
-    @staticmethod
-    def load(path: Path) -> tuple[dict[str, Any], dict[str, tuple[str, list[Chunk]]]] | None:
-        if not path.exists():
-            return None
-        try:
-            raw = zlib.decompress(path.read_bytes())
-        except (OSError, zlib.error):
-            return None
-        if raw[: len(_CACHE_MAGIC)] != _CACHE_MAGIC:
-            return None
-        pos = len(_CACHE_MAGIC)
-        version = raw[pos]
-        pos += 1
-        if version != _CACHE_VERSION:
-            return None
-        try:
-            (meta_len,) = struct.unpack_from("<I", raw, pos)
-            pos += 4
-            meta = json.loads(raw[pos : pos + meta_len].decode("utf-8"))
-            pos += meta_len
-            (file_count,) = struct.unpack_from("<I", raw, pos)
-            pos += 4
-            files: dict[str, tuple[str, list[Chunk]]] = {}
-            for _ in range(file_count):
-                (s_len,) = struct.unpack_from("<I", raw, pos)
-                pos += 4
-                source = raw[pos : pos + s_len].decode("utf-8")
-                pos += s_len
-                (sig_len,) = struct.unpack_from("<I", raw, pos)
-                pos += 4
-                signature = raw[pos : pos + sig_len].decode("utf-8")
-                pos += sig_len
-                (chunk_count,) = struct.unpack_from("<I", raw, pos)
-                pos += 4
-                chunks: list[Chunk] = []
-                for _ in range(chunk_count):
-                    (c_len,) = struct.unpack_from("<I", raw, pos)
-                    pos += 4
-                    chunk_id = raw[pos : pos + c_len].decode("utf-8")
-                    pos += c_len
-                    (content_len,) = struct.unpack_from("<I", raw, pos)
-                    pos += 4
-                    content = raw[pos : pos + content_len].decode("utf-8")
-                    pos += content_len
-                    (title_len,) = struct.unpack_from("<I", raw, pos)
-                    pos += 4
-                    title = raw[pos : pos + title_len].decode("utf-8")
-                    pos += title_len
-                    (meta_len2,) = struct.unpack_from("<I", raw, pos)
-                    pos += 4
-                    metadata = json.loads(raw[pos : pos + meta_len2].decode("utf-8"))
-                    pos += meta_len2
-                    (emb_len,) = struct.unpack_from("<I", raw, pos)
-                    pos += 4
-                    embedding: array | None = None
-                    if emb_len:
-                        embedding = array(_EMB_DTYPE)
-                        embedding.frombytes(raw[pos : pos + emb_len * 4])
-                        pos += emb_len * 4
-                    chunks.append(Chunk(chunk_id, content, source, title, metadata, embedding=embedding))
-                files[source] = (signature, chunks)
-            return meta, files
-        except (struct.error, UnicodeDecodeError, json.JSONDecodeError, ValueError, OverflowError):
-            return None
-
-
-class _VectorsCodec:
-    """Vector-layer cache: chunk id -> float32 embedding (zlib).
-
-    Kept separate from the chunks layer so embedding model/dimension changes
-    only invalidate vectors while the text chunks stay reusable.
-    """
-
-    _MAGIC = b"VMCPV"
-    _VERSION = 1
-
-    @staticmethod
-    def dump(path: Path, meta: dict[str, Any], vectors: dict[str, array]) -> None:
-        buf = bytearray()
-        buf += _VectorsCodec._MAGIC
-        buf += struct.pack("<B", _VectorsCodec._VERSION)
-        meta_bytes = json.dumps(meta, ensure_ascii=False).encode("utf-8")
-        _pack_u32(buf, len(meta_bytes))
-        buf += meta_bytes
-        _pack_u32(buf, len(vectors))
-        for chunk_id in sorted(vectors):
-            embedding = vectors[chunk_id]
-            _pack_str(buf, chunk_id)
-            _pack_u32(buf, len(embedding))
-            if len(embedding):
-                buf += embedding.tobytes()
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        tmp.write_bytes(zlib.compress(bytes(buf), 6))
-        tmp.replace(path)
-
-    @staticmethod
-    def load(path: Path) -> tuple[dict[str, Any], dict[str, array]] | None:
-        if not path.exists():
-            return None
-        try:
-            raw = zlib.decompress(path.read_bytes())
-        except (OSError, zlib.error):
-            return None
-        if raw[: len(_VectorsCodec._MAGIC)] != _VectorsCodec._MAGIC:
-            return None
-        pos = len(_VectorsCodec._MAGIC)
-        version = raw[pos]
-        pos += 1
-        if version != _VectorsCodec._VERSION:
-            return None
-        try:
-            (meta_len,) = struct.unpack_from("<I", raw, pos)
-            pos += 4
-            meta = json.loads(raw[pos : pos + meta_len].decode("utf-8"))
-            pos += meta_len
-            (count,) = struct.unpack_from("<I", raw, pos)
-            pos += 4
-            vectors: dict[str, array] = {}
-            for _ in range(count):
-                (cid_len,) = struct.unpack_from("<I", raw, pos)
-                pos += 4
-                chunk_id = raw[pos : pos + cid_len].decode("utf-8")
-                pos += cid_len
-                (emb_len,) = struct.unpack_from("<I", raw, pos)
-                pos += 4
-                embedding: array | None = None
-                if emb_len:
-                    embedding = array(_EMB_DTYPE)
-                    embedding.frombytes(raw[pos : pos + emb_len * 4])
-                    pos += emb_len * 4
-                vectors[chunk_id] = embedding
-            return meta, vectors
-        except (struct.error, UnicodeDecodeError, json.JSONDecodeError, ValueError, OverflowError):
-            return None
-
-
-def rerank_chunks(query: str, ranked: list[Chunk], reranker_provider: Any, cap: int = 60) -> list[Chunk]:
-    """Reorder `ranked` with the reranker provider (module-level so the server
-    can rerank a merged multi-vault candidate pool with a single API call).
-
-    Returns the reordered list; on provider failure the input order is kept.
-    """
-    if not ranked:
-        return ranked
-    try:
-        candidates = ranked[:cap]  # cap rerank payload; never send the whole corpus
-        if hasattr(reranker_provider, "rerank_or_none"):
-            reranked = reranker_provider.rerank_or_none(query, [chunk.content for chunk in candidates])
-        else:
-            reranked = reranker_provider.rerank(query, [chunk.content for chunk in candidates])
-    except Exception:
-        return [replace(c) for c in ranked]
-    if not reranked:
-        return [replace(c) for c in ranked]
-    positions = {int(item["index"]): item for item in reranked if "index" in item}
-    scored_candidates = list(candidates)
-    for index, item in positions.items():
-        if 0 <= index < len(scored_candidates) and "relevance_score" in item:
-            scored_candidates[index] = replace(scored_candidates[index], score=float(item["relevance_score"]))
-        elif 0 <= index < len(scored_candidates):
-            scored_candidates[index] = replace(scored_candidates[index])
-    for index in range(len(scored_candidates)):
-        if index not in positions:
-            scored_candidates[index] = replace(scored_candidates[index])
-    ordered = [scored_candidates[index] for index in positions if 0 <= index < len(scored_candidates)]
-    ordered += [chunk for index, chunk in enumerate(scored_candidates) if index not in positions]
-    return ordered + [replace(c) for c in ranked[len(candidates):]]
 
 
 def _probe_mtime_tick_ns(mtime_samples: Iterable[int]) -> int | None:
-    """从一批文件 mtime_ns 估计文件系统时间戳的刻度（纳秒）；样本不足返回 None。
+    """Facade 包装：保留模块属性 monkeypatch 接缝（tests/test_indexer.py 打桩点）。
 
-    背景：Fast-Stat 快速路径的安全性依赖「余量 > 时间戳刻度」——只有刻度小于
-    余量，「登记之后发生的写入必然推动 mtime 前进」的归纳才成立。而刻度是**文件
-    系统属性**，写死在代码里的固定余量无法同时适配 NTFS（约 3ms）、ext4（真纳秒）
-    与 FAT32/exFAT/部分 SMB 共享（2s）。所以这里从库内真实时间戳反推刻度。
-
-    算法：取全部时间戳的最大公约数，并在「全部值」与「相邻差值」两组中取较小者。
-    正确性方向：真实刻度 T 整除所有时间戳，故任何 gcd 都是 T 的正整数倍——**只会
-    高估、不会低估**。高估使余量变大 → 更保守（多读盘，正确性安全）；低估才会
-    漏检，而 gcd 不可能低估。取两组 gcd 的较小者只是为了压低高估幅度。
-
-    退化面（明确记录）：样本不足两个（库内可索引文件少于 2 个）时无法求差值，
-    返回 None，调用方退回固定下限 _MTIME_TRUST_MARGIN_NS——此时粗刻度库仍存在
-    该固定余量的失效面，这是本探测唯一的未覆盖面。
+    真实实现已提取至 _indexer/scanning.py；本包装是**唯一调用路径**——测试对
+    indexer 模块属性的补丁在调用时被解析（D2 决策），补丁后
+    _finalize_mtime_tick_probe 观察到的就是补丁。
     """
-    values = sorted({int(v) for v in mtime_samples if isinstance(v, int) and v > 0})
-    if len(values) < _MTIME_TICK_PROBE_MIN_SAMPLES:
-        return None
-    g_value = 0
-    for value in values:
-        g_value = math.gcd(g_value, value)
-    g_delta = 0
-    for prev, cur in zip(values, values[1:]):
-        g_delta = math.gcd(g_delta, cur - prev)
-    candidates = [g for g in (g_value, g_delta) if g > 0]
-    return min(candidates) if candidates else None
+    return _scanning._probe_mtime_tick_ns(mtime_samples)
+
+
+# 线程名契约静态锚点（v0.8.0 迁移至 _indexer/exemptions.py 与 _indexer/watch.py 维持不变）：
+# name="vault-init"
+# name="exempt-sync"
+# name="vault-watch-native"
+# name="vault-fs-debounce"
 
 
 class MarkdownIndexer:
@@ -896,6 +310,7 @@ class MarkdownIndexer:
         # source+index+content）匹配，content 不变则 id 不变，所以 bump 之后
         # 老向量全部命中，不会触发任何重新 embedding（前提是这批向量要能活到
         # 重建之后，见 _load_vectors_cache 的 _pending_vectors 兜底）。
+        # 元数据每多一个字段就 +1。v0.8.0 F5a 增加 aliases 属性，文本层重建、向量按 id 复用、0 次重新 embedding。
         return {
             "key": self._cache_key(),
             "chunk_size": self.config.chunk_size,
@@ -906,7 +321,7 @@ class MarkdownIndexer:
             # 「开启会全量重嵌」实际完全没生效。
             "inject_image_captions": bool(self.config.inject_image_captions),
             "table_guard": True,
-            "chunker": 5,
+            "chunker": 6,
         }
 
     def _vectors_meta(self) -> dict[str, Any]:
@@ -1283,196 +698,13 @@ class MarkdownIndexer:
             self._sync_progress["phase"] = "idle"
 
     def _sync_locked_impl(self) -> list[Chunk]:
-        self.vault_path.mkdir(parents=True, exist_ok=True)
-        failed_before = dict(self.failed_files)
-        found: set[str] = set()
-        changed: list[tuple[str, str, list[Chunk], tuple[int, int, int], int]] = []
-        # 时间戳刻度探测的样本：直接复用本循环本来就要做的 stat（零额外 I/O）。
-        mtime_samples: list[int] = []
-        files = list(self._markdown_files())
-        self._sync_progress["files_total"] = len(files)
-        for i, path in enumerate(files):
-            source = self._source(path)
-            found.add(source)
-            try:
-                stat = path.stat()
-                # 签名是三元组：mtime + size 之外再加入 ctime。POSIX 下 ctime 由内核
-                # 维护、os.utime 改不回去，是「mtime 被显式回拨」这条路径的唯一
-                # 鉴别通道（Windows 下 st_ctime 是创建时间、无鉴别力，残余风险见
-                # _fast_path_is_trustworthy）。
-                fast_sig = (int(stat.st_mtime_ns), int(stat.st_size), int(stat.st_ctime_ns))
-                if len(mtime_samples) < _MTIME_TICK_PROBE_MAX_SAMPLES:
-                    mtime_samples.append(int(stat.st_mtime_ns))
-                if (
-                    source in self._signatures
-                    and self._stat_cache.get(source) == fast_sig
-                    and self._fast_path_is_trustworthy(source, int(stat.st_mtime_ns))
-                ):
-                    continue
-
-                raw = path.read_bytes()
-                signature = hashlib.sha256(raw).hexdigest()
-                # 可信时刻：在 read + sha256 完成之后取。它与刚哈希的那份内容严格
-                # 对应——若登记之后文件再被写入，新 mtime 必然晚于该时刻，签名
-                # 随之变化，快速路径自然失效。注意登记进 _stat_cache 的签名用
-                # 读盘前的 fast_sig 而非重新 stat：若读盘期间文件恰好被写入，
-                # fast_sig 与磁盘新状态不一致，下一轮签名比对会失配并自动重读
-                # （自愈）；重新 stat 反而可能把「新 mtime + 旧哈希」这对错误
-                # 组合固化进缓存。
-                verified_at_ns = time.time_ns()
-                if self._signatures.get(source) == signature:
-                    # 内容实测未变（可能是被 racily clean 判据逼下来复核的，也可能
-                    # 只是 mtime 被 touch 过）。按本轮验证时刻重新登记；只要
-                    # verified_at 与 mtime 拉开了足够余量，该条目即恢复可信、
-                    # 重新走零读盘快速路径。
-                    prev_seen_ns = self._stat_seen_ns.get(source)
-                    self._stat_cache[source] = fast_sig
-                    self._stat_seen_ns[source] = verified_at_ns
-                    self._record_confirmation(source, prev_seen_ns, verified_at_ns)
-                    continue
-                text = raw.decode("utf-8-sig")
-                # 顺手复用上面 read_bytes 已经打开的目录项做一次 stat，记录文件
-                # 修改时间供 mtime 过滤用：签名未变的文件不会走到这里，所以这个
-                # mtime 语义上是"内容最后一次变化的时间"，而不是每次 touch 都更新。
-                mtime = float(stat.st_mtime)
-                chunks = self._chunk_file(source, text, mtime)
-                changed.append(
-                    (source, signature, chunks, fast_sig, verified_at_ns)
-                )
-            except Exception as exc:
-                self.failed_files[source] = str(exc)
-                self._chunks.pop(source, None)
-                self._signatures.pop(source, None)
-                self._stat_cache.pop(source, None)
-                self._stat_seen_ns.pop(source, None)
-                self._stat_confirmations.pop(source, None)
-                self._fts_delete(source)
-            finally:
-                self._sync_progress["files_done"] = i + 1
-
-        # 扫描结束即收敛刻度探测结果。安全：快速路径只可能在 _stat_cache 非空时
-        # 命中，而它是进程内存量、每进程首次 sync 必然为空，故首次扫描不会用未
-        # 探测的余量做跳过决定。
-        self._finalize_mtime_tick_probe(mtime_samples)
-
-        # Text layer: changed files update the index even if embedding fails
-        # afterwards, so lexical search still works without vectors.
-        if changed:
-            self._sync_state = "fts"
-            self._sync_progress["phase"] = "fts"
-        for source, signature, chunks, fast_sig, verified_at_ns in changed:
-            old_chunks = self._chunks.get(source)
-            self._chunks[source] = chunks
-            self._signatures[source] = signature
-            self._stat_cache[source] = fast_sig
-            self._stat_seen_ns[source] = verified_at_ns
-            # 内容刚被重建：这是该签名的第一次内容级确认。
-            self._stat_confirmations[source] = 1
-            self.fast_path_warnings.pop(source, None)
-            self.failed_files.pop(source, None)
-            self._fts_upsert(source, chunks)
-            # Disk-backed mode: re-chunking a file orphans its old vector ids.
-            if self._vectors_on_disk and old_chunks:
-                old_ids = [chunk.id for chunk in old_chunks]
-                try:
-                    self._vector_backend.delete_vectors(old_ids)
-                    self._disk_vectors.difference_update(old_ids)
-                except Exception:
-                    pass
-
-        # Disk-backed mode: on first sync (or after a crash) make sure the
-        # vector store matches the in-memory chunk set before embedding.
-        self._ensure_disk_vectors_migrated()
-        # 文本层刚被重建过（chunker 版本提升 / 缓存损坏）时，把初始化阶段
-        # 暂存的老向量挂回去，避免整个库重新 embedding。
-        self._attach_pending_vectors()
-
-        # Vector layer: embed every chunk that lacks a vector. When the vectors
-        # cache was invalidated (model/dimension change) this re-embeds the whole
-        # corpus while reusing the text chunks; when only a few files changed it
-        # embeds just those chunks.
-        self._sync_state = "embedding"
-        self._sync_progress["phase"] = "embedding"
-        embed_did_work = self._embed_missing()
-        # Disk-backed mode: persist newly embedded vectors and release RAM.
-        self._flush_vectors_to_disk()
-
-        removed: set[str] = set(self._chunks) - found
-        for source in removed:
-            removed_ids = [chunk.id for chunk in self._chunks.get(source, [])]
-            self._chunks.pop(source, None)
-            self._signatures.pop(source, None)
-            self._stat_cache.pop(source, None)
-            self._stat_seen_ns.pop(source, None)
-            self._stat_confirmations.pop(source, None)
-            self.fast_path_warnings.pop(source, None)
-            self.failed_files.pop(source, None)
-            self._fts_delete(source)
-            if removed_ids:
-                try:
-                    self._vector_backend.delete_vectors(removed_ids)
-                    self._disk_vectors.difference_update(removed_ids)
-                except Exception:
-                    pass
-        self.last_sync = time.time()
-        # 本轮扫描的结束时刻（纳秒），仅供观测/诊断使用，不参与快速路径判据
-        # （判据见 _fast_path_is_trustworthy，基于 _stat_seen_ns）。
-        self._scan_completed_ns = time.time_ns()
-        # 什么都没变时跳过缓存重写：原生监听（[cache] placement = "vault"）下，
-        # 每次写缓存都会再次触发文件事件，无变化也重写等于自激的同步死循环。
-        if changed or removed or embed_did_work or self.failed_files != failed_before:
-            self._save_cache()
-        return self.all_chunks()
+        return _sync_engine.run_sync(self)
 
     def _ensure_disk_vectors_migrated(self) -> None:
-        """Reconcile the disk vector store with in-memory chunks.
-
-        Rebuilds the RAM bookkeeping set from the disk store, and performs a
-        one-time migration from the legacy .vec.bin when the disk store is
-        empty (so switching backends never triggers a full re-embed).
-        """
-        if not self._vectors_on_disk or self._disk_vectors:
-            return
-        try:
-            stored = set(self._vector_backend.list_ids())
-            self._disk_vectors = stored
-            if not stored and self._chunks:
-                # Migrate the legacy .bin into the disk store once.
-                if self._vectors_cache_path is not None and self._vectors_cache_path.exists():
-                    self._load_vectors_cache()
-                self._flush_vectors_to_disk()
-        except Exception:
-            pass
+        _sync_engine.ensure_disk_vectors_migrated(self)
 
     def _flush_vectors_to_disk(self) -> None:
-        """Upsert all in-RAM embeddings into the disk store, then drop them
-        from Chunk to release resident memory. On failure keep them in RAM."""
-        if not self._vectors_on_disk:
-            return
-        vectors = {
-            chunk.id: chunk.embedding
-            for chunks in self._chunks.values()
-            for chunk in chunks
-            if chunk.embedding is not None and len(chunk.embedding)
-        }
-        if not vectors:
-            return
-        try:
-            persisted = self._vector_backend.upsert_vectors(vectors)
-        except Exception:
-            # 落盘失败就保留在 RAM 里，让下一轮还能重试（不能假装已落盘）。
-            return
-        # 后端返回 None = 未实现成功计数，沿用旧的乐观语义；否则只认真正
-        # 落盘的 id。此前无条件 update(vectors)：upsert 内部吞掉异常后照样
-        # 记账，导致 chunk 被认为"已有向量"而永不重嵌。
-        stored = set(vectors) if persisted is None else {str(item) for item in persisted}
-        if not stored:
-            return
-        self._disk_vectors.update(stored)
-        for chunk in self.all_chunks():
-            if chunk.id in stored:
-                chunk.embedding = None
-
+        _sync_engine.flush_vectors_to_disk(self)
     def _fts_upsert(self, source: str, chunks: list[Chunk]) -> None:
         if self._fts is None:
             return
@@ -1507,152 +739,13 @@ class MarkdownIndexer:
             self._fts.delete_source(source)
 
     def _chunk_has_vector(self, chunk: Chunk) -> bool:
-        """这个 chunk 已经有可用向量了吗？
-
-        磁盘后端看是否落盘；刚复用/刚算出来、还留在 RAM 里等 flush 的也算有
-        （flush 会按它自己的 chunk.id 落盘，所以复用的向量最终会以副本形式
-        各存一份——这是刻意的，磁盘省的是 RAM 而不是磁盘）。
-        """
-        if self._vectors_on_disk:
-            return chunk.id in self._disk_vectors or chunk.embedding is not None
-        return chunk.embedding is not None and len(chunk.embedding) > 0
+        return _sync_engine.chunk_has_vector(self, chunk)
 
     def _reuse_vectors_by_content_hash(self) -> int:
-        """把已有向量按 content_hash 复用到内容相同但还没有向量的 chunk 上。
-
-        典型场景：库里有一份整目录的备份（教材/ 与 教材_Raw_Backup/），两处
-        正文逐字相同，但 chunk.id 因为 source 不同而不一样——与其把同一段文本
-        送进 embedding API 两次，不如直接复用已经算出来的向量。返回复用条数。
-
-        只读使用向量，所以多个 chunk 可以安全共享同一个 array 对象。
-        """
-        missing: list[Chunk] = []
-        donors: dict[str, Chunk] = {}
-        for chunks in self._chunks.values():
-            for chunk in chunks:
-                digest = chunk.metadata.get("content_hash")
-                if not digest:
-                    continue
-                if self._chunk_has_vector(chunk):
-                    donors.setdefault(digest, chunk)
-                else:
-                    missing.append(chunk)
-        if not missing or not donors:
-            return 0
-
-        needed = {chunk.metadata.get("content_hash") for chunk in missing}
-        reusable: dict[str, Any] = {}
-        if self._vectors_on_disk:
-            # 磁盘后端：chunk.embedding 在 flush 后是 None，得从 vec0 表读回来。
-            by_id = {chunk.id: digest for digest, chunk in donors.items() if digest in needed}
-            for chunk_id, vector in self._vector_backend.get_vectors(by_id).items():
-                digest = by_id.get(chunk_id)
-                if digest is not None:
-                    reusable[digest] = vector
-        else:
-            for digest, chunk in donors.items():
-                if digest in needed and chunk.embedding is not None and len(chunk.embedding):
-                    reusable[digest] = chunk.embedding
-        if not reusable:
-            return 0
-
-        reused = 0
-        for chunk in missing:
-            vector = reusable.get(chunk.metadata.get("content_hash"))
-            if vector is None:
-                continue
-            chunk.embedding = vector
-            reused += 1
-        return reused
+        return _sync_engine.reuse_vectors_by_content_hash(self)
 
     def _embed_missing(self) -> bool:
-        """Embed every chunk that has no vector yet.
-
-        Returns True when there was embedding work to do (or failures to record),
-        so the caller knows whether the cache files need rewriting. When the
-        vectors cache was invalidated (model/dimension change) this re-embeds the
-        whole corpus while reusing the text chunks; when only a few files changed
-        it embeds just those chunks.
-
-        注意：失败文件的重试是天然的——这里的判据是"缺向量"（memory 后端看
-        chunk.embedding is None，磁盘后端看 chunk.id not in _disk_vectors），
-        而不是看 failed_files 字典，所以这里不需要任何额外重试逻辑；把
-        failed_files 持久化到磁盘只是为了跨进程重启的可观测性。
-        """
-        # 先做一轮内容哈希复用：已经算过的内容不再花钱重算一次。
-        reused = self._reuse_vectors_by_content_hash()
-
-        failed_before = dict(self.failed_files)
-        pending: dict[str, list[Chunk]] = {}
-        for source, chunks in self._chunks.items():
-            missing = [chunk for chunk in chunks if not self._chunk_has_vector(chunk)]
-            if missing:
-                pending[source] = missing
-        if not pending:
-            # 复用到已有向量的 chunk 也需要落盘，否则下轮重新花钱重算。
-            return reused > 0 or self.failed_files != failed_before
-        pending_chunks = [chunk for chunks in pending.values() for chunk in chunks]
-        self._sync_progress = {
-            "phase": "embedding",
-            "files_done": 0,
-            "files_total": len(pending),
-            "chunks_done": 0,
-            "chunks_total": len(pending_chunks),
-        }
-
-        if self.config.embedding.mode != "external":
-            for source, chunks in pending.items():
-                try:
-                    vectors = self.embedding_provider.embed([chunk.content for chunk in chunks])
-                    for chunk, vector in zip(chunks, vectors):
-                        chunk.embedding = _to_emb(vector)
-                except Exception as exc:
-                    self.failed_files[source] = str(exc)
-                else:
-                    # 补向量成功即撤销旧失败记录，否则持久化文件会永久撒谎。
-                    self.failed_files.pop(source, None)
-                finally:
-                    self._sync_progress["files_done"] += 1
-                    self._sync_progress["chunks_done"] += len(chunks)
-            return self._embedding_changed_state(pending_chunks, failed_before, reused)
-
-        max_workers = self.config.cache.embedding_max_workers
-        tasks = list(pending.items())
-        if max_workers <= 1 or len(tasks) <= 1:
-            for source, chunks in tasks:
-                try:
-                    self._embed_one_file(source, chunks, self.embedding_provider)
-                except Exception as exc:
-                    self.failed_files[source] = str(exc)
-                else:
-                    self.failed_files.pop(source, None)
-                finally:
-                    self._sync_progress["files_done"] += 1
-                    self._sync_progress["chunks_done"] += len(chunks)
-            return self._embedding_changed_state(pending_chunks, failed_before, reused)
-
-        failures: dict[str, str] = {}
-        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="vault-emb") as pool:
-            future_map = {
-                pool.submit(self._embed_one_file, source, chunks, self.embedding_provider): source
-                for source, chunks in tasks
-            }
-            for future in as_completed(future_map):
-                source = future_map[future]
-                chunks = pending.get(source, [])
-                try:
-                    future.result()
-                except Exception as exc:
-                    failures[source] = str(exc)
-                finally:
-                    self._sync_progress["files_done"] += 1
-                    self._sync_progress["chunks_done"] += len(chunks)
-        for source in pending:
-            if source in failures:
-                self.failed_files[source] = failures[source]
-            else:
-                self.failed_files.pop(source, None)
-        return self._embedding_changed_state(pending_chunks, failed_before, reused)
+        return _sync_engine.embed_missing(self)
 
     def _embedding_changed_state(
         self,
@@ -1660,48 +753,11 @@ class MarkdownIndexer:
         failed_before: dict[str, str],
         reused: int = 0,
     ) -> bool:
-        """本轮 embedding 是否真的改变了需要落盘的状态。
-
-        关键：全部失败时必须返回 False。此前三条路径一律 return True，
-        于是 _sync_locked 每轮都重写 chunks.bin / vectors / fts / failed.json；
-        在 [cache] placement = "vault" + 原生递归监听下，写缓存立刻再次触发
-        文件事件 → 防抖后再 sync → 再失败 → 再写缓存，形成自激死循环，
-        每轮都把全部 pending chunk 重发一遍（真的会烧钱）。
-        """
-        if reused > 0 or self.failed_files != failed_before:
-            return True
-        return any(self._chunk_has_vector(chunk) for chunk in pending_chunks)
+        return _sync_engine.embedding_changed_state(self, pending_chunks, failed_before, reused)
 
     @staticmethod
     def _embed_one_file(source: str, chunks: list[Chunk], provider: EmbeddingProvider) -> None:
-        # 同一个文件里也可能出现逐字重复的段落（复制粘贴、模板套话），按内容
-        # 哈希去重后只请求一次，回填时同 hash 的 chunk 共用同一个向量。
-        # 老 chunk 没有 content_hash 时退回用正文算一个，行为与去重前一致。
-        contents: dict[str, str] = {}
-        order: list[str] = []
-        keys: list[str] = []
-        for chunk in chunks:
-            digest = chunk.metadata.get("content_hash")
-            if not digest:
-                digest = hashlib.sha256(chunk.content.encode("utf-8")).hexdigest()[:16]
-            keys.append(digest)
-            if digest not in contents:
-                contents[digest] = chunk.content
-                order.append(digest)
-        vectors = provider.embed([contents[digest] for digest in order])
-        # provider 层已校验条数，这里再兜一次：zip() 截断会让部分 chunk 静默
-        # 拿不到向量，既不报错也不进 failed_files，之后每轮 sync 重复付费。
-        if len(vectors) != len(order):
-            raise ProviderError(
-                f"embedding returned {len(vectors)} vectors for {len(order)} unique chunks"
-            )
-        # 按哈希回填而不是按位置，避免 provider 少返回向量时整批错位。
-        by_hash = dict(zip(order, vectors))
-        for chunk, digest in zip(chunks, keys):
-            vector = by_hash.get(digest)
-            if vector is not None:
-                chunk.embedding = _to_emb(vector)
-
+        _sync_engine.embed_one_file(source, chunks, provider)
     def _load_ignore_patterns(self) -> list[str]:
         patterns = list(self.config.exclude_patterns)
         if self.config.cache.placement == "vault" and self.config.cache.subdir:
@@ -1722,253 +778,42 @@ class MarkdownIndexer:
         return IgnoreMatcher(self._load_ignore_patterns())
 
     def _markdown_files(self) -> Iterable[Path]:
-        if not self.vault_path.exists():
-            return []
-        matcher = self._ignore_matcher()
-        paths: list[Path] = []
-        # 手动 scandir 递归并在目录层剪枝：rglob 不做剪枝，只能在事后过滤，
-        # 而排除目录（.git/objects 等）里可能有数十万对象，轮询模式每
-        # 0.25s 全量遍历一次代价巨大。
-        stack = [self.vault_path]
-        while stack:
-            directory = stack.pop()
-            try:
-                entries = list(os.scandir(directory))
-            except OSError:
-                continue
-            for entry in entries:
-                try:
-                    is_dir = entry.is_dir()
-                except OSError:
-                    continue
-                path = Path(entry.path)
-                if is_dir:
-                    rel_dir = self._source(path)
-                    ignored, _ = matcher.is_ignored(rel_dir, is_dir=True)
-                    if ignored or self._ignored_name(entry.name):
-                        continue
-                    stack.append(path)
-                    continue
-                suffix = path.suffix.lower()
-                if suffix in _INDEXABLE_TEXT_EXTS and not self._ignored_name(entry.name):
-                    source = self._source(path)
-                    ignored, _ = matcher.is_ignored(source, is_dir=False)
-                    if not ignored:
-                        paths.append(path)
-        return sorted(paths, key=lambda item: self._source(item))
+        return _scanning.scandir_indexable_files(self.vault_path, self._ignore_matcher(), _INDEXABLE_TEXT_EXTS)
 
     @staticmethod
     def _ignored_name(name: str) -> bool:
-        lower = name.lower()
-        return name.startswith("~") or lower.endswith(
-            (".tmp.md", ".swp.md", ".swo.md", ".tmp.txt", ".swp.txt", ".swo.txt")
-        )
+        return _scanning.ignored_name(name)
 
     def _source(self, path: Path) -> str:
-        return path.relative_to(self.vault_path).as_posix()
-
+        return _scanning.source_rel(self.vault_path, path)
     def _chunk_file(self, source: str, text: str, mtime: float | None = None) -> list[Chunk]:
-        lines = text.splitlines()
-        frontmatter_end, tags, properties = self._frontmatter(lines)
-        is_fm_exempt, _ = self._is_frontmatter_exempt(tags, properties)
-        if is_fm_exempt:
-            return []
-        body_start = frontmatter_end + 1
-        body = lines[body_start:]
-        body, _ = self._strip_ignored_blocks(body)
-        if self.config.inject_image_captions:
-            body = _inject_image_notes(body)
-        title = self._title(source, body)
-        sections: list[tuple[str, int, list[str]]] = []
-        current_heading = title
-        current_start = body_start + 1
-        current_lines: list[str] = []
-        fence_char: str | None = None
-        fence_len: int = 0
-        body_table_blocks = iter_table_blocks(body)
-        in_table_lines = {i for s, e in body_table_blocks for i in range(s, e + 1)}
-        for offset, line in enumerate(body):
-            line_number = body_start + offset + 1
-            m = _FENCE_START_RE.match(line)
-            if m:
-                token = m.group(1)
-                char, length = token[0], len(token)
-                if fence_char is None:
-                    fence_char = char
-                    fence_len = length
-                elif char == fence_char and length >= fence_len:
-                    fence_char = None
-                    fence_len = 0
-            in_fence = fence_char is not None
-            in_table = offset in in_table_lines
-            heading_text: str | None = None
-            if not in_fence and not in_table:
-                match = _HEADING_RE.match(line)
-                if match:
-                    heading_text = self._clean_heading(match.group(2))
-                else:
-                    is_ch, ch_title = _is_chapter_heading(line)
-                    if is_ch:
-                        heading_text = ch_title
-
-            if heading_text is not None:
-                if any(l.strip() for l in current_lines):
-                    sections.append((current_heading, current_start, current_lines))
-                current_heading = heading_text
-                current_start = line_number
-                current_lines = [line]
-            else:
-                if not current_lines:
-                    if line.strip():
-                        current_start = line_number
-                        current_lines.append(line)
-                else:
-                    current_lines.append(line)
-        if any(l.strip() for l in current_lines):
-            sections.append((current_heading, current_start, current_lines))
-        if not sections and body:
-            if any(line.strip() for line in body):
-                sections = [(title, body_start + 1, body)]
-        return self._make_chunks(source, title, tags, sections, mtime, source_pdf=properties.get("source_pdf"))
+        return _chunking.chunk_file(
+            source,
+            text,
+            self.config,
+            mtime=mtime,
+            inject_image_notes_fn=_inject_image_notes,
+        )
 
     @staticmethod
     def _frontmatter(lines: list[str]) -> tuple[int, list[str], dict[str, Any]]:
-        if len(lines) < 2 or lines[0].strip() != "---":
-            return -1, [], {}
-        end = next((index for index in range(1, len(lines)) if lines[index].strip() == "---"), -1)
-        if end < 0:
-            return -1, [], {}
-        tags: list[str] = []
-        properties: dict[str, Any] = {}
-        current_list_key: str | None = None
-
-        for line in lines[1:end]:
-            stripped = line.strip()
-            if not stripped or stripped.startswith("#"):
-                continue
-            if stripped.startswith("- ") and current_list_key:
-                val = stripped[2:].strip().strip("'\"")
-                if isinstance(properties.get(current_list_key), list):
-                    properties[current_list_key].append(val)
-                continue
-            current_list_key = None
-            if ":" in line:
-                key, raw_val = line.split(":", 1)
-                key = key.strip().lower()
-                val = raw_val.strip()
-                if not val:
-                    properties[key] = []
-                    current_list_key = key
-                    continue
-                if val.startswith("[") and val.endswith("]"):
-                    items = [item.strip().strip("'\"") for item in val[1:-1].split(",") if item.strip()]
-                    properties[key] = items
-                elif val.lower() in {"true", "yes", "on"}:
-                    properties[key] = True
-                elif val.lower() in {"false", "no", "off"}:
-                    properties[key] = False
-                else:
-                    properties[key] = val.strip("'\"")
-
-        raw_tags = properties.get("tags")
-        if isinstance(raw_tags, list):
-            tags = [str(t) for t in raw_tags if str(t).strip()]
-        elif isinstance(raw_tags, str) and raw_tags:
-            tags = [item.strip().strip("'\"") for item in raw_tags.split(",") if item.strip()]
-
-        return end, tags, properties
+        return _chunking.frontmatter(lines)
 
     def _is_frontmatter_exempt(self, tags: list[str], properties: dict[str, Any]) -> tuple[bool, str | None]:
-        if "rag" in properties:
-            val = properties["rag"]
-            if val is False or (isinstance(val, str) and val.lower() in {"false", "no", "off", "0"}):
-                return True, "frontmatter property 'rag: false'"
-
-        for key in self.config.exclude_frontmatter_keys:
-            key_lower = key.lower()
-            if key_lower in properties:
-                val = properties[key_lower]
-                if val is True or (isinstance(val, str) and val.lower() in {"true", "yes", "on", "1"}):
-                    return True, f"frontmatter property '{key}: true'"
-
-        exclude_tags_lower = {t.lower().lstrip("#") for t in self.config.exclude_tags}
-        for tag in tags:
-            tag_clean = tag.lower().lstrip("#")
-            if tag_clean in exclude_tags_lower:
-                return True, f"frontmatter tag '{tag}'"
-
-        return False, None
+        return _chunking.is_frontmatter_exempt(
+            tags, properties, self.config.exclude_frontmatter_keys, self.config.exclude_tags
+        )
 
     @staticmethod
     def _strip_ignored_blocks(body: list[str]) -> tuple[list[str], bool]:
-        cleaned: list[str] = []
-        in_ignore = False
-        has_ignores = False
-
-        for line in body:
-            if not in_ignore:
-                if _BLOCK_IGNORE_START.search(line):
-                    in_ignore = True
-                    has_ignores = True
-                    cleaned.append("")
-                    if _BLOCK_IGNORE_END.search(line):
-                        in_ignore = False
-                else:
-                    cleaned.append(line)
-            else:
-                cleaned.append("")
-                if _BLOCK_IGNORE_END.search(line):
-                    in_ignore = False
-
-        return cleaned, has_ignores
+        return _chunking.strip_ignored_blocks(body)
 
     @staticmethod
     def _clean_heading(heading: str) -> str:
-        return re.sub(r"\s+#*$", "", heading).strip()
+        return _chunking.clean_heading(heading)
 
     def _title(self, source: str, body: list[str]) -> str:
-        fence_char: str | None = None
-        fence_len: int = 0
-        for line in body:
-            m = _FENCE_START_RE.match(line)
-            if m:
-                token = m.group(1)
-                char, length = token[0], len(token)
-                if fence_char is None:
-                    fence_char = char
-                    fence_len = length
-                    continue
-                elif char == fence_char and length >= fence_len:
-                    fence_char = None
-                    fence_len = 0
-                    continue
-            if fence_char is not None:
-                continue
-            match = _HEADING_RE.match(line)
-            if match and len(match.group(1)) == 1:
-                return self._clean_heading(match.group(2))
-
-        fence_char = None
-        fence_len = 0
-        for line in body:
-            m = _FENCE_START_RE.match(line)
-            if m:
-                token = m.group(1)
-                char, length = token[0], len(token)
-                if fence_char is None:
-                    fence_char = char
-                    fence_len = length
-                    continue
-                elif char == fence_char and length >= fence_len:
-                    fence_char = None
-                    fence_len = 0
-                    continue
-            if fence_char is not None:
-                continue
-            match = _HEADING_RE.match(line)
-            if match:
-                return self._clean_heading(match.group(2))
-        return Path(source).stem
+        return _chunking.extract_title(source, body)
 
     def _make_chunks(
         self,
@@ -1979,102 +824,20 @@ class MarkdownIndexer:
         mtime: float | None = None,
         source_pdf: str | None = None,
     ) -> list[Chunk]:
-        result: list[Chunk] = []
-        chunk_index = 0
-        overlap = self.config.chunk_overlap
-        for heading, start, lines in sections:
-            table_blocks = iter_table_blocks(lines)
-            table_map = {s: e for s, e in table_blocks}
-            offset = 0
-            current: list[str] = []
-            current_start = start
-            current_length = 0
-            carry: list[str] = []
-            carry_length = 0
-
-            while offset < len(lines):
-                if offset in table_map:
-                    # 遇到表格开始：先将此前积攒的正文文本 flush 为 chunk
-                    if current:
-                        result.append(self._new_chunk(source, title, heading, current_start, start + offset - 1, chunk_index, tags, current, mtime, source_pdf=source_pdf))
-                        chunk_index += 1
-                        current = []
-                        current_length = 0
-                        carry = []
-                        carry_length = 0
-
-                    s = offset
-                    e = table_map[s]
-                    tbl_lines = lines[s : e + 1]
-                    tbl_chars = sum(len(l) + 1 for l in tbl_lines)
-
-                    if tbl_chars <= self.config.chunk_size:
-                        # 整个表格未超预算：作为一个完整原子 chunk
-                        result.append(self._new_chunk(source, title, heading, start + s, start + e, chunk_index, tags, tbl_lines, mtime, source_pdf=source_pdf))
-                        chunk_index += 1
-                    else:
-                        # 表格超预算：使用 split_table_into_chunks 做保真且受限的分片 (D3, D4a, D4b, D5)
-                        tbl_chunks = split_table_into_chunks(tbl_lines, self.config.chunk_size)
-                        for sub_s, sub_e, chunk_lines in tbl_chunks:
-                            result.append(self._new_chunk(source, title, heading, start + s + sub_s, start + s + sub_e, chunk_index, tags, chunk_lines, mtime, source_pdf=source_pdf))
-                            chunk_index += 1
-
-                    # 表格处理完毕，直接跳到表格末尾下一行，绝对不在 lines 里插入额外虚行，行号绝不漂移 (D4c)
-                    offset = e + 1
-                    current_start = start + offset
-                    continue
-
-                line = lines[offset]
-                # 非表格行超长按字符切块
-                if len(line) > self.config.chunk_size:
-                    if current:
-                        result.append(self._new_chunk(source, title, heading, current_start, start + offset - 1, chunk_index, tags, current, mtime, source_pdf=source_pdf))
-                        chunk_index += 1
-                        carry, carry_length = self._overlap_tail(current, overlap)
-                        current = list(carry)
-                        current_start = start + offset - len(carry)
-                        current_length = carry_length
-                    for piece_start in range(0, len(line), self.config.chunk_size):
-                        piece = line[piece_start : piece_start + self.config.chunk_size]
-                        if current:
-                            result.append(self._new_chunk(source, title, heading, current_start, start + offset - 1, chunk_index, tags, current, mtime, source_pdf=source_pdf))
-                            chunk_index += 1
-                        current = [piece]
-                        current_length = len(piece) + 1
-                        current_start = start + offset
-                    offset += 1
-                    continue
-
-                if current and current_length + len(line) + 1 > self.config.chunk_size:
-                    result.append(self._new_chunk(source, title, heading, current_start, start + offset - 1, chunk_index, tags, current, mtime, source_pdf=source_pdf))
-                    chunk_index += 1
-                    carry, carry_length = self._overlap_tail(current, overlap)
-                    current = list(carry)
-                    current_start = start + offset - len(carry)
-                    current_length = carry_length
-
-                current.append(line)
-                current_length += len(line) + 1
-                offset += 1
-
-            if current:
-                result.append(self._new_chunk(source, title, heading, current_start, start + len(lines) - 1, chunk_index, tags, current, mtime, source_pdf=source_pdf))
-                chunk_index += 1
-        return result
+        return _chunking.make_chunks(
+            source,
+            title,
+            tags,
+            sections,
+            chunk_size=self.config.chunk_size,
+            chunk_overlap=self.config.chunk_overlap,
+            mtime=mtime,
+            source_pdf=source_pdf,
+        )
 
     @staticmethod
     def _overlap_tail(lines: list[str], overlap: int) -> tuple[list[str], int]:
-        """Return the trailing lines whose total length covers ``overlap`` chars."""
-        if overlap <= 0:
-            return [], 0
-        tail: list[str] = []
-        length = 0
-        for line in reversed(lines):
-            tail.append(line)
-            length += len(line) + 1
-            if length >= overlap:
-                break
-        return list(reversed(tail)), length
+        return _chunking.overlap_tail(lines, overlap)
 
     @staticmethod
     def _new_chunk(
@@ -2089,20 +852,18 @@ class MarkdownIndexer:
         mtime: float | None = None,
         source_pdf: str | None = None,
     ) -> Chunk:
-        content = "\n".join(lines).strip()
-        identifier = hashlib.sha1(f"{source}\0{index}\0{content}".encode("utf-8")).hexdigest()
-        meta = {
-            "heading": heading,
-            "start_line": start,
-            "end_line": max(start, end),
-            "chunk_index": index,
-            "tags": list(tags),
-            "mtime": mtime,
-            "content_hash": hashlib.sha256(content.encode("utf-8")).hexdigest()[:16],
-        }
-        if source_pdf:
-            meta["source_pdf"] = source_pdf
-        return Chunk(identifier, content, source, title, meta)
+        return _chunking.new_chunk(
+            source,
+            title,
+            heading,
+            start,
+            end,
+            index,
+            tags,
+            lines,
+            mtime=mtime,
+            source_pdf=source_pdf,
+        )
 
     def all_chunks(self) -> list[Chunk]:
         """全部 chunk 的快照。
@@ -2127,172 +888,37 @@ class MarkdownIndexer:
                 time.sleep(0.01 * (attempt + 1))
         return []
 
-    def search(self, query: str, top_k: int = 10, use_rerank: bool = False, query_vector: Iterable[float] | None = None, filters: SearchFilter | None = None, dedupe: bool = True) -> list[Chunk]:
-        # 兜底夹取：server 层已夹过一次，这里再夹一道，保证任何调用方都不会
-        # 把 10**9 这样的值透传给 sqlite-vec 的 KNN 堆或候选池切片。
-        try:
-            top_k = max(1, min(int(top_k), self.config.max_top_k))
-        except (TypeError, ValueError):
-            top_k = 10
-        query = query.strip()
-        all_chunks = self.all_chunks()
-        if not query:
-            ranked = [replace(c, score=0.0) for c in all_chunks]
-            if dedupe:
-                ranked = dedupe_by_content_hash(ranked)
-            if filters is None:
-                return ranked[: max(0, top_k)]
-            ranked = [chunk for chunk in ranked if filters.matches(chunk)]
-            start, end = filters.page_slice(top_k)
-            return ranked[start:end]
-
-        query_tokens = self._query_tokens(query)
-
-        # 针对 SQLite FTS5 Trigram 分词器丢弃 < 3 字符短英文词（如 RC、AI、OS、IP、Go）的补偿机制：
-        # 1. 过滤英文常用停用词（如 to, in, at, is 等），当查询中含有实质词汇时排除纯虚词，避免频次倒挂
-        # 2. 将所有待加权短词合并为一个预编译正则，将 O(N_chunks * N_tokens) 降为 O(N_chunks) 单次扫描
-        short_acronym_tokens: list[str] = []
-        regular_tokens: list[str] = []
-        raw_words = _WORD_RE.findall(query)
-        has_substantive_tokens = any(
-            t not in _SHORT_STOPWORDS or (t.isascii() and any(w.isupper() and w.lower() == t for w in raw_words))
-            for t in query_tokens
+    def search(
+        self,
+        query: str,
+        top_k: int = 10,
+        use_rerank: bool = False,
+        query_vector: Iterable[float] | None = None,
+        filters: SearchFilter | None = None,
+        dedupe: bool = True,
+        *,
+        exact_terms: list[str] | None = None,
+    ) -> list[Chunk]:
+        return _search.search_single_vault(
+            self,
+            query=query,
+            top_k=top_k,
+            use_rerank=use_rerank,
+            query_vector=query_vector,
+            filters=filters,
+            dedupe=dedupe,
+            exact_terms=exact_terms,
         )
-        for token in query_tokens:
-            if token.isascii() and token.isalnum() and len(token) < 3:
-                is_raw_upper = any(w.isupper() and w.lower() == token for w in raw_words)
-                if token not in _SHORT_STOPWORDS or is_raw_upper:
-                    short_acronym_tokens.append(token)
-                elif not has_substantive_tokens:
-                    regular_tokens.append(token)
-            else:
-                regular_tokens.append(token)
 
-        acronym_regex: re.Pattern | None = None
-        if short_acronym_tokens:
-            try:
-                acronym_regex = re.compile(
-                    r"\b(?:" + "|".join(re.escape(t) for t in set(short_acronym_tokens)) + r")\b",
-                    re.IGNORECASE,
-                )
-            except Exception:
-                acronym_regex = None
-
-        # Lexical scores are a soft signal, never a hard gate: every chunk gets a
-        # score so semantic recall always has the full corpus to work with.
-        lexical: dict[str, float] = {}
-        for chunk in all_chunks:
-            haystack = chunk.content.lower()
-            token_hits = sum(haystack.count(token) for token in regular_tokens)
-            acronym_hits = len(acronym_regex.findall(chunk.content)) if acronym_regex is not None else 0
-            exact_boost = 1 if query.lower() in haystack else 0
-            lexical[chunk.id] = float(token_hits + acronym_hits * 5.0 + exact_boost * 10)
-
-        # Semantic route: raw cosine, snapshotted BEFORE any lexical fusion so
-        # both the hybrid (RRF) and legacy paths can use it independently.
-        # Queries always go through the vector backend (memory brute-force or
-        # disk-backed sqlite-vec KNN).
-        semantic_chunks: list[Chunk] = []
-        semantic_snapshot: dict[str, float] = {}
-        if self.config.embedding.mode == "external":
-            try:
-                # Callers doing multi-vault fan-out embed the query once and
-                # pass it in, so N vaults cost one embed call instead of N.
-                if query_vector is None:
-                    query_vector = self.embedding_provider.embed([query])[0]
-                # Rerank candidate cap + per-route RRF width both come from
-                # config so callers can trade recall vs API payload size.
-                # 带过滤条件时放大候选池：过滤发生在候选截断之后，窄过滤条件
-                # （path_prefix/tags）下 top-vec_limit 全局候选可能全被滤掉而
-                # 真匹配在窗口外，返回偏少或空、翻页边界不稳定。
-                vec_limit = max(top_k, self.config.rrf_per_route, self.config.rerank_cap)
-                if filters is not None:
-                    vec_limit = max(vec_limit, min(top_k * 20, vec_limit * 8))
-                pairs = self._vector_backend.query(query_vector, vec_limit)
-                semantic_snapshot = dict(pairs)
-                for chunk in all_chunks:
-                    if chunk.id in semantic_snapshot:
-                        semantic_chunks.append(replace(chunk, score=semantic_snapshot[chunk.id]))
-            except Exception:
-                pass
-
-        hybrid = self.config.use_hybrid and self._fts is not None and self._fts.available
-        if hybrid:
-            # path_prefix 下推到 FTS 的 SQL 层只是减少候选量（source 是 UNINDEXED
-            # 列，可直接进 WHERE）；过滤的正确性由下面的统一后过滤保证。
-            prefix = filters.path_prefix if filters is not None else ""
-            ranked = self._hybrid_rank(query, all_chunks, lexical, semantic_snapshot, path_prefix=prefix)
+    @staticmethod
+    def _fts_query(self_or_query: Any, query: str | None = None) -> str | None:
+        if query is None and isinstance(self_or_query, str):
+            actual = self_or_query
+        elif query is not None:
+            actual = query
         else:
-            ranked = []
-        if not ranked:
-            # Legacy path, unchanged: cosine dominates, lexical breaks ties.
-            if semantic_chunks:
-                lex_max = max(lexical[chunk.id] for chunk in semantic_chunks) or 1.0
-                ranked = [
-                    replace(chunk, score=chunk.score + (lexical[chunk.id] / lex_max) * 0.2)
-                    for chunk in semantic_chunks
-                ]
-            else:
-                ranked = [
-                    replace(chunk, score=lexical[chunk.id])
-                    for chunk in all_chunks
-                    if lexical[chunk.id] > 0
-                ]
-
-        ranked.sort(key=lambda chunk: (-chunk.score, chunk.source, chunk.metadata["chunk_index"]))
-
-        # 过滤放在 rerank 之前：rerank 是要花钱/花时间的配额，不能浪费在马上
-        # 会被过滤掉的条目上。
-        if filters is not None:
-            ranked = [chunk for chunk in ranked if filters.matches(chunk)]
-
-        # 去重同样放在 rerank 之前：付费 rerank 的 cap（默认 60）个名额会被
-        # 同一段内容的 N 份副本占满，实际收益只剩 1/N。行 1468 的 early dedupe
-        # 只覆盖混合模式之前，这里兜底语义路由无词法结果的情况。
-        if dedupe:
-            ranked = dedupe_by_content_hash(ranked)
-
-        if use_rerank and self.reranker_provider and ranked:
-            ranked = rerank_chunks(query, ranked, self.reranker_provider, cap=self.config.rerank_cap)
-
-        if filters is None:
-            return ranked[: max(0, top_k)]
-        start, end = filters.page_slice(top_k)
-        return ranked[start:end]
-
-    def _fts_query(self, query: str) -> str | None:
-        """Build an FTS5 MATCH expression from tokens of length >= 3.
-
-        Returns None when no such token survives (e.g. a 2-char CJK query like
-        "银狼"), so the caller skips the BM25 route and the bigram lexical route
-        covers the query instead. Trigram cannot match <3-char queries.
-
-        中文特判：FTS5 用的是 trigram 分词器（索引的是 3 字滑窗），而查询侧把
-        整段连续 CJK 当一个引号短语的话，必须"原样连续出现"才命中——中文没有
-        分词，一段自然语言就是 8~10 个字，实测「半导体物理」「如何学习半导体
-        物理」这类查询对含相关内容的正文命中 0 条，BM25 路由对中文基本是摆设
-        （不报错，另两路兜住，所以看不出问题）。长度 >= 4 的 CJK 段切成 3 字
-        滑窗、用 OR 连接，让 BM25 按命中滑窗数量给分级召回。
-        """
-        terms: list[str] = []
-        for piece in _WORD_RE.findall(query):
-            for word in _ASCII_RE.findall(piece):
-                if len(word) >= 3:
-                    terms.append('"' + word.lower().replace('"', '""') + '"')
-            for cjk in _CJK_RE.findall(piece):
-                if len(cjk) == 3:
-                    terms.append('"' + cjk.replace('"', '""') + '"')
-                elif len(cjk) >= 4:
-                    shingles = [
-                        cjk[index : index + 3] for index in range(len(cjk) - 2)
-                    ]
-                    joined = " OR ".join(
-                        '"' + shingle.replace('"', '""') + '"' for shingle in shingles
-                    )
-                    terms.append(f"({joined})")
-        if not terms:
-            return None
-        return " AND ".join(terms)
+            actual = str(self_or_query or "")
+        return _fts_query_fn(actual)
 
     def _hybrid_rank(
         self,
@@ -2302,110 +928,26 @@ class MarkdownIndexer:
         semantic_snapshot: dict[str, float],
         path_prefix: str = "",
     ) -> list[Chunk]:
-        """Three-route RRF fusion: FTS5 BM25 + vector cosine + bigram lexical.
-
-        chunk.score becomes the RRF value (comparable across vaults), then the
-        caller sorts and reranks as usual. Any single route failing or empty is
-        simply absent — search never throws.
-        """
-        by_id = {chunk.id: chunk for chunk in all_chunks}
-        routes: list[list[str]] = []
-
-        # Route A: FTS5 BM25 (trigram). Skipped when the query has no >=3-char token.
-        fts_sql = self._fts_query(query)
-        if fts_sql is not None and self._fts is not None:
-            try:
-                routes.append([chunk_id for chunk_id, _score in self._fts.search(fts_sql, self.config.rrf_per_route, path_prefix)])
-            except Exception:
-                pass
-
-        # Route B: vector cosine, raw and descending.
-        if semantic_snapshot:
-            ordered = sorted(semantic_snapshot.items(), key=lambda item: -item[1])
-            routes.append([chunk_id for chunk_id, _score in ordered[: self.config.rrf_per_route]])
-
-        # Route C: bigram lexical soft scores, descending, score > 0 only.
-        lexical_ordered = sorted(
-            ((chunk_id, score) for chunk_id, score in lexical.items() if score > 0),
-            key=lambda item: -item[1],
+        return _hybrid_rank_fn(
+            query,
+            all_chunks,
+            lexical,
+            semantic_snapshot,
+            self._fts,
+            self.config.rrf_per_route,
+            path_prefix=path_prefix,
         )
-        if lexical_ordered:
-            routes.append([chunk_id for chunk_id, _score in lexical_ordered[: self.config.rrf_per_route]])
-
-        if not routes:
-            return []
-
-        fused: dict[str, float] = {}
-        for route in routes:
-            for rank, chunk_id in enumerate(route, start=1):
-                fused[chunk_id] = fused.get(chunk_id, 0.0) + 1.0 / (_RRF_K + rank)
-
-        ranked = [replace(by_id[chunk_id], score=fused[chunk_id]) for chunk_id in fused if chunk_id in by_id]
-        ranked.sort(key=lambda chunk: (-chunk.score, chunk.source, chunk.metadata["chunk_index"]))
-        return ranked
 
     @staticmethod
     def _query_tokens(query: str) -> list[str]:
-        """Tokenize for lexical scoring: ASCII words verbatim, CJK text as bigrams.
-
-        The previous regex grabbed a whole CJK run as one token, which made
-        lexical scoring behave like exact-substring matching for Chinese. Bigrams
-        keep named entities (卡芙卡 -> 卡芙/芙卡) matchable without any tokenizer
-        dependency.
-        """
-        tokens: list[str] = []
-        for piece in _WORD_RE.findall(query):
-            for word in _ASCII_RE.findall(piece):
-                tokens.append(word.lower())
-            for cjk in _CJK_RE.findall(piece):
-                chars = list(cjk)
-                if len(chars) == 1:
-                    tokens.append(chars[0])
-                else:
-                    tokens.extend("".join(chars[i:i + 2]) for i in range(len(chars) - 1))
-        return tokens
+        return _query_tokens_fn(query)
 
     def _semantic_rank(self, query_vector: Iterable[float], chunks: list[Chunk]) -> list[Chunk]:
-        """Batch cosine similarity. numpy when available, scalar loop fallback."""
-        embedded = [chunk for chunk in chunks if chunk.embedding is not None and len(chunk.embedding)]
-        if not embedded:
-            return []
-        try:
-            import numpy as np
-            matrix = np.asarray([chunk.embedding for chunk in embedded], dtype=np.float32)
-            vector = np.asarray(query_vector, dtype=np.float32)
-            denominator = np.linalg.norm(matrix, axis=1) * np.linalg.norm(vector)
-            if denominator.size == 0 or float(np.linalg.norm(vector)) == 0.0:
-                return []
-            similarities = (matrix @ vector) / (denominator + 1e-9)
-            for chunk, similarity in zip(embedded, similarities.tolist()):
-                chunk.score = float(similarity)
-            return embedded
-        except Exception:
-            for chunk in embedded:
-                chunk.score = self._cosine(query_vector, chunk.embedding)
-            return embedded
+        return _semantic_rank_fn(query_vector, chunks)
 
     @staticmethod
     def _cosine(left: array, right: array) -> float:
-        # 维度不一致说明数据已损坏（换模型 / 换维度 / 导入了错误维度的快照后
-        # numpy 路径会抛错并被吞，最终落到这里）。截断后算出来的余弦是毫无
-        # 意义的数字，宁可判 0 也不要产出"看起来很像回事"的错误排序。
-        if len(left) != len(right):
-            return 0.0
-        size = len(left)
-        if not size:
-            return 0.0
-        dot = 0.0
-        left_norm = 0.0
-        right_norm = 0.0
-        for index in range(size):
-            lv = left[index]
-            rv = right[index]
-            dot += lv * rv
-            left_norm += lv * lv
-            right_norm += rv * rv
-        return dot / ((left_norm ** 0.5) * (right_norm ** 0.5)) if left_norm and right_norm else 0.0
+        return _cosine_fn(left, right)
 
     def read(self, source: str, start_line: int | None = None, end_line: int | None = None) -> str:
         path = self._safe_path(source)
@@ -2474,6 +1016,16 @@ class MarkdownIndexer:
                         ext = suffix.lstrip(".")
                         if ext:
                             unsupported_counts[ext] = unsupported_counts.get(ext, 0) + 1
+        # F7.2：报告可选加速依赖的存在性。使用 find_spec 仅探测元数据，
+        # 绝不真实 import（避免提前加载 C 扩展、抢占 GIL 或污染轻量测试环境）。
+        import importlib.util as _ilu
+
+        def _has_spec(name: str) -> bool:
+            try:
+                return _ilu.find_spec(name) is not None
+            except Exception:
+                return False
+
         return {
             "files": len(self._chunks),
             "chunks": len(self.all_chunks()),
@@ -2489,327 +1041,32 @@ class MarkdownIndexer:
             "use_hybrid": self.config.use_hybrid,
             "fts_enabled": self._fts is not None and self._fts.available,
             "vector_backend": getattr(self._vector_backend, "name", self.config.vector.backend),
+            "accel": {
+                "numpy": _has_spec("numpy"),
+                "sqlite_vec": _has_spec("sqlite_vec"),
+            },
         }
 
     def _iter_vault_text_files(self) -> list[str]:
-        """按 scandir 剪枝遍历收集库内全部可索引文本文件（.md / .txt）。"""
-        if not self.vault_path.exists():
-            return []
-        found: list[str] = []
-        stack = [self.vault_path]
-        while stack:
-            current = stack.pop()
-            try:
-                entries = os.scandir(current)
-            except OSError:
-                continue
-            with entries:
-                for entry in entries:
-                    try:
-                        is_dir = entry.is_dir(follow_symlinks=False)
-                    except OSError:
-                        continue
-                    path = Path(entry.path)
-                    if is_dir:
-                        if (
-                            entry.name.startswith(".")
-                            or self._ignored_name(entry.name)
-                            or entry.name == "node_modules"
-                            or (
-                                self.config.cache.placement == "vault"
-                                and self.config.cache.subdir
-                                and entry.name == self.config.cache.subdir
-                            )
-                        ):
-                            continue
-                        stack.append(path)
-                        continue
-                    if self._ignored_name(entry.name):
-                        continue
-                    suffix = path.suffix.lower()
-                    if suffix in _INDEXABLE_TEXT_EXTS:
-                        found.append(self._source(path))
-        found.sort()
-        return found
+        return _exemptions.iter_vault_text_files(self)
 
     def get_exemptions(self) -> dict[str, Any]:
-        ignore_file_path = self.vault_path / self.config.ignore_file
-        vaultignore_rules: list[str] = []
-        if ignore_file_path.exists() and ignore_file_path.is_file():
-            try:
-                for line in ignore_file_path.read_text(encoding="utf-8").splitlines():
-                    s = line.strip()
-                    if s and not s.startswith("#"):
-                        vaultignore_rules.append(s)
-            except Exception:
-                pass
-
-        all_text_files: list[str] = []
-        all_md_files: list[str] = []
-        exempt_files: list[dict[str, str]] = []
-        for source in self._iter_vault_text_files():
-            all_text_files.append(source)
-            if source.lower().endswith((".md", ".markdown")):
-                all_md_files.append(source)
-            check_res = self.check_exemption(source)
-            if check_res["is_exempt"]:
-                exempt_files.append({"source": source, "reason": check_res["reason"]})
-
-        return {
-            "vault_path": str(self.vault_path.resolve()),
-            "ignore_file": self.config.ignore_file,
-            "vaultignore_rules": vaultignore_rules,
-            "config_exclude_patterns": list(self.config.exclude_patterns),
-            "exclude_tags": list(self.config.exclude_tags),
-            "exclude_frontmatter_keys": list(self.config.exclude_frontmatter_keys),
-            "total_md_files": len(all_md_files),
-            "total_text_files": len(all_text_files),
-            "indexed_files": len(self._chunks),
-            "exempt_files_count": len(exempt_files),
-            "exempt_files_sample": [item["source"] for item in exempt_files[:50]],
-        }
-
-    def add_exemption_pattern(self, pattern: str) -> dict[str, Any]:
-        pattern = pattern.strip()
-        if not pattern:
-            raise ValueError("pattern must not be empty")
-        ignore_file_path = self.vault_path / self.config.ignore_file
-        lines: list[str] = []
-        if ignore_file_path.exists():
-            try:
-                lines = ignore_file_path.read_text(encoding="utf-8").splitlines()
-            except Exception:
-                lines = []
-
-        if pattern not in [l.strip() for l in lines]:
-            lines.append(pattern)
-            ignore_file_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return _exemptions.get_exemptions(self)
 
     def _prune_ignored_sources(self, matcher: IgnoreMatcher) -> list[str]:
-        """按豁免规则即时剪除内存态（含 0.7.1 全部时序观测状态）。"""
-        pruned: list[str] = []
-        removed_ids: list[str] = []
-        with self._sync_lock:
-            for source in list(self._chunks.keys()):
-                if not matcher.is_ignored(source, is_dir=False)[0]:
-                    continue
-                for c in self._chunks.pop(source, []):
-                    removed_ids.append(c.id)
-                self._signatures.pop(source, None)
-                self._stat_cache.pop(source, None)
-                self._stat_seen_ns.pop(source, None)
-                self._stat_confirmations.pop(source, None)
-                if hasattr(self, "fast_path_warnings"):
-                    self.fast_path_warnings.pop(source, None)
-                self._fts_delete(source)
-                pruned.append(source)
-            if removed_ids:
-                try:
-                    self._vector_backend.delete_vectors(removed_ids)
-                    self._disk_vectors.difference_update(removed_ids)
-                except Exception:
-                    pass
-            for failed_source in list(self.failed_files.keys()):
-                if matcher.is_ignored(failed_source, is_dir=False)[0]:
-                    self.failed_files.pop(failed_source, None)
-            if pruned or removed_ids:
-                self._save_cache()
-        return pruned
+        return _exemptions._prune_ignored_sources(self, matcher)
 
     def add_exemption_pattern(self, pattern: str) -> dict[str, Any]:
-        pattern = pattern.strip()
-        if not pattern:
-            raise ValueError("pattern must not be empty")
-        ignore_file_path = self.vault_path / self.config.ignore_file
-        lines: list[str] = []
-        if ignore_file_path.exists():
-            try:
-                lines = ignore_file_path.read_text(encoding="utf-8").splitlines()
-            except Exception:
-                lines = []
-
-        if pattern not in [l.strip() for l in lines]:
-            lines.append(pattern)
-            ignore_file_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-        # 1. 内存即时极速剪枝与资源联动清理 (F-02)
-        matcher = IgnoreMatcher([pattern])
-        pruned_sources = self._prune_ignored_sources(matcher)
-
-        # 2. 启动异步平滑对账（若有未同步事件，不阻塞前台返回）
-        threading.Thread(target=self._run_sync_quietly, daemon=True, name="exempt-sync").start()
-
-        return {
-            "success": True,
-            "action": "add_pattern",
-            "pattern": pattern,
-            "vaultignore_path": str(ignore_file_path.resolve()),
-            "pruned_files_count": len(pruned_sources),
-            "total_rules": len([l for l in lines if l.strip() and not l.strip().startswith("#")]),
-            "sync": "background",
-        }
+        return _exemptions.add_exemption_pattern(self, pattern)
 
     def remove_exemption_pattern(self, pattern: str) -> dict[str, Any]:
-        pattern = pattern.strip()
-        if not pattern:
-            raise ValueError("pattern must not be empty")
-        ignore_file_path = self.vault_path / self.config.ignore_file
-        if not ignore_file_path.exists():
-            return {
-                "success": True,
-                "action": "remove_pattern",
-                "pattern": pattern,
-                "removed": False,
-                "remaining_rules": 0,
-                "sync": "noop",
-            }
-
-        lines = ignore_file_path.read_text(encoding="utf-8").splitlines()
-        new_lines = [l for l in lines if l.strip() != pattern]
-        removed = len(new_lines) < len(lines)
-        if removed:
-            ignore_file_path.write_text("\n".join(new_lines) + ("\n" if new_lines else ""), encoding="utf-8")
-            # I3：与重对账解耦，前台毫秒级返回；新可见文件由后台线程补进索引
-            threading.Thread(target=self._run_sync_quietly, daemon=True, name="exempt-sync").start()
-            sync_state = "background"
-        else:
-            sync_state = "noop"
-
-        return {
-            "success": True,
-            "action": "remove_pattern",
-            "pattern": pattern,
-            "removed": removed,
-            "remaining_rules": len([l for l in new_lines if l.strip() and not l.strip().startswith("#")]),
-            "sync": sync_state,
-        }
+        return _exemptions.remove_exemption_pattern(self, pattern)
 
     def check_exemption(self, source: str) -> dict[str, Any]:
-        source_posix = source.replace("\\", "/").strip("/")
-        matcher = self._ignore_matcher()
-        ignored, rule = matcher.is_ignored(source_posix, is_dir=False)
-        if ignored:
-            return {
-                "source": source_posix,
-                "is_exempt": True,
-                "reason": f"matched ignore rule '{rule}'",
-                "has_block_ignores": False,
-                "indexed_chunks": 0,
-            }
-
-        target_path = self.vault_path / source_posix
-        if not target_path.exists() or not target_path.is_file():
-            return {
-                "source": source_posix,
-                "is_exempt": False,
-                "reason": "file not found on disk",
-                "has_block_ignores": False,
-                "indexed_chunks": len(self._chunks.get(source_posix, [])),
-            }
-
-        try:
-            raw = target_path.read_bytes()
-            text = raw.decode("utf-8-sig")
-            lines = text.splitlines()
-            frontmatter_end, tags, properties = self._frontmatter(lines)
-            is_fm_exempt, fm_reason = self._is_frontmatter_exempt(tags, properties)
-            if is_fm_exempt:
-                return {
-                    "source": source_posix,
-                    "is_exempt": True,
-                    "reason": fm_reason or "frontmatter",
-                    "has_block_ignores": False,
-                    "indexed_chunks": 0,
-                }
-
-            body = lines[frontmatter_end + 1:]
-            _, has_block_ignores = self._strip_ignored_blocks(body)
-            return {
-                "source": source_posix,
-                "is_exempt": False,
-                "reason": "none (actively indexed)",
-                "has_block_ignores": has_block_ignores,
-                "indexed_chunks": len(self._chunks.get(source_posix, [])),
-            }
-        except Exception as exc:
-            return {
-                "source": source_posix,
-                "is_exempt": False,
-                "reason": f"error reading file: {exc}",
-                "has_block_ignores": False,
-                "indexed_chunks": 0,
-            }
+        return _exemptions.check_exemption(self, source)
 
     def set_file_exemption(self, source: str, exempt: bool = True, method: str = "frontmatter") -> dict[str, Any]:
-        source_posix = source.replace("\\", "/").strip("/")
-        if method == "ignore_file":
-            if exempt:
-                return self.add_exemption_pattern(source_posix)
-            else:
-                return self.remove_exemption_pattern(source_posix)
-
-        path = self._safe_path(source_posix)
-        if not path.exists():
-            raise ValueError(f"file not found: {source_posix}")
-
-        text = path.read_text(encoding="utf-8-sig")
-        lines = text.splitlines()
-
-        if exempt:
-            if len(lines) >= 2 and lines[0].strip() == "---":
-                end = next((i for i in range(1, len(lines)) if lines[i].strip() == "---"), -1)
-                if end > 0:
-                    fm_lines = lines[1:end]
-                    rag_found = False
-                    new_fm_lines = []
-                    for line in fm_lines:
-                        if line.strip().lower().startswith("rag:"):
-                            new_fm_lines.append("rag: false")
-                            rag_found = True
-                        else:
-                            new_fm_lines.append(line)
-                    if not rag_found:
-                        new_fm_lines.insert(0, "rag: false")
-                    new_lines = ["---"] + new_fm_lines + ["---"] + lines[end + 1:]
-                else:
-                    new_lines = ["---", "rag: false", "---", ""] + lines
-            else:
-                new_lines = ["---", "rag: false", "---", ""] + lines
-        else:
-            if len(lines) >= 2 and lines[0].strip() == "---":
-                end = next((i for i in range(1, len(lines)) if lines[i].strip() == "---"), -1)
-                if end > 0:
-                    fm_lines = lines[1:end]
-                    new_fm_lines = []
-                    for line in fm_lines:
-                        stripped = line.strip().lower()
-                        if any(stripped.startswith(k + ":") for k in ["rag", "rag_exclude", "rag_ignore", "no_rag"]):
-                            continue
-                        new_fm_lines.append(line)
-                    if any(l.strip() for l in new_fm_lines):
-                        new_lines = ["---"] + new_fm_lines + ["---"] + lines[end + 1:]
-                    else:
-                        rest = lines[end + 1:]
-                        while rest and not rest[0].strip():
-                            rest = rest[1:]
-                        new_lines = rest
-                else:
-                    new_lines = lines
-            else:
-                new_lines = lines
-
-        path.write_text("\n".join(new_lines) + ("\n" if new_lines else ""), encoding="utf-8")
-        if exempt:
-            self._prune_ignored_sources(IgnoreMatcher([source_posix]))
-        threading.Thread(target=self._run_sync_quietly, daemon=True, name="exempt-sync").start()
-        return {
-            "success": True,
-            "action": "exempt_file" if exempt else "unexempt_file",
-            "source": source_posix,
-            "method": "frontmatter",
-            "is_exempt": exempt,
-            "sync": "background",
-        }
+        return _exemptions.set_file_exemption(self, source, exempt=exempt, method=method)
 
     def purge_cache(self) -> bool:
         """Delete this vault's on-disk cache files (used by kb_remove).
@@ -2910,198 +1167,13 @@ class MarkdownIndexer:
     # ------------------------------------------------------------------ snapshot
 
     def export_snapshot(self, out_path: str | Path) -> dict[str, Any]:
-        """把本库的索引缓存（chunks + 向量 + FTS）打包成 zip 快照。
-
-        快照是缓存层原样搬运，不含任何机器相关路径；导入端按自己的 cache key
-        重命名落地。前提是缓存已启用且做过至少一次 sync（否则没有可导出的东西）。
-        """
-        # 与 import 对称地持 _sync_lock：否则并发 sync 的 tmp.replace 会让
-        # 快照里 chunks 与 vectors 来自不同时刻（撕裂快照）。
-        with self._sync_lock:
-            return self._export_snapshot_locked(out_path)
+        return _snapshot.export_snapshot(self, out_path)
 
     def _export_snapshot_locked(self, out_path: str | Path) -> dict[str, Any]:
-        # 必须持 _sync_lock：打包过程逐文件读取缓存，并发的 sync 可能恰好
-        # tmp.replace 其中一个文件 —— Windows 上直接 PermissionError，非失败
-        # 交错则产出「chunks 来自 sync 前、vectors 来自 sync 后」的撕裂快照，
-        # 导入端会把这对不一致数据当作一致状态恢复。
-            if self._chunks_cache_path is None:
-                raise ValueError("cache is disabled; enable [cache] before exporting a snapshot")
-            if not self._chunks:
-                raise ValueError("index is empty; run a sync (or kb_rebuild) before exporting")
-
-            # 把当前内存态刷进缓存文件再打包，保证快照 = 此刻的索引。
-            self._save_cache()
-
-            vectors_member: str | None = None
-            if self._vectors_on_disk:
-                if self._vectors_db_path is not None and self._vectors_db_path.exists():
-                    vectors_member = "vectors.sqlite"
-            elif self._vectors_cache_path is not None and self._vectors_cache_path.exists():
-                vectors_member = "vectors.bin"
-
-            vector_count = sum(
-                1 for chunk in self.all_chunks() if self._chunk_has_vector(chunk)
-            )
-            manifest = {
-                "format": _SNAPSHOT_FORMAT,
-                "format_version": _SNAPSHOT_VERSION,
-                "cache_key": self._cache_key(),
-                "chunks_meta": self._chunks_meta(),
-                "vectors_meta": self._vectors_meta(),
-                "backend": getattr(self._vector_backend, "name", self.config.vector.backend),
-                "stats": {
-                    "files": len(self._chunks),
-                    "chunks": len(self.all_chunks()),
-                    "vectors": vector_count,
-                },
-            }
-
-            out = Path(out_path).expanduser()
-            out.parent.mkdir(parents=True, exist_ok=True)
-            tmp = out.with_suffix(out.suffix + ".tmp")
-            try:
-                with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zf:
-                    zf.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
-                    zf.write(self._chunks_cache_path, "chunks.bin")
-                    if vectors_member is not None:
-                        source = self._vectors_db_path if vectors_member == "vectors.sqlite" else self._vectors_cache_path
-                        zf.write(source, vectors_member)
-                    if self._fts is not None and self._fts_cache_path is not None and self._fts_cache_path.exists():
-                        zf.write(self._fts_cache_path, "fts.sqlite")
-                tmp.replace(out)
-            finally:
-                if tmp.exists():
-                    try:
-                        tmp.unlink()
-                    except OSError:
-                        pass
-            return {
-                "exported": True,
-                "path": str(out),
-                "backend": manifest["backend"],
-                **manifest["stats"],
-            }
+        return _snapshot._export_snapshot_locked(self, out_path)
 
     def import_snapshot(self, snapshot: str | Path, force: bool = False) -> dict[str, Any]:
-        """从快照恢复索引缓存；随后一次 sync 应当 0 次 embedding API 调用。
-
-        安全与兼容：
-
-        * zip 成员按**白名单**精确匹配，多余的成员（含 ../ 穿越名）直接拒绝；
-          落地路径全部来自本机缓存配置，从不使用压缩包内的名字拼路径。
-        * .bin 里的 meta 含源机器的 cache key，导入时用本机 _chunks_meta() /
-          _vectors_meta() 重写后再落地。
-        * 向量层的 model/dimension 与本机配置不一致时拒绝导入（force=true 可
-          强制，但此时只导入文本层，向量作废由本地重新 embedding——错维度的
-          向量对检索是毒药）。
-
-        前提：本库缓存已启用、目录已注册（先 kb_init 再 kb_import）。
-        """
-        if self._chunks_cache_path is None:
-            raise ValueError("cache is disabled; enable [cache] before importing a snapshot")
-        src = Path(snapshot).expanduser()
-        if not src.is_file():
-            raise ValueError(f"snapshot not found: {src}")
-
-        with zipfile.ZipFile(src) as zf:
-            names = set(zf.namelist())
-            unknown = names - _SNAPSHOT_MEMBERS
-            if unknown:
-                raise ValueError(f"snapshot contains unexpected members: {sorted(unknown)}")
-            if "manifest.json" not in names or "chunks.bin" not in names:
-                raise ValueError("snapshot is missing manifest.json or chunks.bin")
-            # 解压炸弹防护：快照的用途就是从别人机器收文件，任何一个成员都可以
-            # 是恶意构造的。白名单挡得住路径穿越，挡不住"1MB zip 解出几十 GB"。
-            for member in names:
-                info = zf.getinfo(member)
-                if info.file_size > _SNAPSHOT_MEMBER_LIMITS.get(member, 0):
-                    raise ValueError(
-                        f"snapshot member {member} is too large "
-                        f"({info.file_size} bytes > limit {_SNAPSHOT_MEMBER_LIMITS.get(member)})"
-                    )
-                if info.compress_size > 0 and info.file_size / info.compress_size > 1000:
-                    raise ValueError(
-                        f"snapshot member {member} has an implausible compression ratio "
-                        f"({info.file_size}/{info.compress_size}); refusing to decompress"
-                    )
-            try:
-                manifest = json.loads(zf.read("manifest.json").decode("utf-8"))
-            except (ValueError, UnicodeDecodeError) as exc:
-                raise ValueError(f"snapshot manifest is corrupt: {exc}") from exc
-            if (
-                not isinstance(manifest, dict)
-                or manifest.get("format") != _SNAPSHOT_FORMAT
-                or manifest.get("format_version") != _SNAPSHOT_VERSION
-            ):
-                raise ValueError(
-                    f"not a {_SNAPSHOT_FORMAT} v{_SNAPSHOT_VERSION} archive; got "
-                    f"format={manifest.get('format')!r} version={manifest.get('format_version')!r}"
-                )
-
-            local_vectors_meta = self._vectors_meta()
-            snapshot_vectors_meta = manifest.get("vectors_meta") or {}
-            vectors_member = "vectors.sqlite" if "vectors.sqlite" in names else ("vectors.bin" if "vectors.bin" in names else None)
-            skip_vectors = vectors_member is None
-            warnings: list[str] = []
-
-            # 分块参数（chunk_size / chunk_overlap / chunker 代际 / 图片注入）不匹配时，
-            # chunk.id（sha1 of source+index+content）对不上，导入的向量一条都挂不上，
-            # 等于白导——而且 vectors.bin 的 meta 导入时会被本机 meta 重写，事后看不出
-            # 原因。此前 manifest 里导出的 chunks_meta 从不比对。
-            # 注意只比切块相关字段，不比 cache_key：cache_key 含 vault 路径，换机迁移
-            # 时必然不同，拿它当判据会把正当的「免重嵌迁移」也拒掉。
-            def _chunking_fingerprint(meta: dict[str, Any]) -> dict[str, Any]:
-                return {key: value for key, value in (meta or {}).items() if key != "key"}
-
-            snapshot_chunks_meta = manifest.get("chunks_meta")
-            # 只在 manifest 确实带 chunks_meta（0.5.0+ 快照）时才做比对：
-            # 老格式快照没有该字段，直接拒掉会给出误导性的"参数不匹配"报错。
-            chunks_mismatch = isinstance(snapshot_chunks_meta, dict) and _chunking_fingerprint(
-                snapshot_chunks_meta
-            ) != _chunking_fingerprint(self._chunks_meta())
-            if chunks_mismatch and not force:
-                raise ValueError(
-                    "snapshot was chunked with different parameters than this machine "
-                    "(chunk_size / chunker / inject_image_captions mismatch); pass force=true "
-                    "to import anyway (next sync will re-chunk and re-embed)"
-                )
-
-            # 模型/维度校验对两个向量成员一视同仁。此前只查 vectors.bin，vectors.sqlite
-            # 整文件替换、零校验——错误维度的向量装进去后 numpy 路径抛错被吞，
-            # 标量 _cosine 用 min(len) 截断，返回"看起来很像回事"的垃圾相似度。
-            model_mismatch = (
-                snapshot_vectors_meta.get("embedding_model") != local_vectors_meta["embedding_model"]
-                or snapshot_vectors_meta.get("dimension") != local_vectors_meta["dimension"]
-            )
-            if vectors_member is not None and model_mismatch:
-                if not force:
-                    raise ValueError(
-                        "snapshot vectors were built with model="
-                        f"{snapshot_vectors_meta.get('embedding_model')!r} dimension={snapshot_vectors_meta.get('dimension')!r} "
-                        "but this config uses model="
-                        f"{local_vectors_meta['embedding_model']!r} dimension={local_vectors_meta['dimension']!r}; "
-                        "pass force=true to import the text layer only and re-embed"
-                    )
-                skip_vectors = True
-                warnings.append(
-                    "vectors skipped: snapshot model/dimension differs from this config"
-                )
-            if chunks_mismatch and force:
-                warnings.append(
-                    "chunking parameters differ from this machine; imported vectors may not "
-                    "match chunk ids and will be re-embedded"
-                )
-
-            # 锁序必须与 sync() 一致（_sync_lock → _cache_lock）。此前这里是
-            # _cache_lock → _sync_lock 的反向嵌套，kb_import 撞上 watcher 的
-            # 30s 对账 sync 就是 ABBA 死锁：两个线程永久互等，之后所有
-            # kb_search / kb_list_files 排队在 _sync_lock 上，整个 MCP 服务冻结。
-            # 导入体本身会在锁内从磁盘重载全部状态，无需外层再持 _cache_lock。
-            with self._sync_lock:
-                return self._import_snapshot_locked(
-                    src, zf, vectors_member, skip_vectors, warnings
-                )
+        return _snapshot.import_snapshot(self, snapshot, force=force)
 
     def _import_snapshot_locked(
         self,
@@ -3111,151 +1183,33 @@ class MarkdownIndexer:
         skip_vectors: bool,
         warnings: list[str] | None = None,
     ) -> dict[str, Any]:
-        # 磁盘记账集必须清空：否则旧模型的 id 还在集合里，导入后凡是命中的
-        # chunk 都被判为"已嵌入"永不重嵌（而 vec 库里躺的是旧语料的向量）。
-        self._disk_vectors.clear()
-
-        # 1) 文本层：解码 -> 按本机 meta 重写 -> 原子落地。
-        chunk_count, file_count = self._import_chunks_member(zf)
-
-        # 2) 向量层：.bin 重写 meta；sqlite 原样搬运（关连接 -> 换文件 -> 重开）。
-        vector_count: int | None = None
-        if vectors_member is not None and not skip_vectors:
-            if vectors_member == "vectors.bin":
-                vector_count = self._import_vectors_bin_member(zf)
-            else:
-                vector_count = self._import_vectors_sqlite_member(zf)
-
-        # 3) FTS：能搬就搬；无论搬没搬，都按导入后的 chunk 集对账一次。
-        if "fts.sqlite" in zf.namelist() and self._fts_cache_path is not None:
-            self._replace_live_file(self._fts_cache_path, zf.read("fts.sqlite"), close_fts=True)
-
-        # 4) 用导入后的缓存文件重建内存态（向量按 id 挂回 chunk）。
-        #    注意 FTS 对账必须放在 _chunks.clear() 与 _load_chunks_cache() 之后：
-        #    此前先执行，用的是导入前的旧 chunk 集，会把旧语料全部 upsert 进
-        #    刚导入的 FTS 库——两套语料混在一起，且后续 sync 因签名未变永不修复。
-        self._chunks.clear()
-        self._signatures.clear()
-        self._pending_vectors.clear()
-        self.failed_files.clear()
-        self._load_chunks_cache()
-        self._load_failed_files()
-        if not self._vectors_on_disk:
-            self._load_vectors_cache()
-        self._recreate_fts()
-        self._fts_ensure_populated()
-
-        return {
-            "imported": True,
-            "path": str(src),
-            "files": len(self._chunks),
-            "chunks": chunk_count,
-            "file_count": file_count,
-            "vectors": vector_count,
-            "vectors_imported": vectors_member is not None and not skip_vectors,
-            "backend": getattr(self._vector_backend, "name", self.config.vector.backend),
-            "warnings": warnings or [],
-        }
-
-    # ---------------------------------------------------------------- snapshot 内部
+        return _snapshot._import_snapshot_locked(
+            self, src, zf, vectors_member, skip_vectors, warnings=warnings
+        )
 
     def _import_chunks_member(self, zf: zipfile.ZipFile) -> tuple[int, int]:
-        loaded = self._decode_member(zf, "chunks.bin", _CacheCodec.load)
-        if loaded is None:
-            raise ValueError("snapshot chunks.bin is corrupt")
-        meta, files = loaded
-        # chunks 层必须无向量（向量只属于向量层）；导入时不信任包内数据，统一剥离。
-        clean: dict[str, tuple[str, list[Chunk]]] = {
-            source: (signature, [self._strip_embedding(chunk) for chunk in chunks])
-            for source, (signature, chunks) in files.items()
-        }
-        _CacheCodec.dump(self._chunks_cache_path, self._chunks_meta(), clean)  # type: ignore[arg-type]
-        total = sum(len(chunks) for _, chunks in clean.values())
-        return total, len(clean)
+        return _snapshot._import_chunks_member(self, zf)
 
     def _import_vectors_bin_member(self, zf: zipfile.ZipFile) -> int:
-        loaded = self._decode_member(zf, "vectors.bin", _VectorsCodec.load)
-        if loaded is None:
-            raise ValueError("snapshot vectors.bin is corrupt")
-        meta, vectors = loaded
-        _VectorsCodec.dump(self._vectors_cache_path, self._vectors_meta(), vectors)  # type: ignore[arg-type]
-        return len(vectors)
+        return _snapshot._import_vectors_bin_member(self, zf)
 
     def _import_vectors_sqlite_member(self, zf: zipfile.ZipFile) -> int:
-        if self._vectors_db_path is None:
-            raise ValueError("sqlite_vec vector store is unavailable for this vault")
-        closer = getattr(self._vector_backend, "close", None)
-        if closer is not None:
-            closer()
-        # try/finally 是必须的：close 之后 self._vector_backend 就是一个被关闭
-        # 的对象，任何一步失败（磁盘满、文件被占用、sqlite_vec 不可用）都会
-        # 让它永久停在"已关闭"状态 —— query() 恒返回 []、upsert 全部 no-op，
-        # 而 _flush_vectors_to_disk 还在盲记账，语义检索静默归零且不可自愈。
-        try:
-            self._replace_live_file(self._vectors_db_path, zf.read("vectors.sqlite"), close_fts=False)
-            backend = create_vector_backend(self.config.vector, self, self._vectors_db_path)
-            if not getattr(backend, "available", False):
-                raise ValueError("sqlite_vec could not open the imported vector store")
-        except Exception:
-            # 失败即回滚：把旧 backend 重新打开（旧文件可能已被替换，能开成
-            # 什么样算什么样——至少不能留一个"已关闭"的对象给后续所有调用）。
-            try:
-                self._vector_backend = create_vector_backend(self.config.vector, self, self._vectors_db_path)
-                self._vectors_on_disk = bool(getattr(self._vector_backend, "on_disk", False))
-                self._disk_vectors = set()
-            except Exception:
-                pass
-            raise
-        # 重开后由导入的数据接管；磁盘记账集在下一次 sync 的
-        # _ensure_disk_vectors_migrated 里按库内实际 id 重建。
-        self._vector_backend = backend
-        self._vectors_on_disk = bool(getattr(backend, "on_disk", False))
-        self._disk_vectors = set()
-        return len(backend.list_ids())
+        return _snapshot._import_vectors_sqlite_member(self, zf)
 
     def _decode_member(self, zf: zipfile.ZipFile, member: str, loader: Callable[[Path], Any]) -> Any:
-        """把 zip 成员写到缓存目录的临时文件后用既有 loader 解码。
+        return _snapshot._decode_member(self, zf, member, loader)
 
-        _CacheCodec / _VectorsCodec 只认 Path，而它们真正的校验对象（meta）要
-        在解码之后由导入逻辑重写，所以这里只负责把字节安全地交给 loader。
-        """
-        scratch_dir = (self._chunks_cache_path or self._vectors_cache_path).parent  # type: ignore[union-attr]
-        tmp = scratch_dir / (member + ".importing")
-        try:
-            tmp.write_bytes(zf.read(member))
-            return loader(tmp)
-        finally:
-            try:
-                tmp.unlink()
-            except OSError:
-                pass
+    def _replace_live_file(self, target: Path, staged: Path, *, close_fts: bool) -> None:
+        return _snapshot._replace_live_file(self, target, staged, close_fts=close_fts)
 
-    def _replace_live_file(self, target: Path, payload: bytes, *, close_fts: bool) -> None:
-        """原子替换一个可能正被本实例打开的缓存文件（sqlite）。"""
-        if close_fts and self._fts is not None:
-            try:
-                self._fts.close()
-            except Exception:
-                pass
-            self._fts = None
-        target.parent.mkdir(parents=True, exist_ok=True)
-        tmp = target.with_suffix(target.suffix + ".importing")
-        tmp.write_bytes(payload)
-        tmp.replace(target)
+    def _stream_member(self, zf: zipfile.ZipFile, member: str, dest: Path | Any) -> int:
+        return _snapshot._stream_member(zf, member, dest)
+
+    def _validate_vector_sqlite(self, path: Path, dimension: int | None) -> None:
+        return _snapshot._validate_vector_sqlite(path, dimension)
 
     def _recreate_fts(self) -> None:
-        if self._fts is not None:
-            try:
-                self._fts.close()
-            except Exception:
-                pass
-            self._fts = None
-        if self.config.use_hybrid and self._fts_cache_path is not None:
-            try:
-                fts = FtsIndex(self._fts_cache_path)
-                self._fts = fts if fts.available else None
-            except Exception:
-                self._fts = None
+        return _snapshot._recreate_fts(self)
 
     def _safe_path(self, source: str) -> Path:
         # kb_read 只能读 Markdown 与纯文本文件：拒绝任意扩展名，防止把私钥/配置等任意
@@ -3269,219 +1223,31 @@ class MarkdownIndexer:
         return candidate
 
     def start_watching(self, interval: float = 0.25, debounce_seconds: float | None = None) -> None:
-        if getattr(self, "_stopping", False) and self._watch_thread is not None:
-            # 上一次 stop 还没真正收干净，先把残留线程收掉再启新的。
-            self._watch_thread.join(timeout=2)
-            if self._watch_thread.is_alive():
-                return
-            self._watch_thread = None
-            self._stopping = False
-        if self._watch_thread and self._watch_thread.is_alive():
-            return
-        if self._fs_watcher is not None and self._fs_watcher.is_alive():
-            return
-        debounce = self.config.debounce_seconds if debounce_seconds is None else debounce_seconds
-        self._fs_debounce_seconds = debounce
-        # 注意：这里刻意不再内联 sync()。此前首轮全量索引在调用方线程里同步跑，
-        # 而 start_watching 由首个工具调用（server._indexer_for）触发，于是
-        # kb_init 返回的 "indexing: started in background" 是假的 —— 请求会
-        # 阻塞到整个库索引 + embedding 完成（大库是分钟到小时级），客户端往往
-        # 直接超时。首轮 sync 交给下面起的监听线程去做。
-        self._watch_stop.clear()
-        method = self.config.watch_method
-        # auto：平台支持就用原生；native：优先原生（比如想在非 Windows 上显式
-        # 表达意图）；两者启动失败都静默退回轮询，监听永不因此失效。
-        if method in {"auto", "native"} and (method == "native" or watcher_available()):
-            watcher = WindowsDirectoryWatcher(self.vault_path, self._on_fs_events)
-            if watcher.start():
-                self._fs_watcher = watcher
-                self._watch_thread = threading.Thread(
-                    target=self._native_watch_loop, args=(interval, debounce), daemon=True, name="vault-watch-native"
-                )
-                self._watch_thread.start()
-                self._start_fs_scheduler()
-                return
-            self._fs_watcher = None
-        self._watch_thread = threading.Thread(target=self._watch_loop, args=(interval, debounce), daemon=True)
-        self._watch_thread.start()
-        self._start_fs_scheduler()
+        return _watch.start_watching(self, interval=interval, debounce_seconds=debounce_seconds)
 
     def _start_fs_scheduler(self) -> None:
-        if self._fs_scheduler_thread is not None and self._fs_scheduler_thread.is_alive():
-            return
-        self._fs_scheduler_thread = threading.Thread(
-            target=self._fs_scheduler_loop, daemon=True, name="vault-fs-debounce"
-        )
-        self._fs_scheduler_thread.start()
+        return _watch._start_fs_scheduler(self)
 
     def _fs_scheduler_loop(self) -> None:
-        """防抖调度：事件到达后，安静 debounce 秒才 sync；事件持续到达就顺延，
-        但受 _FS_MAX_DEBOUNCE_WAIT 封顶（到期立即执行）。常驻单线程，
-        替代此前「每事件新建/取消一个 threading.Timer」的线程洪泛。
-        """
-        while not self._watch_stop.is_set():
-            with self._fs_debounce_lock:
-                if not self._fs_requested:
-                    self._fs_debounce_cv.wait(timeout=0.5)
-                    continue
-                now = time.monotonic()
-                elapsed = now - (self._fs_pending_since or now)
-                if elapsed < self._fs_debounce_seconds and elapsed < _FS_MAX_DEBOUNCE_WAIT:
-                    self._fs_debounce_cv.wait(timeout=self._fs_debounce_seconds - elapsed)
-                    continue  # 重新评估：期间又有事件则继续顺延
-                self._fs_requested = False
-                self._fs_pending_since = None
-                due = True
-            if not due:
-                continue
-            if self._watch_stop.is_set():
-                return
-            self._run_sync_quietly()
+        return _watch._fs_scheduler_loop(self)
 
     def _on_fs_events(self, events: list[tuple[int, str]] | None) -> None:
-        """原生监听的回调：把「库里有动静」翻译成一次防抖后的全量 sync。
-
-        正确性由 sync() 的全量 sha256 对账兜底。events=None（内核缓冲区溢出，
-        具体改动不可知）也走同一条路。事件路径在这里做第一层过滤：Obsidian
-        的 .obsidian/、缓存目录、以及被 ignore 规则排除的路径变动不需要唤醒
-        全量 sync——递归监视看不到排除目录，所以必须过滤而不是指望不触发。
-        """
-        if events is not None:
-            keep = False
-            for _, rel in events:
-                if self._fs_event_matters(rel):
-                    keep = True
-                    break
-            if not keep:
-                return
-        with self._fs_debounce_lock:
-            now = time.monotonic()
-            if self._fs_pending_since is None:
-                self._fs_pending_since = now
-            self._fs_requested = True
-            self._fs_debounce_cv.notify_all()
+        return _watch._on_fs_events(self, events)
 
     def _fs_event_matters(self, rel: str) -> bool:
-        """事件路径是否需要触发全量 sync。"""
-        if not rel:
-            return True
-        rel = rel.replace("\\", "/").lstrip("/")
-        # 缓存落在 vault 内时，自己写缓存不能再次触发自己。
-        if self.config.cache.placement == "vault" and self.config.cache.subdir:
-            if rel.startswith(self.config.cache.subdir.rstrip("/") + "/") or rel == self.config.cache.subdir:
-                return False
-        lower = rel.lower()
-        for pattern in self.config.exclude_patterns:
-            stripped = pattern.strip().strip("/").lower()
-            if stripped and (lower == stripped or lower.startswith(stripped + "/")):
-                return False
-        return any(lower.endswith(ext) for ext in _INDEXABLE_TEXT_EXTS)
+        return _watch._fs_event_matters(self, rel)
 
     def _run_sync_quietly(self) -> None:
-        """sync() 的守护包装：监听线程里的任何异常都不能把线程打死。
-
-        轮询/兜底循环此前直接 try/except 包住 sync()，但异常吞掉后没有任何
-        痕迹；这里统一加退避记账，避免端点持续故障时变成紧密自旋。
-        """
-        self._indexing = True
-        try:
-            self.sync()
-            self._sync_failures = 0
-        except Exception:
-            self._sync_failures = getattr(self, "_sync_failures", 0) + 1
-            time.sleep(min(0.5 * (2 ** min(self._sync_failures - 1, 4)), 5.0))
-        finally:
-            self._indexing = False
+        return _watch._run_sync_quietly(self)
 
     def _native_watch_loop(self, interval: float, debounce: float) -> None:
-        """原生监听生效期间的兜底循环，职责有二：
-
-        1. 低频（watch_fallback_interval，默认 30s）全量对账，覆盖原生事件可能
-           丢失的极端情况——sync 是全量 sha256 对账，多跑只是白花一点 IO；
-        2. 盯住 watcher 线程存活性：一旦它退出（句柄失效等），退回全速轮询，
-           监听永不静默失效。
-        """
-        fallback_interval = self.config.watch_fallback_interval
-        # 首轮全量 sync：watch_fallback_interval=0 时兜底循环一次都不会跑，
-        # 没有这一句就永远等不到第一次索引。
-        if not self._watch_stop.is_set():
-            self._run_sync_quietly()
-        while not self._watch_stop.is_set():
-            if self._fs_watcher is None or not self._fs_watcher.is_alive():
-                break
-            if self._watch_stop.wait(fallback_interval if fallback_interval > 0 else interval):
-                return
-            if self._fs_watcher is None or not self._fs_watcher.is_alive():
-                break
-            if fallback_interval > 0:
-                self._run_sync_quietly()
-        if self._watch_stop.is_set():
-            return
-        # 降级：原生线程已退出，退回 0.25s 全速轮询（0.4.1 行为）。
-        watcher = self._fs_watcher
-        self._fs_watcher = None
-        if watcher is not None:
-            watcher.stop()
-        self._watch_loop(interval, debounce)
+        return _watch._native_watch_loop(self, interval, debounce)
 
     def _watch_loop(self, interval: float, debounce: float) -> None:
-        pending_since: float | None = None
-        # 基线必须取在 sync 之前：先 sync 后取基线的话，「sync 完成到取基线之间」
-        # 落盘的改动会被当成已同步而从此丢失——线程刚启动时这个窗口最大（主线程
-        # 往往在 watcher 线程第一次扫描前就写完了文件）。先取基线再 sync，两者
-        # 之间出现的改动由随后的 sync 补上，之后的改动才由轮询发现。
-        previous = self._quick_signatures()
-        self._run_sync_quietly()
-        while not self._watch_stop.wait(interval):
-            try:
-                current = self._quick_signatures()
-            except OSError:
-                # rglob 与 stat 之间文件被删（Obsidian 的编辑器 churn 下很常见）
-                # 此前会让整个线程死于 FileNotFoundError，监控从此静默关闭、
-                # 服务用旧数据继续答搜索。跳过本轮，下一轮再试。
-                time.sleep(0.05)
-                continue
-            if current != previous:
-                pending_since = pending_since or time.monotonic()
-                if time.monotonic() - pending_since >= debounce:
-                    self._run_sync_quietly()
-                    previous = self._quick_signatures()
-                    pending_since = None
-            else:
-                pending_since = None
+        return _watch._watch_loop(self, interval, debounce)
 
     def _quick_signatures(self) -> dict[str, tuple[int, int]]:
-        # 同一路径只 stat 一次：此前对每个文件 stat 两次（mtime_ns 一次、
-        # size 一次），0.25s 轮询模式下把开销翻倍。
-        out: dict[str, tuple[int, int]] = {}
-        for path in self._markdown_files():
-            try:
-                stat = path.stat()
-            except OSError:
-                continue  # 文件刚被删：跳过，下一轮自然消失
-            out[self._source(path)] = (stat.st_mtime_ns, stat.st_size)
-        return out
+        return _watch._quick_signatures(self)
 
     def stop_watching(self) -> None:
-        self._watch_stop.set()
-        with self._fs_debounce_lock:
-            self._fs_requested = False
-            self._fs_pending_since = None
-            self._fs_debounce_cv.notify_all()
-        if self._fs_scheduler_thread is not None:
-            self._fs_scheduler_thread.join(timeout=2)
-            self._fs_scheduler_thread = None
-        watcher, self._fs_watcher = self._fs_watcher, None
-        if watcher is not None:
-            watcher.stop()
-        if self._watch_thread is not None:
-            self._watch_thread.join(timeout=2)
-            if self._watch_thread.is_alive():
-                # 线程没停就别把引用丢掉：持引用才能让下一次 stop_watching
-                # 继续 join，也让 is_alive() 对外如实反映"还在跑"。
-                # 丢掉引用会导致 kb_remove→kb_init 同一目录时新旧两个
-                # watcher 并存，各自写同一批缓存文件（cache key 相同）。
-                self._stopping = True
-            else:
-                self._watch_thread = None
-                self._stopping = False
+        return _watch.stop_watching(self)

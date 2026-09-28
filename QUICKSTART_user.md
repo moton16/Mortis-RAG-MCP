@@ -43,9 +43,20 @@ python -m pip install -e .
 # 仍失败（如离线/构建隔离异常）再退而求其次：
 # python -m pip install -e . --no-build-isolation
 # 可选加速（批量余弦用 numpy）：
-# python -m pip install numpy
+# python -m pip install numpy   # 等价写法：python -m pip install "mortis-rag-mcp[accel]"
 # 可选：磁盘向量后端（向量不占内存，13k 切片约省 55MB RAM）：
 # python -m pip install "mortis-rag-mcp[vec]"   # 然后配置里开 [vector] backend = "sqlite_vec"
+```
+
+上面两个可选依赖**建议装上**，大库体验更好：
+
+- `numpy` 让检索排序快约一个数量级（批量余弦）；
+- `sqlite-vec` 让向量落盘、不占内存（装完在 `config/app.toml` 里把 `[vector]` 的 `backend` 改为 `"sqlite_vec"`）。
+
+**不装也完全能用**：没有 numpy 时自动回退内置标量计算（结果一致，只是慢些）；没有 sqlite-vec 时用默认的内存后端，核心功能不受影响。一次装齐：
+
+```powershell
+python -m pip install "mortis-rag-mcp[accel,vec]"
 ```
 
 ## 2. 配置

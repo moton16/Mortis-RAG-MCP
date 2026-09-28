@@ -173,6 +173,47 @@ def test_kb_exempt_api(tmp_path):
     assert len(indexer.all_chunks()) == 2
 
 
+def test_check_exemption_rejects_paths_outside_vault(tmp_path):
+    """C1 回归：vault 外路径（含真实存在的文件）必须与「不存在」同响应。
+
+    存在性 oracle 被封死的判据：库外文件明明在磁盘上，回报仍是
+    "file not found on disk" 且不抛异常、响应键集不变。
+    """
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (vault / "inside.md").write_text("# Inside\n正常内容", encoding="utf-8")
+    (tmp_path / "outside.md").write_text("# Outside\n库外真实文件", encoding="utf-8")
+
+    config = AppConfig(vault_path=str(vault))
+    indexer = MarkdownIndexer(vault, config)
+    indexer.sync()
+
+    for bad_source in ["../outside.md", "C:/x.md", "../../outside.md"]:
+        res = indexer.check_exemption(bad_source)
+        assert res["is_exempt"] is False
+        assert res["reason"] == "file not found on disk"
+        # 响应键集冻结（MCP 返回契约）
+        assert set(res.keys()) == {"source", "is_exempt", "reason", "has_block_ignores", "indexed_chunks"}
+
+    # 库内文件不受影响，正常回报
+    assert indexer.check_exemption("inside.md")["reason"] == "none (actively indexed)"
+
+    # 库内真实存在但后缀不受支持：必须与「不存在」区分开，否则是给模型的假事实
+    # （"这个文件为什么没被索引" 会得到"磁盘上没这个文件"）。
+    for name in ("paper.pdf", "board.canvas"):
+        (vault / name).write_bytes(b"not markdown at all")
+        unsupported = indexer.check_exemption(name)
+        assert unsupported["is_exempt"] is False
+        assert "unsupported source type" in unsupported["reason"]
+        assert set(unsupported.keys()) == {
+            "source",
+            "is_exempt",
+            "reason",
+            "has_block_ignores",
+            "indexed_chunks",
+        }
+
+
 def test_stdio_kb_exempt_tool(tmp_path):
     vault = tmp_path / "vault"
     vault.mkdir()

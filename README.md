@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/moton16/Mortis-RAG-MCP/actions/workflows/ci.yml/badge.svg)](https://github.com/moton16/Mortis-RAG-MCP/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Version: 0.7.3](https://img.shields.io/badge/Version-0.7.3-blue.svg)](CHANGELOG_user.md)
+[![Version: 0.8.0](https://img.shields.io/badge/Version-0.8.0-blue.svg)](CHANGELOG_user.md)
 
 [English](README_EN.md) | 简体中文
 
@@ -14,6 +14,9 @@
 ## 🌟 核心特性
 
 - 📂 **自由挂载，零路径绑定**：通过 `kb_init` 一键挂载任意本地文件夹为知识库，配置持久化保存，不绑定死路径，换电脑或多库管理极简。
+- 📖 **切片原地展开与双链直读（0.8.0）**：命中切片后直接由 `kb_read(chunk_id=...)` 原地展开上下文，省去手工换算行号；遇到 `[[双链]]` 引用直接按短名快速寻址阅读。
+- 🏷️ **别名检索与硬词保底（0.8.0）**：原生支持 frontmatter `aliases` 别名；支持 `exact_terms` 专有名词硬包含保底，专有代号与生僻术语绝不漏召回。
+- 🛡️ **搜索预算控制与本地诊断（0.8.0）**：支持 `budget_bytes` 字节硬预算，避免大搜索撑爆上下文或击穿宿主缓冲区；支持脱敏本地诊断日志。
 - 📚 **库名直呼与多库定向（0.7.2）**：检索时可直接传库名（如 `vault_path="我的笔记"`）而无需拼接 Windows 漫长物理路径；支持通过 `vault_paths` 数组同时指定多个目标库定向检索。
 - 🔍 **轻量预览与二段式精读（0.7.2）**：支持 `preview=true` 极速返回高光切片与行号，降低 70%+ Token 消耗，正文配合 `kb_read` 按需精准精读。
 - 📄 **纯文本 .txt 原生收录（0.7.2）**：纯文本 `.txt`（小说/分卷/资料）与 Markdown 享有同等索引地位，支持小说章节标题自动识别。

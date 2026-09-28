@@ -146,6 +146,34 @@ DEFAULT_EXCLUDE_FRONTMATTER_KEYS = ["rag_exclude", "rag_ignore", "no_rag"]
 
 
 @dataclass(slots=True)
+class IndexConfig:
+    # kb_read 单次读取最大字符数截断阈值，防止整篇大文件撑爆模型上下文或击穿宿主缓冲区。
+    # 默认 20000 字符；可在 [index] 节中配置 read_max_chars。
+    read_max_chars: int = 20000
+
+    def __post_init__(self) -> None:
+        # 防御正整数：下限 100，上限 1000000，非法值退回默认 20000
+        # 避免配置手误（负数、非法类型、超大值）导致服务抛异常无法启动
+        try:
+            val = int(self.read_max_chars)
+            if isinstance(self.read_max_chars, bool) or val < 100 or val > 1_000_000:
+                self.read_max_chars = 20000
+            else:
+                self.read_max_chars = val
+        except (TypeError, ValueError, OverflowError):
+            self.read_max_chars = 20000
+
+
+@dataclass(slots=True)
+class DiagConfig:
+    enabled: bool = False
+    dir: str = "~/.mortis_rag_mcp"
+    max_bytes: int = 1048576  # 1MB
+    files: int = 2
+    retention_days: int = 7
+
+
+@dataclass(slots=True)
 class AppConfig:
     # 空串 = 未配置默认库（0.3.0 起 vault 选择完全由用户级注册表接管，
     # 该字段仅作为 legacy [vault].path 的读取出口供自动迁移使用）。
@@ -155,6 +183,8 @@ class AppConfig:
     vector: VectorConfig = field(default_factory=VectorConfig)
     cache: CacheConfig = field(default_factory=CacheConfig)
     ingest: IngestConfig = field(default_factory=IngestConfig)
+    index: IndexConfig = field(default_factory=IndexConfig)
+    diag: DiagConfig = field(default_factory=DiagConfig)
     # 混合检索开关：true（默认）用 FTS5 BM25 + 向量余弦 + bigram 词法三路 RRF
     # 融合；false 完整还原旧的「词法软信号 + 余弦」行为。
     use_hybrid: bool = True
@@ -233,6 +263,14 @@ class AppConfig:
             self.ingest.output_dirname = ".mortis-parsed"
         else:
             self.ingest.output_dirname = out_dir
+        if self.diag.max_bytes < 1:
+            raise ValueError("diag.max_bytes must be positive")
+        if self.diag.files < 1:
+            raise ValueError("diag.files must be >= 1")
+        if self.diag.retention_days < 0:
+            raise ValueError("diag.retention_days must be >= 0")
+        if not self.diag.dir:
+            raise ValueError("diag.dir must not be empty")
 
 
 def _env(value: Any) -> Any:
@@ -441,6 +479,27 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
 
     ignore_file = str(index.get("ignore_file", data.get("ignore_file", ".vaultignore")))
 
+    raw_read_max_chars = index.get("read_max_chars", data.get("read_max_chars", 20000))
+    # 防御正整数：下限 100，上限 1000000，非法值退回默认 20000
+    # 避免因用户手误（如负数、非法字符串）导致服务启动失败
+    read_max_chars = 20000
+    if not isinstance(raw_read_max_chars, bool):
+        try:
+            parsed_chars = int(raw_read_max_chars)
+            if 100 <= parsed_chars <= 1_000_000:
+                read_max_chars = parsed_chars
+        except (TypeError, ValueError, OverflowError):
+            pass
+
+    diag = _section(data, "diag")
+    dg = DiagConfig(
+        enabled=bool(diag.get("enabled", False)),
+        dir=str(_env(diag.get("dir", "~/.mortis_rag_mcp"))),
+        max_bytes=_numeric(diag, data, "max_bytes", int, 1048576, 1),
+        files=_numeric(diag, data, "files", int, 2, 1),
+        retention_days=_numeric(diag, data, "retention_days", int, 7, 0),
+    )
+
     return AppConfig(
         vault_path=str(vault_path),
         embedding=emb,
@@ -448,6 +507,8 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
         vector=VectorConfig(backend=str(vector.get("backend", "memory")).lower()),
         cache=cch,
         ingest=ing,
+        index=IndexConfig(read_max_chars=read_max_chars),
+        diag=dg,
         use_hybrid=bool(index.get("use_hybrid", data.get("use_hybrid", True))),
         chunk_size=_numeric(index, data, "chunk_size", int, 1200, 1),
         chunk_overlap=_numeric(index, data, "chunk_overlap", int, 0, 0),
