@@ -418,7 +418,35 @@
 > - **测试隔离缺陷（不在本批 8 卡范围，仅上报不动）**：`config.py` 的 `DEFAULT_CACHE_DIR` 固定为 `~/.mortis_rag_mcp_cache` 且无环境变量可覆盖，而 `tests/test_exempt.py`、`tests/test_mcp_stdio.py` 等 stdio 用例的 app.toml 未写 `[cache] dir`（`test_registry_server.py`、`test_multivault.py`、`test_snapshot.py` 等则写了），这些用例会把临时库缓存写进使用者的真实缓存目录——本机实测累积 **18153** 个孤儿缓存文件；叠加 pytest 默认只保留 3 轮 `tmp_path`、更早整轮被改名 `garbage-*` 后整目录删除（实测单个目录 837~1262 文件），本机每跑一次全量即触发一次 500+ 文件的批量删除审核。另 `tests/test_budget_bytes.py` 的子进程 env 只设 `VAULT_MCP_REGISTRY`，宿主若导出 `MORTIS_RAG_REGISTRY`（新名优先）会压过测试自身隔离：本会话实测该陷阱令 `test_mcp_stdio.py` 两个用例假失败（`KeyError: 'description'`，真因是复用的注册表已存在、legacy `vault_path` 自动迁移被跳过），故本地验证统一改用「仅重定向 `HOME`/`USERPROFILE`、不导出任何 REGISTRY 变量、独立 `--basetemp` + `-p no:cacheprovider`」的隔离配方（修正后同批用例即全绿）。
 > - **本轮不做**：§4 明确清单（C3/C4/C5/C7/C8 与 46 条 informational）一律未动；`tests/test_subvaults.py` 的 rebuild 已知环境红未顺手修。
 
+### FIX-9 — moton16,2026-9-29,CodeBuddy,Deepseek-V4.1-Flash — docs: PROJECT_GUIDE 转义污染全量清理（805 处反斜杠残留还原）
 
+> **涵盖提交**：`docs: PROJECT_GUIDE 转义污染全量清理（§1–§15 共 805 处反斜杠残留还原）`（`e5eb33d`）
+> **来源**：v0.8.1 计划 Lane E 的前置独立 commit（用户裁定 D4：P1 必须先于 C58 的 §四/§七 文档改动，否则同一文件里大段机械 diff 与语义编辑互相遮蔽）。编号走并行线——`C53`–`C64` 已被 v0.8.1 的 12 张卡占用，故沿用 `FIX-x` 清扫线。
+>
+> **问题（规模实测，与原始描述不一致）**：`REPORT.md` 的 P1 记「§3.2 标题、§4.5、§六/七多处」；实测污染覆盖 §1–§15：**290 / 1103 行、805 个反斜杠 token、21 种形态**。其中 `\_` 的 7 反斜杠形态 592 处、3 反斜杠 19 处、1 反斜杠 103 处，系多轮「转义反斜杠 + 转义标点」叠加而成；GitHub 渲染后表现为标识符前挂着若干反斜杠。
+>
+> **映射与命中数（逐形态定目标后脚本化还原）**：
+> - markdown 标点转义 `\_` `\[` `\]` `\*` `\~` → 去反斜杠：**770** 处
+> - 水平分割线 `\---` → `---`：**16** 处
+> - f-string 空字符 `\0`：8 → 1 反斜杠：**4** 处
+> - 长路径前缀 `\\?\\`：16 → 2 反斜杠：**1** 处
+> - PowerShell 路径分隔符：8 → 1 反斜杠 **3** 处；连缀符 `&&`：7 → 0 反斜杠 **2** 处
+> - JSON 示例 Windows 路径 `D:\\笔记\\工作库`：16 → 2 反斜杠：**2** 处
+> - SQL `ESCAPE '\\'`：8 → 2 反斜杠；同行括号内被转义字符 `\`：8 → 1 反斜杠：各 **1** 处
+> - **刻意保留（合法、非遗留）**：regex `\b` 3 处、Markdown 表格单元格 `\|` 1 处（表格必需）；`Quick-start_developer.md` §7 的 `.\.venv\Scripts\python.exe` 本就是单反斜杠（非污染，未动）。
+>
+> **验证**：清理后对全文重跑反斜杠 token 直方图，残留仅剩上述合法形态（无意外残留）；行数 1103 不变；`git diff --stat` = 292 insertions / 292 deletions（纯行内替换）；无代码与测试影响。
 
+### FIX-10 — moton16,2026-9-29,CodeBuddy,Deepseek-V4.1-Flash — docs: 过期行号订正 + 仓库地图/白名单修齐（5 个主文档口径，X3）
 
+> **涵盖提交**：`docs: 过期行号订正 + 仓库地图/白名单修齐（5 个主文档口径，X3）`（`96e205f`）
+> **来源**：v0.8.1 计划 Lane E（陈旧行号）；用户裁定 X3（延后项用仓库自己的 `docs/Execution-plan_developer.md` 口径，不新建根 `TODOS.md`）。
+>
+> **改动概况**：
+> - **过期行号**：`PROJECT_GUIDE.md` §4.8 `server.py` 约 1064 → 约 1312 行（计划点名的三处之一）；同清单内一并订正 §4.1 config 465→526、§4.2 registry 363→384、§4.5 indexer 1238→1253、§4.6 fts 149→152。`Quick-start_developer.md` 仓库地图 server.py 1126→1312、config 390→526、registry 304→384、indexer 1238→1253、fts 149→152、包体 `~5800`→`~10850` 行。实测依据：`server.py` **1312 行**（计划记 1313，以实测为准）；Lane C（C55–C57）改动后行数会再变，**由 C60/T8 复核**。
+> - **测试规模标注**：`PROJECT_GUIDE.md` §11「24 个文件 / 约 5250 行 / 264+ passed, 2 skipped」与 `Quick-start_developer.md`「340+ 测试用例」「22 个测试文件」→ 实测 **50 个文件 / 49 个测试文件 / 416 个用例 / 约 11570 行**；并把「全量 pytest 全绿」的表述改为「全量回归由 CI 承接，本地按靶向文件单跑」，与「本地不跑全量」的项目约定对齐。
+> - **仓库地图与白名单（X3）**：新建 `docs/Execution-plan_developer.md`（延后项落点：`_save_state` 剪枝、`list_files()` 全量构造、FTS 构造期写盘、多平台 watcher、云路径验收闸门、TTHW/进度反馈/DX 候选、两条口径残留）；`.gitignore` 白名单 3 → 5（+ `Execution-plan_developer.md`、+ `Docs_Folder-descriptions.md`）；`Docs_Folder-descriptions.md` 的「只需保留」清单 4 → 5；`Quick-start_developer.md` §2 地图补 `PROJECT_GUIDE.md` 与 `Docs_Folder-descriptions.md` 两行（原地图漏列 PROJECT_GUIDE）。
+> - **历史条目处置（本次裁定）**：本文件 C49 条目「`server.py` 由 1359 行降至 1126 行」**不改写**（该数字在其提交时点为真），仅追加「（v0.8.1 实测 1312 行）」注——记账流水是历史快照，不随版本回填。
+>
+> **验证**：纯文档/配置改动，无代码与测试影响；18 处替换均由脚本断言「原文唯一命中」后落盘；`.gitignore` 生效核验 = 两个新文件在 `git status` 中由「被忽略」变为「未跟踪可见」，提交后显示 `create mode 100644` 两行。
 
