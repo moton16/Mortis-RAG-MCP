@@ -77,6 +77,9 @@ backend = "memory"
 # Disk cache of chunk signatures + embeddings so restarts skip re-embedding.
 # Defaults: enabled = true (when the section is absent it is still enabled),
 # dir = ~/.mortis_rag_mcp_cache (兼容旧名 ~/.vault_mcp_cache), embedding_max_workers = 6.
+# 未在此处显式写 dir 时，默认落点可用环境变量覆盖：
+#   MORTIS_RAG_CACHE_DIR（新名，优先）/ VAULT_MCP_CACHE_DIR（旧名兼容）。
+# 显式写了 dir 则以此处为准。
 enabled = true
 # Concurrent embedding requests during full rebuilds.
 embedding_max_workers = 2

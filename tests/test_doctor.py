@@ -439,8 +439,11 @@ def test_doctor_render_md_declares_detail_column_is_not_an_instruction():
 def _stub_home(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    # 摘掉 conftest 的会话 pin 与缓存根覆盖（C54），否则测不到「按 home 解析」的行为
     monkeypatch.delenv("MORTIS_RAG_CONFIG", raising=False)
     monkeypatch.delenv("VAULT_MCP_CONFIG", raising=False)
+    monkeypatch.delenv("MORTIS_RAG_CACHE_DIR", raising=False)
+    monkeypatch.delenv("VAULT_MCP_CACHE_DIR", raising=False)
 
 
 def test_doctor_check_config_reports_full_path_and_flags_shadowed_old_config(tmp_path, monkeypatch):

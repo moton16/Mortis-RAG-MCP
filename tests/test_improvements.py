@@ -204,9 +204,12 @@ def test_short_acronym_lexical_boost_and_word_boundary(tmp_path):
     assert combo_results[0].source == "circuit.md"
 
 
-def test_multivault_search_with_rerank_integration(tmp_path):
+def test_multivault_search_with_rerank_integration(tmp_path, monkeypatch):
     from mortis_rag_mcp.server import VaultMcpServer
     import json
+
+    # C54c：VaultMcpServer() 构造会读注册表并后台预索引其中的库；不隔离会读宿主真实注册表
+    monkeypatch.setenv("MORTIS_RAG_REGISTRY", str(tmp_path / "vaults.toml"))
 
     v1 = tmp_path / "vault1"
     v2 = tmp_path / "vault2"

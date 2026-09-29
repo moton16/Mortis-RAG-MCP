@@ -70,8 +70,18 @@ class VectorConfig:
 
 
 def resolve_default_cache_dir() -> str:
-    """新名 ~/.mortis_rag_mcp_cache 优先；旧名独占时原子搬迁。
-    延迟至运行时调用，严禁在模块顶层 import 时产生文件系统副作用。"""
+    """默认缓存根：env 覆盖 > 新名 ~/.mortis_rag_mcp_cache >（旧名独占时）原子搬迁。
+    延迟至运行时调用，严禁在模块顶层 import 时产生文件系统副作用。
+
+    env 覆盖（MORTIS_RAG_CACHE_DIR 新名优先 / VAULT_MCP_CACHE_DIR 旧名兼容）**必须短路在
+    改名逻辑之前**：下面的 os.rename 是真实副作用，用 env 显式指定缓存根的会话（测试隔离、
+    多实例并行）不该顺带搬动宿主的 ~/.vault_mcp_cache。只作用于「未显式配置 [cache] dir」
+    的场景——配置文件里写了 dir 时以配置为准（load_config 的口径）。
+    """
+    override = (os.getenv("MORTIS_RAG_CACHE_DIR", "").strip()
+                or os.getenv("VAULT_MCP_CACHE_DIR", "").strip())
+    if override:
+        return str(Path(override).expanduser())
     new = Path.home() / ".mortis_rag_mcp_cache"
     old = Path.home() / ".vault_mcp_cache"
     if not new.exists() and old.exists():

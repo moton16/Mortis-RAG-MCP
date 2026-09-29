@@ -97,6 +97,9 @@ def test_resolve_api_key_and_registry_env_priority(tmp_path, monkeypatch):
 
 def test_resolve_config_path_and_cache_dir_chain(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    # 本用例专测「默认缓存根的改名链」，必须摘掉 conftest 的 env 覆盖（C54a'）与配置 pin
+    monkeypatch.delenv("MORTIS_RAG_CACHE_DIR", raising=False)
+    monkeypatch.delenv("VAULT_MCP_CACHE_DIR", raising=False)
 
     # 1. Cache dir: old exists -> atomic migration to new
     old_cache = tmp_path / ".vault_mcp_cache"
@@ -172,6 +175,8 @@ def test_user_config_dir_rename_race_fallback_to_new_if_exists(tmp_path, monkeyp
 
 def test_resolve_default_cache_dir_rename_race_fallback_to_new_if_exists(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.delenv("MORTIS_RAG_CACHE_DIR", raising=False)
+    monkeypatch.delenv("VAULT_MCP_CACHE_DIR", raising=False)
     old_cache = tmp_path / ".vault_mcp_cache"
     new_cache = tmp_path / ".mortis_rag_mcp_cache"
     old_cache.mkdir()
