@@ -24,6 +24,9 @@ import time
 from typing import Any, Callable
 from contextvars import ContextVar
 
+# 版本号单一真源（包顶层 __version__）；不要再在诊断日志里硬编码版本字面量
+from . import __version__ as PACKAGE_VERSION
+
 # 10 键白名单，超出此名单的任何字段绝对禁止落盘
 WHITELIST_KEYS = frozenset({
     "ts",
@@ -192,7 +195,7 @@ def record(
     response_bytes: int | None = None,
     truncated: bool | None = None,
     error_code: str | None = None,
-    version: str = "0.8.0",
+    version: str = PACKAGE_VERSION,
     config: Any = None,
     ts: str | None = None,
     **extra: Any,
@@ -223,7 +226,7 @@ def record(
         "tool": str(tool),
         "stage": stage_str,
         "ms": round(float(ms), 2),
-        "version": str(version or "0.8.0"),
+        "version": str(version or PACKAGE_VERSION),
     }
     if result_count is not None:
         try:

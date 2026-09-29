@@ -13,7 +13,7 @@ from mortis_rag_mcp.config import AppConfig, DiagConfig, EmbeddingConfig, load_c
 from mortis_rag_mcp import diaglog
 from mortis_rag_mcp.indexer import MarkdownIndexer
 from mortis_rag_mcp.registry import VaultRegistry
-from mortis_rag_mcp.server import VaultMcpServer
+from mortis_rag_mcp.server import SERVER_INFO, VaultMcpServer
 
 
 @pytest.fixture
@@ -117,7 +117,8 @@ def test_diag_enabled_whitelist_fields_and_corr_id(isolated_env: tuple[Path, Pat
     assert set(first_line.keys()).issubset(allowed_keys)
     assert first_line["tool"] == "kb_list"
     assert first_line["stage"] == "serialize"
-    assert first_line["version"] == "0.8.0"
+    # 版本号取自包顶层单一真源，不再硬编码（C63）——发版只改 mortis_rag_mcp.__version__
+    assert first_line["version"] == SERVER_INFO["version"]
     assert isinstance(first_line["ms"], (int, float))
     assert isinstance(first_line["response_bytes"], int)
     assert len(first_line["corr_id"]) == 16  # secrets.token_hex(8)
