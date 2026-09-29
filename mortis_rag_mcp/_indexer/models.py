@@ -122,6 +122,32 @@ class Chunk:
         return d
 
 
+def path_prefix_match(source: str, prefix: str) -> bool:
+    """库内相对 posix 路径的前缀匹配（kb_search 的 SearchFilter.path_prefix 与
+    kb_list_files 共用同一口径，避免两套前缀语义漂移）。
+
+    - 归一化：反斜杠 → '/'、去尾部 '/'，Windows 下大小写不敏感；
+    - D14：穿透 `.mortis-parsed/` 产物目录，让源目录前缀也能召回对应的 PDF 摄取产物；
+    - 空 prefix 返回 True（调用方仍应显式判空，避免「没传前缀 = 全选中」被误解）。
+
+    这里没有路径穿越风险：source 恒为库内相对路径，`../` 或绝对路径只会零命中。
+    """
+    p = str(prefix or "").replace("\\", "/").rstrip("/")
+    if not p:
+        return True
+    src = source
+    if os.name == "nt":
+        p = p.casefold()
+        src = src.casefold()
+    if src.startswith(p):
+        return True
+    for parsed_dir in (".mortis-parsed/", ".mortis-parsed"):
+        pdir = parsed_dir.casefold() if os.name == "nt" else parsed_dir
+        if src.startswith(pdir) and src[len(pdir):].lstrip("/").startswith(p):
+            return True
+    return False
+
+
 @dataclass
 class SearchFilter:
     """kb_search 的过滤条件与分页参数（全部可选）。
@@ -141,28 +167,9 @@ class SearchFilter:
     def matches(self, chunk: Chunk) -> bool:
         """chunk 是否满足全部已设置的条件（未设置的条件一律放行）。"""
         if self.path_prefix:
-            # 归一化后比较：source 恒为 posix 风格（'dir/file.md'），而 Windows
-            # 用户自然会传 '教材\\' 或大小写不同的 'notes/' —— 此前是裸
-            # startswith，两者都静默零召回（FTS 下推的 LIKE 对 ASCII 大小写
-            # 不敏感，比权威后过滤更宽松，掩盖了这个问题）。
-            prefix = self.path_prefix.replace("\\", "/").rstrip("/")
-            source = chunk.source
-            if os.name == "nt":
-                prefix = prefix.casefold()
-                source = source.casefold()
-            matched = False
-            if prefix and source.startswith(prefix):
-                matched = True
-            elif prefix:
-                # D14: 穿透 .mortis-parsed/ 产物目录，召回对应的 PDF 摄取文档
-                for parsed_dir in (".mortis-parsed/", ".mortis-parsed"):
-                    pdir = parsed_dir.casefold() if os.name == "nt" else parsed_dir
-                    if source.startswith(pdir):
-                        stripped = source[len(pdir):].lstrip("/")
-                        if stripped.startswith(prefix):
-                            matched = True
-                            break
-            if not matched:
+            # 归一化 / 大小写 / 产物目录穿透的细节见 path_prefix_match——它同时被
+            # kb_list_files 复用，保证「前缀」在前缀过滤与分页列表里是同一套语义。
+            if not path_prefix_match(chunk.source, self.path_prefix):
                 return False
         if self.tags:
             wanted = {str(tag).lower().lstrip("#") for tag in self.tags if str(tag).strip()}

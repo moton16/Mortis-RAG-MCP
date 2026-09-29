@@ -27,6 +27,7 @@ from ._indexer.models import (
     _candidate_terms,
     _extract_snippet,
     dedupe_by_content_hash,
+    path_prefix_match,
 )
 from ._indexer import scanning as _scanning
 from ._indexer.scanning import (
@@ -115,7 +116,12 @@ class MarkdownIndexer:
         config: AppConfig | None = None,
         embedding_provider: EmbeddingProvider | None = None,
         reranker_provider: RerankerProvider | None = None,
+        *,
+        load_vectors: bool = True,
     ) -> None:
+        # load_vectors=False：只读探测用（如 kb_read 的跨库 chunk_id 寻址）——跳过向量层
+        # 全量加载，省掉每个未加载库一次的向量反序列化；文本层与 FTS 仍会加载
+        # （残余代价见 docs/Execution-plan_developer.md 第 3 条）。
         self.vault_path = Path(vault_path).expanduser()
         self.config = config or AppConfig(vault_path=str(self.vault_path))
         self.embedding_provider = embedding_provider or create_embedding_provider(self.config.embedding)
@@ -194,7 +200,7 @@ class MarkdownIndexer:
         self._vector_backend: Any = None
         if self.config.cache.enabled and self.config.cache.dir:
             try:
-                self._init_cache_paths()
+                self._init_cache_paths(load_vectors=load_vectors)
             except OSError:
                 self._chunks_cache_path = None
                 self._vectors_cache_path = None
@@ -246,7 +252,7 @@ class MarkdownIndexer:
         normalized = os.path.normcase(os.path.realpath(raw))
         return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
 
-    def _init_cache_paths(self) -> None:
+    def _init_cache_paths(self, *, load_vectors: bool = True) -> None:
         root = self._cache_root()
         namespace = self.config.cache.namespace or "default"
         base = root / namespace
@@ -277,7 +283,7 @@ class MarkdownIndexer:
         # With the disk-backed sqlite_vec backend, vectors are not loaded into
         # RAM (that's the memory win); the disk store is migrated/flushed by
         # _ensure_disk_vectors_migrated() on first sync.
-        if self.config.vector.backend != "sqlite_vec":
+        if load_vectors and self.config.vector.backend != "sqlite_vec":
             self._load_vectors_cache()
         self._sweep_stale_cache()
 

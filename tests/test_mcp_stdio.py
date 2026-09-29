@@ -49,6 +49,54 @@ def test_stdio_initialize_tools_and_list_search(tmp_path):
     assert searched["chunks"][0]["metadata"]["heading"] == "项目笔记"
 
 
+def test_stdio_kb_list_files_pagination_and_prefix(tmp_path):
+    """C57/C62：分页切片、前缀过滤、total/next_offset 语义，以及缺省全量与现状一致。"""
+    vault = tmp_path / "vault"
+    (vault / "教材").mkdir(parents=True)
+    (vault / "杂记").mkdir(parents=True)
+    for i in range(3):
+        (vault / "教材" / f"ch{i}.md").write_text(f"# 教材 {i}\n数字电路内容 {i}\n", encoding="utf-8")
+    for i in range(2):
+        (vault / "杂记" / f"m{i}.md").write_text(f"# 杂记 {i}\n随笔内容 {i}\n", encoding="utf-8")
+
+    config = tmp_path / "app.toml"
+    config.write_text(f'vault_path = "{vault.as_posix()}"\nmode = "static"\n', encoding="utf-8")
+
+    responses = _run_stdio(config, [
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "kb_list_files", "arguments": {}}},
+        {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "kb_list_files", "arguments": {"limit": 2, "offset": 0}}},
+        {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "kb_list_files", "arguments": {"limit": 2, "offset": 2}}},
+        {"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": "kb_list_files", "arguments": {"path_prefix": "教材/"}}},
+        {"jsonrpc": "2.0", "id": 6, "method": "tools/call", "params": {"name": "kb_list_files", "arguments": {"offset": 99}}},
+    ])
+
+    full = json.loads(responses[1]["result"]["content"][0]["text"])
+    page1 = json.loads(responses[2]["result"]["content"][0]["text"])
+    page2 = json.loads(responses[3]["result"]["content"][0]["text"])
+    pref = json.loads(responses[4]["result"]["content"][0]["text"])
+    beyond = json.loads(responses[5]["result"]["content"][0]["text"])
+
+    # 缺省 = 全量（与修复前一致），且不标分页截断
+    assert full["total"] == 5 and len(full["files"]) == 5
+    assert full["next_offset"] is None and full["page_truncated"] is False
+
+    # 切片 + total（过滤后切片前）+ next_offset
+    assert [f["source"] for f in page1["files"]] == ["教材/ch0.md", "教材/ch1.md"]
+    assert page1["total"] == 5 and page1["next_offset"] == 2 and page1["page_truncated"] is True
+    assert [f["source"] for f in page2["files"]] == ["教材/ch2.md", "杂记/m0.md"]
+    assert page2["next_offset"] == 4
+
+    # 前缀过滤（与 kb_search.path_prefix 同口径）
+    assert pref["total"] == 3
+    assert all(f["source"].startswith("教材/") for f in pref["files"])
+
+    # offset 越界：空页 + total 仍为总数
+    assert beyond["files"] == []
+    assert beyond["total"] == 5
+    assert beyond["next_offset"] is None
+
+
 def test_stdio_kb_describe_updates_description(tmp_path):
     (tmp_path / "note.md").write_text("# Test\ncontent\n", encoding="utf-8")
     config = tmp_path / "app.toml"

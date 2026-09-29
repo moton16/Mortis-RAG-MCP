@@ -275,9 +275,12 @@ def test_multi_vault_chunk_id_disambiguation(tmp_path: Path):
     assert chunk1.id == chunk2.id
     cid = chunk1.id
 
-    # 1. 未传 vault_path 且多库存在：触发现有消歧机制报错
-    with pytest.raises(ValueError, match="multiple vaults registered; pass an explicit vault_path"):
+    # 1. 未传 vault_path 且真撞 id：fail-closed 并列出候选库（C56 契约变更）
+    with pytest.raises(ValueError) as exc_info:
         server._kb_read({"chunk_id": cid})
+    msg = str(exc_info.value)
+    assert "同时命中" in msg
+    assert "VaultOne" in msg and "VaultTwo" in msg
 
     # 2. 显式传 VaultOne：成功读取
     res1 = server._kb_read({"chunk_id": cid, "vault_path": "VaultOne"})
@@ -290,3 +293,149 @@ def test_multi_vault_chunk_id_disambiguation(tmp_path: Path):
     assert res2["source"] == "shared.md"
     assert res2["chunk_id"] == cid
     assert "Identical content" in res2["content"]
+
+
+def test_chunk_id_unique_hit_auto_expands_across_vaults(tmp_path: Path):
+    """C56 契约变更：唯一命中时未传 vault_path 也自动展开，并带库归属键。"""
+    vault_a = tmp_path / "vault_a"
+    vault_b = tmp_path / "vault_b"
+    vault_a.mkdir()
+    vault_b.mkdir()
+    (vault_a / "only_here.md").write_text("# Only\nunique alpha content\n", encoding="utf-8")
+    (vault_b / "other.md").write_text("# Other\nbeta content\n", encoding="utf-8")
+
+    config_path = tmp_path / "app.toml"
+    config_path.write_text('mode = "static"\n', encoding="utf-8")
+    server = VaultMcpServer(config_path)
+    server.registry.add(str(vault_a), name="VaultA")
+    server.registry.add(str(vault_b), name="VaultB")
+    idx_a = server._indexer_for({"vault_path": "VaultA"})
+    idx_b = server._indexer_for({"vault_path": "VaultB"})
+    idx_a.sync()
+    idx_b.sync()
+
+    cid = next(c for c in idx_a.all_chunks() if c.source == "only_here.md").id
+    res = server._kb_read({"chunk_id": cid})
+
+    assert res["source"] == "only_here.md"
+    assert res["chunk_id"] == cid
+    assert res["vault"] == "VaultA"
+    assert res["vault_path"] == str(idx_a.vault_path)
+
+
+def test_chunk_id_probe_covers_unloaded_vault(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """C56：探测必须覆盖未加载的库——只查 self._indexers 会谎报「not found」。"""
+    # 关掉启动预索引线程，保证「未加载」这个前提是确定的（否则后台线程可能抢先加载）
+    monkeypatch.setattr(VaultMcpServer, "_startup_index_all", lambda self: None)
+    loaded = tmp_path / "vault_loaded"
+    unloaded = tmp_path / "vault_unloaded"
+    loaded.mkdir()
+    unloaded.mkdir()
+    (loaded / "a.md").write_text("# A\nloaded content\n", encoding="utf-8")
+    (unloaded / "b.md").write_text("# B\ntarget content in unloaded vault\n", encoding="utf-8")
+
+    config_path = tmp_path / "app.toml"
+    config_path.write_text('mode = "static"\n', encoding="utf-8")
+    server = VaultMcpServer(config_path)
+    server.registry.add(str(loaded), name="LoadedVault")
+    server.registry.add(str(unloaded), name="UnloadedVault")
+    idx = server._indexer_for({"vault_path": "LoadedVault"})
+    idx.sync()
+
+    # 第二个库刻意不经 server（保持「未加载」），用临时 indexer 建好缓存后立刻释放
+    probe = MarkdownIndexer(str(unloaded), server.config)
+    probe.sync()
+    cid = probe.all_chunks()[0].id
+    VaultMcpServer._close_probe_indexer(probe)
+    assert str(unloaded.resolve()) not in server._indexers
+
+    res = server._kb_read({"chunk_id": cid})
+
+    assert res["source"] == "b.md"
+    assert res["vault"] == "UnloadedVault"
+    assert "target content" in res["content"]
+
+
+def test_chunk_id_zero_hit_reports_unprobed_vaults(tmp_path: Path):
+    """C56：有库未探测时，零命中文案必须如实报「跳过」清单，不得谎报文件已修改。"""
+    import shutil
+
+    alive = tmp_path / "vault_alive"
+    gone = tmp_path / "vault_gone"
+    alive.mkdir()
+    gone.mkdir()
+    (alive / "n.md").write_text("# N\nalive content\n", encoding="utf-8")
+    (gone / "g.md").write_text("# G\ngone content\n", encoding="utf-8")
+
+    config_path = tmp_path / "app.toml"
+    config_path.write_text('mode = "static"\n', encoding="utf-8")
+    server = VaultMcpServer(config_path)
+    server.registry.add(str(alive), name="AliveVault")
+    server.registry.add(str(gone), name="GoneVault")
+    idx = server._indexer_for({"vault_path": "AliveVault"})
+    idx.sync()
+    shutil.rmtree(gone)  # 注册表有条目但目录已删 → 探测必须跳过并计入「未探测」
+
+    with pytest.raises(ValueError) as exc_info:
+        server._kb_read({"chunk_id": "0" * 40})
+    msg = str(exc_info.value)
+
+    assert "跳过 1 个" in msg
+    assert "GoneVault" in msg
+    assert "目录已不存在" in msg
+    assert "文件可能已修改" not in msg
+
+
+def test_chunk_id_probe_honours_budget_cap(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """C64：探测上限（库数/时间预算）生效时，被裁掉的库必须计入「未探测」并如实报错。"""
+    monkeypatch.setattr(VaultMcpServer, "_startup_index_all", lambda self: None)
+    monkeypatch.setattr(VaultMcpServer, "_PROBE_MAX_UNLOADED_VAULTS", 1)
+
+    vaults = []
+    for name in ("a", "b", "c"):
+        vault = tmp_path / f"vault_{name}"
+        vault.mkdir()
+        (vault / "n.md").write_text(f"# {name}\ncontent {name}\n", encoding="utf-8")
+        vaults.append(vault)
+
+    config_path = tmp_path / "app.toml"
+    config_path.write_text('mode = "static"\n', encoding="utf-8")
+    server = VaultMcpServer(config_path)
+    for name, vault in zip(("A", "B", "C"), vaults):
+        server.registry.add(str(vault), name=name)
+
+    with pytest.raises(ValueError) as exc_info:
+        server._kb_read({"chunk_id": "0" * 40})
+    msg = str(exc_info.value)
+
+    assert "超过探测库数上限" in msg
+    assert "探测了 1 个" in msg
+    assert "跳过 2 个" in msg
+
+
+def test_chunk_id_hit_in_solo_vault_reports_name_only(tmp_path: Path):
+    """D5 裁定：solo 库参与 chunk_id 探测，但结果只给库名 + solo 标记（不展开路径）。"""
+    solo = tmp_path / "vault_solo"
+    normal = tmp_path / "vault_normal"
+    solo.mkdir()
+    normal.mkdir()
+    (solo / "s.md").write_text("# S\nsolo only content\n", encoding="utf-8")
+    (normal / "n.md").write_text("# N\nnormal content\n", encoding="utf-8")
+
+    config_path = tmp_path / "app.toml"
+    config_path.write_text('mode = "static"\n', encoding="utf-8")
+    server = VaultMcpServer(config_path)
+    server.registry.add(str(solo), name="SoloVault", solo=True)
+    server.registry.add(str(normal), name="NormalVault")
+    idx_solo = server._indexer_for({"vault_path": "SoloVault"})
+    idx_normal = server._indexer_for({"vault_path": "NormalVault"})
+    idx_solo.sync()
+    idx_normal.sync()
+
+    cid = next(c for c in idx_solo.all_chunks() if c.source == "s.md").id
+    res = server._kb_read({"chunk_id": cid})
+
+    assert res["source"] == "s.md"
+    assert res["vault"] == "SoloVault"
+    assert res["solo"] is True
+    assert "vault_path" not in res
