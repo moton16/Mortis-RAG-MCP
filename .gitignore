@@ -20,6 +20,8 @@ docs/*
 !docs/Changelog_developer.md
 !docs/PROJECT_GUIDE.md
 !docs/Quick-start_developer.md
+!docs/Execution-plan_developer.md
+!docs/Docs_Folder-descriptions.md
 # Tooling / test artifacts
 .pytest_cache/
 .smoke_vaults.toml

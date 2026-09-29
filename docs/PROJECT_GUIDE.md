@@ -191,7 +191,7 @@ embedding（static 哈希 / 外部 API，按文件并发）     ←—— 向量
 
 以下按依赖顺序（自底向上）讲解。行数以 v0.5.0 为准。
 
-### 4.1 `config.py`（约 465 行）—— 配置加载与校验
+### 4.1 `config.py`（约 526 行）—— 配置加载与校验
 
 **职责**：把 TOML 配置文件解析成强类型的 dataclass，负责环境变量插值、默认值、类型/范围校验。
 
@@ -214,7 +214,7 @@ embedding（static 哈希 / 外部 API，按文件并发）     ←—— 向量
 
 **改动须知**：给任何 dataclass 加字段必须同步三处——字段默认值、`__post_init__` 校验、`load_config()` 的读取；影响 chunk 内容的键还要参与 `_chunks_meta()` 缓存失效判据（见 4.5）。
 
-### 4.2 `registry.py`（约 363 行）—— 用户级知识库注册表
+### 4.2 `registry.py`（约 384 行）—— 用户级知识库注册表
 
 **职责**：管理"哪些文件夹是知识库"。持久化为 `~/.vault_mcp/vaults.toml`（`REGISTRY_VERSION = 3`）。
 
@@ -259,7 +259,7 @@ embedding（static 哈希 / 外部 API，按文件并发）     ←—— 向量
   * 任何异常都吞掉返回空结果，但 `upsert_vectors` 失败时**必须返回实际落盘集合**（可能为空集）而不是 None——None 会被 indexer 当成"全部成功"记账，chunk 从此被认为已有向量、永不重嵌。
 * `create_vector_backend`：配置 sqlite_vec 但 import/加载失败 → 静默回退 memory。
 
-### 4.5 `indexer.py`（Facade 入口，约 1238 行）与 `_indexer/` 私有核心包
+### 4.5 `indexer.py`（Facade 入口，约 1253 行）与 `_indexer/` 私有核心包
 
 在 v0.8.0 之前，`indexer.py` 是超过 3400 行的单体大文件。v0.8.0 采用 **私有实现包 + 稳定 Facade** 架构，将切块、扫描、同步引擎、检索、缓存、快照、豁免、监听等子系统彻底拆解至 `mortis_rag_mcp/_indexer/`，`indexer.py` 转变为职责清晰、零破坏向后兼容的 Facade 入口，原位保留薄委托与历史打桩 re-export。
 
@@ -407,7 +407,7 @@ query 为空 → 直接返回（过滤+分页后）的 chunk 列表
 * `rebuild()`：删缓存 + 清内存 + 重 sync + 重建 FTS 并回填，`kb_rebuild` 用（高危：全量重新 embedding）；
 * `_sweep_stale_cache()`：`cache.max_age_days > 0` 时按 mtime 清理过期缓存文件。
 
-### 4.6 `fts.py`（约 149 行）—— FTS5 全文索引
+### 4.6 `fts.py`（约 152 行）—— FTS5 全文索引
 
 * 每库一个 sqlite 文件，虚表 `chunks_fts(source UNINDEXED, chunk_id UNINDEXED, content, tokenize='trigram')`。
 * **trigram 分词器**：中文子串匹配可用，但 <3 字符查询必然 0 行（调用方跳过该路，由 bigram 词法路兜底）。
@@ -429,7 +429,7 @@ query 为空 → 直接返回（过滤+分页后）的 chunk 列表
 * 长路径兜底：>240 字符的路径加 `\\?\\` 前缀。
 * 所有 Win32 调用带显式 `argtypes/restype`（ctypes 默认推断容易传错指针/句柄）；`use_last_error=True` 保存 GetLastError。
 
-### 4.8 `server.py`（约 1064 行）—— MCP 协议层与编排
+### 4.8 `server.py`（约 1312 行）—— MCP 协议层与编排
 
 * **`VaultMcpServer.__init__`**：加载配置 → 建注册表 → legacy `[vault].path` 自动迁移（注册表文件不存在时）→ 起后台线程**串行**预索引全部注册库（N 个库绝不能并发打爆 embedding API）→ `atexit.register(shutdown)` 释放原生监听句柄（嵌入式用法没有 serve_stdio 的 finally）。
 * **路径解析**（`_resolve_vault_path`）：必须绝对路径 + 必须已在注册表（注册表白名单取代旧的"根库包含"LFI 检查）；`for_registration=True` 时只校验是目录。
@@ -680,7 +680,7 @@ MCP 工具的参数可能被提示注入的 LLM 操控，项目按「零信任�
 ## 十一、测试体系
 
 ```
-tests/（24 个文件，约 5250 行；python -m pytest -q 全绿：264+ passed, 2 skipped）
+tests/（50 个文件，约 11570 行；python -m pytest -q 全量回归由 CI 承接，本地按靶向文件单跑）
 ├── conftest.py               # pytest 全局钩子：sessionfinish 记录测试成绩入 STATUS.md（解耦 overall）
 ├── test_doctor.py            # doctor 模块探活、离线容错、状态防假、静默生成单测
 ├── test_path_migration.py    # 路径与配置无损原子迁移（~/.vault_mcp* -> ~/.mortis_rag_mcp*）

@@ -27,15 +27,15 @@ Mortis'RAG MCP 是一个**本地 Markdown 知识库 RAG 服务器**，通过 MCP
 
 ```
 Mortis-RAG-MCP/
-├── mortis_rag_mcp/          # 包本体（~5800 行，v0.8.0 模块化拆分架构）
+├── mortis_rag_mcp/          # 包本体（~10850 行，v0.8.0 模块化拆分架构）
 │   ├── __main__.py          # 入口：python -m mortis_rag_mcp --serve-mcp-stdio
-│   ├── config.py            # 配置加载（390 行）
-│   ├── registry.py          # 用户级知识库注册表（304 行）
-│   ├── server.py            # MCP 协议层 + 15 个公开工具路由表与轻量入口（1126 行）
+│   ├── config.py            # 配置加载（526 行）
+│   ├── registry.py          # 用户级知识库注册表（384 行）
+│   ├── server.py            # MCP 协议层 + 15 个公开工具路由表与轻量入口（1312 行）
 │   ├── _server/             # 服务端路由与跨库编排私有包
 │   │   ├── search_dispatch.py # 单库/Scoped/全局检索路由与入参规范化
 │   │   └── fanout.py          # 跨库候选聚合、权重计算、去重、rerank、全局/分组分页
-│   ├── indexer.py           # MarkdownIndexer Facade、向后兼容 re-export 与生命周期（1238 行）
+│   ├── indexer.py           # MarkdownIndexer Facade、向后兼容 re-export 与生命周期（1253 行）
 │   ├── _indexer/            # 索引器核心实现私有包
 │   │   ├── models.py        # Chunk、SearchFilter 数据模型与纯去重逻辑
 │   │   ├── cache_codec.py   # _CacheCodec、_VectorsCodec 二进制编解码持久化
@@ -48,16 +48,18 @@ Mortis-RAG-MCP/
 │   │   └── watch.py         # 文件系统 watcher 监听与防抖生命周期调度
 │   ├── ingest/              # PDF/Office 异步摄取与表格处理（worker, mineru, tables）
 │   ├── providers.py         # embedding / reranker HTTP 封装（230 行）
-│   ├── fts.py               # FTS5 SQLite 封装（149 行）
+│   ├── fts.py               # FTS5 SQLite 封装（152 行）
 │   ├── vector.py            # 向量后端：memory / sqlite_vec（367 行）
 │   └── fsnotify.py          # Windows ReadDirectoryChangesW 原生监听（557 行）
 ├── config/app.toml.example  # 配置模板（app.toml 本体被 gitignore）
 ├── skills/mortis-rag-mcp/   # 配套 agent skill（教 AI 怎么用这套工具）
-├── tests/                   # pytest，340+ 测试用例
+├── tests/                   # pytest，49 个测试文件 / 416 个用例
 ├── docs/
-│   ├── Quick-start_developer.md    # 本文件
-│   ├── Changelog_developer.md      # 每次 commit 的技术变更流水
-│   └── Execution-plan_developer.md # 待执行功能的代码级方案
+│   ├── Quick-start_developer.md       # 本文件
+│   ├── Changelog_developer.md         # 每次 commit 的技术变更流水
+│   ├── PROJECT_GUIDE.md               # 全系统架构指南（代码级现状全貌）
+│   ├── Execution-plan_developer.md    # 待执行功能的代码级方案（做完一个划掉一个）
+│   └── Docs_Folder-descriptions.md    # docs/ 目录保留口径说明（本目录的元文档）
 ├── QUICKSTART_user.md       # 用户向：初次部署指南
 ├── CHANGELOG_user.md        # 用户向：release 版本变更（无技术细节）
 └── README.md (中文主页) / README_EN.md (English)
@@ -195,7 +197,7 @@ stdin 一行 JSON → handle() → method=="tools/call"
 .\.venv\Scripts\python.exe -m pytest tests/ -q     # 全量（约 80s）
 ```
 
-- 22 个测试文件：切块/缓存/多库/子库/豁免/去重/快照/solo/混合检索/过滤器/并发硬化/监听……
+- 49 个测试文件：切块/缓存/多库/子库/豁免/去重/快照/solo/混合检索/过滤器/并发硬化/监听……
 - **约定**：不碰真实网络（embedding 用 `static` 模式或 monkeypatch）；临时库一律 `tmp_path`；
   Windows 与 Unicode 路径已有专项用例，新功能涉及路径必须补。
 - 已知 Windows 平台坑：`kb_rebuild` 删 FTS 缓存走系统回收站，trash 失败会

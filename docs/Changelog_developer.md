@@ -317,7 +317,7 @@
 >   - 坚守活实例契约：直接操作 `server._indexers`，实时观测 `_chunks` 与 `_sync_progress`，绝无静态快照脏读。
 > - `mortis_rag_mcp/indexer.py` 与 `server.py` 瘦身：
 >   - `indexer.py` 由 2289 行降至 2035 行（净减 254 行）；原位保留 `search`、`_fts_query`、`_hybrid_rank`、`_query_tokens`、`_semantic_rank`、`_cosine` 薄委托，显式 re-export `rerank_chunks` 与 `_to_emb`；
->   - `server.py` 由 1359 行降至 1126 行（净减 233 行）；`_fanout_search` 与 `_kb_search` 委托至 `_server/`。
+>   - `server.py` 由 1359 行降至 1126 行（净减 233 行；v0.8.1 实测 1312 行）；`_fanout_search` 与 `_kb_search` 委托至 `_server/`。
 > - Oracle 等价与回归测试：
 >   - 新增 `tests/test_search_oracle.py`（9 个测试：常驻 Chunk `score` 原地不修改断言、SearchEngine 与 Facade 产物 `(id, score, source)` 严格恒等、server 端到端委托校验、向后兼容静态方法测试）。
 > - **验证**：全量单测增至 **338 passed, 4 skipped**（基线 329 + 9 P4 专项，`PYTEST_EXIT=0`）；eval **Hit@5 100.0% / MRR@5 1.000**；金测 `test_golden_v073.py` 严格相等。
