@@ -22,6 +22,9 @@ docs/*
 !docs/Quick-start_developer.md
 !docs/Execution-plan_developer.md
 !docs/Docs_Folder-descriptions.md
+# 版本目录特例（用户裁定）：docs/v0.8.1/ 的计划、实机报告与 Worklog 随版本入库。
+# docs/* 只匹配 docs 的直接子项，所以把目录本身重新纳入即可让其中文件可见。
+!docs/v0.8.1/
 # Tooling / test artifacts
 .pytest_cache/
 .smoke_vaults.toml
