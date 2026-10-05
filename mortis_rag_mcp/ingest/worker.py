@@ -38,6 +38,23 @@ except ImportError:
         pymupdf_fallback: bool = True
         convert_small_tables: bool = True
         table_convert_max_cells: int = 60
+        auto_watch: bool = False
+        max_file_size_mb: int = 20
+
+        def __post_init__(self) -> None:
+            if not isinstance(self.auto_watch, bool):
+                raise ValueError(f"ingest.auto_watch must be a boolean, got {self.auto_watch!r}")
+            if (
+                isinstance(self.max_file_size_mb, bool)
+                or not isinstance(self.max_file_size_mb, int)
+                or self.max_file_size_mb < 0
+            ):
+                raise ValueError(f"ingest.max_file_size_mb must be an integer >= 0, got {self.max_file_size_mb!r}")
+
+        @property
+        def max_file_size_bytes(self) -> int:
+            """Max file size in bytes (1024*1024 per MiB). 0 means unlimited."""
+            return self.max_file_size_mb * 1024 * 1024
 
 from .mineru import AGENT_EXTS, MineruClient, MineruError
 from .tables import convert_small_tables

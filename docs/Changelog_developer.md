@@ -517,5 +517,24 @@
 >   `.\.venv\Scripts\python.exe -m pytest tests/test_read_stale.py tests/test_anti_contention.py tests/test_diaglog.py tests/test_multivault.py tests/test_scoped_search.py tests/test_ingest_server.py tests/test_p5_lifecycle.py tests/test_sync_engine.py tests/test_concurrency_hardening.py tests/test_search_oracle.py -q`
 > - 全库回归测试（454 passed, 2 skipped in 108.83s）。
 
+### C58a — moton16,2026-10-05,Antigravity — feat(config): add opt-in ingest auto watch and size policy
+> **代码改动概况**：
+> - `mortis_rag_mcp/config.py`：
+>   - `IngestConfig` dataclass 尾部新增 `auto_watch: bool = False` 与 `max_file_size_mb: int = 20`，新增 `max_file_size_bytes` 属性（`max_file_size_mb * 1024 * 1024`，0 表示不限），保持既有字段顺序与默认 `enabled=False`；
+>   - `IngestConfig.__post_init__` 与 `AppConfig.__post_init__`：严格校验 `auto_watch` 必须为真 `bool`，`max_file_size_mb` 必须为非布尔、非负、有限非浮点整数（`int >= 0`）；
+>   - `load_config`：从 `[ingest]` 节解析 `auto_watch`（严格 `isinstance(raw, bool)`，拒绝 `"false"` 等字符串，抛出具名 `ValueError`）；`max_file_size_mb` 经 `_numeric(..., int, 20, 0)` 解析与范围门禁；
+>   - 明确 `enabled=false + auto_watch=true` 为合法配置（有效但不激活运行时上传）。
+> - `mortis_rag_mcp/ingest/worker.py`：
+>   - 同步更新 fallback `IngestConfig` dataclass，保持相同的字段、默认值、类型校验与 `max_file_size_bytes` 属性。
+> - `config/app.toml.example`：
+>   - 在 `[ingest]` 节增补注释：明确默认关闭不上传、启用后扫描包含既有文档、支持全部 `INGEST_EXTS` 格式、默认 20MiB 上限（0 不限）、云端配额/费用与隐私影响声明、修改后需重启服务。
+> - `tests/test_ingest_auto.py`：
+>   - 新建测试套件，全面覆盖配置默认值、显式值解析、非 bool 严格拒绝、数值上下界与类型门禁、0 不限尺寸计算与边界判定、TOML fallback 解析兼容等。
+>
+> **验证**：
+> - 专项测试（67 passed in 2.93s）：
+>   `.\.venv\Scripts\python.exe -m pytest tests/test_ingest_auto.py tests/test_path_migration.py tests/test_doctor.py -q`
+> - 全局回归测试（479 passed, 2 skipped in 109.16s）。
+
 
 

@@ -212,7 +212,7 @@ CURRENT                         THIS RELEASE                     12-MONTH IDEAL
 | 0 | [x] | Intake | 基线/需求/73项验证/旧计划还原点 | 无 | 已完成 |
 | 1 | [x] | C65 | 已提交跨库寻址的fail-closed补强 | Intake | 2–4h / 30–60m |
 | 2 | [x] | C66 | 可合并后台refresh、所有MCP只读路径、A4回调 | C65 | 1–2d / 1.5–3h |
-| 3 | [ ] | C58a | auto_watch与size配置 | Intake | 1–2h / 20–40m |
+| 3 | [x] | C58a | auto_watch与size配置 | Intake | 1–2h / 20–40m |
 | 4 | [ ] | C58b | 统一size闸门、自动判据账本、单队列 | C58a | 0.5–1d / 1–2h |
 | 5 | [ ] | C58c+C61 | native/poll触发、扫描合并与生命周期 | C66,C58b | 0.5–1d / 1–2h |
 | 6 | [ ] | C58d | server/doctor/hint接线与集成 | C58c | 2–4h / 30–60m |
@@ -343,7 +343,7 @@ MCP search -> existing chunks/FTS/vectors -> serialize
 
 **完成标准**：测试用Event证明前台返回早于sync release；不是把1.5s变0.1s。现有同期排序/去重/筛选oracle通过。提交 `fix(search): serve existing indexes while refresh runs in background`，A4记同一条技术账。残余：构造未加载大库、FTS短事务竞争、query embedding/rerank仍可能慢，分别可观测，不宣称都已解决。
 
-### [ ] C58a：自动摄取配置与统一size策略
+### [x] C58a：自动摄取配置与统一size策略
 
 **前置**：无代码前置，可在C66后顺序做。文件：`config.py::IngestConfig/AppConfig.__post_init__/load_config`、worker的ImportError fallback dataclass、`config/app.toml.example`；新建 `tests/test_ingest_auto.py`。
 
