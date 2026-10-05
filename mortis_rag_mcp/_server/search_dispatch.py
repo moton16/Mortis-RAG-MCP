@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
 from .fanout import fanout_search, apply_budget
@@ -60,6 +61,59 @@ def _parse_exact_terms(value: Any) -> list[str] | None:
     return terms or None
 
 
+def _search_single_vault(
+    server: VaultMcpServer,
+    indexer: Any,
+    query: str,
+    top_k: int,
+    use_rerank: bool,
+    search_filters: Any,
+    dedupe: bool,
+    exact_terms: list[str] | None,
+    preview: bool,
+    query_tokens: list[str] | None,
+    budget_bytes: int | None,
+) -> dict[str, Any]:
+    if not Path(indexer.vault_path).is_dir():
+        with indexer._cache_lock:
+            indexer._chunks = {}
+            indexer._signatures = {}
+        return {"chunks": []}
+    indexer.request_refresh()
+    r_status = indexer.refresh_status()
+    is_cold = (
+        indexer.last_sync is None
+        and not getattr(indexer, "_chunks_cache_loaded", False)
+        and len(indexer._chunks) == 0
+    )
+    if is_cold:
+        return {
+            "status": "indexing",
+            "message": "知识库正在后台进行首次初始化构建与嵌入计算，请稍候...",
+            "progress": r_status["indexing_progress"],
+            "retry_after": 3,
+            "chunks": [],
+        }
+
+    results = indexer.search(
+        query,
+        top_k,
+        bool(use_rerank),
+        filters=search_filters,
+        dedupe=bool(dedupe),
+        exact_terms=exact_terms,
+    )
+    res_dict: dict[str, Any] = {"chunks": [chunk.to_dict(preview=preview, query_tokens=query_tokens) for chunk in results]}
+    if r_status["indexing_in_progress"]:
+        res_dict["indexing_in_progress"] = True
+        res_dict["indexing_progress"] = r_status["indexing_progress"]
+    if r_status.get("refresh_error"):
+        res_dict["indexing_error"] = r_status["refresh_error"]
+    if budget_bytes is not None:
+        res_dict = apply_budget(res_dict, budget_bytes, orig_offset=search_filters.offset, preview=preview)
+    return res_dict
+
+
 def dispatch_search(server: VaultMcpServer, arguments: dict[str, Any]) -> dict[str, Any]:
     """处理 kb_search 请求分发。"""
     from ..server import _parse_top_k, _search_filter, _tokenize_query
@@ -93,30 +147,19 @@ def dispatch_search(server: VaultMcpServer, arguments: dict[str, Any]) -> dict[s
     if len(targets) == 1:
         resolved_single = server._resolve_vault_path(targets[0])
         indexer = server._indexer_for({"vault_path": resolved_single})
-        sync_ok = indexer.try_sync_with_guard(timeout=1.5)
-        if not sync_ok and len(indexer._chunks) == 0:
-            return {
-                "status": "indexing",
-                "message": "知识库正在后台进行首次初始化构建与嵌入计算，请稍候...",
-                "progress": indexer._sync_progress,
-                "retry_after": 3,
-                "chunks": [],
-            }
-        results = indexer.search(
-            query,
-            top_k,
-            bool(use_rerank),
-            filters=search_filters,
-            dedupe=bool(dedupe),
+        return _search_single_vault(
+            server,
+            indexer,
+            query=query,
+            top_k=top_k,
+            use_rerank=use_rerank,
+            search_filters=search_filters,
+            dedupe=dedupe,
             exact_terms=exact_terms,
+            preview=preview,
+            query_tokens=query_tokens,
+            budget_bytes=budget_bytes,
         )
-        res_dict: dict[str, Any] = {"chunks": [chunk.to_dict(preview=preview, query_tokens=query_tokens) for chunk in results]}
-        if not sync_ok:
-            res_dict["indexing_in_progress"] = True
-            res_dict["indexing_progress"] = indexer._sync_progress
-        if budget_bytes is not None:
-            res_dict = apply_budget(res_dict, budget_bytes, orig_offset=search_filters.offset, preview=preview)
-        return res_dict
 
     # 未指定目标时的默认单库处理
     if not targets:
@@ -128,30 +171,19 @@ def dispatch_search(server: VaultMcpServer, arguments: dict[str, Any]) -> dict[s
             )
         if len(entries) == 1:
             indexer = server._indexer_for({"vault_path": entries[0].path})
-            sync_ok = indexer.try_sync_with_guard(timeout=1.5)
-            if not sync_ok and len(indexer._chunks) == 0:
-                return {
-                    "status": "indexing",
-                    "message": "知识库正在后台进行首次初始化构建与嵌入计算，请稍候...",
-                    "progress": indexer._sync_progress,
-                    "retry_after": 3,
-                    "chunks": [],
-                }
-            results = indexer.search(
-                query,
-                top_k,
-                bool(use_rerank),
-                filters=search_filters,
-                dedupe=bool(dedupe),
+            return _search_single_vault(
+                server,
+                indexer,
+                query=query,
+                top_k=top_k,
+                use_rerank=use_rerank,
+                search_filters=search_filters,
+                dedupe=dedupe,
                 exact_terms=exact_terms,
+                preview=preview,
+                query_tokens=query_tokens,
+                budget_bytes=budget_bytes,
             )
-            res_dict = {"chunks": [chunk.to_dict(preview=preview, query_tokens=query_tokens) for chunk in results]}
-            if not sync_ok:
-                res_dict["indexing_in_progress"] = True
-                res_dict["indexing_progress"] = indexer._sync_progress
-            if budget_bytes is not None:
-                res_dict = apply_budget(res_dict, budget_bytes, orig_offset=search_filters.offset, preview=preview)
-            return res_dict
 
     # 跨库检索（Scoped 定向多库 或 全局盲搜）
     return fanout_search(

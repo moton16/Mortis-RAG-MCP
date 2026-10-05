@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import atexit
+import hashlib
 import json
 import os
 import re
@@ -789,10 +790,13 @@ class VaultMcpServer:
             with self._ingest_managers_lock:
                 manager = self._ingest_managers.get(key)
                 if manager is None:
-                    def _on_job_finished(out_path: str) -> None:
-                        indexer = self._indexers.get(key)
-                        if indexer is not None:
-                            threading.Thread(target=indexer.sync, daemon=True, name="ingest-sync").start()
+                    def _on_job_finished(source: str, out_md: Path | str) -> None:
+                        try:
+                            indexer = self._indexers.get(key)
+                            if indexer is not None:
+                                indexer.request_refresh(immediate=True)
+                        except Exception:
+                            pass
 
                     manager = IngestManager(vault_path, self.config.ingest, on_job_finished=_on_job_finished)
                     self._ingest_managers[key] = manager
@@ -988,7 +992,8 @@ class VaultMcpServer:
 
     def _kb_list_files(self, arguments: dict[str, Any]) -> dict[str, Any]:
         indexer = self._indexer_for(arguments)
-        indexer.try_sync_with_guard(timeout=1.0)
+        indexer.request_refresh()
+        r_status = indexer.refresh_status()
         files = indexer.list_files()
         # path_prefix 与 kb_search 同口径（共用 path_prefix_match），空值不过滤；
         # source 恒为库内相对 posix 路径，`../`/绝对路径只会零命中（天生 fail-closed）。
@@ -1008,7 +1013,7 @@ class VaultMcpServer:
         next_offset = None
         if limit is not None and offset + len(page) < total:
             next_offset = offset + len(page)
-        return {
+        res = {
             "files": page,
             "total": total,
             # 不叫 truncated：v0.8.0 的 truncated 是**字节预算截断**（fanout.apply_budget），
@@ -1016,6 +1021,12 @@ class VaultMcpServer:
             "page_truncated": next_offset is not None,
             "next_offset": next_offset,
         }
+        if r_status["indexing_in_progress"]:
+            res["indexing_in_progress"] = True
+            res["indexing_progress"] = r_status["indexing_progress"]
+        if r_status.get("refresh_error"):
+            res["indexing_error"] = r_status["refresh_error"]
+        return res
 
     # ------------------------------------------------------------ chunk_id 跨库寻址（C56）
 
@@ -1127,11 +1138,21 @@ class VaultMcpServer:
         if explicit or len(entries) <= 1:
             target = arguments if explicit else {"vault_path": entries[0].path}
             indexer = self._indexer_for(target)
-            indexer.try_sync_with_guard(timeout=1.5)
+            indexer.request_refresh()
+            r_status = indexer.refresh_status()
             entry = self.registry.get(str(indexer.vault_path))
             for c in indexer.all_chunks():
                 if c.id == chunk_id:
                     return self._chunk_attribution(entry, indexer, c)
+            is_cold = (
+                indexer.last_sync is None
+                and not getattr(indexer, "_chunks_cache_loaded", False)
+                and len(indexer._chunks) == 0
+            )
+            if is_cold:
+                raise ValueError(
+                    f"知识库正在后台进行首次初始化构建，无法定位 chunk_id {chunk_id[:12]}…，请稍后重试"
+                )
             raise ValueError(self._chunk_miss_message(chunk_id, max(len(entries), 1), 1, []))
 
         hits: list[dict[str, Any]] = []
@@ -1262,6 +1283,26 @@ class VaultMcpServer:
             attribution = located["attribution"]
 
             source = chunk.source
+            recorded_sig = indexer._signatures.get(source)
+            if not recorded_sig:
+                raise ValueError(
+                    f"chunk_id {chunk_id[:12]}… 所在源文件 {source} 缺失索引签名记录（stale）；"
+                    "请重新 kb_search 获取新 id，或改用 source + heading / 行区间读取"
+                )
+            try:
+                phys_path = indexer._safe_path(source)
+                content_bytes = phys_path.read_bytes()
+                current_sig = hashlib.sha256(content_bytes).hexdigest()
+            except Exception as exc:
+                raise ValueError(
+                    f"无法读取 chunk_id {chunk_id[:12]}… 对应的源文件 {source}: {exc}；请重新 kb_search"
+                )
+            if current_sig != recorded_sig:
+                raise ValueError(
+                    f"chunk_id {chunk_id[:12]}… 已过期（stale：物理文件 {source} 内容签名不一致/已修改）；"
+                    "请重新 kb_search 获取新 id，或改用 source + heading / 行区间读取"
+                )
+
             c_start = chunk.metadata.get("start_line", 1)
             c_end = chunk.metadata.get("end_line", c_start)
             try:
@@ -1277,9 +1318,7 @@ class VaultMcpServer:
             is_chunk_read = True
         else:
             indexer = self._indexer_for(arguments)
-            # 与 kb_search/kb_stats 同款冷启动守护：锁空闲时同步完成首建/增量对账，
-            # 避免后台首建未完成时短名寻址查空 _chunks 而误报 FileNotFound。
-            indexer.try_sync_with_guard(timeout=1.5)
+            indexer.request_refresh()
             is_chunk_read = False
             raw_heading = arguments.get("heading")
             heading = str(raw_heading).strip() if raw_heading is not None and str(raw_heading).strip() != "" else None
@@ -1346,6 +1385,15 @@ class VaultMcpServer:
                         f"ambiguous note name '{orig_query}' matches multiple files: {', '.join(candidates[:5])}..."
                     )
                 else:
+                    is_cold = (
+                        indexer.last_sync is None
+                        and not getattr(indexer, "_chunks_cache_loaded", False)
+                        and len(indexer._chunks) == 0
+                    )
+                    if is_cold:
+                        raise ValueError(
+                            f"知识库正在后台进行首次初始化构建，无法解析短文件名 '{orig_query}'，请稍后重试或使用完整路径"
+                        )
                     source = clean_source
             else:
                 source = clean_source
@@ -1391,8 +1439,15 @@ class VaultMcpServer:
 
     def _kb_stats(self, arguments: dict[str, Any]) -> dict[str, Any]:
         indexer = self._indexer_for(arguments)
-        indexer.try_sync_with_guard(timeout=1.0)
-        return indexer.stats()
+        indexer.request_refresh()
+        r_status = indexer.refresh_status()
+        stats = indexer.stats()
+        if r_status["indexing_in_progress"]:
+            stats["indexing_in_progress"] = True
+            stats["indexing_progress"] = r_status["indexing_progress"]
+        if r_status.get("refresh_error"):
+            stats["indexing_error"] = r_status["refresh_error"]
+        return stats
 
     def _kb_exempt(self, arguments: dict[str, Any]) -> dict[str, Any]:
         indexer = self._indexer_for(arguments)

@@ -211,7 +211,7 @@ CURRENT                         THIS RELEASE                     12-MONTH IDEAL
 |---|---|---|---|---|---|
 | 0 | [x] | Intake | 基线/需求/73项验证/旧计划还原点 | 无 | 已完成 |
 | 1 | [x] | C65 | 已提交跨库寻址的fail-closed补强 | Intake | 2–4h / 30–60m |
-| 2 | [ ] | C66 | 可合并后台refresh、所有MCP只读路径、A4回调 | C65 | 1–2d / 1.5–3h |
+| 2 | [x] | C66 | 可合并后台refresh、所有MCP只读路径、A4回调 | C65 | 1–2d / 1.5–3h |
 | 3 | [ ] | C58a | auto_watch与size配置 | Intake | 1–2h / 20–40m |
 | 4 | [ ] | C58b | 统一size闸门、自动判据账本、单队列 | C58a | 0.5–1d / 1–2h |
 | 5 | [ ] | C58c+C61 | native/poll触发、扫描合并与生命周期 | C66,C58b | 0.5–1d / 1–2h |
@@ -272,7 +272,7 @@ CURRENT                         THIS RELEASE                     12-MONTH IDEAL
 
 **完成标准**：上表与原有跨库/solo/歧义/显式库用例通过；C64保留软预算说明。提交建议 `fix(read): fail closed on incomplete chunk probes`，附C65技术账。
 
-### [ ] C66：读优先后台刷新 + A4摄取完成回调
+### [x] C66：读优先后台刷新 + A4摄取完成回调
 
 **目标**：只读MCP前台不跑全库sync、不等待_sync_lock；合并刷新请求；保留编程API同步语义。P1。
 

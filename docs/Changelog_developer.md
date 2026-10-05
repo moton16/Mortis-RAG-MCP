@@ -484,4 +484,38 @@
 > **验证**：
 > - `tests/test_kb_read_chunkid.py`（20 passed）、`tests/test_facade_freeze.py`、`tests/test_vector_backend.py`（合计 29 passed, 4.56s）。
 
+### C66 — moton16,2026-10-05,Antigravity,Gemini 3.8 Flash — fix(search): serve existing indexes while refresh runs in background
+
+> **涵盖改动**：`fix(search): serve existing indexes while refresh runs in background`
+> **来源**：Issue #5、Issue #6 前置、v0.8.1 计划 C66 卡 + A4 回调修复。
+>
+> **改动概况**：
+> - `mortis_rag_mcp/_indexer/watch.py` & `indexer.py`：
+>   - 新增 `request_refresh(owner, *, immediate=False) -> bool` 与 `refresh_status(owner) -> dict[str, Any]`。
+>   - 调度线程 `_fs_scheduler_thread` 启动引入双检锁（`_fs_scheduler_start_lock`），避免多并发请求创建重复调度线程。
+>   - 连续读节拍限制：`_READ_REFRESH_MIN_INTERVAL_SECONDS = 1.0`，1 秒内重复只读请求合并；失败指数退避上限 5 秒。
+>   - `_fs_scheduler_loop` 进 sync 前清空 dirty 标记，sync 期间新请求重新置 dirty，单次最多合并一轮。
+>   - `_run_sync_quietly` 记录可观测 `_refresh_error` 与 `_last_refresh_completed_at`。
+>   - 停止状态下（`stop_watching`）拒绝新 refresh 请求，安全 join `_fs_scheduler_thread`。
+> - `mortis_rag_mcp/_server/search_dispatch.py` & `_server/fanout.py`：
+>   - 单库检索统一通过 `_search_single_vault` 处理，替换旧有的 `try_sync_with_guard`；
+>   - 冷库判定：未同步且无缓存且无 chunks 时立即返回 `status="indexing"`, `retry_after=3`, `chunks=[]`；
+>   - warm 检索不阻塞 `_sync_lock`，立即基于当前可用索引执行 search，并追加 `indexing_in_progress` 与 `indexing_progress`；
+>   - 目录不存在/被删除时防御性清空 chunks，返回空结果，避免死库缓存被持续召回。
+>   - 跨库 fan-out 支持汇总 `indexing_vaults` 状态，单库 cold 不阻断其他 warm 库，query 向量在外部模型下仅计算一次。
+> - `mortis_rag_mcp/server.py`：
+>   - A4 摄取完成回调修复：`_on_job_finished(source, out_md)` 接收二参数，仅对已存在 indexer 请求 `immediate=True` 后台刷新，不再反向启动阻塞 sync。
+>   - 只读 MCP 工具 `kb_read`、`kb_list_files`、`kb_stats` 前台不再同步等锁，改由 `request_refresh()` 后台驱动；
+>   - `kb_read` 显式 `chunk_id` 寻址增加物理文件 sha256 签名校验（stale chunk 快速 fail-visible，杜绝读错章节）。
+> - `mortis_rag_mcp/diaglog.py`：
+>   - 代理层适配 `request_refresh`，统计调度开销，四阶段顺序（sync -> retrieve -> rerank -> serialize）与 corr_id 严格保持。
+> - `tests/test_read_stale.py`：
+>   - 新建 C66 专用测试套件，覆盖 Event 阻塞下前台秒级返回、冷启动 indexing 状态机、防抖突发合并、chunk_id stale 签名过期拦截、A4 完成回调集成等。
+>
+> **验证**：
+> - C66 专项验收命令（86 passed in 48.94s）：
+>   `.\.venv\Scripts\python.exe -m pytest tests/test_read_stale.py tests/test_anti_contention.py tests/test_diaglog.py tests/test_multivault.py tests/test_scoped_search.py tests/test_ingest_server.py tests/test_p5_lifecycle.py tests/test_sync_engine.py tests/test_concurrency_hardening.py tests/test_search_oracle.py -q`
+> - 全库回归测试（454 passed, 2 skipped in 108.83s）。
+
+
 

@@ -272,6 +272,7 @@ def fanout_search(
     merged: list[tuple[VaultEntry, Chunk]] = []
     searched: list[str] = []
     errors: dict[str, str] = {}
+    indexing_vaults: dict[str, Any] = {}
 
     # Embed the query exactly once for the whole fan-out.
     query_vector = None
@@ -285,10 +286,28 @@ def fanout_search(
     for entry in entries:
         try:
             indexer = server._indexer_for({"vault_path": entry.path})
-            sync_ok = indexer.try_sync_with_guard(timeout=1.5)
-            if not sync_ok and len(indexer._chunks) == 0:
+            indexer.request_refresh()
+            r_status = indexer.refresh_status()
+            is_cold = (
+                indexer.last_sync is None
+                and not getattr(indexer, "_chunks_cache_loaded", False)
+                and len(indexer._chunks) == 0
+            )
+            if is_cold:
                 errors[entry.path] = "indexing in progress"
+                indexing_vaults[entry.path] = {
+                    "indexing_in_progress": True,
+                    "indexing_progress": r_status["indexing_progress"],
+                }
                 continue
+            if r_status["indexing_in_progress"] or r_status.get("refresh_error"):
+                v_info: dict[str, Any] = {
+                    "indexing_in_progress": r_status["indexing_in_progress"],
+                    "indexing_progress": r_status["indexing_progress"],
+                }
+                if r_status.get("refresh_error"):
+                    v_info["indexing_error"] = r_status["refresh_error"]
+                indexing_vaults[entry.path] = v_info
             chunks = indexer.search(
                 query,
                 per_vault_k,
@@ -376,6 +395,9 @@ def fanout_search(
             key=lambda group: -max(chunk["score"] for chunk in group["chunks"]),
         )
         res: dict[str, Any] = {"groups": groups, "searched": searched, "errors": errors, "excluded_solo": excluded_solo}
+        if indexing_vaults:
+            res["indexing_vaults"] = indexing_vaults
+            res["indexing_in_progress"] = True
         if len(searched) > 1 and not target_vaults:
             names = [vault_name_map.get(s, Path(s).name) for s in searched]
             res["hint"] = (
@@ -395,6 +417,9 @@ def fanout_search(
         data["vault_name"] = entry.name
         out_chunks.append(data)
     res = {"chunks": out_chunks, "searched": searched, "errors": errors, "excluded_solo": excluded_solo}
+    if indexing_vaults:
+        res["indexing_vaults"] = indexing_vaults
+        res["indexing_in_progress"] = True
     if len(searched) > 1 and not target_vaults:
         names = [vault_name_map.get(s, Path(s).name) for s in searched]
         res["hint"] = (

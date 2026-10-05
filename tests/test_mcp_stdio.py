@@ -16,7 +16,11 @@ def _run_stdio(config: Path, requests: list[dict]) -> list[dict]:
         capture_output=True,
         check=False,
         encoding="utf-8",
-        env={**os.environ, "VAULT_MCP_REGISTRY": str(config.parent / "vaults.toml")},
+        env={
+            **os.environ,
+            "VAULT_MCP_REGISTRY": str(config.parent / "vaults.toml"),
+            "MORTIS_RAG_REGISTRY": str(config.parent / "vaults.toml"),
+        },
     )
     assert proc.returncode == 0, proc.stderr
     assert not proc.stderr, proc.stderr
@@ -41,9 +45,20 @@ def test_stdio_initialize_tools_and_list_search(tmp_path):
     assert {"kb_list", "kb_list_files", "kb_search", "kb_read", "kb_stats", "kb_describe"} <= names
 
     listed = json.loads(responses[2]["result"]["content"][0]["text"])
+    searched = json.loads(responses[3]["result"]["content"][0]["text"])
+    if not listed.get("files") or searched.get("status") == "indexing":
+        import time
+        time.sleep(0.5)
+        responses2 = _run_stdio(config, [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "kb_list_files", "arguments": {}}},
+            {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "kb_search", "arguments": {"query": "MCP stdio", "top_k": 5, "use_rerank": False}}},
+        ])
+        listed = json.loads(responses2[1]["result"]["content"][0]["text"])
+        searched = json.loads(responses2[2]["result"]["content"][0]["text"])
+
     assert listed["files"][0]["source"] == "知识库.md"
 
-    searched = json.loads(responses[3]["result"]["content"][0]["text"])
     assert searched["chunks"]
     assert searched["chunks"][0]["source"] == "知识库.md"
     assert searched["chunks"][0]["metadata"]["heading"] == "项目笔记"
@@ -72,6 +87,18 @@ def test_stdio_kb_list_files_pagination_and_prefix(tmp_path):
     ])
 
     full = json.loads(responses[1]["result"]["content"][0]["text"])
+    if full.get("total") == 0 and full.get("indexing_in_progress"):
+        import time
+        time.sleep(0.5)
+        responses = _run_stdio(config, [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "kb_list_files", "arguments": {}}},
+            {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "kb_list_files", "arguments": {"limit": 2, "offset": 0}}},
+            {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "kb_list_files", "arguments": {"limit": 2, "offset": 2}}},
+            {"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": "kb_list_files", "arguments": {"path_prefix": "教材/"}}},
+            {"jsonrpc": "2.0", "id": 6, "method": "tools/call", "params": {"name": "kb_list_files", "arguments": {"offset": 99}}},
+        ])
+        full = json.loads(responses[1]["result"]["content"][0]["text"])
     page1 = json.loads(responses[2]["result"]["content"][0]["text"])
     page2 = json.loads(responses[3]["result"]["content"][0]["text"])
     pref = json.loads(responses[4]["result"]["content"][0]["text"])

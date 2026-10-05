@@ -173,10 +173,16 @@ class MarkdownIndexer:
         self._fs_debounce_cv = threading.Condition(self._fs_debounce_lock)
         self._fs_scheduler_thread: threading.Thread | None = None
         self._fs_requested = False
+        self._fs_refresh_immediate: bool = False
         self._fs_pending_since: float | None = None
         self._fs_debounce_seconds: float = 0.5
         # 连续同步的最小间隔：避免高频事件把 sync 压成紧密循环。
         self._fs_last_sync_at: float = 0.0
+        self._fs_scheduler_start_lock = threading.Lock()
+        self._refresh_error: str | None = None
+        self._refresh_requested_at: float | None = None
+        self._last_refresh_completed_at: float = 0.0
+        self._READ_REFRESH_MIN_INTERVAL_SECONDS: float = 1.0
         self._sync_lock = threading.Lock()
         self._cache_lock = threading.Lock()
         # 是否正在 sync（供 kb_stats 报进度）；连续失败次数用于监听线程的退避。
@@ -1259,3 +1265,9 @@ class MarkdownIndexer:
 
     def stop_watching(self) -> None:
         return _watch.stop_watching(self)
+
+    def request_refresh(self, *, immediate: bool = False) -> bool:
+        return _watch.request_refresh(self, immediate=immediate)
+
+    def refresh_status(self) -> dict[str, Any]:
+        return _watch.refresh_status(self)

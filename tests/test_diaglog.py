@@ -127,6 +127,7 @@ def test_diag_enabled_whitelist_fields_and_corr_id(isolated_env: tuple[Path, Pat
     log_file.unlink()
 
     # 2. 调用 kb_search：多阶段覆盖（sync, retrieve, rerank, serialize）
+    server._indexer_for({"vault_path": str(isolated_env[0])}).sync()
     search_res = server.call_tool("kb_search", {"query": "test", "preview": True})
     assert "content" in search_res
 

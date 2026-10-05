@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ..fsnotify import WindowsDirectoryWatcher, watcher_available
@@ -59,13 +60,69 @@ def start_watching(
     owner._start_fs_scheduler()
 
 
+def request_refresh(owner: MarkdownIndexer, *, immediate: bool = False) -> bool:
+    if owner._watch_stop.is_set() or getattr(owner, "_stopping", False):
+        return False
+    if not Path(owner.vault_path).is_dir():
+        with owner._cache_lock:
+            owner._chunks = {}
+            owner._signatures = {}
+        return False
+    _start_fs_scheduler(owner)
+    with owner._fs_debounce_lock:
+        now = time.monotonic()
+        owner._refresh_requested_at = now
+        if immediate:
+            owner._fs_refresh_immediate = True
+            owner._fs_requested = True
+            owner._fs_pending_since = now
+            owner._fs_debounce_cv.notify_all()
+            return True
+        min_interval = getattr(owner, "_READ_REFRESH_MIN_INTERVAL_SECONDS", 1.0)
+        last_completed = getattr(owner, "_last_refresh_completed_at", 0.0)
+        if (now - last_completed) < min_interval:
+            return True
+        owner._fs_requested = True
+        if owner._fs_pending_since is None:
+            owner._fs_pending_since = now
+        owner._fs_debounce_cv.notify_all()
+        return True
+
+
+def refresh_status(owner: MarkdownIndexer) -> dict[str, Any]:
+    with owner._fs_debounce_lock:
+        pending = bool(owner._fs_requested)
+        ref_err = getattr(owner, "_refresh_error", None)
+    indexing = pending or getattr(owner, "_indexing", False) or (getattr(owner, "_sync_state", "idle") != "idle")
+    progress_copy = dict(getattr(owner, "_sync_progress", {}))
+    return {
+        "last_sync": owner.last_sync,
+        "refresh_pending": pending,
+        "indexing_in_progress": indexing,
+        "indexing_progress": progress_copy,
+        "refresh_error": ref_err,
+    }
+
+
 def _start_fs_scheduler(owner: MarkdownIndexer) -> None:
+    if owner._watch_stop.is_set() or getattr(owner, "_stopping", False):
+        return
     if owner._fs_scheduler_thread is not None and owner._fs_scheduler_thread.is_alive():
         return
-    owner._fs_scheduler_thread = threading.Thread(
-        target=owner._fs_scheduler_loop, daemon=True, name="vault-fs-debounce"
-    )
-    owner._fs_scheduler_thread.start()
+    start_lock = getattr(owner, "_fs_scheduler_start_lock", None)
+    if start_lock is None:
+        owner._fs_scheduler_start_lock = threading.Lock()
+        start_lock = owner._fs_scheduler_start_lock
+    with start_lock:
+        if owner._watch_stop.is_set() or getattr(owner, "_stopping", False):
+            return
+        if owner._fs_scheduler_thread is not None and owner._fs_scheduler_thread.is_alive():
+            return
+        t = threading.Thread(
+            target=owner._fs_scheduler_loop, daemon=True, name="vault-fs-debounce"
+        )
+        owner._fs_scheduler_thread = t
+        t.start()
 
 
 def _fs_scheduler_loop(owner: MarkdownIndexer) -> None:
@@ -79,11 +136,16 @@ def _fs_scheduler_loop(owner: MarkdownIndexer) -> None:
                 owner._fs_debounce_cv.wait(timeout=0.5)
                 continue
             now = time.monotonic()
-            elapsed = now - (owner._fs_pending_since or now)
-            if elapsed < owner._fs_debounce_seconds and elapsed < _FS_MAX_DEBOUNCE_WAIT:
-                owner._fs_debounce_cv.wait(timeout=owner._fs_debounce_seconds - elapsed)
-                continue  # 重新评估：期间又有事件则继续顺延
+            pending_since = owner._fs_pending_since or now
+            elapsed = max(0.0, now - pending_since)
+            if not getattr(owner, "_fs_refresh_immediate", False):
+                if elapsed < owner._fs_debounce_seconds and elapsed < _FS_MAX_DEBOUNCE_WAIT:
+                    wait_time = min(owner._fs_debounce_seconds - elapsed, _FS_MAX_DEBOUNCE_WAIT - elapsed)
+                    owner._fs_debounce_cv.wait(timeout=max(0.01, wait_time))
+                    continue  # 重新评估：期间又有事件则继续顺延
+            # Clear dirty flags BEFORE sync
             owner._fs_requested = False
+            owner._fs_refresh_immediate = False
             owner._fs_pending_since = None
             due = True
         if not due:
@@ -144,9 +206,16 @@ def _run_sync_quietly(owner: MarkdownIndexer) -> None:
     try:
         owner.sync()
         owner._sync_failures = 0
-    except Exception:
+        owner._refresh_error = None
+        owner._last_refresh_completed_at = time.monotonic()
+    except Exception as exc:
         owner._sync_failures = getattr(owner, "_sync_failures", 0) + 1
-        time.sleep(min(0.5 * (2 ** min(owner._sync_failures - 1, 4)), 5.0))
+        err_msg = str(exc)
+        if len(err_msg) > 200:
+            err_msg = err_msg[:197] + "..."
+        owner._refresh_error = err_msg or exc.__class__.__name__
+        backoff = min(0.5 * (2 ** min(owner._sync_failures - 1, 4)), 5.0)
+        owner._watch_stop.wait(backoff)
     finally:
         owner._indexing = False
 
@@ -227,11 +296,15 @@ def stop_watching(owner: MarkdownIndexer) -> None:
     owner._watch_stop.set()
     with owner._fs_debounce_lock:
         owner._fs_requested = False
+        owner._fs_refresh_immediate = False
         owner._fs_pending_since = None
         owner._fs_debounce_cv.notify_all()
     if owner._fs_scheduler_thread is not None:
         owner._fs_scheduler_thread.join(timeout=2)
-        owner._fs_scheduler_thread = None
+        if owner._fs_scheduler_thread.is_alive():
+            owner._stopping = True
+        else:
+            owner._fs_scheduler_thread = None
     watcher, owner._fs_watcher = owner._fs_watcher, None
     if watcher is not None:
         watcher.stop()
@@ -245,4 +318,5 @@ def stop_watching(owner: MarkdownIndexer) -> None:
             owner._stopping = True
         else:
             owner._watch_thread = None
-            owner._stopping = False
+            if owner._fs_scheduler_thread is None:
+                owner._stopping = False

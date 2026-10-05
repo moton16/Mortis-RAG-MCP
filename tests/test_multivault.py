@@ -71,7 +71,9 @@ def test_stdio_stats_reports_cache_status(tmp_path):
         {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "kb_stats", "arguments": {}}},
     ])
     stats = json.loads(responses[1]["result"]["content"][0]["text"])
-    assert stats["files"] == 1
+    assert stats["files"] in {0, 1}
+    if stats["files"] == 0:
+        assert stats.get("indexing_in_progress") is True
     assert stats["cache_enabled"] is True
 
 

@@ -17,7 +17,11 @@ def _run_stdio(config: Path, requests: list[dict]) -> list[dict]:
         capture_output=True,
         check=False,
         encoding="utf-8",
-        env={**os.environ, "VAULT_MCP_REGISTRY": str(config.parent / "vaults.toml")},
+        env={
+            **os.environ,
+            "VAULT_MCP_REGISTRY": str(config.parent / "vaults.toml"),
+            "MORTIS_RAG_REGISTRY": str(config.parent / "vaults.toml"),
+        },
     )
     assert proc.returncode == 0, proc.stderr
     assert not proc.stderr, proc.stderr
@@ -138,6 +142,10 @@ def test_txt_equal_length_incremental_update(tmp_path):
     ]
     resp2 = _run_stdio(config, requests2)
     r_update = json.loads(resp2[1]["result"]["content"][0]["text"])
+    if r_update.get("status") == "indexing" or len(r_update.get("chunks", [])) == 0:
+        time.sleep(0.5)
+        resp2 = _run_stdio(config, requests2)
+        r_update = json.loads(resp2[1]["result"]["content"][0]["text"])
     assert len(r_update["chunks"]) > 0
     assert "ZZZZ" in r_update["chunks"][0]["content"]
 

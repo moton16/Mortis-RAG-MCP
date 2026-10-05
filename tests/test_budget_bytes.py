@@ -242,6 +242,7 @@ def test_budget_bytes_first_chunk_exceeds_budget(tmp_path, monkeypatch):
 
     server = VaultMcpServer(config_path)
     server.call_tool("kb_init", {"path": str(vault), "name": "Giant"})
+    server._indexer_for({"vault_path": "Giant"}).sync()
 
     # 1. full 模式下的截断（预算设置 650 字节：大于空元数据 530 字节，小于完整 chunk ~2000 字节）
     budget_full = 650

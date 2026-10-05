@@ -295,6 +295,13 @@ class _IndexerProxy:
         self._trace.add_sync_ms(duration)
         return res
 
+    def request_refresh(self, *args: Any, **kwargs: Any) -> Any:
+        t0 = time.perf_counter()
+        res = self._target.request_refresh(*args, **kwargs)
+        duration = round((time.perf_counter() - t0) * 1000, 2)
+        self._trace.add_sync_ms(duration)
+        return res
+
     def search(self, *args: Any, **kwargs: Any) -> Any:
         t0 = time.perf_counter()
         rerank_before = self._trace.rerank_ms
