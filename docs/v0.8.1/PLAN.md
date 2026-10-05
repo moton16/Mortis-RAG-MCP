@@ -470,7 +470,7 @@ poll/start/fallback cadence -+                                  |
 
 **验收**：默认零副作用；矛盾键不阻启动；诊断可判定；所有层只授权后上传。提交 `feat(server): wire automatic ingest with explicit status and safe defaults`。
 
-### [ ] C67：compact初筛投影，全路由一致
+### [x] C67：compact初筛投影，全路由一致
 
 **前置**：C66。文件：`server.py::_tool_definitions/_fanout_search`、`_server/search_dispatch.py`、`_server/fanout.py`、`_indexer/models.py::Chunk.to_dict`；新建 `tests/test_compact_search.py`，保留preview/budget/oracle测试。
 

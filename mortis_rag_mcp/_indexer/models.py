@@ -96,7 +96,23 @@ class Chunk:
     score: float = 0.0
     embedding: array | None = field(default=None, repr=False)
 
-    def to_dict(self, preview: bool = False, query_tokens: list[str] | None = None) -> dict[str, Any]:
+    def to_dict(
+        self,
+        preview: bool = False,
+        query_tokens: list[str] | None = None,
+        *,
+        compact: bool = False,
+    ) -> dict[str, Any]:
+        if compact:
+            start_line = self.metadata.get("start_line", 1)
+            end_line = self.metadata.get("end_line", 1)
+            heading = self.metadata.get("heading", self.title)
+            return {
+                "source": self.source,
+                "heading": heading,
+                "lines": [start_line, end_line],
+                "snippet": _extract_snippet(self.content, query_tokens),
+            }
         d: dict[str, Any] = {
             "id": self.id,
             "score": self.score,

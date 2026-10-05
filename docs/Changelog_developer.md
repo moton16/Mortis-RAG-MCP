@@ -604,6 +604,31 @@
 > - 专项测试（106 passed in 10.68s）：
 >   `.\.venv\Scripts\python.exe -m pytest tests/test_ingest_server.py tests/test_ingest_auto.py tests/test_doctor.py tests/test_watch_integration.py -q`
 
+### C67 — moton16,2026-10-05,Antigravity — feat(search): add opt-in compact result projection
+> **代码改动概况**：
+> - `mortis_rag_mcp/_indexer/models.py`：
+>   - `Chunk.to_dict` 增加 keyword-only 参数 `compact=False`（Req 3 & 4）；
+>   - 当 `compact=True` 时，直接构造并返回极简四键结构（`source`, `heading`, `lines`, `snippet`），排除 `id`, `score`, `title`, `metadata`, `char_count`, `source_pdf`, `content`，保持 Chunk 实例与缓存对象不可变；
+> - `mortis_rag_mcp/_server/search_dispatch.py`：
+>   - `dispatch_search` 兼容解析布尔字符串格式的 `compact` 参数（Req 2）；
+>   - `compact=True` 强制激活 `preview=True` 并优先于 `mode="full"`；
+>   - `_search_single_vault` 支持 `compact` 参数（Req 5）：单库顶层注入已解析的绝对路径 `vault` 与注册名称 `vault_name`，chunks 内部不重复记录库标识；
+> - `mortis_rag_mcp/_server/fanout.py`：
+>   - `fanout_search` 增补 `compact: bool = False` 参数并支持全路由通道；
+>   - 组排序与最高分降序提前至 `pairs` / `Chunk` 层执行，杜绝投影后对无 `score` 键的 compact 字典排序（Req 7）；
+>   - 平铺跨库（`group_by_vault=False`）每条 chunk 追加 `vault` 绝对路径，不重复 `vault_name`；
+>   - 分组跨库（`group_by_vault=True`）在 group 顶层记录 `vault` 与 `vault_name`，group 内 chunks 不重复注入库属性；
+> - `mortis_rag_mcp/server.py`：
+>   - `_tool_definitions` 在 `kb_search` 的 inputSchema 中新增 `compact` 布尔参数（Req 1）；
+>   - `_fanout_search` 透传 `compact` 关键字参数；
+> - `tests/test_compact_search.py`：
+>   - 新增 7 个专项测试：Chunk.to_dict 四键投影与不变量检查、kb_search 工具 schema 与布尔字符串容错、单库顶层归属、平铺跨库每 chunk 带 vault 免重复 vault_name、分组跨库组级归属、compact/full 顺序与过滤等价性、单库/平铺/分组行号+库路径 `kb_read` 原文回读闭环、30 篇中文笔记在分组与平铺形态下的真实 payload 缩减量测（分组减幅达 33.3% >= 30%）。
+>
+> **验证**：
+> - 专项与相关测试（58 passed in 44.74s）：
+>   `.\.venv\Scripts\python.exe -m pytest tests/test_compact_search.py tests/test_preview_mode.py tests/test_budget_bytes.py tests/test_multivault.py tests/test_scoped_search.py tests/test_search_oracle.py tests/test_facade_freeze.py -q`
+
+
 
 
 

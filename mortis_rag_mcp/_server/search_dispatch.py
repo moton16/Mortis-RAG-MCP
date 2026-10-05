@@ -73,12 +73,21 @@ def _search_single_vault(
     preview: bool,
     query_tokens: list[str] | None,
     budget_bytes: int | None,
+    compact: bool = False,
 ) -> dict[str, Any]:
+    v_path = str(Path(indexer.vault_path).expanduser().resolve())
+    entry = server.registry.get(indexer.vault_path)
+    v_name = entry.name if entry else Path(indexer.vault_path).name
+
     if not Path(indexer.vault_path).is_dir():
         with indexer._cache_lock:
             indexer._chunks = {}
             indexer._signatures = {}
-        return {"chunks": []}
+        res_empty: dict[str, Any] = {"chunks": []}
+        if compact:
+            res_empty["vault"] = v_path
+            res_empty["vault_name"] = v_name
+        return res_empty
     indexer.request_refresh()
     r_status = indexer.refresh_status()
     is_cold = (
@@ -87,13 +96,17 @@ def _search_single_vault(
         and len(indexer._chunks) == 0
     )
     if is_cold:
-        return {
+        res_cold = {
             "status": "indexing",
             "message": "知识库正在后台进行首次初始化构建与嵌入计算，请稍候...",
             "progress": r_status["indexing_progress"],
             "retry_after": 3,
             "chunks": [],
         }
+        if compact:
+            res_cold["vault"] = v_path
+            res_cold["vault_name"] = v_name
+        return res_cold
 
     results = indexer.search(
         query,
@@ -103,7 +116,14 @@ def _search_single_vault(
         dedupe=bool(dedupe),
         exact_terms=exact_terms,
     )
-    res_dict: dict[str, Any] = {"chunks": [chunk.to_dict(preview=preview, query_tokens=query_tokens) for chunk in results]}
+    if compact:
+        res_dict: dict[str, Any] = {
+            "vault": v_path,
+            "vault_name": v_name,
+            "chunks": [chunk.to_dict(preview=True, query_tokens=query_tokens, compact=True) for chunk in results],
+        }
+    else:
+        res_dict = {"chunks": [chunk.to_dict(preview=preview, query_tokens=query_tokens) for chunk in results]}
     if r_status["indexing_in_progress"]:
         res_dict["indexing_in_progress"] = True
         res_dict["indexing_progress"] = r_status["indexing_progress"]
@@ -130,13 +150,23 @@ def dispatch_search(server: VaultMcpServer, arguments: dict[str, Any]) -> dict[s
     dedupe = arguments.get("dedupe", True)
     if isinstance(dedupe, str):
         dedupe = dedupe.strip().lower() not in {"0", "false", "no", "off"}
-    preview_val = arguments.get("preview", False)
-    if isinstance(preview_val, str):
-        preview = preview_val.strip().lower() in {"1", "true", "yes", "on"}
+
+    compact_val = arguments.get("compact", False)
+    if isinstance(compact_val, str):
+        compact = compact_val.strip().lower() in {"1", "true", "yes", "on"}
     else:
-        preview = bool(preview_val)
-    if arguments.get("mode") == "preview":
+        compact = bool(compact_val)
+
+    if compact:
         preview = True
+    else:
+        preview_val = arguments.get("preview", False)
+        if isinstance(preview_val, str):
+            preview = preview_val.strip().lower() in {"1", "true", "yes", "on"}
+        else:
+            preview = bool(preview_val)
+        if arguments.get("mode") == "preview":
+            preview = True
 
     search_filters = _search_filter(arguments, server.config.max_top_k)
     query_tokens = _tokenize_query(query)
@@ -159,6 +189,7 @@ def dispatch_search(server: VaultMcpServer, arguments: dict[str, Any]) -> dict[s
             preview=preview,
             query_tokens=query_tokens,
             budget_bytes=budget_bytes,
+            compact=compact,
         )
 
     # 未指定目标时的默认单库处理
@@ -183,6 +214,7 @@ def dispatch_search(server: VaultMcpServer, arguments: dict[str, Any]) -> dict[s
                 preview=preview,
                 query_tokens=query_tokens,
                 budget_bytes=budget_bytes,
+                compact=compact,
             )
 
     # 跨库检索（Scoped 定向多库 或 全局盲搜）
@@ -199,4 +231,5 @@ def dispatch_search(server: VaultMcpServer, arguments: dict[str, Any]) -> dict[s
         query_tokens=query_tokens,
         budget_bytes=budget_bytes,
         exact_terms=exact_terms,
+        compact=compact,
     )

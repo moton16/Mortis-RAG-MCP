@@ -255,6 +255,7 @@ def _tool_definitions() -> list[dict[str, Any]]:
                 "vault_path": {"type": "string", "description": "可选，已注册知识库的名称或绝对路径；缺省时跨全部非 solo 注册库检索"},
                 "vault_paths": {"type": "array", "items": {"type": "string"}, "description": "可选，知识库名称或绝对路径数组；用于定向组合检索指定的若干个库（Scoped Multi-Vault）"},
                 "preview": {"type": "boolean", "default": False, "description": "可选，轻量预览模式：设为 true 时仅返回高光摘要与行号区间，不返回全文，有效节约模型上下文"},
+                "compact": {"type": "boolean", "default": False, "description": "可选，极简预览，隐含preview，返回source/heading/lines/snippet；按行号+库回读，不返回id"},
                 "mode": {"type": "string", "enum": ["full", "preview"], "default": "full", "description": "可选，检索结果呈现模式：'full'（默认，返回完整正文 content）或 'preview'（轻量高光预览，仅返回 snippet 与行号区间）"},
                 "group_by_vault": {"type": "boolean", "default": False, "description": "可选，仅跨库检索（不传 vault_path）时生效：结果按知识库分组返回 groups，每组取 top_k 条"},
                 "path_prefix": {"type": "string", "description": "可选，只保留 source 以该前缀开头的 chunk（source 是库内相对 posix 路径）。用户提到具体课程名/文件夹名/主题目录时，用它把检索限定在该子树，如 '教材/'、'数字电路/'"},
@@ -872,6 +873,7 @@ class VaultMcpServer:
         dedupe: bool = True,
         target_vaults: list[str] | None = None,
         preview: bool = False,
+        compact: bool = False,
     ) -> dict[str, Any]:
         return _fanout_search_impl(
             self,
@@ -883,6 +885,7 @@ class VaultMcpServer:
             dedupe=dedupe,
             target_vaults=target_vaults,
             preview=preview,
+            compact=compact,
         )
 
     # v0.8.0 Phase 1：call_tool 由巨型 if 链改为显式路由表（15 个 kb_* 工具 → 处理方法）。

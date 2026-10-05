@@ -218,6 +218,7 @@ def fanout_search(
     *,
     budget_bytes: int | None = None,
     exact_terms: list[str] | None = None,
+    compact: bool = False,
 ) -> dict[str, Any]:
     """Search across registered vaults (either globally or scoped to target_vaults), merge and rerank once.
 
@@ -374,26 +375,50 @@ def fanout_search(
     else:
         tokens = query_tokens
 
+    effective_preview = True if compact else preview
+
     if group_by_vault:
-        # 分组模式：保持融合后的组内顺序，按库切桶；组顺序取各组最高分降序。
+        # 分组模式：在 pairs 层按库切桶，组顺序取各组最高分降序。
         # 分页在这里是"每组各翻一页"——全局先切一刀会让低分库整组消失。
+        # 排序在 pairs/Chunk 层完成，投影后不可依赖 chunk["score"]（compact 无此键）。
         buckets: dict[str, dict[str, Any]] = {}
         for entry, chunk in pairs:
             group = buckets.get(entry.path)
             if group is None:
-                group = {"vault": entry.path, "vault_name": entry.name, "chunks": []}
+                group = {
+                    "entry": entry,
+                    "pairs": [],
+                    "max_score": chunk.score,
+                }
                 buckets[entry.path] = group
-            data = chunk.to_dict(preview=preview, query_tokens=tokens)
-            data["vault"] = entry.path
-            data["vault_name"] = entry.name
-            group["chunks"].append(data)
+            else:
+                if chunk.score > group["max_score"]:
+                    group["max_score"] = chunk.score
+            group["pairs"].append((entry, chunk))
+
         for group in buckets.values():
-            group["chunks"] = group["chunks"][start:end]
-        # 切片后桶可能空了，直接丢掉（max 不接受空序列）。
-        groups = sorted(
-            (group for group in buckets.values() if group["chunks"]),
-            key=lambda group: -max(chunk["score"] for chunk in group["chunks"]),
+            group["pairs"] = group["pairs"][start:end]
+
+        sorted_buckets = sorted(
+            (group for group in buckets.values() if group["pairs"]),
+            key=lambda group: -group["max_score"],
         )
+
+        groups = []
+        for grp in sorted_buckets:
+            entry = grp["entry"]
+            grp_chunks = []
+            for _, chunk in grp["pairs"]:
+                data = chunk.to_dict(preview=effective_preview, query_tokens=tokens, compact=compact)
+                if not compact:
+                    data["vault"] = entry.path
+                    data["vault_name"] = entry.name
+                grp_chunks.append(data)
+            groups.append({
+                "vault": entry.path,
+                "vault_name": entry.name,
+                "chunks": grp_chunks,
+            })
         res: dict[str, Any] = {"groups": groups, "searched": searched, "errors": errors, "excluded_solo": excluded_solo}
         if indexing_vaults:
             res["indexing_vaults"] = indexing_vaults
@@ -405,16 +430,17 @@ def fanout_search(
                 "下次请传 vault_path 或 path_prefix 定向检索，精度更高、噪音更少。"
             )
         if budget_bytes is not None:
-            res = apply_budget(res, budget_bytes, orig_offset=start, preview=preview)
+            res = apply_budget(res, budget_bytes, orig_offset=start, preview=effective_preview)
         return res
 
     pairs = pairs[start:end]
 
     out_chunks = []
     for entry, chunk in pairs:
-        data = chunk.to_dict(preview=preview, query_tokens=tokens)
+        data = chunk.to_dict(preview=effective_preview, query_tokens=tokens, compact=compact)
         data["vault"] = entry.path
-        data["vault_name"] = entry.name
+        if not compact:
+            data["vault_name"] = entry.name
         out_chunks.append(data)
     res = {"chunks": out_chunks, "searched": searched, "errors": errors, "excluded_solo": excluded_solo}
     if indexing_vaults:
@@ -427,5 +453,5 @@ def fanout_search(
             "下次请传 vault_path 或 path_prefix 定向检索，精度更高、噪音更少。"
         )
     if budget_bytes is not None:
-        res = apply_budget(res, budget_bytes, orig_offset=start, preview=preview)
+        res = apply_budget(res, budget_bytes, orig_offset=start, preview=effective_preview)
     return res
