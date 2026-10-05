@@ -449,7 +449,7 @@ poll/start/fallback cadence -+                                  |
 
 **验收**：native、poll、非win回退、watcher死亡、events=None、interval0、启动既有文档、慢hook不阻文本、事件风暴合并、stop后零新上传均通过。提交 `feat(watch): trigger coalesced automatic ingest across native and poll modes`；C61记为同批完成。
 
-### [ ] C58d：server接线、hint、doctor与实时状态
+### [x] C58d：server接线、hint、doctor与实时状态
 
 **前置**：C58c。文件：`server.py::_indexer_for/_ingest_manager_for/_kb_init/_kb_init_solo/_kb_ingest/_kb_stats/shutdown`、`doctor.py::check_config/render_md`，`tests/test_ingest_server.py/test_doctor.py/test_ingest_auto.py`。
 

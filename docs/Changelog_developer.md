@@ -584,6 +584,27 @@
 > - 全局回归测试（107 passed in 55.25s）：
 >   覆盖 stale read、防争用、diaglog、多库、scoped search、ingest server、sync engine、并发加固、search oracle、chunkid read、facade freeze 等全部核心链路。
 
+### C58d — moton16,2026-10-05,Antigravity — feat(server): wire automatic ingest with explicit status and safe defaults
+> **代码改动概况**：
+> - `mortis_rag_mcp/server.py`：
+>   - 惰性挂载摄取 Hook（Req 1 & 2）：`_indexer_for` 在 `start_watching()` 之前仅在 `enabled && auto_watch` 为 True 时注入惰性 `_ingest_hook`（不在闭包定义时构造 manager，不提前创建 `.mortis-parsed` 目录）；
+>   - 锁序死锁规避（Req 2）：`_ingest_manager_for` 注入动态 `_ignore_provider`（实时拉取 `idx.config.exclude_patterns`），禁止反向申请 `_indexers_lock`，消除反向嵌套死锁风险；
+>   - 友好提示与矛盾检测（Req 3 & 5）：`_ingest_init_hint` 升级 `kb_init` / `kb_init_solo` 提示文案，明确容量上限（如 20MiB）、自动模式授权风险，并在 `auto_watch=true` 但 `enabled=false` 时给出矛盾警告；`kb_ingest(action="status")` 同样在矛盾配置下返回 `warning`；
+>   - 状态只读快照（Req 6）：`kb_stats` 追加 `ingest_auto` 状态快照（configured, effective, max_file_size_mb, watch_method, effective_interval, last_scan_at, last_error, skipped 计数等），仅只读现有 manager / state，manager 不存在则 `last_scan_at = None`，绝不因查 stats 隐式启动扫描或 worker；
+>   - 优雅停机（Req 9）：`shutdown` 与 `_kb_remove` 优先解除 `_ingest_hook` 引用，再触发 `stop_watching()`。
+> - `mortis_rag_mcp/doctor.py`：
+>   - 配置体检（Req 7）：`check_config` 诊断 `detail` 回显摄取有效状态（自动/手动/未启用）、容量上限及矛盾警告，保持 VALID 判定不因自动摄取关闭而失败；
+>   - 状态快照（Req 7 & 8）：新增 `check_ingest` 与 `STATUS.md` 表格中的 `文档摄取` 栏，仅做已有 `.ingest_state.json` 的轻量快照读取并明确标注 `（报告生成时快照）`，不构造 manager、不发起任何网络调用。
+> - `tests/test_ingest_server.py`：
+>   - 新增 4 个集成测试：`kb_stats` 的 `ingest_auto` 快照字段完整性与有效性校验、矛盾配置下 `kb_ingest` 告警、Mock 端到端全链路（enabled+auto true -> 放 PDF -> 触发 hook -> fake parse -> .mortis-parsed md 落盘 -> A4 刷新 -> kb_search 命中）、auto_watch=false 时负向路径（零 hook、零 worker 启动）。
+> - `tests/test_doctor.py`：
+>   - 新增 2 个诊断测试：`check_config` 三态回显与矛盾警告检测、`check_ingest` 状态快照读取与报告生成时快照标注。
+>
+> **验证**：
+> - 专项测试（106 passed in 10.68s）：
+>   `.\.venv\Scripts\python.exe -m pytest tests/test_ingest_server.py tests/test_ingest_auto.py tests/test_doctor.py tests/test_watch_integration.py -q`
+
+
 
 
 

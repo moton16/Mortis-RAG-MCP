@@ -217,3 +217,138 @@ def test_kb_stats_skipped_unsupported_excludes_ingest_exts(tmp_path):
         bare = ext.lstrip(".")
         assert bare not in skipped, f"kb_stats.skipped_unsupported 误包含了可摄取格式: {bare}"
 
+
+def test_kb_stats_includes_ingest_auto_snapshot(tmp_path, monkeypatch):
+    monkeypatch.setenv("VAULT_MCP_REGISTRY", str(tmp_path / "vaults.toml"))
+    vault = tmp_path / "stats_auto_vault"
+    vault.mkdir()
+    (vault / "note.md").write_text("# Note\ncontent", encoding="utf-8")
+
+    server = VaultMcpServer()
+    server.config.ingest.enabled = True
+    server.config.ingest.auto_watch = True
+    server.config.ingest.max_file_size_mb = 15
+    server.config.watch_method = "poll"
+    server.config.watch_fallback_interval = 25.0
+
+    server.call_tool("kb_init", {"path": str(vault), "name": "auto_vault"})
+    res = server.call_tool("kb_stats", {"vault_path": "auto_vault"})
+    stats = json.loads(res["content"][0]["text"])
+
+    assert "ingest_auto" in stats
+    ia = stats["ingest_auto"]
+    assert ia["configured"] is True
+    assert ia["effective"] is True
+    assert ia["max_file_size_mb"] == 15
+    assert ia["watch_method"] == "poll"
+    assert ia["effective_interval"] == 25.0
+    assert ia["skipped_too_large"] == 0
+    assert ia["skipped_seen"] == 0
+    assert ia["skipped_ignored"] == 0
+
+    # Trigger hook to guarantee last_scan_at is recorded
+    indexer = server._indexer_for({"vault_path": "auto_vault"})
+    indexer._ingest_hook()
+    res_after = server.call_tool("kb_stats", {"vault_path": "auto_vault"})
+    stats_after = json.loads(res_after["content"][0]["text"])
+    assert stats_after["ingest_auto"]["last_scan_at"] is not None
+
+    # Negative check: vault initialized when ingest is disabled has last_scan_at None
+    server_dis = VaultMcpServer()
+    server_dis.config.ingest.enabled = False
+    vault_dis = tmp_path / "stats_dis_vault"
+    vault_dis.mkdir()
+    (vault_dis / "note.md").write_text("# Note", encoding="utf-8")
+    server_dis.call_tool("kb_init", {"path": str(vault_dis), "name": "dis_vault"})
+    res_dis = server_dis.call_tool("kb_stats", {"vault_path": "dis_vault"})
+    stats_dis = json.loads(res_dis["content"][0]["text"])
+    assert stats_dis["ingest_auto"]["last_scan_at"] is None
+
+
+def test_kb_ingest_status_warning_when_contradictory(tmp_path, monkeypatch):
+    monkeypatch.setenv("VAULT_MCP_REGISTRY", str(tmp_path / "vaults.toml"))
+    vault = tmp_path / "contra_vault"
+    vault.mkdir()
+    (vault / "paper.pdf").write_bytes(b"%PDF-1.4 dummy")
+
+    server = VaultMcpServer()
+    server.config.ingest.enabled = False
+    server.config.ingest.auto_watch = True
+    server.call_tool("kb_init", {"path": str(vault), "name": "contra_vault"})
+
+    status_res = server.call_tool("kb_ingest", {"action": "status", "vault_path": "contra_vault"})
+    data = json.loads(status_res["content"][0]["text"])
+    assert "warning" in data
+    assert "auto_watch=true 但 enabled=false" in data["warning"]
+
+
+def test_mock_e2e_auto_ingest_flow(tmp_path, monkeypatch):
+    monkeypatch.setenv("VAULT_MCP_REGISTRY", str(tmp_path / "vaults.toml"))
+    vault = tmp_path / "e2e_vault"
+    vault.mkdir()
+    (vault / "paper.pdf").write_bytes(b"%PDF-1.4 e2e test dummy content")
+
+    server = VaultMcpServer()
+    server.config.ingest.enabled = True
+    server.config.ingest.auto_watch = True
+
+    with patch("mortis_rag_mcp.ingest.worker.IngestManager._client_or_make") as mock_client_factory:
+        mock_client = MagicMock()
+        mock_client_factory.return_value = mock_client
+        mock_parsed = MagicMock()
+        mock_parsed.channel = "v4"
+        mock_parsed.markdown = "# Quantum Computing Overview\nQubits and entanglement in deep space."
+        mock_parsed.images = {}
+        mock_client.parse.return_value = mock_parsed
+
+        server.call_tool("kb_init", {"path": str(vault), "name": "e2e_vault"})
+
+        # Get indexer, which has _ingest_hook wired
+        indexer = server._indexer_for({"vault_path": "e2e_vault"})
+        assert callable(indexer._ingest_hook)
+
+        # Trigger hook directly (simulates scan thread trigger)
+        indexer._ingest_hook()
+
+        # Manager should have auto_submitted and started worker thread.
+        # Wait briefly for worker to complete parsing
+        manager = server._ingest_manager_for(str(vault))
+        if manager._worker and manager._worker.is_alive():
+            manager._worker.join(timeout=5.0)
+
+        # Confirm markdown落盘
+        parsed_md = vault / ".mortis-parsed" / "paper.md"
+        assert parsed_md.exists()
+        assert "Quantum Computing Overview" in parsed_md.read_text(encoding="utf-8")
+
+        # IngestManager on_job_finished called indexer.request_refresh()
+        # Verify search hits the newly parsed content
+        indexer.sync()
+
+        search_res = server.call_tool("kb_search", {
+            "query": "entanglement quantum",
+            "vault_path": "e2e_vault",
+        })
+        search_data = json.loads(search_res["content"][0]["text"])
+        chunks = search_data.get("chunks") or search_data.get("results") or []
+        assert len(chunks) > 0
+        assert any("Quantum Computing" in r.get("content", "") or "Quantum Computing" in r.get("heading", "") or "paper.md" in r.get("source", "") for r in chunks)
+
+
+def test_mock_auto_ingest_negative_when_auto_watch_false(tmp_path, monkeypatch):
+    monkeypatch.setenv("VAULT_MCP_REGISTRY", str(tmp_path / "vaults.toml"))
+    vault = tmp_path / "neg_vault"
+    vault.mkdir()
+    (vault / "paper.pdf").write_bytes(b"%PDF-1.4 dummy")
+
+    server = VaultMcpServer()
+    server.config.ingest.enabled = True
+    server.config.ingest.auto_watch = False
+
+    with patch("mortis_rag_mcp.ingest.worker.IngestManager._client_or_make") as mock_client_factory:
+        server.call_tool("kb_init", {"path": str(vault), "name": "neg_vault"})
+        indexer = server._indexer_for({"vault_path": "neg_vault"})
+        assert indexer._ingest_hook is None
+        mock_client_factory.assert_not_called()
+
+

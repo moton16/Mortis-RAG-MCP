@@ -397,9 +397,10 @@ class VaultMcpServer:
         atexit.register(self.shutdown)
 
     def shutdown(self) -> None:
-        """停掉所有知识库的文件监听（幂等，可重复调用）。"""
+        """停掉所有知识库的文件监听与摄取扫描（幂等，可重复调用）。"""
         for indexer in list(self._indexers.values()):
             try:
+                indexer._ingest_hook = None
                 indexer.stop_watching()
             except Exception:
                 pass
@@ -593,6 +594,13 @@ class VaultMcpServer:
             indexer = self._indexers.get(key)
             if indexer is None:
                 indexer = MarkdownIndexer(vault_path, self.config)
+                # C58d: start_watching 之前挂 hook，仅 effective=enabled && auto_watch 时挂
+                # 惰性获取 manager，不在定义闭包时构造 manager，不默认创建 .mortis-parsed
+                if self.config.ingest.enabled and self.config.ingest.auto_watch:
+                    def _ingest_hook() -> None:
+                        mgr = self._ingest_manager_for(key)
+                        mgr.auto_submit()
+                    indexer._ingest_hook = _ingest_hook
                 indexer.start_watching()
                 self._indexers[key] = indexer
         return indexer
@@ -654,19 +662,41 @@ class VaultMcpServer:
         }
         if unsupported:
             res["skipped_unsupported"] = unsupported
-        if doc_files and not self.config.ingest.enabled:
-            res["hint"] = (
+        hint = self._ingest_init_hint(doc_files)
+        if hint:
+            res["hint"] = hint
+        return res
+
+    def _ingest_init_hint(self, doc_files: int) -> str | None:
+        if not doc_files:
+            return None
+        ingest_cfg = self.config.ingest
+        effective_auto = ingest_cfg.enabled and ingest_cfg.auto_watch
+        cap_mb = ingest_cfg.max_file_size_mb
+        cap_str = f"{cap_mb}MiB" if cap_mb > 0 else "无限制"
+        if effective_auto:
+            return (
+                f"检测到 {doc_files} 个 PDF/Office 文档。自动摄取已激活（单文件上限 {cap_str}），"
+                "新文档将自动提交云端解析（云端解析可能产生费用/隐私影响）。"
+                "可用 kb_ingest(action='status') 查看队列进度。"
+            )
+        if not ingest_cfg.enabled and ingest_cfg.auto_watch:
+            return (
+                f"检测到 {doc_files} 个 PDF/Office 文档。auto_watch=true 但 enabled=false，"
+                "自动摄取未生效；需同时在 config/app.toml 设置 [ingest] enabled = true 并重启服务。"
+                "如需检索，请先向用户确认后再开启，或通过 kb_ingest(action='pending') 查看待解析列表。"
+            )
+        if not ingest_cfg.enabled:
+            return (
                 f"检测到 {doc_files} 个 PDF/Office 文档。PDF 摄取层默认未启用；"
                 "若用户需要检索这些文档，请先向用户确认，然后在 config/app.toml 设置 "
-                "[ingest] enabled = true 并重启服务，再调用 kb_ingest(action='submit')。"
+                "[ingest] enabled = true 并重启服务，再调用 kb_ingest(action='pending') 查看待解析列表并在确认后 submit。"
                 "未确认前不要自作主张开启。"
             )
-        elif doc_files:
-            res["hint"] = (
-                f"检测到 {doc_files} 个 PDF/Office 文档，可调用 "
-                "kb_ingest(action='pending') 查看待解析列表。"
-            )
-        return res
+        return (
+            f"检测到 {doc_files} 个 PDF/Office 文档（单文件上限 {cap_str}），当前为手动摄取模式；"
+            "可调用 kb_ingest(action='pending') 查看待解析列表，由用户确认后调用 kb_ingest(action='submit') 提交。"
+        )
 
     def _kb_init_solo(self, arguments: dict[str, Any]) -> dict[str, Any]:
         """kb_init_solo：初始化/确保一个 solo 库（幂等三态）。
@@ -711,18 +741,9 @@ class VaultMcpServer:
             }
             if unsupported:
                 res["skipped_unsupported"] = unsupported
-            if doc_files and not self.config.ingest.enabled:
-                res["hint"] = (
-                    f"检测到 {doc_files} 个 PDF/Office 文档。PDF 摄取层默认未启用；"
-                    "若用户需要检索这些文档，请先向用户确认，然后在 config/app.toml 设置 "
-                    "[ingest] enabled = true 并重启服务，再调用 kb_ingest(action='submit')。"
-                    "未确认前不要自作主张开启。"
-                )
-            elif doc_files:
-                res["hint"] = (
-                    f"检测到 {doc_files} 个 PDF/Office 文档，可调用 "
-                    "kb_ingest(action='pending') 查看待解析列表。"
-                )
+            hint = self._ingest_init_hint(doc_files)
+            if hint:
+                res["hint"] = hint
             return res
         entry = self.registry.set_solo(existing.path, True)
         return {
@@ -754,7 +775,8 @@ class VaultMcpServer:
         indexer = self._indexers.pop(key, None)
         watcher_stopped = False
         if indexer is not None:
-            indexer.stop_watching()  # idempotent; joins the watch thread
+            indexer._ingest_hook = None
+            indexer.stop_watching()  # idempotent; joins the watch thread & scan thread
             watcher_stopped = True
         self.registry.remove(entry.path)
         cache_purged = False
@@ -798,7 +820,19 @@ class VaultMcpServer:
                         except Exception:
                             pass
 
-                    manager = IngestManager(vault_path, self.config.ingest, on_job_finished=_on_job_finished)
+                    def _ignore_provider() -> Any:
+                        idx = self._indexers.get(key)
+                        if idx is None:
+                            return None
+                        from ._indexer.scanning import IgnoreMatcher
+                        return IgnoreMatcher(idx.config.exclude_patterns)
+
+                    manager = IngestManager(
+                        vault_path,
+                        self.config.ingest,
+                        on_job_finished=_on_job_finished,
+                        ignore_provider=_ignore_provider,
+                    )
                     self._ingest_managers[key] = manager
         return manager
 
@@ -818,7 +852,10 @@ class VaultMcpServer:
         if action == "pending":
             return {"pending": manager.scan_pending()}
         if action == "status":
-            return manager.status(str(arguments.get("job_id", "")).strip() or None)
+            res = manager.status(str(arguments.get("job_id", "")).strip() or None)
+            if not self.config.ingest.enabled and self.config.ingest.auto_watch:
+                res["warning"] = "ingest.auto_watch=true 但 enabled=false，自动摄取未生效"
+            return res
         force = bool(arguments.get("force", False))
         result = manager.submit(arguments.get("sources") or None, force=force)
         result["hint"] = ("解析在后台进行，用 kb_ingest(action='status') 查进度；"
@@ -1447,6 +1484,44 @@ class VaultMcpServer:
             stats["indexing_progress"] = r_status["indexing_progress"]
         if r_status.get("refresh_error"):
             stats["indexing_error"] = r_status["refresh_error"]
+
+        vault_key = str(indexer.vault_path.resolve())
+        ingest_cfg = self.config.ingest
+        effective_auto = bool(ingest_cfg.enabled and ingest_cfg.auto_watch)
+        watch_method = self.config.watch_method
+        fallback_int = self.config.watch_fallback_interval
+        effective_interval = fallback_int if fallback_int > 0 else 30.0
+
+        manager = self._ingest_managers.get(vault_key)
+        last_scan_at = None
+        last_err = None
+        skipped_too_large = 0
+        skipped_seen = 0
+        skipped_ignored = 0
+        if manager is not None and manager.state_path.exists():
+            try:
+                st_data = manager._load_state()
+                aw_st = st_data.get("auto_watch", {})
+                last_scan_at = aw_st.get("last_scan_at")
+                last_err = aw_st.get("last_error") or None
+                skipped_too_large = aw_st.get("skipped_too_large", 0)
+                skipped_seen = aw_st.get("skipped_seen", 0)
+                skipped_ignored = aw_st.get("skipped_ignored", 0)
+            except Exception:
+                pass
+
+        stats["ingest_auto"] = {
+            "configured": bool(ingest_cfg.auto_watch),
+            "effective": bool(effective_auto),
+            "max_file_size_mb": ingest_cfg.max_file_size_mb,
+            "watch_method": watch_method,
+            "effective_interval": effective_interval,
+            "last_scan_at": last_scan_at,
+            "last_error": last_err,
+            "skipped_too_large": skipped_too_large,
+            "skipped_seen": skipped_seen,
+            "skipped_ignored": skipped_ignored,
+        }
         return stats
 
     def _kb_exempt(self, arguments: dict[str, Any]) -> dict[str, Any]:
