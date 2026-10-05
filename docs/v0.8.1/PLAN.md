@@ -214,7 +214,7 @@ CURRENT                         THIS RELEASE                     12-MONTH IDEAL
 | 2 | [x] | C66 | 可合并后台refresh、所有MCP只读路径、A4回调 | C65 | 1–2d / 1.5–3h |
 | 3 | [x] | C58a | auto_watch与size配置 | Intake | 1–2h / 20–40m |
 | 4 | [x] | C58b | 统一size闸门、自动判据账本、单队列 | C58a | 0.5–1d / 1–2h |
-| 5 | [ ] | C58c+C61 | native/poll触发、扫描合并与生命周期 | C66,C58b | 0.5–1d / 1–2h |
+| 5 | [x] | C58c+C61 | native/poll触发、扫描合并与生命周期 | C66,C58b | 0.5–1d / 1–2h |
 | 6 | [ ] | C58d | server/doctor/hint接线与集成 | C58c | 2–4h / 30–60m |
 | 7 | [ ] | C67 | compact全路由投影 | C66 | 2–4h / 30–60m |
 | 8 | [ ] | C68 | 完整chunk预算与续页 | C67 | 4–6h / 45–90m |
@@ -414,7 +414,7 @@ Agent限额PDFfallback；queued恢复/源变大二次闸门；ignore配置与动
 
 **验收/提交**：所有网络mock；静态failed不自动重试；>500用例必须通过。提交 `feat(ingest): enforce size policy and persist automatic submission dedupe`。明确账本状态落盘与既有state兼容，不更改缓存协议。
 
-### [ ] C58c + C61：原生/poll自动触发与扫描合并
+### [x] C58c + C61：原生/poll自动触发与扫描合并
 
 **前置**：C66、C58b。文件：`_indexer/watch.py`、indexer初始化/Facade、`tests/test_watch_integration.py/test_fsnotify.py/test_ingest_auto.py/test_p5_lifecycle.py`。
 

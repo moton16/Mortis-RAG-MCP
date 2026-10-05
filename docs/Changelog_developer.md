@@ -559,5 +559,31 @@
 >   `.\.venv\Scripts\python.exe -m pytest tests/test_ingest_auto.py tests/test_ingest_worker.py tests/test_adversarial_v070.py tests/test_ingest_server.py tests/test_registry.py -q`
 > - 全局回归测试（497 passed, 2 skipped in 113.71s）。
 
+### C58c+C61 — moton16,2026-10-05,Antigravity — feat(watch): trigger coalesced automatic ingest across native and poll modes
+> **代码改动概况**：
+> - `mortis_rag_mcp/_indexer/watch.py`：
+>   - 架构解耦与控制流图：增加架构设计注释与 ASCII 控制流图，阐明文本同步（毫秒级本地哈希与分块）与文档摄取扫描（秒到分钟级二进制哈希与云端 MinerU 解析）解耦的核心逻辑；
+>   - 按需摄取扫描工作线程：新增 `request_ingest_scan(owner)` 与 `_ingest_scan_loop(owner)`，采用双检锁按需启动至多一条 `vault-ingest-scan` 守护线程，快速合并高频事件风暴（100 个事件只起一个 worker）；锁外调用 `_ingest_hook`，失败采用指数退避（0.5s -> 5.0s）；
+>   - 原生事件双通道分类：更新 `_on_fs_events`，逐条分类文件事件为文本事件与摄取事件（纯 PDF 事件仅唤醒 `vault-ingest-scan`，零文本 sync 开销；纯文本事件仅唤醒文本防抖；混合与目录变动/events=None 双向派发）；
+>   - 监听循环双模接线与 0 规则：`_native_watch_loop` 启动与每个 `fallback_interval > 0` 节拍触发摄取扫描；`_watch_loop` 启动与每 30s 节拍触发摄取扫描（若 `watch_fallback_interval == 0` 关闭原生兜底，轮询文档扫描仍保留 30s 默认节拍以防功能静默失效）；
+>   - 优雅生命周期停止：`stop_watching` 设置停止标记、清理 dirty、通知条件变量并以 2s 超时优雅 join `vault-ingest-scan` 线程，停止后拒绝新扫描请求。
+> - `mortis_rag_mcp/indexer.py`：
+>   - `MarkdownIndexer.__init__`：新增摄取协调状态字段（`_ingest_hook`, `_ingest_lock`, `_ingest_cv`, `_ingest_dirty`, `_ingest_worker_thread`, `_ingest_stopping`, `_last_ingest_scan_at`, `_ingest_scan_failures`, `_last_ingest_error`, `_ingest_scan_start_lock`）；
+>   - Facade 委托方法：暴露 `request_ingest_scan()` 与 `_ingest_scan_loop()`。
+> - `mortis_rag_mcp/ingest/worker.py`：
+>   - 复制判稳与写操作防抖（Req 9）：`IngestManager` 新增 `_stat_samples` 与 `_settling_files`（及 `mark_settling`）；`_auto_pending` 对 0 字节文件与采样仍在变化中的文件延后入队，且不阻断同批其他稳定文件；
+>   - 入队后源文件变更防御（Req 10）：`_run_job` 在解析前复核当前 sha256，若与任务 hash 不符直接标记 `state="failed"`, `error="source_changed: ..."`，杜绝错误上传并允许下一轮扫描按新版本哈希入队。
+> - `tests/test_watch_integration.py`：
+>   - 新增 7 个专项测试：纯 PDF 事件零文本 sync、纯文本事件零摄取 hook、混合与 indeterminate 事件双触发、100 事件合并单线程、阻塞摄取 hook 不卡死文本 sync、轮询模式 0 间隔默认兜底、停止生命周期无泄漏线程、非 Windows 环境 auto 退回 poll 仍保留摄取扫描。
+> - `tests/test_ingest_auto.py`：
+>   - 新增 2 个专项测试：0 字节与动态写文件判稳延后不阻塞稳定文件、入队后修改文件 worker 拦截 `source_changed` 且免上传并在后续扫描重新入队。
+>
+> **验证**：
+> - 专项测试（70 passed, 2 skipped in 6.14s）：
+>   `.\.venv\Scripts\python.exe -m pytest tests/test_watch_integration.py tests/test_fsnotify.py tests/test_ingest_auto.py tests/test_p5_lifecycle.py -q`
+> - 全局回归测试（107 passed in 55.25s）：
+>   覆盖 stale read、防争用、diaglog、多库、scoped search、ingest server、sync engine、并发加固、search oracle、chunkid read、facade freeze 等全部核心链路。
+
+
 
 

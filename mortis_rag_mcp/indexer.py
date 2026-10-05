@@ -183,6 +183,17 @@ class MarkdownIndexer:
         self._refresh_requested_at: float | None = None
         self._last_refresh_completed_at: float = 0.0
         self._READ_REFRESH_MIN_INTERVAL_SECONDS: float = 1.0
+        # Ingest auto-scan coordination (Card C58c / C61)
+        self._ingest_hook: Callable[[], Any] | None = None
+        self._ingest_lock = threading.Lock()
+        self._ingest_cv = threading.Condition(self._ingest_lock)
+        self._ingest_dirty: bool = False
+        self._ingest_worker_thread: threading.Thread | None = None
+        self._ingest_stopping: bool = False
+        self._last_ingest_scan_at: float = 0.0
+        self._ingest_scan_failures: int = 0
+        self._last_ingest_error: str | None = None
+        self._ingest_scan_start_lock = threading.Lock()
         self._sync_lock = threading.Lock()
         self._cache_lock = threading.Lock()
         # 是否正在 sync（供 kb_stats 报进度）；连续失败次数用于监听线程的退避。
@@ -1271,3 +1282,10 @@ class MarkdownIndexer:
 
     def refresh_status(self) -> dict[str, Any]:
         return _watch.refresh_status(self)
+
+    def request_ingest_scan(self) -> bool:
+        return _watch.request_ingest_scan(self)
+
+    def _ingest_scan_loop(self) -> None:
+        return _watch._ingest_scan_loop(self)
+

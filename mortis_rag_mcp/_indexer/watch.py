@@ -3,18 +3,48 @@ from __future__ import annotations
 import threading
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from ..fsnotify import WindowsDirectoryWatcher, watcher_available
 from .chunking import _INDEXABLE_TEXT_EXTS
+
+try:
+    from ..ingest.worker import INGEST_EXTS
+except ImportError:
+    INGEST_EXTS = {".pdf", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx"}
 
 if TYPE_CHECKING:
     from ..indexer import MarkdownIndexer
 
 
+# ---------------------------------------------------------------------------
+# Architecture Note (Decoupling Text Sync from Ingest Scanning - Card C58c / C61):
+#
+# native event  .md/.txt       -> existing refresh flag -> vault-fs-debounce -> sync
+#               PDF/Office    -> ingest dirty flag ----> vault-ingest-scan -> auto_submit
+# poll/start/fallback cadence -+                                  |
+#                                                          ingest-worker parse
+#                                                                |
+#                                           A4 callback -> immediate request_refresh
+#
+# Why text sync and ingest scanning are decoupled:
+# 1. Latency & Resource Profile: Text sync is a millisecond-scale local file
+#    reconciliation (hashing small markdown files and updating in-memory chunks/FTS).
+#    Ingest scanning involves discovering and hashing large binary documents (PDF/Office)
+#    and uploading them to cloud Mineru parsers, which takes seconds to minutes.
+# 2. Worker Independence: Running document scanning or hashing inside the text
+#    debounce scheduler (vault-fs-debounce) would stall all text sync operations and
+#    starve real-time search updates.
+# 3. Asymmetric Triggers: Pure PDF events must not trigger full-vault text syncs
+#    until the ingest worker finishes parsing and writes the resulting .md file,
+#    whereupon the A4 callback triggers an immediate request_refresh().
+# ---------------------------------------------------------------------------
+
 # native 监听回调的防抖延迟上限：编辑器保存风暴（事件持续不断）会让防抖定时器
 # 一直顺延，超过这个窗口就必须同步一次，不能让事件流饿死同步。
 _FS_MAX_DEBOUNCE_WAIT = 5.0
+_DEFAULT_POLL_INGEST_INTERVAL = 30.0
+
 
 
 def start_watching(
@@ -22,13 +52,22 @@ def start_watching(
     interval: float = 0.25,
     debounce_seconds: float | None = None,
 ) -> None:
-    if getattr(owner, "_stopping", False) and owner._watch_thread is not None:
-        # 上一次 stop 还没真正收干净，先把残留线程收掉再启新的。
-        owner._watch_thread.join(timeout=2)
-        if owner._watch_thread.is_alive():
-            return
-        owner._watch_thread = None
+    if getattr(owner, "_stopping", False):
+        if owner._watch_thread is not None:
+            # 上一次 stop 还没真正收干净，先把残留线程收掉再启新的。
+            owner._watch_thread.join(timeout=2)
+            if owner._watch_thread.is_alive():
+                return
+            owner._watch_thread = None
+        if owner._ingest_worker_thread is not None:
+            owner._ingest_worker_thread.join(timeout=2)
+            if owner._ingest_worker_thread.is_alive():
+                return
+            owner._ingest_worker_thread = None
         owner._stopping = False
+        owner._ingest_stopping = False
+    else:
+        owner._ingest_stopping = False
     if owner._watch_thread and owner._watch_thread.is_alive():
         return
     if owner._fs_watcher is not None and owner._fs_watcher.is_alive():
@@ -104,6 +143,76 @@ def refresh_status(owner: MarkdownIndexer) -> dict[str, Any]:
     }
 
 
+def request_ingest_scan(owner: MarkdownIndexer) -> bool:
+    """Request an ingest scan for PDF/Office documents (coalesced).
+
+    Returns True if request was accepted/coalesced; False if auto-ingest hook
+    is not configured or indexer is stopping.
+    """
+    if owner._ingest_hook is None:
+        return False
+    if owner._watch_stop.is_set() or getattr(owner, "_stopping", False) or owner._ingest_stopping:
+        return False
+    _start_ingest_scan_worker(owner)
+    with owner._ingest_lock:
+        owner._ingest_dirty = True
+        owner._ingest_cv.notify_all()
+        return True
+
+
+def _start_ingest_scan_worker(owner: MarkdownIndexer) -> None:
+    if owner._ingest_hook is None:
+        return
+    if owner._watch_stop.is_set() or getattr(owner, "_stopping", False) or owner._ingest_stopping:
+        return
+    if owner._ingest_worker_thread is not None and owner._ingest_worker_thread.is_alive():
+        return
+    start_lock = getattr(owner, "_ingest_scan_start_lock", None)
+    if start_lock is None:
+        owner._ingest_scan_start_lock = threading.Lock()
+        start_lock = owner._ingest_scan_start_lock
+    with start_lock:
+        if owner._watch_stop.is_set() or getattr(owner, "_stopping", False) or owner._ingest_stopping:
+            return
+        if owner._ingest_worker_thread is not None and owner._ingest_worker_thread.is_alive():
+            return
+        t = threading.Thread(
+            target=owner._ingest_scan_loop, daemon=True, name="vault-ingest-scan"
+        )
+        owner._ingest_worker_thread = t
+        t.start()
+
+
+def _ingest_scan_loop(owner: MarkdownIndexer) -> None:
+    """按需 ingest 扫描循环：合并 PDF/Office 变动事件，锁外调用 _ingest_hook。
+    失败执行指数退避 (0.5s -> 5.0s)，避免紧密自旋。
+    """
+    while not (owner._watch_stop.is_set() or getattr(owner, "_stopping", False) or owner._ingest_stopping):
+        with owner._ingest_lock:
+            while not owner._ingest_dirty:
+                if owner._watch_stop.is_set() or getattr(owner, "_stopping", False) or owner._ingest_stopping:
+                    return
+                owner._ingest_cv.wait(timeout=0.5)
+            owner._ingest_dirty = False
+
+        hook = owner._ingest_hook
+        if hook is None:
+            return
+        try:
+            hook()
+            owner._last_ingest_scan_at = time.time()
+            owner._ingest_scan_failures = 0
+            owner._last_ingest_error = None
+        except Exception as exc:
+            owner._ingest_scan_failures = getattr(owner, "_ingest_scan_failures", 0) + 1
+            err_msg = str(exc)
+            if len(err_msg) > 200:
+                err_msg = err_msg[:197] + "..."
+            owner._last_ingest_error = err_msg or exc.__class__.__name__
+            backoff = min(0.5 * (2 ** min(owner._ingest_scan_failures - 1, 4)), 5.0)
+            owner._watch_stop.wait(backoff)
+
+
 def _start_fs_scheduler(owner: MarkdownIndexer) -> None:
     if owner._watch_stop.is_set() or getattr(owner, "_stopping", False):
         return
@@ -156,31 +265,54 @@ def _fs_scheduler_loop(owner: MarkdownIndexer) -> None:
 
 
 def _on_fs_events(owner: MarkdownIndexer, events: list[tuple[int, str]] | None) -> None:
-    """原生监听的回调：把「库里有动静」翻译成一次防抖后的全量 sync。
+    """原生监听的回调：将文件事件分类为文本事件与摄取事件，分别派发。
 
-    正确性由 sync() 的全量 sha256 对账兜底。events=None（内核缓冲区溢出，
-    具体改动不可知）也走同一条路。事件路径在这里做第一层过滤：Obsidian
-    的 .obsidian/、缓存目录、以及被 ignore 规则排除的路径变动不需要唤醒
-    全量 sync——递归监视看不到排除目录，所以必须过滤而不是指望不触发。
+    文本事件 -> vault-fs-debounce 调度器 -> 全量 sync
+    摄取事件 -> vault-ingest-scan 调度器 -> auto_submit
+    两者互不阻塞，纯 PDF 事件不触发全量文本 sync。
     """
-    if events is not None:
-        keep = False
-        for _, rel in events:
-            if _fs_event_matters(owner, rel):
-                keep = True
-                break
-        if not keep:
-            return
-    with owner._fs_debounce_lock:
-        now = time.monotonic()
-        if owner._fs_pending_since is None:
-            owner._fs_pending_since = now
-        owner._fs_requested = True
-        owner._fs_debounce_cv.notify_all()
+    if events is None:
+        has_text_event = True
+        has_ingest_event = owner._ingest_hook is not None
+    else:
+        has_text_event = False
+        has_ingest_event = False
+        for _action, rel in events:
+            if not _fs_event_path_allowed(owner, rel):
+                continue
+            if not rel:
+                has_text_event = True
+                if owner._ingest_hook is not None:
+                    has_ingest_event = True
+                continue
+            lower = rel.replace("\\", "/").lower()
+            is_text = any(lower.endswith(ext) for ext in _INDEXABLE_TEXT_EXTS)
+            is_ingest = any(lower.endswith(ext) for ext in INGEST_EXTS)
+            if is_text:
+                has_text_event = True
+            if is_ingest and owner._ingest_hook is not None:
+                has_ingest_event = True
+            if not is_text and not is_ingest:
+                name = Path(rel).name
+                if "." not in name:
+                    has_text_event = True
+                    if owner._ingest_hook is not None:
+                        has_ingest_event = True
+
+    if has_ingest_event:
+        owner.request_ingest_scan()
+
+    if has_text_event:
+        with owner._fs_debounce_lock:
+            now = time.monotonic()
+            if owner._fs_pending_since is None:
+                owner._fs_pending_since = now
+            owner._fs_requested = True
+            owner._fs_debounce_cv.notify_all()
 
 
-def _fs_event_matters(owner: MarkdownIndexer, rel: str) -> bool:
-    """事件路径是否需要触发全量 sync。"""
+def _fs_event_path_allowed(owner: MarkdownIndexer, rel: str) -> bool:
+    """事件路径是否在允许范围内（非缓存、非排除目录）。"""
     if not rel:
         return True
     rel = rel.replace("\\", "/").lstrip("/")
@@ -193,7 +325,18 @@ def _fs_event_matters(owner: MarkdownIndexer, rel: str) -> bool:
         stripped = pattern.strip().strip("/").lower()
         if stripped and (lower == stripped or lower.startswith(stripped + "/")):
             return False
+    return True
+
+
+def _fs_event_matters(owner: MarkdownIndexer, rel: str) -> bool:
+    """事件路径是否需要触发全量 sync（保持旧接口兼容）。"""
+    if not _fs_event_path_allowed(owner, rel):
+        return False
+    if not rel:
+        return True
+    lower = rel.replace("\\", "/").lower()
     return any(lower.endswith(ext) for ext in _INDEXABLE_TEXT_EXTS)
+
 
 
 def _run_sync_quietly(owner: MarkdownIndexer) -> None:
@@ -229,6 +372,8 @@ def _native_watch_loop(owner: MarkdownIndexer, interval: float, debounce: float)
        监听永不静默失效。
     """
     fallback_interval = owner.config.watch_fallback_interval
+    # 启动请求一次 ingest 扫描（处理启动时既有的待摄取文档）
+    owner.request_ingest_scan()
     # 首轮全量 sync：watch_fallback_interval=0 时兜底循环一次都不会跑，
     # 没有这一句就永远等不到第一次索引。
     if not owner._watch_stop.is_set():
@@ -241,6 +386,7 @@ def _native_watch_loop(owner: MarkdownIndexer, interval: float, debounce: float)
         if owner._fs_watcher is None or not owner._fs_watcher.is_alive():
             break
         if fallback_interval > 0:
+            owner.request_ingest_scan()
             owner._run_sync_quietly()
     if owner._watch_stop.is_set():
         return
@@ -254,13 +400,27 @@ def _native_watch_loop(owner: MarkdownIndexer, interval: float, debounce: float)
 
 def _watch_loop(owner: MarkdownIndexer, interval: float, debounce: float) -> None:
     pending_since: float | None = None
+    # 启动请求一次 ingest 扫描（处理启动时既有的待摄取文档）
+    owner.request_ingest_scan()
     # 基线必须取在 sync 之前：先 sync 后取基线的话，「sync 完成到取基线之间」
     # 落盘的改动会被当成已同步而从此丢失——线程刚启动时这个窗口最大（主线程
     # 往往在 watcher 线程第一次扫描前就写完了文件）。先取基线再 sync，两者
     # 之间出现的改动由随后的 sync 补上，之后的改动才由轮询发现。
     previous = owner._quick_signatures()
     owner._run_sync_quietly()
+
+    poll_ingest_interval = (
+        owner.config.watch_fallback_interval
+        if owner.config.watch_fallback_interval > 0
+        else _DEFAULT_POLL_INGEST_INTERVAL
+    )
+    last_ingest_poll = time.monotonic()
+
     while not owner._watch_stop.wait(interval):
+        now = time.monotonic()
+        if (now - last_ingest_poll) >= poll_ingest_interval:
+            owner.request_ingest_scan()
+            last_ingest_poll = now
         try:
             current = owner._quick_signatures()
         except OSError:
@@ -294,6 +454,18 @@ def _quick_signatures(owner: MarkdownIndexer) -> dict[str, tuple[int, int]]:
 
 def stop_watching(owner: MarkdownIndexer) -> None:
     owner._watch_stop.set()
+    # 停止 ingest 扫描 worker
+    owner._ingest_stopping = True
+    with owner._ingest_lock:
+        owner._ingest_dirty = False
+        owner._ingest_cv.notify_all()
+    if owner._ingest_worker_thread is not None:
+        owner._ingest_worker_thread.join(timeout=2)
+        if owner._ingest_worker_thread.is_alive():
+            owner._stopping = True
+        else:
+            owner._ingest_worker_thread = None
+
     with owner._fs_debounce_lock:
         owner._fs_requested = False
         owner._fs_refresh_immediate = False
@@ -318,5 +490,6 @@ def stop_watching(owner: MarkdownIndexer) -> None:
             owner._stopping = True
         else:
             owner._watch_thread = None
-            if owner._fs_scheduler_thread is None:
+            if owner._fs_scheduler_thread is None and owner._ingest_worker_thread is None:
                 owner._stopping = False
+

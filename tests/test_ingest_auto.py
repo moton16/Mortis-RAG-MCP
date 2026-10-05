@@ -600,3 +600,79 @@ def test_disabled_auto_watch_zero_side_effect(tmp_path: Path) -> None:
     assert res["status"] == "disabled"
     assert res["submitted"] == 0
     assert mgr._worker is None
+
+
+def test_copy_settling_defers_zero_byte_and_changing_files(tmp_path: Path) -> None:
+    """A 0-byte file or actively changing file is deferred while stable files proceed."""
+    mgr = IngestManager(tmp_path, IngestConfig(enabled=True, auto_watch=True))
+
+    zero_doc = tmp_path / "zero.pdf"
+    zero_doc.write_bytes(b"")  # 0 bytes
+
+    stable_doc = tmp_path / "stable.pdf"
+    stable_doc.write_bytes(b"%PDF-1.4 Stable content")
+
+    changing_doc = tmp_path / "changing.pdf"
+    changing_doc.write_bytes(b"%PDF-1.4 Part 1")
+    mgr.mark_settling("changing.pdf")
+
+    with patch.object(mgr, "_worker_loop"):
+        # First scan
+        r1 = mgr.auto_submit()
+        # stable.pdf must be submitted (not blocked by zero or changing)
+        assert r1["submitted"] == 1
+        assert r1["jobs"][0]["source"] == "stable.pdf"
+
+        # Now zero_doc gets some bytes, but enters settling check
+        zero_doc.write_bytes(b"%PDF-1.4 Zero content now present")
+        # changing_doc changes size (still changing)
+        changing_doc.write_bytes(b"%PDF-1.4 Part 1 and Part 2 (more content)")
+
+        # Second scan: changing_doc size changed -> deferred again
+        r2 = mgr.auto_submit()
+        # zero_doc was deferred because previous sample was 0 bytes, now sampled non-zero
+        assert r2["submitted"] == 0
+
+        # Third scan: zero_doc and changing_doc now remain unchanged (settled)
+        r3 = mgr.auto_submit()
+        assert r3["submitted"] == 2
+        sources = {j["source"] for j in r3["jobs"]}
+        assert sources == {"zero.pdf", "changing.pdf"}
+
+
+def test_source_changed_fails_job_without_upload_and_next_scan_reenqueues(tmp_path: Path) -> None:
+    """When source file changes while in queue, worker fails with source_changed without upload; next scan reenqueues."""
+    mgr = IngestManager(tmp_path, IngestConfig(enabled=True, auto_watch=True))
+    doc = tmp_path / "evolving.pdf"
+    doc.write_bytes(b"%PDF-1.4 Version 1")
+
+    mock_parse = MagicMock()
+    with patch("mortis_rag_mcp.ingest.mineru.MineruClient.parse", mock_parse):
+        # Don't let worker loop run automatically yet
+        with patch.object(mgr, "_worker_loop"):
+            res = mgr.auto_submit()
+            assert res["submitted"] == 1
+            job_id = res["jobs"][0]["job_id"]
+
+        # Modify document BEFORE worker processes it!
+        doc.write_bytes(b"%PDF-1.4 Version 2 completely changed")
+
+        # Now run the worker loop manually
+        mgr._worker_loop()
+
+        st = mgr.status(job_id)
+        job = st["job"]
+        assert job["state"] == "failed"
+        assert "source_changed" in job["error"]
+        # MinerU parse MUST NOT have been called!
+        assert mock_parse.call_count == 0
+
+        # Run auto_submit() again: it must discover the new hash and enqueue a new job!
+        with patch.object(mgr, "_worker_loop"):
+            res2 = mgr.auto_submit()
+            assert res2["submitted"] == 1
+            new_job = res2["jobs"][0]
+            assert new_job["source"] == "evolving.pdf"
+            assert new_job["job_id"] != job_id
+            assert new_job["state"] == "queued"
+

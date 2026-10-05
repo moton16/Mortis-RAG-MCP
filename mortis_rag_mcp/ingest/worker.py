@@ -150,8 +150,16 @@ class IngestManager:
         self.on_job_finished = on_job_finished
         self.ignore_provider = ignore_provider
 
+        self._stat_samples: dict[str, tuple[float, int]] = {}
+        self._settling_files: set[str] = set()
+
         # 启动时自动恢复僵尸 parsing 任务 (D10a)
         self._recover_zombie_jobs()
+
+    def mark_settling(self, rel: str) -> None:
+        """Mark a source as currently being copied/written (forces settle check)."""
+        self._settling_files.add(Path(rel).as_posix())
+
 
     def _size_limit_bytes(self) -> int:
         cap = getattr(self.config, "max_file_size_bytes", None)
@@ -487,6 +495,23 @@ class IngestManager:
                                         })
                                     continue
 
+                                # 复制尚在进行的文档判稳（Card C58c / C61 Req 9）
+                                if st.st_size == 0:
+                                    scan_stats["skipped_settling"] = scan_stats.get("skipped_settling", 0) + 1
+                                    self._stat_samples[rel] = (st.st_mtime, 0)
+                                    self._settling_files.add(rel)
+                                    continue
+
+                                if rel in self._settling_files:
+                                    prev_mtime, prev_size = self._stat_samples.get(rel, (0.0, -1))
+                                    if st.st_size != prev_size or st.st_mtime != prev_mtime:
+                                        self._stat_samples[rel] = (st.st_mtime, st.st_size)
+                                        scan_stats["skipped_settling"] = scan_stats.get("skipped_settling", 0) + 1
+                                        continue
+                                    self._settling_files.discard(rel)
+
+                                self._stat_samples[rel] = (st.st_mtime, st.st_size)
+
                                 digest = _sha256(path)
                                 seen = auto_seen.get(rel)
                                 if seen is not None and seen.get("sha256") == digest:
@@ -655,6 +680,15 @@ class IngestManager:
         if not self._check_file_size(st.st_size):
             limit = self._size_limit_bytes()
             raise ValueError(f"file size {st.st_size} bytes exceeds limit {limit} bytes: {job['source']}")
+
+        # C58c / C61 Req 10: worker 解析前哈希与入队 hash 不符时标 source_changed，等待下一扫描按新 hash 入队
+        current_sha = _sha256(src)
+        if current_sha != job.get("sha256"):
+            job["state"] = "failed"
+            job["error"] = f"source_changed: expected {job.get('sha256', '')[:8]}, got {current_sha[:8]}"
+            job["finished_at"] = time.time()
+            return
+
         rel = Path(job["source"])
         out_md = self.out_root / rel.parent / (rel.stem + ".md")
         out_md.parent.mkdir(parents=True, exist_ok=True)
