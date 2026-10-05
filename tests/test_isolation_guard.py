@@ -58,7 +58,7 @@ def test_cache_env_inherited_by_subprocess():
     """④ stdio 用例把 os.environ 整包传给子进程，覆盖必须一起继承下去。"""
     code = "import os;print(os.environ.get('MORTIS_RAG_CACHE_DIR',''))"
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
-                         encoding="utf-8", timeout=30)
+                         encoding="utf-8", timeout=30, env={**os.environ, "PYTHONUTF8": "1"})
     assert out.stdout.strip() == os.environ["MORTIS_RAG_CACHE_DIR"]
 
 

@@ -33,173 +33,218 @@ def _measure_payload_bytes(result: Any) -> int:
     return len(json.dumps(outer, ensure_ascii=False).encode("utf-8"))
 
 
+def _build_overflow_response(
+    base_meta: dict[str, Any],
+    orig_offset: int,
+    budget_bytes: int,
+    mode: str = "flat",
+    group_next_offsets: dict[str, int] | None = None,
+) -> dict[str, Any]:
+    overflow_res = dict(base_meta)
+    if mode == "flat":
+        overflow_res["chunks"] = []
+        overflow_res["next_offset"] = orig_offset
+    else:
+        overflow_res["groups"] = []
+        overflow_res["next_offset"] = None
+        if group_next_offsets is not None:
+            overflow_res["group_next_offsets"] = dict(group_next_offsets)
+    overflow_res["truncated"] = True
+    overflow_res["returned"] = 0
+    overflow_res["budget_exceeded"] = True
+    overflow_res["budget_hint"] = "narrow vaults or increase budget_bytes"
+
+    # 迭代稳定 minimum_budget_bytes（最多 3 次），避免格式化字符数变化导致假称 <= budget
+    est = budget_bytes
+    for _ in range(3):
+        overflow_res["minimum_budget_bytes"] = est
+        actual = _measure_payload_bytes(overflow_res)
+        if actual == est:
+            break
+        est = actual
+    overflow_res["minimum_budget_bytes"] = est
+    return overflow_res
+
+
 def apply_budget(
     result: dict[str, Any],
     budget_bytes: int | None,
     orig_offset: int = 0,
     preview: bool = False,
+    group_orig_offsets: dict[str, int] | None = None,
 ) -> dict[str, Any]:
-    """根据 budget_bytes 预算对检索结果进行有界截断。"""
+    """根据 budget_bytes 预算对检索结果进行有界截断（完整 chunk 粒度，不切半个 chunk）。"""
     if budget_bytes is None:
         return result
 
     # 1. 平铺模式 (chunks)
     if "chunks" in result:
         all_chunks = list(result["chunks"])
-        test_res = dict(result)
-        test_res["truncated"] = False
-        test_res["returned"] = len(all_chunks)
-        test_res["next_offset"] = orig_offset + len(all_chunks)
-        if _measure_payload_bytes(test_res) <= budget_bytes:
-            return test_res
+        N = len(all_chunks)
 
-        truncated_res = dict(result)
-        truncated_res["truncated"] = True
+        base_meta = {
+            k: v for k, v in result.items()
+            if k not in (
+                "chunks", "truncated", "returned", "next_offset",
+                "budget_hint", "budget_exceeded", "minimum_budget_bytes",
+            )
+        }
 
-        if not all_chunks:
-            truncated_res["chunks"] = []
-            truncated_res["returned"] = 0
-            truncated_res["next_offset"] = orig_offset
-            return truncated_res
+        # 1. 先测全量 N（truncated=False，无 hint）
+        cand_all = dict(base_meta)
+        cand_all["chunks"] = all_chunks
+        cand_all["truncated"] = False
+        cand_all["returned"] = N
+        cand_all["next_offset"] = orig_offset + N
 
-        # 检查首条是否超预算
-        c0 = dict(all_chunks[0])
-        truncated_res["chunks"] = [c0]
-        truncated_res["returned"] = 1
-        truncated_res["next_offset"] = orig_offset + 1
+        if _measure_payload_bytes(cand_all) <= budget_bytes:
+            return cand_all
 
-        if _measure_payload_bytes(truncated_res) > budget_bytes:
-            # 首条即超预算：二分截断首条正文/摘要
-            target_field = "snippet" if preview and "snippet" in c0 else "content"
-            orig_text = str(c0.get(target_field, ""))
-            low, high = 0, len(orig_text)
-            best_len = 0
+        # 2. 对正整数前缀 1..N-1 进行二分查找（truncated=True，无 hint）
+        best_k = 0
+        if N > 1:
+            low = 1
+            high = N - 1
             while low <= high:
                 mid = (low + high) // 2
-                c0[target_field] = orig_text[:mid]
-                truncated_res["chunks"] = [c0]
-                if _measure_payload_bytes(truncated_res) <= budget_bytes:
-                    best_len = mid
+                cand_mid = dict(base_meta)
+                cand_mid["chunks"] = all_chunks[:mid]
+                cand_mid["truncated"] = True
+                cand_mid["returned"] = mid
+                cand_mid["next_offset"] = orig_offset + mid
+                if _measure_payload_bytes(cand_mid) <= budget_bytes:
+                    best_k = mid
                     low = mid + 1
                 else:
                     high = mid - 1
-            c0[target_field] = orig_text[:best_len]
-            truncated_res["chunks"] = [c0]
-            truncated_res["returned"] = 1
-            truncated_res["next_offset"] = orig_offset + 1
-            return truncated_res
 
-        # 首条能放入，逐条追加其余 chunk 直至超预算
-        kept_chunks = [c0]
-        for chunk in all_chunks[1:]:
-            truncated_res["chunks"] = kept_chunks + [chunk]
-            truncated_res["returned"] = len(truncated_res["chunks"])
-            truncated_res["next_offset"] = orig_offset + len(truncated_res["chunks"])
-            if _measure_payload_bytes(truncated_res) <= budget_bytes:
-                kept_chunks.append(chunk)
-            else:
-                break
+        if best_k >= 1:
+            res_kept = dict(base_meta)
+            res_kept["chunks"] = all_chunks[:best_k]
+            res_kept["truncated"] = True
+            res_kept["returned"] = best_k
+            res_kept["next_offset"] = orig_offset + best_k
+            return res_kept
 
-        truncated_res["chunks"] = kept_chunks
-        truncated_res["returned"] = len(kept_chunks)
-        truncated_res["next_offset"] = orig_offset + len(kept_chunks)
-        return truncated_res
+        # 3. best_k == 0：正前缀一个也不满足（或 N == 0）
+        if N == 0:
+            cand_zero = dict(base_meta)
+            cand_zero["chunks"] = []
+            cand_zero["truncated"] = False
+            cand_zero["returned"] = 0
+            cand_zero["next_offset"] = orig_offset
+            if _measure_payload_bytes(cand_zero) <= budget_bytes:
+                return cand_zero
+            return _build_overflow_response(base_meta, orig_offset, budget_bytes, mode="flat")
+
+        # N > 0 且首条放不下：测试带 hint 的空包络
+        zero_res = dict(base_meta)
+        zero_res["chunks"] = []
+        zero_res["truncated"] = True
+        zero_res["returned"] = 0
+        zero_res["next_offset"] = orig_offset
+        zero_res["budget_hint"] = "use compact or increase budget_bytes"
+
+        if _measure_payload_bytes(zero_res) <= budget_bytes:
+            return zero_res
+
+        # 空包络亦超出预算：显式 metadata 溢出声明
+        return _build_overflow_response(base_meta, orig_offset, budget_bytes, mode="flat")
 
     # 2. 分组模式 (groups)
     if "groups" in result:
-        all_groups = result["groups"]
-        total_chunks = sum(len(g.get("chunks", [])) for g in all_groups)
-        test_res = dict(result)
-        test_res["truncated"] = False
-        test_res["returned"] = total_chunks
-        test_res["next_offset"] = orig_offset + total_chunks
-        if _measure_payload_bytes(test_res) <= budget_bytes:
-            return test_res
+        all_groups = list(result["groups"])
+        base_meta = {
+            k: v for k, v in result.items()
+            if k not in (
+                "groups", "truncated", "returned", "next_offset",
+                "budget_hint", "budget_exceeded", "minimum_budget_bytes",
+                "group_next_offsets",
+            )
+        }
 
-        truncated_res = dict(result)
-        truncated_res["truncated"] = True
-
-        if total_chunks == 0:
-            truncated_res["groups"] = []
-            truncated_res["returned"] = 0
-            truncated_res["next_offset"] = orig_offset
-            return truncated_res
-
-        first_group = None
-        first_chunk = None
+        vault_orig_map: dict[str, int] = {}
+        if group_orig_offsets is not None:
+            vault_orig_map.update(group_orig_offsets)
         for g in all_groups:
-            if g.get("chunks"):
-                first_group = g
-                first_chunk = g["chunks"][0]
-                break
+            v_path = g.get("vault", "")
+            if v_path and v_path not in vault_orig_map:
+                vault_orig_map[v_path] = orig_offset
 
-        if first_group is None or first_chunk is None:
-            truncated_res["groups"] = []
-            truncated_res["returned"] = 0
-            truncated_res["next_offset"] = orig_offset
-            return truncated_res
+        total_chunks = sum(len(g.get("chunks", [])) for g in all_groups)
 
-        c0 = dict(first_chunk)
-        g0 = dict(first_group)
-        g0["chunks"] = [c0]
-        truncated_res["groups"] = [g0]
-        truncated_res["returned"] = 1
-        truncated_res["next_offset"] = orig_offset + 1
+        def _construct_grouped_candidate(k: int, truncated: bool) -> dict[str, Any]:
+            cand = dict(base_meta)
+            cand_groups: list[dict[str, Any]] = []
+            cand_next_offsets = dict(vault_orig_map)
+            k_rem = k
 
-        if _measure_payload_bytes(truncated_res) > budget_bytes:
-            target_field = "snippet" if preview and "snippet" in c0 else "content"
-            orig_text = str(c0.get(target_field, ""))
-            low, high = 0, len(orig_text)
-            best_len = 0
+            for g in all_groups:
+                v_path = g.get("vault", "")
+                v_orig = vault_orig_map.get(v_path, orig_offset)
+                g_chunks = g.get("chunks", [])
+                r = min(k_rem, len(g_chunks))
+                k_rem -= r
+                cand_next_offsets[v_path] = v_orig + r
+
+                if r > 0:
+                    cand_g = dict(g)
+                    cand_g["chunks"] = list(g_chunks[:r])
+                    cand_g["returned"] = r
+                    cand_g["truncated"] = (r < len(g_chunks))
+                    cand_g["next_offset"] = v_orig + r
+                    cand_groups.append(cand_g)
+
+            cand["groups"] = cand_groups
+            cand["returned"] = k
+            cand["truncated"] = truncated
+            cand["next_offset"] = None
+            cand["group_next_offsets"] = cand_next_offsets
+            return cand
+
+        # 1. 先测全量 total_chunks
+        cand_all = _construct_grouped_candidate(total_chunks, truncated=False)
+        if _measure_payload_bytes(cand_all) <= budget_bytes:
+            return cand_all
+
+        # 2. 二分查找正整数前缀 1..total_chunks-1
+        best_k = 0
+        if total_chunks > 1:
+            low = 1
+            high = total_chunks - 1
             while low <= high:
                 mid = (low + high) // 2
-                c0[target_field] = orig_text[:mid]
-                g0["chunks"] = [c0]
-                truncated_res["groups"] = [g0]
-                if _measure_payload_bytes(truncated_res) <= budget_bytes:
-                    best_len = mid
+                cand_mid = _construct_grouped_candidate(mid, truncated=True)
+                if _measure_payload_bytes(cand_mid) <= budget_bytes:
+                    best_k = mid
                     low = mid + 1
                 else:
                     high = mid - 1
-            c0[target_field] = orig_text[:best_len]
-            g0["chunks"] = [c0]
-            truncated_res["groups"] = [g0]
-            truncated_res["returned"] = 1
-            truncated_res["next_offset"] = orig_offset + 1
-            return truncated_res
 
-        kept_groups: list[dict[str, Any]] = []
-        total_returned = 0
-        budget_exhausted = False
+        if best_k >= 1:
+            return _construct_grouped_candidate(best_k, truncated=True)
 
-        for g in all_groups:
-            if budget_exhausted:
-                break
-            g_copy = dict(g)
-            g_chunks = g.get("chunks", [])
-            kept_in_group: list[dict[str, Any]] = []
-            for chunk in g_chunks:
-                cand_g = dict(g_copy)
-                cand_g["chunks"] = kept_in_group + [chunk]
-                cand_groups = [dict(kg) for kg in kept_groups] + [cand_g]
+        # 3. best_k == 0
+        if total_chunks == 0:
+            cand_zero = _construct_grouped_candidate(0, truncated=False)
+            if _measure_payload_bytes(cand_zero) <= budget_bytes:
+                return cand_zero
+            return _build_overflow_response(
+                base_meta, orig_offset, budget_bytes, mode="grouped",
+                group_next_offsets=vault_orig_map,
+            )
 
-                truncated_res["groups"] = cand_groups
-                truncated_res["returned"] = total_returned + 1
-                truncated_res["next_offset"] = orig_offset + truncated_res["returned"]
-                if _measure_payload_bytes(truncated_res) <= budget_bytes:
-                    kept_in_group.append(chunk)
-                    total_returned += 1
-                else:
-                    budget_exhausted = True
-                    break
-            if kept_in_group:
-                g_copy["chunks"] = kept_in_group
-                kept_groups.append(g_copy)
+        # total_chunks > 0 且连一条也放不下：测试带 hint 的空包络
+        cand_zero_hint = _construct_grouped_candidate(0, truncated=True)
+        cand_zero_hint["budget_hint"] = "use compact or increase budget_bytes"
+        if _measure_payload_bytes(cand_zero_hint) <= budget_bytes:
+            return cand_zero_hint
 
-        truncated_res["groups"] = kept_groups
-        truncated_res["returned"] = total_returned
-        truncated_res["next_offset"] = orig_offset + total_returned
-        return truncated_res
+        # 空包络溢出
+        return _build_overflow_response(
+            base_meta, orig_offset, budget_bytes, mode="grouped",
+            group_next_offsets=vault_orig_map,
+        )
 
     return result
 
@@ -219,6 +264,7 @@ def fanout_search(
     budget_bytes: int | None = None,
     exact_terms: list[str] | None = None,
     compact: bool = False,
+    group_offsets: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     """Search across registered vaults (either globally or scoped to target_vaults), merge and rerank once.
 
@@ -226,7 +272,11 @@ def fanout_search(
     filters 的过滤条件对每个库分别生效，分页（offset/limit）只在最后合并
     排序后的全局结果上做一次——否则各库各翻一页，合并出来的顺序没有意义。
     """
-    per_vault_k = max(top_k, 20)
+    if group_by_vault:
+        per_vault_k = min(server.config.max_top_k, max(top_k, 20))
+    else:
+        req_depth = (filters.offset + (filters.limit or top_k)) if filters is not None else top_k
+        per_vault_k = min(server.config.max_top_k, max(top_k, req_depth, 20))
     # 单库检索只吃过滤条件，不吃分页：分页留到全局合并之后。
     per_vault_filters: SearchFilter | None = None
     if filters is not None:
@@ -396,8 +446,18 @@ def fanout_search(
                     group["max_score"] = chunk.score
             group["pairs"].append((entry, chunk))
 
+        # group_offsets 与分页切片
+        page_size = filters.limit if (filters and filters.limit) else top_k
+        group_orig_offsets: dict[str, int] = {}
+        for entry in entries:
+            v_start = group_offsets.get(entry.path, start) if group_offsets else start
+            group_orig_offsets[entry.path] = v_start
+
         for group in buckets.values():
-            group["pairs"] = group["pairs"][start:end]
+            e_path = group["entry"].path
+            v_start = group_orig_offsets.get(e_path, start)
+            v_end = v_start + page_size
+            group["pairs"] = group["pairs"][v_start:v_end]
 
         sorted_buckets = sorted(
             (group for group in buckets.values() if group["pairs"]),
@@ -430,7 +490,13 @@ def fanout_search(
                 "下次请传 vault_path 或 path_prefix 定向检索，精度更高、噪音更少。"
             )
         if budget_bytes is not None:
-            res = apply_budget(res, budget_bytes, orig_offset=start, preview=effective_preview)
+            res = apply_budget(
+                res,
+                budget_bytes,
+                orig_offset=start,
+                preview=effective_preview,
+                group_orig_offsets=group_orig_offsets,
+            )
         return res
 
     pairs = pairs[start:end]

@@ -215,9 +215,9 @@ CURRENT                         THIS RELEASE                     12-MONTH IDEAL
 | 3 | [x] | C58a | auto_watch与size配置 | Intake | 1–2h / 20–40m |
 | 4 | [x] | C58b | 统一size闸门、自动判据账本、单队列 | C58a | 0.5–1d / 1–2h |
 | 5 | [x] | C58c+C61 | native/poll触发、扫描合并与生命周期 | C66,C58b | 0.5–1d / 1–2h |
-| 6 | [ ] | C58d | server/doctor/hint接线与集成 | C58c | 2–4h / 30–60m |
-| 7 | [ ] | C67 | compact全路由投影 | C66 | 2–4h / 30–60m |
-| 8 | [ ] | C68 | 完整chunk预算与续页 | C67 | 4–6h / 45–90m |
+| 6 | [x] | C58d | server/doctor/hint接线与集成 | C58c | 2–4h / 30–60m |
+| 7 | [x] | C67 | compact全路由投影 | C66 | 2–4h / 30–60m |
+| 8 | [x] | C68 | 完整chunk预算与续页 | C67 | 4–6h / 45–90m |
 | 9 | [ ] | C69a | 原文读范围/越界/总行数 | C66 | 2–4h / 30–60m |
 | 10 | [ ] | C69b | 物理heading章节读取 | C69a | 4–6h / 45–90m |
 | 11 | [ ] | C59 | Windows升级占用说明 | 任意；代码不变 | 0.5–1h / 10–20m |
@@ -509,7 +509,7 @@ poll/start/fallback cadence -+                                  |
 
 **验收**：普通默认字段不变；四种路由+分组都可读回；排序不依赖投影字段；量测记账。提交 `feat(search): add opt-in compact result projection`。
 
-### [ ] C68：完整chunk预算、最低envelope与分组续页
+### [x] C68：完整chunk预算、最低envelope与分组续页
 
 **前置**：C67。文件：`_server/fanout.py::_measure_payload_bytes/apply_budget/fanout_search`、
 `_server/search_dispatch.py`、schema descriptions；

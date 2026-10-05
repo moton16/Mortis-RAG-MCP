@@ -99,6 +99,7 @@ def test_foreground_read_returns_immediately_while_sync_lock_held(tmp_path: Path
 def test_cold_search_returns_indexing_status(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """C66: 首次无缓存冷启动时，返回 status=indexing 与 retry_after=3。"""
     monkeypatch.setattr(VaultMcpServer, "_startup_index_all", lambda self: None)
+    monkeypatch.setattr(MarkdownIndexer, "start_watching", lambda self: None)
     vault = tmp_path / "vault_cold"
     vault.mkdir()
     (vault / "note.md").write_text("# Cold\ncontent\n", encoding="utf-8")

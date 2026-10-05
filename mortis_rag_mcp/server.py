@@ -258,6 +258,7 @@ def _tool_definitions() -> list[dict[str, Any]]:
                 "compact": {"type": "boolean", "default": False, "description": "可选，极简预览，隐含preview，返回source/heading/lines/snippet；按行号+库回读，不返回id"},
                 "mode": {"type": "string", "enum": ["full", "preview"], "default": "full", "description": "可选，检索结果呈现模式：'full'（默认，返回完整正文 content）或 'preview'（轻量高光预览，仅返回 snippet 与行号区间）"},
                 "group_by_vault": {"type": "boolean", "default": False, "description": "可选，仅跨库检索（不传 vault_path）时生效：结果按知识库分组返回 groups，每组取 top_k 条"},
+                "group_offsets": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 0}, "description": "可选，仅在 group_by_vault=true 时生效：指定各知识库的起始偏移量字典（键为库名或绝对路径，值为非负整数）。未指定的库默认回落到 offset 参数。"},
                 "path_prefix": {"type": "string", "description": "可选，只保留 source 以该前缀开头的 chunk（source 是库内相对 posix 路径）。用户提到具体课程名/文件夹名/主题目录时，用它把检索限定在该子树，如 '教材/'、'数字电路/'"},
                 "tags": {"type": "array", "items": {"type": "string"}, "description": "可选，frontmatter 标签过滤：命中任一标签即保留（大小写不敏感，自动去掉 '#' 前缀）"},
                 "mtime_after": {"type": ["number", "string"], "description": "可选，只保留修改时间 >= 该值的文件；epoch 秒或 ISO 8601 字符串（如 '2026-01-01'）"},
@@ -265,7 +266,7 @@ def _tool_definitions() -> list[dict[str, Any]]:
                 "offset": {"type": "integer", "minimum": 0, "default": 0, "description": "可选，跳过前 N 条结果（分页用）"},
                 "limit": {"type": "integer", "minimum": 1, "description": "可选，本页最多返回条数；缺省时用 top_k"},
                 "dedupe": {"type": "boolean", "default": True, "description": "可选，默认 true：正文完全相同的 chunk 只保留排在最前面的一条（重复备份/复制段落不再占多格 top_k）"},
-                "budget_bytes": {"type": "integer", "description": "可选，输出最大 UTF-8 字节预算（[500, 100000]），超限截断并标 truncated: true"},
+                "budget_bytes": {"type": "integer", "description": "可选，输出最大 UTF-8 字节预算（[500, 100000]），超限截断并标 truncated: true；若元数据包络本身超出预算则返回 budget_exceeded: true 与 minimum_budget_bytes"},
                 "exact_terms": {"type": "array", "items": {"type": "string"}, "description": "可选，专有名词显式硬包含词表（AND 语义，不区分大小写，最多 8 条每条≤100 字符）"},
             }},
         },
@@ -874,6 +875,10 @@ class VaultMcpServer:
         target_vaults: list[str] | None = None,
         preview: bool = False,
         compact: bool = False,
+        *,
+        budget_bytes: int | None = None,
+        exact_terms: list[str] | None = None,
+        group_offsets: dict[str, int] | None = None,
     ) -> dict[str, Any]:
         return _fanout_search_impl(
             self,
@@ -886,6 +891,9 @@ class VaultMcpServer:
             target_vaults=target_vaults,
             preview=preview,
             compact=compact,
+            budget_bytes=budget_bytes,
+            exact_terms=exact_terms,
+            group_offsets=group_offsets,
         )
 
     # v0.8.0 Phase 1：call_tool 由巨型 if 链改为显式路由表（15 个 kb_* 工具 → 处理方法）。

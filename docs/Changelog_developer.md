@@ -628,6 +628,33 @@
 > - 专项与相关测试（58 passed in 44.74s）：
 >   `.\.venv\Scripts\python.exe -m pytest tests/test_compact_search.py tests/test_preview_mode.py tests/test_budget_bytes.py tests/test_multivault.py tests/test_scoped_search.py tests/test_search_oracle.py tests/test_facade_freeze.py -q`
 
+### C68 — moton16,2026-10-05,Antigravity — fix(search): enforce whole-result budgeting and explicit grouped cursors
+> **代码改动概况**：
+> - `mortis_rag_mcp/_server/fanout.py`：
+>   - 废弃一切二分截断正文或 snippet 的破碎 chunk 逻辑，严格保持 chunk 全量原子性（Req 3 & 4）；
+>   - 引入正整数前缀 $1 \dots N-1$ 二分搜索（`_binary_search_prefix`），构建统一形状评估真实 UTF-8 封装大小（Req 9）；
+>   - 首条 chunk 超出预算时安全退化为正规空 envelope（`chunks=[]`, `returned=0`, `truncated=True`, 原游标保持），注入明确诊断提示 `budget_hint="use compact or increase budget_bytes"`（Req 6）；
+>   - 最小 envelope 超限处理（`_build_overflow_response`）：当元数据（searched, errors, status 等）本身超过预算时，不产生虚假错误或非法截断，而是显式标记 `budget_exceeded=True`，经过最多 3 轮迭代计算真实稳定的 `minimum_budget_bytes` 并给出提示 `narrow vaults or increase budget_bytes`（Req 7 & 8）；
+>   - 分组跨库分页与游标（Req 10–14）：废弃单值游标跨组伪进位，在 `group_by_vault=True` 且启用预算时，顶层 `next_offset` 设为 `None`，以字典形式显式返回 `group_next_offsets: dict[str, int]`（包含本页未分配到预算的候选组，未推进组保留原始偏移）；
+> - `mortis_rag_mcp/_server/search_dispatch.py`：
+>   - 严格参数校验 `_validate_group_offsets`（Req 12）：仅允许 `group_by_vault=True` 传入，校验字典值非负整数，校验 keys 必须属于本次已解析已授权库（拒绝未授权/未注册库，拒绝全局模式传入 solo 库，拒绝重复别名）；
+>   - 单库冷状态（`is_cold` / `indexing`）及空结果统一经由 `apply_budget` 包装（Req 15），消除控制字段绕过预算的口径差异；
+>   - 候选窗口稳定化（Req 16）：分组跨库固定 `per_vault_k = min(max_top_k, max(top_k, 20))`，确保多页分页过程中跨库候选集窗口稳定，消除深分页时候选池动态扩增导致 RRF 重排错位；
+> - `mortis_rag_mcp/server.py`：
+>   - `_tool_definitions` 在 `kb_search` 的 inputSchema 中新增 `group_offsets`（object，int 值）；
+>   - 完善 `budget_bytes` 说明，明确首条超限空 envelope 与包络溢出声明；
+>   - `_fanout_search` 转发 `group_offsets` 参数；
+> - `tests/test_budget_bytes.py`：
+>   - 更新旧用例 `test_budget_bytes_first_chunk_exceeds_budget`，断言整条 chunk 丢弃、`returned: 0`、`budget_hint` 出现、游标不跃迁，并对照测试 compact 模式下整条 chunk 正常装入；
+>   - 更新 `test_budget_bytes_fanout_grouped`，断言每组独立游标、顶层 `next_offset is None` 以及 `group_next_offsets` 回传 `group_offsets` 续页无漏读；
+>   - 新增 5 个深度对抗测试：最小 envelope 溢出迭代与 `minimum_budget_bytes` 精确声明、`group_offsets` 各种非法输入严格校验报错、`apply_budget` 输入对象不可变深比对、单库冷状态/空结果预算合规性、CJK/四字节 Emoji/反斜杠/转义字符 UTF-8 双层 json.loads 真实计量；
+> - `tests/test_read_stale.py` & `tests/test_isolation_guard.py`：
+>   - 消除 watcher sync 偶发竞争与子进程 Windows 编码警告。
+>
+> **验证**：
+> - 专项与相关测试（46 passed in 23.33s）：
+>   `.\.venv\Scripts\python.exe -m pytest tests/test_budget_bytes.py tests/test_compact_search.py tests/test_multivault.py tests/test_preview_mode.py tests/test_search_filters.py -q`
+
 
 
 
