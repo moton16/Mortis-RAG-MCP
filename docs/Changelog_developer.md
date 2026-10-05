@@ -463,3 +463,25 @@
 > **验证**：`git check-ignore -v docs/v0.8.1/*.md` 退出码 **1**（未忽略，符合预期）；`git status` 中 `docs/v0.8.1/` 由「被忽略」变为「未跟踪可见」；`docs/` 根目录仍只有 5 个主文档 + 版本子目录。
 > **记账欠账（如实登记）**：本轮 Lane E/A/B/C 的技术卡条目（`C53`、`C54`+P0、`C63`、`C55`、`C56`、`C57`+`C62`、`C64`）**尚未补写**，将另行一次性批量追加；Lane D（A4/C58/C61/C59）的条目随其提交一并写。
 
+### C65 — moton16,2026-10-05,Antigravity,Gemini 3.8 Flash — fix(read): fail closed on incomplete chunk probes
+
+> **涵盖改动**：`fix(read): fail closed on incomplete chunk probes`
+> **来源**：Issue #5 剩余工作、v0.8.1 计划 C65 卡。
+>
+> **改动概况**：
+> - `mortis_rag_mcp/server.py`：
+>   - 注册表为空且未显式指定 `vault_path` 时，显式拦截并报 `ValueError("没有已注册的知识库，请先使用 kb_init 注册知识库")`，MCP `handle` 返回 `isError=True` 具名错误，杜绝协议级 `-32000` / `IndexError`。
+>   - 新增 `_chunk_incomplete_message` 辅助函数：当存在跳过库（`skipped`）且已命中不足 2 个时判定为 `incomplete`，如实汇报已命中/跳过库名与原因，要求显式传 `vault_path`，杜绝未探全时误以为唯一而展开。
+>   - solo 库在探测报错/跳过原因中绝不泄露绝对物理路径，保持纯库名与 solo 标记。
+>   - 探测临时 indexer 收集到 `probes_to_close`，并在 `finally` 块中统一切断 FTS/vector 连接；不影响常驻 indexer。
+>   - 命中临时库提升为常驻 indexer 时，重新按 id 取 chunk，若取不到抛出 `ValueError` 引导重新 `kb_search`，不再静默使用陈旧 probe chunk 兜底。
+> - `mortis_rag_mcp/indexer.py`：
+>   - 初始化新增 `self._chunks_cache_loaded: bool = False`，在 `_load_chunks_cache` 确认有效且 meta 匹配后置 `True`；未加载且无有效文本缓存的库跳过并记「尚无可探测文本索引」。
+>   - `sqlite_vec` 回退至 `memory` 时，为 `_load_vectors_cache()` 补齐 `and load_vectors` 门禁，确保只读探测期零向量加载。
+> - `tests/test_kb_read_chunkid.py`：
+>   - 新增 8 项分支测试（`test_chunk_read_no_registered_vaults`、`test_chunk_probe_one_hit_with_unprobed_vault_is_incomplete`、`test_chunk_probe_missing_cache_is_unprobed`、`test_chunk_probe_valid_empty_cache_is_complete`、`test_chunk_probe_solo_diagnostics_do_not_leak_path`、`test_probe_load_vectors_false_survives_backend_fallback`、`test_chunk_probe_closes_resources_on_all_outcomes`、`test_probe_promoted_chunk_disappeared`）。
+>
+> **验证**：
+> - `tests/test_kb_read_chunkid.py`（20 passed）、`tests/test_facade_freeze.py`、`tests/test_vector_backend.py`（合计 29 passed, 4.56s）。
+
+

@@ -1057,6 +1057,30 @@ class VaultMcpServer:
         return f"{head}；文件可能已修改，请重新 kb_search 获取新 id）"
 
     @staticmethod
+    def _chunk_incomplete_message(
+        chunk_id: str,
+        total: int,
+        probed: int,
+        hits: list[dict[str, Any]],
+        skipped: list[tuple[str, str]],
+    ) -> str:
+        """存在跳过库且已命中不足 2 个时的 incomplete 报错（C65）：
+        无法确认唯一性，必须要求调用方显式传 vault_path。
+        """
+        hit_names = [
+            (getattr(h["entry"], "name", None) or Path(h["entry"].path).name)
+            + ("（solo 库）" if getattr(h["entry"], "solo", False) else "")
+            for h in hits
+        ]
+        hits_str = f"，已在 {len(hits)} 个库中命中（{', '.join(hit_names)}）" if hits else ""
+        detail = "；".join(f"{name}（{reason}）" for name, reason in skipped)
+        return (
+            f"chunk_id 探测未完成（incomplete）: {chunk_id[:12]}…（共 {total} 个候选库，探测了 {probed} 个{hits_str}，"
+            f"跳过 {len(skipped)} 个：{detail}）；"
+            "存在未探测库，无法确认唯一性，请显式传 vault_path 指定目标库"
+        )
+
+    @staticmethod
     def _close_probe_indexer(probe: MarkdownIndexer) -> None:
         """关闭临时探测 indexer 持有的 sqlite 连接（探测不该留下句柄）。"""
         fts = getattr(probe, "_fts", None)
@@ -1074,14 +1098,19 @@ class VaultMcpServer:
                 pass
 
     def _locate_chunk_for_read(self, chunk_id: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        """定位 chunk_id 所属库并返回「可读的 indexer + 归属键」（C56）。
+        """定位 chunk_id 所属库并返回「可读的 indexer + 归属键」（C56 / C65）。
 
         - 显式传了库标识（vault_path / vault / vault_name / path）→ **只探该库**，保留既有语义；
+        - 未传且注册表为空 → 抛出具名工具错误（引导 kb_init），不报 IndexError；
         - 未传且只注册了一个库 → 走既有单库路径（行为与修复前一致）；
         - 未传且注册了多库 → 遍历**全部注册库（含 solo）**做只读探测：
           已加载的读内存态，未加载的用 `MarkdownIndexer(..., load_vectors=False)` 临时轻量
           构造（不起 watcher、不注册 atexit、不触发 sync/embedding）；
-        - 逐库错误（目录已删 / 缓存损坏 / 构造失败）→ 跳过并计入「未探测」，**绝不中断**。
+        - 探测边界裁决（C65）：
+          1. 两个以上命中 → 已证实歧义，提示选库；
+          2. 存在 skipped 且命中不足两个 → 报 incomplete 并要求显式传 vault_path；
+          3. 无 skipped 且单命中 → 展开；
+          4. 完整零命中 → not found（文件可能已修改）。
         """
         explicit = str(
             arguments.get("vault_path")
@@ -1091,6 +1120,9 @@ class VaultMcpServer:
             or ""
         ).strip()
         entries = self.registry.load()
+
+        if not explicit and not entries:
+            raise ValueError("没有已注册的知识库，请先使用 kb_init 注册知识库")
 
         if explicit or len(entries) <= 1:
             target = arguments if explicit else {"vault_path": entries[0].path}
@@ -1107,70 +1139,92 @@ class VaultMcpServer:
         probed = 0
         probe_started = time.monotonic()
         unloaded_probes = 0
-        for entry in entries:
-            label = getattr(entry, "name", None) or entry.path
-            key = str(Path(entry.path).expanduser().resolve())
-            indexer = self._indexers.get(key)
-            probe: MarkdownIndexer | None = None
-            if indexer is None:
-                # 上限只约束「需要临时构造的库」：已加载库读内存态，零成本且必须探
-                over_count = unloaded_probes >= self._PROBE_MAX_UNLOADED_VAULTS
-                over_time = (time.monotonic() - probe_started) > self._PROBE_BUDGET_SECONDS
-                if over_count or over_time:
-                    reason = ("超过探测库数上限" if over_count else "超过探测时间预算")
-                    skipped.append((label, f"{reason}（本次已探测 {probed} 个）"))
-                    continue
-                unloaded_probes += 1
-                if not Path(entry.path).is_dir():
-                    skipped.append((label, "目录已不存在"))
-                    continue
+        probes_to_close: list[MarkdownIndexer] = []
+        try:
+            for entry in entries:
+                is_solo = bool(getattr(entry, "solo", False))
+                name = getattr(entry, "name", None) or Path(entry.path).name
+                label = f"{name}（solo 库）" if is_solo else (getattr(entry, "name", None) or entry.path)
+                key = str(Path(entry.path).expanduser().resolve())
+                indexer = self._indexers.get(key)
+                probe: MarkdownIndexer | None = None
+                if indexer is None:
+                    # 上限只约束「需要临时构造的库」：已加载库读内存态，零成本且必须探
+                    over_count = unloaded_probes >= self._PROBE_MAX_UNLOADED_VAULTS
+                    over_time = (time.monotonic() - probe_started) > self._PROBE_BUDGET_SECONDS
+                    if over_count or over_time:
+                        reason = ("超过探测库数上限" if over_count else "超过探测时间预算")
+                        skipped.append((label, f"{reason}（本次已探测 {probed} 个）"))
+                        continue
+                    unloaded_probes += 1
+                    if not Path(entry.path).is_dir():
+                        skipped.append((label, "目录已不存在"))
+                        continue
+                    try:
+                        probe = MarkdownIndexer(entry.path, self.config, load_vectors=False)
+                        probes_to_close.append(probe)
+                    except Exception as exc:  # OSError / zlib.error / 缓存损坏 / 构造失败 …
+                        reason = type(exc).__name__ if is_solo else f"{type(exc).__name__}: {exc}"[:100]
+                        skipped.append((label, reason))
+                        continue
+                    if not getattr(probe, "_chunks_cache_loaded", False):
+                        skipped.append((label, "尚无可探测文本索引"))
+                        continue
+                    indexer = probe
+                else:
+                    if indexer.last_sync is None and not getattr(indexer, "_chunks_cache_loaded", False) and not indexer._chunks:
+                        skipped.append((label, "尚无可探测文本索引"))
+                        continue
+
+                probed += 1
                 try:
-                    probe = MarkdownIndexer(entry.path, self.config, load_vectors=False)
-                except Exception as exc:  # OSError / zlib.error / 缓存损坏 / 构造失败 …
-                    skipped.append((label, f"{type(exc).__name__}: {exc}"[:100]))
+                    hit = next((c for c in indexer.all_chunks() if c.id == chunk_id), None)
+                except Exception as exc:
+                    reason = type(exc).__name__ if is_solo else f"{type(exc).__name__}: {exc}"[:100]
+                    skipped.append((label, reason))
+                    probed -= 1
                     continue
-                indexer = probe
-            probed += 1
-            try:
-                hit = next((c for c in indexer.all_chunks() if c.id == chunk_id), None)
-            except Exception as exc:
-                skipped.append((label, f"{type(exc).__name__}: {exc}"[:100]))
-                probed -= 1
-                if probe is not None:
-                    self._close_probe_indexer(probe)
-                continue
-            if hit is not None:
-                hits.append({"entry": entry, "indexer": indexer, "chunk": hit, "probe": probe})
-            elif probe is not None:
-                self._close_probe_indexer(probe)
+                if hit is not None:
+                    hits.append({"entry": entry, "indexer": indexer, "chunk": hit, "probe": probe})
 
-        for h in hits:
-            if h["probe"] is not None:
-                self._close_probe_indexer(h["probe"])
+            if len(hits) > 1:
+                listed = "\n".join(
+                    f"  - {getattr(h['entry'], 'name', None) or Path(h['entry'].path).name}"
+                    + ("（solo 库）" if getattr(h["entry"], "solo", False) else f"：{h['entry'].path}")
+                    for h in hits
+                )
+                raise ValueError(
+                    f"chunk_id {chunk_id[:12]}… 在 {len(hits)} 个库中同时命中"
+                    "（id = sha1(source\\0index\\0content)，同一文件复制进多库会撞 id）。"
+                    f"请显式传 vault_path 指定其中一个：\n{listed}"
+                )
 
-        if not hits:
-            raise ValueError(self._chunk_miss_message(chunk_id, len(entries), probed, skipped))
-        if len(hits) > 1:
-            listed = "\n".join(
-                f"  - {getattr(h['entry'], 'name', None) or h['entry'].path}"
-                + ("（solo 库）" if getattr(h["entry"], "solo", False) else f"：{h['entry'].path}")
-                for h in hits
-            )
-            raise ValueError(
-                f"chunk_id {chunk_id[:12]}… 在 {len(hits)} 个库中同时命中"
-                "（id = sha1(source\\0index\\0content)，同一文件复制进多库会撞 id）。"
-                f"请显式传 vault_path 指定其中一个：\n{listed}"
-            )
+            if skipped:
+                if hits:
+                    raise ValueError(
+                        self._chunk_incomplete_message(chunk_id, len(entries), probed, hits, skipped)
+                    )
+                raise ValueError(self._chunk_miss_message(chunk_id, len(entries), probed, skipped))
 
-        hit = hits[0]
-        if hit["probe"] is not None:
-            # 命中未加载库：提升为常驻 indexer（与显式传 vault_path 同款），
-            # 并在新 indexer 上按 id 复核一次（缓存态一致时必然命中）。
-            indexer = self._indexer_for({"vault_path": hit["entry"].path})
-            chunk = next((c for c in indexer.all_chunks() if c.id == chunk_id), hit["chunk"])
-        else:
-            indexer, chunk = hit["indexer"], hit["chunk"]
-        return self._chunk_attribution(hit["entry"], indexer, chunk)
+            if not hits:
+                raise ValueError(self._chunk_miss_message(chunk_id, len(entries), probed, skipped))
+
+            hit = hits[0]
+            if hit["probe"] is not None:
+                # 命中未加载库：提升为常驻 indexer（与显式传 vault_path 同款），
+                # 并在新 indexer 上按 id 复核一次（缓存态一致时必然命中）。
+                indexer = self._indexer_for({"vault_path": hit["entry"].path})
+                chunk = next((c for c in indexer.all_chunks() if c.id == chunk_id), None)
+                if chunk is None:
+                    raise ValueError(
+                        f"chunk_id {chunk_id[:12]}… 所属库索引已变化，请重新 kb_search 获取新 id"
+                    )
+            else:
+                indexer, chunk = hit["indexer"], hit["chunk"]
+            return self._chunk_attribution(hit["entry"], indexer, chunk)
+        finally:
+            for p in probes_to_close:
+                self._close_probe_indexer(p)
 
     def _kb_read(self, arguments: dict[str, Any]) -> dict[str, Any]:
         raw_source = arguments.get("source")

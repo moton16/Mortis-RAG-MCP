@@ -1,1865 +1,1231 @@
-<!-- /autoplan restore point: C:\Users\14166\.gstack\projects\moton16-Mortis-RAG-MCP\main-autoplan-restore-20260929-080941.md -->
+<!-- /autoplan restore point: C:\Users\芝士雪豹\.gstack\projects\moton16-Mortis-RAG-MCP\feat-v0.8.1-autoplan-restore-20261005-a8fbb4d.md -->
 
-# v0.8.1 执行计划 — GitHub Issue #5 全量落地（含 auto_watch RFC）
+# v0.8.1 执行计划：Issue #5 剩余工作 + Issue #6 全量落地
 
-> 2026-09-29 · 承接 v0.8.0（HEAD `82989c8`）与同目录 `REPORT.md`。
-> 来源：[issue #5](https://github.com/moton16/Mortis-RAG-MCP/issues/5)（作者 Vodyanitsaaa，v0.8.0 实机实测报告）。
-> 本文档是**动工前的施工图**：逐条给出核验结论、改动点、测试与验证命令、提交切分。
-> 2026-09-29 增补：本文档经一次**独立子代理审阅**（只读源码与测试、不读本文件、不跑全量测试）。3 处结论被修订、2 处被确认、2 处被加固（另挖出 1 个更严重的测试污染源）；修订痕迹见文末「独立审阅记录」。
-> 注意：`docs/*` 在 `.gitignore:19` 被整体忽略（只白名单放行 3 个主文档），本文件与 `REPORT.md` 一样是本地草稿，不进仓库。
+> 审核日期：2026-10-05，America/New_York。
+> 代码基线：`feat/v0.8.1`，HEAD `a8fbb4d`；对照基线 `origin/main` / v0.8.0 `82989c8`。
+> 本轮只审核、重写计划与验证现有代码，不实现功能、不提交、不推送、不操作真实知识库。
+> 状态：**文档编写与审核完成，可按§3顺序实施**。本轮不实现代码、不发布。
+> 需求来源：[GitHub #5](https://github.com/moton16/Mortis-RAG-MCP/issues/5)、[GitHub #6](https://github.com/moton16/Mortis-RAG-MCP/issues/6)。
+> #5 最后更新 2026-09-29；#6 最后更新 2026-10-04。本轮通过 Exa 读取正文、`gh issue view` 核对状态与评论，两者均 OPEN、无评论。
 
-## 意图
+## 0. 接手说明
 
-issue #5 里唯一会让用户直接踩死的是 MinerU 预签名上传 403（开了 PDF 摄取的人一个文件都传不上去）；其余为测试宿主隔离、两处 DX 契约、一处分页、一条 Windows 文档注记，外加一条与既有硬性设计冲突的 auto_watch RFC。本计划把 7 条**全部**落地，auto_watch 按用户裁定做成**显式 opt-in、默认关闭**，并保持 MCP 工具契约向后兼容（只加可选参数与新键，不改既有语义）。
+**本轮范围收口（用户2026-10-05最新指示）**：优先完成#5剩余与#6本身，不把额外防御性工程作为本版前置。不新增摄取worker所有权/租约机制、上传临时副本、检索事务代际或锁框架改造。这些审查建议只作为后续记录；本版继续复用现有manager、文件锁、同步与读快照实现。历史已确认的20MiB策略、默认自动关闭、现有沙箱/ignore规则保留，不属于新增架构。
 
-版本策略（已裁定）：**一次发 0.8.1**，不拆补丁版——仓库没有「修复必须独立发版」的成文条文，`CHANGELOG_user.md` 本身按 Added/Fixed 混排，拆版的额外成本是可数的（版本三件套 + README×2 + SKILL 头 + 多一轮全量 CI）。若 C53 的实机验收久拖不决，再单独讨论补丁版。
+### 0.1 这份文档如何执行
 
-## 已核验事实（动工前对照，勿重复调研）
+1. 先读本节、§1 当前事实、§2 契约，再从 §3 的第一个未完成任务顺序执行。
+2. 每张任务卡均按「前置条件 → 文件/符号 → 编码步骤 → 测试 → 验收 → 提交边界」执行。不要自行替换成另一套设计。
+3. `[x]` 表示在本轮基线中已核实；`[ ]` 表示还需执行。写了测试规格不等于测试已存在，写了方案不等于功能已实现。
+4. 每卡通过后就地打勾，记录实际 commit、测试数量、命令与残余风险；技术账写 `docs/Changelog_developer.md`，不要只改 Worklog。
+5. 符号名是定位主键，行号只是 `a8fbb4d` 的辅助锚点。改完不沿用旧行数。
+6. 上一版 1865 行计划及三轮审核可以用 `git show a8fbb4d:docs/v0.8.1/PLAN.md` 查看。完整原文还原点见文件首行，SHA256 为 `397343dd5f816b2b2eeef8e02487f4fa27207047654936d5d60704903939d805`。
+7. 本版合并了历史有效裁定、删除了相互冲突的过期施工指令。历史观点仅作审计，不得覆盖本版任务卡。
 
-| # | issue 声称 | 核验结论 | 关键证据 |
+### 0.2 先读哪些文件
+
+| 顺序 | 文件 | 用途 |
+|---|---|---|
+| 1 | `docs/Quick-start_developer.md` | 分层、零依赖、测试与记账约定 |
+| 2 | `docs/PROJECT_GUIDE.md` | 架构、缓存不变量、协议、安全与并发 |
+| 3 | `docs/Docs_Folder-descriptions.md` | 五份主文档与版本目录的分工 |
+| 4 | 本文件 | 本版本唯一执行清单 |
+| 5 | `docs/Execution-plan_developer.md` | 未排期项；不能把其中“现状”当作已实现证明 |
+| 按需 | `docs/v0.8.1/Worklog_2026-09-29.md` | 历史尝试、已提交工作与当时量测，不是当前工作树 |
+
+源码优先于现状文档。主文档还含旧包名、旧线程流程和旧工具表，§6 指定收口位置；不为这些偏差开展无关重构。
+
+### 0.3 开工命令与环境
+
+在仓库根目录的 PowerShell 执行，每行单独运行：
+
+```powershell
+Set-Location 'D:\dependency\Mortis-RAG-MCP'
+git status --short --branch
+git branch --show-current
+git log --oneline -10
+git diff origin/main...HEAD --stat
+git stash list
+$env:PYTHONUTF8 = '1'
+$env:PYTHONIOENCODING = 'utf-8'
+.\.venv\Scripts\python.exe -m pytest tests/test_version_sync.py -q
+```
+
+检查结果：分支应为 `feat/v0.8.1`；本轮开始时工作树干净。已有 `stash@{0}` 是历史 MinerU header 修复，**不要 apply/pop/drop**。若 HEAD 已推进，只核对本文件受影响符号与新增提交，不重做已完成卡。若有用户改动，保留并基于它继续。
+
+venv 不存在时才建；不因为读计划而升级依赖，不启动真实 `--doctor`，不读取用户 key：
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -e .
+.\.venv\Scripts\python.exe -m pip install pytest
+```
+
+Windows 安装前按 C59 关闭占用该项目入口的 MCP 客户端。可选 numpy/sqlite-vec 不作为基础安装前置。
+
+### 0.4 本轮实际验证
+
+命令：
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests/test_ingest_worker.py tests/test_ingest_mineru.py tests/test_isolation_guard.py tests/test_kb_read_chunkid.py tests/test_budget_bytes.py tests/test_preview_mode.py tests/test_wikilink_read.py tests/test_anti_contention.py -q
+```
+
+- 未设置 UTF-8 的第一次：72 passed / 1 failed。失败是 `test_cache_env_inherited_by_subprocess` 的子进程输出使用本机编码，父进程强按 UTF-8 解码，产生 `UnicodeDecodeError`，随后 `stdout=None`。不是 worker fixture 报错。
+- 设置与 CI 相同的 `PYTHONUTF8=1`、`PYTHONIOENCODING=utf-8` 后：**73 passed，10.32s**。
+- 恢复后另跑不重叠的8文件：`test_version_sync/test_facade_freeze/test_facade_seam/test_cache_codec_roundtrip/test_watch_integration/test_p5_lifecycle/test_scoped_search/test_multivault`，**49 passed，44.00s**。两组共 **122 passed**，只说明当前已提交功能的靶向基线，不证明待实施功能通过。
+- 历史 Worklog 中 worker 的 16 个 fixture setup errors 本轮未复现，不能列为现存阻塞项，更不能以删除 conftest 隔离夹具“修复”。
+- 离线 Golden：仓库 `tests/eval/vault`、static384、reranker/ingest/diag关闭、外置独立cache；**Hit@5=1/1，MRR@5=1.000**。Golden只有1条，不能据此声称真实小说/课程库100%命中。
+- schema list 基线实测：`origin/main` 12563 bytes，本轮HEAD 13412 bytes（**+6.758%**）；15工具。`{"tools":...}`结果包装为13423 bytes，勿与纯list混比。基线函数用AST从Git对象中只提取 `_tool_definitions` 求值，无checkout/服务启动。
+- 未跑全量，未调用外部 embedding/reranker/MinerU，未验证真实 OSS 上传。新功能尚无验证结论。
+
+可复跑命令与已生成隔离配置：
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests/test_version_sync.py tests/test_facade_freeze.py tests/test_facade_seam.py tests/test_cache_codec_roundtrip.py tests/test_watch_integration.py tests/test_p5_lifecycle.py tests/test_scoped_search.py tests/test_multivault.py -q
+.\.venv\Scripts\python.exe scripts/eval_search.py --golden tests/eval/golden_queries.json --config 'C:\Users\芝士雪豹\.gstack\projects\moton16-Mortis-RAG-MCP\feat-v0.8.1-eval-offline-20261005.toml' --k 5
+```
+
+上述外置配置是本机审查产物，其他机器按C70.3创建自己的临时配置；不复制个人绝对路径进公共指南。
+
+## 1. 当前事实与差异审核
+
+### 1.1 已完成工作：不要重复开发
+
+| 状态 | 卡/范围 | 提交 | 源码证据与本轮结论 |
 |---|---|---|---|
-| 1 | `_put_upload` 触发 OSS 403 SignatureDoesNotMatch | **真**：本机回环探针实测旧代码发出 `Content-Type: application/x-www-form-urlencoded`（urllib 在 `data=` 且无 Content-Type 时注入），修法后发出空 Content-Type | `mortis_rag_mcp/ingest/mineru.py:79-81`；探针 2026-09-29 |
-| 2 | test_diaglog 两个用例在配了 config.toml 的宿主上固定红 | **条件为真**：conftest 未 pin `MORTIS_RAG_CONFIG`，`VaultMcpServer()` 回落到 `~/.mortis_rag_mcp/config.toml`；仅 `embedding.mode == "external"` 且慢于 30ms / 1.5s 阈值才红 | `tests/conftest.py:28-34`、`server.py:376`、`config.py:342-362`、`_indexer/search.py:339-342`、`_server/search_dispatch.py:96-104`、`tests/test_diaglog.py:408,146` |
-| 2b | （issue 未提）宿主注册表同理未隔离 | **真**：`tests/test_improvements.py:218`、`tests/test_adversarial_v070.py:260` 的 `VaultMcpServer()` 仍读真实 `~/.mortis_rag_mcp/vaults.toml` | 代码扫描 |
-| 2c | （独立审阅发现）测试往真实缓存根写文件 | **真，且量级最大**：缓存根 `DEFAULT_CACHE_DIR` 无 env 可覆盖，而部分 stdio 用例的 app.toml 未写 `[cache] dir` → 缓存落真实 `~/.mortis_rag_mcp_cache`；本机实测累积 **18153** 个孤儿文件 | `docs/Changelog_developer.md:418`；`config.py:436-437` |
-| 3 | `kb_init`/`kb_init_solo`/`kb_remove` 参数名不一致 | **部分成立**：`kb_remove`(`server.py:709-716`) 早已兜 `vault_path`/`vault`/`vault_name`；只有 `_kb_init`(612)、`_kb_init_solo`(652) 缺别名 | `server.py` |
-| 4 | chunk_id 具有天然唯一性，可跨库自动寻址 | **前提有误**：id = `sha1(source \0 index \0 content)`，同文件复制进两库会撞 id；现有硬报错是设计且有测试锁定 | `_indexer/chunking.py:296`、`tests/test_kb_read_chunkid.py:279`、`server.py:562-563` |
-| 5 | `kb_list_files` 无分页/子树过滤，大库输出数万字符 | **真** | schema `server.py:238-241`；`indexer.list_files()` `indexer.py:961-962` |
-| 6 | Windows 下 exe 被占用导致 `pip install -e .` WinError 5 | **真**（属通用 Windows 行为），文档未提 | `QUICKSTART_user.md:109` 推荐 .exe 连接器；`docs/Quick-start_developer.md:192-203` 无相关说明 |
-| 7 | 建议新增 `[ingest] auto_watch` + `max_file_size_mb` | **与既有硬性设计冲突，需 opt-in 实现**；且 per-channel 硬闸门（v4 200MB / agent 10MB，错误码 `-60005`/`-30001`）已存在，新键是**策略层前置拦截**（省额度、提前失败），不是补安全缺口 | `mortis_rag_mcp/ingest/worker.py:1-4`「不做 watcher 自动摄取」；`config.py:115-129` 现无这两个键；`ingest/mineru.py:25-32,107-122` |
+| [x] | Lane E 转义清理、五主文档白名单 | `e5eb33d` / `96e205f` / `eaceabf` | `.gitignore`、主文档已落地；不用再清理一遍 |
+| [x] | C53 MinerU PUT header | `11fa7c5` | `_put_upload` 显式空 Content-Type；本机回环回归测试存在；**真实云端验收仍待做** |
+| [x] | C63 版本单一真源 | `23e555a` | 包 `__version__` → `SERVER_INFO`、diaglog；发布仍需把值从 0.8.0 改为 0.8.1 |
+| [x] | C54 + P0 测试隔离/竞态测试 | `58cfe6b` | conftest 配置 pin、per-test 缓存 env、NO_STATUS_HOOK；P0 改带超时轮询 |
+| [x] | C55 handler 别名 | `65a53ff` | init/solo 认 `path/vault_path/vault/vault_name`，description 与错误说明已补；schema 仍 required path |
+| [x] | C56 跨库 chunk 寻址主流程 | `65a53ff` | 含 solo、临时 load_vectors=False 探测、句柄清理、候选歧义报错；安全缺口见 C65 |
+| [x] | C57+C62 文件分页/前缀 | `65a53ff` | `total` 过滤后计数、`page_truncated`、`next_offset`；不传分页仍全量 |
+| [x] | C64 初步成本控制 | `65a53ff` | 临时库数上限32、循环间时间检查2s；这是软预算，不是单次磁盘操作硬超时 |
+| [x] | 版本目录跟踪 | `a8fbb4d` | `.gitignore` 已 `!docs/v0.8.1/`；本文件不再是被忽略的本地草稿 |
 
-## Scope
+C54b 的实际实现是 conftest 覆盖默认缓存根，而非逐个补齐所有测试 TOML。**显式 `[cache] dir` 优先于 env**，所以不能宣传为覆盖所有显式配置；继续保留已有临时目录设置即可。
 
-- **In**：issue #5 的 7 条全部；auto_watch 做成默认关闭的显式 opt-in；配套测试、文档、版本收口。
-- **Out**：
-  - `docs/v0.8.1/REPORT.md` 的 P0（`test_gate_9_retryable_mineru_error` 竞态）/ P1（PROJECT_GUIDE 转义清理）/ P2（`Changelog_developer - 副本.md` 处置）——并列候选，是否并入见「仍待裁定」。
-  - 不引入任何第三方依赖（`dependencies = []` 铁律）；不改动已有 MCP 工具的必填参数与返回语义。
+### 1.2 尚未完成与失效记录
 
-## Action items
-
-### [ ] C53 — fix(ingest): MinerU 预签名 PUT 显式置空 Content-Type（issue #1）
-
-- 改动：`mortis_rag_mcp/ingest/mineru.py:79-81`，`_put_upload` 改为
-  `urllib.request.Request(url, data=payload, headers={"Content-Type": ""}, method="PUT")`，
-  注释写明原因链：urllib `AbstractHTTPHandler.do_request_` 会在有 `data` 且无 Content-Type 时注入
-  `application/x-www-form-urlencoded`；OSS V1 预签名把 CONTENT-TYPE 计入 StringToSign（服务端用**实际请求头**重算），
-  故 403 `SignatureDoesNotMatch`。v4(`:159`) 与 Agent(`:215`) 两通道共用本函数，一处修全局生效。
-- 需要知道的事实（评审补充）：`http.client` 会发出 `Content-type: `（**空值头**），不是「不发这个头」；urllib
-  无法真正不发头（传 `None` 会 `ValueError`）。OSS V1 的 StringToSign 下空值与缺省等价，所以修法可用。
-- 回归测试（`tests/test_ingest_mineru.py` 新增 1 条）——**两条断言都要**：
-  ① 本机回环 `http.server`（端口 0）捕获 PUT 头，断言收到的 `Content-Type` **不是** `application/x-www-form-urlencoded`，且 200 不抛错；
-  ② **`req.has_header("Content-type")` 为真**。第二条锁的是**回归安全**（防止未来重构退回 urllib 的自动注入），不是当前行为——
-  只断言①等于「空值或缺省都放行」，没有锁定任何东西。
-- 验证：`.\.venv\Scripts\python.exe -m pytest tests/test_ingest_mineru.py -q`
-- **未覆盖项（发版必填字段，E1 降级形态）**：真实阿里云 200 需维护者带 MinerU key 实机确认一次。
-  本卡完成时必须在 `docs/Changelog_developer.md` 的条目里二选一写明：**「实机验证：已通过（日期）」或「待实机验证（原因）」**。
-  禁止留空——这正是 v0.8.0 那次「旗舰功能 100% 坏、3 天无人察觉」的结构化成因。载体沿用
-  `docs/PROJECT_GUIDE.md:764-769` 的发布 4 步 + `Changelog_developer.md` 的「验证：」记账先例（C13/C14）。
-  可选（不阻塞）：`scripts/smoke_mineru.py` 手动脚本；`ci.yml:10` 已有 `workflow_dispatch`，需要时可挂手动 job，
-  **不进自动 CI**（单 job、零 secret 通道、且每次运行烧付费额度）。
-- 残余风险（如实申报）：空 Content-Type 在其他 S3 兼容服务（非阿里云 OSS）上的行为**未验证**；本卡只对 OSS V1 预签名有证据。
-
-### [ ] C54 — test: 测试隔离三件事（issue #2 / 2b；审阅修订后范围）
-
-- **C54a 配置隔离（必做）**：`tests/conftest.py`
-  - 新增 **session 级** fixture 生成一个真实存在的 app.toml（内容仅 `[cache] dir = "<session tmp>/cache"`，
-    保持 `enabled=true` 语义不变、把缓存落点搬出真实 home）；
-  - 新增 **function 级 autouse** fixture：`monkeypatch.setenv("MORTIS_RAG_CONFIG"/"VAULT_MCP_CONFIG", ...)`；
-  - 会话启动时 `os.environ.pop("MORTIS_RAG_REGISTRY", None)`：宿主若导出新名会压过用例自设的旧名
-    （`registry.py:126-127` 新名优先），历史上造成过 `KeyError: 'description'` 假失败（`Changelog_developer.md:418`）。
-- **C54a' 缓存根 env 覆盖（新增，用户裁定 D3）**：`mortis_rag_mcp/config.py`
-  - 新增 **`MORTIS_RAG_CACHE_DIR`**（新名优先 / 旧名 **`VAULT_MCP_CACHE_DIR`** 兼容），语义与 `MORTIS_RAG_*` 系列一致
-    （`MORTIS_RAG_API_KEY` / `MORTIS_RAG_CONFIG` / `MORTIS_RAG_REGISTRY` 已是这个模式）；`config/app.toml.example` 补注释。
-  - **位置是硬要求（评审 N3）**：覆盖必须**短路在 `resolve_default_cache_dir()` 的目录改名逻辑之前**。
-    `config.py:72-84` 在「新目录不存在且旧目录存在」时会 `os.rename` 原子搬迁 `~/.vault_mcp_cache`；
-    若覆盖落在其后，跑测试会触发宿主的目录搬家。降级说明：这不是本版新引入的风险——
-    `config.py:437` 显示该函数**今天已在每次 `load_config()` 生效**，且 rename 是 v0.7.1 设计内的原子迁移
-    （`CHANGELOG_user.md:70,86-87`），不是数据销毁。env 短路严格更优，故做，但不阻塞发版。
-- **C54b 配置补齐（必做；污染的真正来源）——⚠ 机制与清单均已修正**：
-  - **修正后的机制**（原判据「`_init_cache_paths` 无条件 mkdir，与 `cache.enabled` 无关」**是错的**）：
-    `indexer.py:195` 是 `if self.config.cache.enabled and self.config.cache.dir:`，`198-203` 另有 `except OSError` 降级。
-    真实机制是：**`cache.enabled` 经 `load_config` 默认 true，`dir` 未显式设置时回落到真实 home**
-    → 所以**任何「没有 `[cache]` 段」的 app.toml 都会往真实缓存根写**；而写了 `[cache] enabled = false` 的
-    （如 `tests/test_search_filters.py:182`）**本来就安全**。
-  - **修正后的可执行清单**（原计划写「逐一排查所有 stdio 用例」，指令本身完整，以下是省去逐个排查的清单）：
-    15 个 stdio 用例里只有 3 个写了 `[cache] dir`（`test_solo_vault.py:40-43`、`test_registry_server.py:31-34`、
-    `test_multivault.py:63-66`）；**缺的 12 个**：`test_wikilink_read.py:47`、`test_ingest_server.py:202`、
-    `test_txt_indexing.py:51,119`、`test_subvaults.py:99,123`、`test_scoped_search.py:34`、`test_exempt.py:223`、
-    `test_preview_mode.py:106`、`test_diaglog.py:333-345`、`test_mcp_stdio.py:28`、`test_kb_read_chunkid.py:89,260`、
-    `test_budget_bytes.py`（8 处）、`test_anti_contention.py:133`。另**进程内**用例同样需要（不受 C54a 的 env pin 影响，
-    因为显式 `config_path` 优先于 env）。`test_snapshot.py:211-217` 已写但它是**进程内**用例，不是 stdio。
-- **C54c 注册表隔离（可选，单独评估）**：消除 2b（`tests/test_improvements.py:218`、`tests/test_adversarial_v070.py:260`
-  读真实注册表）。注意：**必须 per-test 文件**，共享 session 文件会造成跨用例状态泄漏；并评估 pytest tmp 目录膨胀。
-- 必须遵守的坑（**已修正**）：
-  1. pin 的路径必须是**真实文件**（`resolve_config_path` 对「env 指定但不存在」的路径会继续回落 home，
-     `config.py:346-355`，假 pin 会静默失效且可能把宿主的 external embedding + 真 key 引进测试）；用 session 级单文件
-     而非每用例 `mktemp`，避免加剧 tmp 碎片。
-  2. **function 级 fixture 必须显式声明依赖 session 级 fixture**。pytest 只按依赖图 + 作用域排序，autouse 的
-     function 级 fixture **不会**自动继承 session 级 → env 可能指向尚未创建的文件，触发上一条的静默回落。
-     （`autouse=True` 写在 session 级 fixture 上是同样有效的替代写法，一行即可根治。）
-  3. **`os.environ.pop("MORTIS_RAG_REGISTRY", None)` 必须配套由 fixture 自设一个临时注册表**。`tests/conftest.py:15`
-     的 `pytest_sessionfinish` 守卫读的是 `os.getenv`——pop 之后若不再 set，守卫失效；
-     虽然 `conftest.py:29` 还有一层「宿主已存在 `status.json` 才更新」的封顶，但方向是错的，不要制造这个依赖。
-     （**更正**：原计划把 pop 当作必做项，评审指出它只有在「pop 后不再 set」时才有害。）
-  4. `cache.enabled = false` 的配置是安全的，不要为了统一而给它加 `dir`。
-- 影响面（已核验）：31 处显式传 `config_path` 的构造点不受影响；15 个子进程用例全部 `env={**os.environ, ...}`
-  且显式传 `--app-config`，pin 会被继承但其行为由 explicit 决定；唯二需要 delenv 的用例
-  （`tests/test_path_migration.py:133,136`、`tests/test_doctor.py:442-443`）已自带 delenv，不会红——`test_doctor.py:446`
-  会先调 `_stub_home` 删掉两个变量，已逐行核对（439-454 行）。
-- 验证：`pytest tests/test_diaglog.py tests/test_path_migration.py tests/test_doctor.py -q`，
-  再单跑 `tests/test_improvements.py`、`tests/test_adversarial_v070.py`、`tests/test_exempt.py`、`tests/test_mcp_stdio.py`。
-
-### [ ] C55 — fix(server): kb_init / kb_init_solo 支持 vault_path 别名（issue #3）
-
-- 改动（handler 层，保留）：`_kb_init`(server.py:612-613)、`_kb_init_solo`(server.py:661-663) 取参改为
-  `path or vault_path or vault or vault_name`，与 `kb_remove`(`:709-716`)、`_indexer_for`(`:565-572`)、
-  `_kb_describe`(`:744-750`)、`kb_ingest`(`:778-784`)、`kb_read`(`:907-913`) 的五处既有口径对齐。
-- **诚实评估（评审 N2 终裁，必须知道）**：handler 别名**有效但不可发现**。
-  - `kb_init_solo` 的 `inputSchema`（`server.py:192-195`）只有 `path` / `name` 属性 + `required: ["path"]`。
-    模型读的是 schema → 它不会知道可以传 `vault_path`。
-  - 但 MCP 客户端通常**不拒收** properties 之外的参数（未禁 `additionalProperties`），所以别名对
-    「模型受其余 15 个工具的 `vault_path` 习惯影响而误传」是**有效的**——那正是 issue #3 的痛点。
-  - **不改 schema 是刻意的取舍**：`docs/PROJECT_GUIDE.md:1099` 有「`tools/list` schema 体积增量 ≤10%」的门禁。
-  - 另：`kb_remove` 的四别名（`:709-716`）同样**没有任何测试用别名**，`PROJECT_GUIDE.md:496-500` 也只文档化了 `path`
-    → 这是既存的口径不一致，不是本卡新引入的。
-- **本卡真正该补的（评审三轮的共识）**：
-  1. `kb_init` / `kb_init_solo` 的 schema **`description` 里写明**「`vault_path` 亦可，等价于 `path`」——
-     这是零成本的可发现性修复，不触碰体积门禁。
-  2. `server.py:615`（`path is required for kb_init`）与 `:663`（solo 的同类报错）的**报错文案**要提示别名可用。
-- 测试：`tests/test_scoped_search.py` 追加：以 `vault_path` 调 `kb_init_solo` 成功；旧的 `path` 路径回归。
-- 验证：`pytest tests/test_scoped_search.py tests/test_solo_vault.py -q` + **复测 `tools/list` 的 schema 体积增量 ≤10%**
-
-### [ ] C56 — feat(server): kb_read(chunk_id) 跨库自动寻址（issue #4）
-
-- 事实纠正：chunk_id = `sha1(source \0 index \0 content)`（`_indexer/chunking.py:296`），不是纯内容哈希；
-  同一文件复制进多库（同相对路径 + 同切片序号 + 逐字节同内容）会撞 id。另外 `kb_read` 只有 `vault_path`，
-  **没有 `vault_paths`**（`_indexer_for` 只认四个单值键，`server.py:566-572`）。
-- 设计（`_kb_read` 重构：先看 chunk_id，再决定是否解析 indexer）：
-  - 探测范围必须覆盖**未加载的库**：`_indexers` 是惰性字典、可能缺条目，只探它会谎报「未找到」。已加载的直接读
-    `all_chunks()`；未加载的用临时 `MarkdownIndexer(path, config)` 探测。**绝不可走 `self._indexer_for`**
-    （那会起 watcher 线程 + 持目录句柄 + 注册 atexit）。遍历源用 `registry.load()`。
-    探测只读现成内存/缓存态：不触发 sync、不触发 embedding。
-  - **⚠「轻量构造」并不轻（三轮评审一致确认，原描述的「可接受」是错的）**：`indexer.py:195` 门控通过后，
-    `_init_cache_paths()`（`:249-282`）会 ① `_load_chunks_cache()` **全量加载文本层**；② `_load_vectors_cache()`
-    全量加载向量（`:280-281`，仅当 `vector.backend != "sqlite_vec"`）；③ 构造 `FtsIndex`（`:205-218`，`fts.py:43-50`
-    **会真建 sqlite 文件**）并可能调 `_fts_ensure_populated()` **写盘**。无网络、无线程、无 atexit——这几点原来判断正确。
-  - **修法（改两行，不新增抽象）**：给 `MarkdownIndexer.__init__` 加 `load_vectors: bool = True` 开关，
-    探测时传 `False`，省掉第 ② 步。
-  - **⚠ 残余（评审盲点 B4）**：`load_vectors=False` **盖不住第 ① 步**——chunks 层仍全量加载。本卡先修向量部分；
-    chunks 部分的代价评估见新增 **C64**。（原判据的「20 库 × 20MB ≈ 400MB」**无实测依据**，已撤回；真实量级需实测。）
-  - **错误路径必须显式**（原计划未指定）：逐库探测时 `OSError` / `zlib.error` / `FileNotFoundError`
-    （注册表有条目但目录已删）→ **跳过该库并计入「未探测库」**，不得中断整个 `kb_read`，也不得计入「已探测」。
-  - **solo 库是否参与探测必须明确**：`kb_search` 的 fan-out 跳过 solo 库并列出 `excluded_solo`（`server.py:440` 一带）。
-    `kb_read(chunk_id)` 是显式寻址而非 fan-out，建议**参与探测**（用户已经指名了具体切片），
-    但要在结果与报错文案里说明该库是 solo——否则会出现「搜不到但读得到」的口径矛盾。**这是本卡必须拍板的一处。**
-  - **可观测性**：零命中报错里要带上「共 N 个候选库，探测了 M 个，跳过 K 个（列出名字与原因）」——
-    否则用户拿到「未找到」无从排障（原计划的「如实说明」缺具体形状）。
-  - **单命中**：用该库展开，结果追加库归属（`vault_path` 绝对路径 + `vault` 名）。已核对
-    `tests/test_kb_read_chunkid.py:72-78` 是逐键断言而**不是**键集等价断言 → 加键不破现有测试。
-  - **多命中**：fail-closed，报错并列出候选 vault（依据：仓库歧义报错口径 `server.py:453-459`、`1084-1087`）。
-  - **零命中**：只有在全部候选库都探过之后，才允许沿用现有的 `chunk_id not found: …（文件可能已修改…）`；
-    若有库未探测（未加载/未索引），必须如实说明，不得谎报「文件已修改」。
-- 契约变更（必须显式记账）：`tests/test_kb_read_chunkid.py:278-280` 现断言「多库 + 无 vault_path → 报错」，
-  需改写为「唯一命中自动展开」，并新增撞 id 的 fail-closed 用例；`skills/mortis-rag-mcp/SKILL.md`
-  的多库阅读纪律同步改。
-- 验证：`pytest tests/test_kb_read_chunkid.py tests/test_mcp_stdio.py -q`
-
-### [ ] C57 — feat(server): kb_list_files 分页与子树过滤（issue #5）
-
-- 改动：schema（server.py:238-241）增 `limit` / `offset` / `path_prefix`；handler `_kb_list_files`(963-966)
-  在 `list_files()` 结果上做前缀过滤与切片，返回增加 `total` / `truncated` / `next_offset`
-  （不传参数时行为与现在完全一致）。
-- **`total` 语义必须钉死**：`total` = **前缀过滤后、切片前的条目数**（不是「已索引文件总数」，也不是「本页条数」）。
-  消费方靠它判断是否还有下一页；`next_offset = offset + len(files)`（无更多时为 `None`）。
-- `path_prefix` 语义与 `kb_search.path_prefix` 对齐（库内相对 posix 前缀匹配）。
-  **注意：这里没有穿越风险**——`models.py:143-166` 是 `chunk.source.startswith(prefix)`，`source` 恒为库内相对路径，
-  `../` 或绝对路径只会**零命中**（天生 fail-closed）。所以本项是 **DRY 要求**（避免两套前缀语义漂移），
-  **不是补安全缺口**。但两端实现应共用同一函数。
-- **⚠ 同名字段、相反缺省（评审盲点 B1，必须处理）**：`kb_search.limit` 的缺省语义是「用 top_k」（`server.py:257`），
-  而 `kb_list_files.limit` 的缺省是「返回全量」（现状如此，C57 承诺不变）。同名参数在两个工具里语义相反，
-  模型必然误判。**二选一，必须在卡里拍板**：(a) 保持「缺省全量」，并在 schema `description` 里**显式写明**
-  「缺省返回全部已索引文件，大库请传 limit」；(b) 给 `limit` 设一个保守缺省（如 200）并把「取全量」变成显式
-  `limit=0` 或 `all=true`——**但这与 C57 的兼容性承诺冲突，需要改 plan 的兼容性口径**。建议 (a)。
-- **⚠ `truncated` 撞名（评审盲点 B2，必须处理）**：v0.8.0 已有一个 `truncated`，语义是**字节预算截断**
-  （`fanout.py:50-58` 的 `apply_budget`）。C57 新增的 `truncated` 是**分页截断**。同一响应体里两个 `truncated`
-  会让消费方误读。**建议改名 `page_truncated`**，或在 `description` 里明确区分两者；不要复用同名键。
-- **`limit` 上限**：**不加**。理由（第三轮已证伪第二轮的主张）：`kb_search.limit` 虽在 schema 里只有 `minimum`，
-  但 handler 侧已被 `_search_filter` 夹取（`server.py:98` 的 `min(limit, max_limit)`，**已实测复核**）；
-  `budget_bytes` 是 `kb_search` 的专属可选参数（`:259`；`fanout.py:43-44` 仅非 None 时生效），
-  `kb_list_files` 没有这条通道；且 `list_files()` 返回的是摘要 `{source,title,chunks}`（`indexer.py:962`），
-  与返回全文 chunk 的 `kb_search` 差几个数量级。给 `limit` 加上限反而会改变默认行为（今天不传就是全量）。
-  → **只保留「描述里写明缺省语义」这一条。**
-- 测试：`tests/test_mcp_stdio.py`（保持 `files[0]["source"]` 断言成立）+ 新增：切片 / 前缀过滤 / 默认全量一致 /
-  `total` 与 `next_offset` 正确 / `offset` 越界返回空 + `total` 仍为过滤后总数。
-- 验证：`pytest tests/test_mcp_stdio.py tests/test_preview_mode.py -q`
-
-### [ ] C58 — feat(config,indexer,ingest,server): auto_watch 自动摄取（issue #7 RFC）
-
-- 配置（`mortis_rag_mcp/config.py` + `config/app.toml.example`）：
-  - `[ingest] auto_watch = false`（默认关，隐私/额度双闸）；
-  - `[ingest] max_file_size_mb = 20`（**⚠ 用户裁定 D2 改判：默认 20，所有路径统一**。原计划的「默认 0 = 不限制」
-    已推翻。`0` 仍保留为显式「不限制」；正数走 `_numeric(min=1)` 校验。**这是对存量用户的行为变更**：
-    20MB 以上的文件在 `submit(None)` 扫描路径会被跳过——必须写进 `CHANGELOG_user.md` 的升级须知，见 T8）；
-  - 矛盾键 `auto_watch=true` + `enabled=false`：**不抛错**，忽略该键并在 doctor/STATUS.md 与 kb_init/kb_ingest 的 hint
-    里点明（依据：`config.py:219-273` 全为单键校验、无跨键先例；`doctor.py:449-457` 有「静默忽略但必须点出」的范式；
-    抛错会让整个服务起不来，为一个笔误牺牲搜索可用性不值）。
-  - 自动路径的生效状态**必须可观测**（评审 A17）：`doctor` / `STATUS.md` 报 `auto_watch` 是否生效、
-    最近一次自动触发扫描的时间；否则用户分不清「已关」与「坏了」。
-- 接线（不破坏分层）：
-  - `server._indexer_for` 创建 indexer 后、`start_watching()` **之前**挂 `indexer._ingest_hook`（默认 None，
-    hook 内部 `try/except` 全吞，绝不把 watcher 线程打死），指向 `self._ingest_manager_for(vault).submit(None)`。
-  - **⚠ hook 的两条硬约束（评审 A2，缺一不可）**：
-    ① **`auto_watch` 关闭时零调用**（早退），否则每个文件事件都白跑一次全库扫描；
-    ② **不得在 watcher / 防抖调度线程内同步执行全库扫描**——`_fs_scheduler_loop`（`watch.py:71-93`）是每库唯一的
-       防抖线程，在里面同步跑 `scan_pending()`（全库递归 + 首轮每 PDF 做 sha256）会**饿死文本 sync**。
-       修法：丢给一次性 worker 线程，或做成可合并的 dirty 标志（合并多次事件为一次扫描）。
-  - `_indexer/watch.py` 事件分类从「只认 .md/.txt」扩为两级：文本事件 → 现有 sync 防抖路径（**不变**）；
-    可摄取文档（`INGEST_EXTS`）事件 → 单独的 ingest 请求标志。
-    **⚠ 原计划的理由错了**：它写「避免 PDF 事件白跑一次全量 sha256 对账」，但 `watch.py:134` 只对
-    `_INDEXABLE_TEXT_EXTS = {".md", ".txt"}`（`chunking.py:32`）返回 True —— **PDF 事件今天什么也不触发**，
-    不存在「白跑一次全量对账」。改动本身仍然必需（它是把「什么都不做」变成「触发 ingest」），但别按错误模型去设计。
-  - **⚠ poll 路径是真空洞（评审 N1，三轮一致确认为 P1）**：原计划写「事件丢失与 `watch_method="poll"` 情况由
-    `_native_watch_loop` 的 30s 兜底节拍各补一次 ingest 扫描」——**这是错的**。`watch.py:46-59` 显示：
-    poll（或原生 watcher 启动失败）走的是 `owner._watch_loop`（第 57 行），**根本不进 `_native_watch_loop`**（第 51 行）。
-    而且 `_fs_scheduler_loop` 虽在 poll 下也启动，但 `_fs_requested` 只由原生事件设置（`:112-117`）→ **poll 下永假**。
-    **范围比原判断更严重**：`fsnotify.py:218-242` 在非 win32 上恒返回不可用，而 `config.py:210` 默认
-    `watch_method = "auto"` → **Linux / macOS 是 100% 走 poll，auto_watch 在那里完全不会触发（属常态，非极端回退）**。
-    → 必须在 `_watch_loop` 里也挂 ingest 节拍（复用 `watch_fallback_interval`），**或**在 poll 模式下明确声明
-    不支持 auto_watch 并在 `doctor` / hint 里点明（fail-closed 的表态优于静默失效）。见新增 **C61**。
-  - `_recover_zombie_jobs` 会拉起 `.ingest.lock` 跨进程锁并 mkdir `<vault>/.mortis-parsed/`——这是**新增副作用**，
-    需记账（A7）。
-  - **E2 并入本卡（评审终裁：不单列卡）**：`server.py:638-649`/`687-698` 的 PDF hint **已存在且被测试锁定**
-    （`tests/test_ingest_server.py:65,83,99` 断言 `ingestible_docs`），`SKILL.md` 关于摄取只有 `:49`/`:57` 两句。
-    增量 = ① hint 里带上 pending 清单与建议动作；② `SKILL.md` 补一句纪律。工作量 S。
-    （C58 与 E2 不重叠：C58 是 watcher 自动触发，E2 是 agent 主动触发；纪律不可测、机制可测，故纪律作为本卡子项。）
-- 体积闸门（**策略层前置拦截，不是补安全缺口**——per-channel 硬闸门 200MB/10MB 已存在）：
-  - **闸门位置必须在 `channel_for` 判定之前**；否则超 200MB 的 PDF 会走 `pymupdf_fallback` 静默降级成本地文本提取
-    （`ingest/worker.py:352-365` 的 `except MineruError` → `_pymupdf_fallback`），闸门形同虚设。**这条判断已复核，准确。**
-  - 扫描路径（`submit(None)` / `action="pending"`）：跳过超限文件，在 pending 项写 `reason="too_large"`（带 size/limit），
-    submit 汇总加 `skipped_too_large` 计数与 hint；**不要**塞进 `kb_stats.skipped_unsupported`——它被测试锁定为
-    排除 `INGEST_EXTS`（`tests/test_ingest_server.py:194-218`）；
-  - 显式 `sources=[...]` 超限 → **报错**（fail-closed，不静默跳过、也不替用户绕过他自己设的上限），错误文案给出修法。
-  - **⚠ 闸门只拦「用户自己配置的 cap」（评审 A1，必须区分）**：无 key 时走 Agent 通道，`mineru.py:118-122` 会强加
-    10MB 上限并抛 `-30001`（`retryable=False`）→ 今天会落到 `pymupdf` 本地兜底拿到（粗糙）结果。
-    若新闸门把这类「channel 强加的限额」也变成硬失败，则**无 key 用户今天能拿到的兜底结果会被砍掉**——
-    这是本卡引入的、计划未申报的行为变更。**修法：只有「用户自己设的 `max_file_size_mb`」被超才硬报错；
-    由 channel 强加的限额维持今天的 PyMuPDF 兜底语义。**
-    （与 D2 的张力如实申报：D2 裁定「所有路径统一 20MB」，但 D2 讨论的是**默认值**，不是「channel 限额的处置」。
-    A1 是对 D2 的细化，不违背 D2。）
-  - **⚠ 闸门必须在 `_run_job` 再校验一次（评审 A13）**：只在扫描路径设闸会漏两类——
-    ① `_recover_zombie_jobs` 把 `parsing → queued` 恢复的旧 job，会在下次 `submit` 启动 worker 时
-    按 `state` 取走（`worker.py:300`，**不看本次 targets**）；② 「入队后文件变大」的 TOCTOU。
-  - **⚠ 自动路径必须复用 ignore / exclude 过滤（评审 A8）**：这是**隐私边界**问题——打开 `auto_watch` 后，
-    「被上传到第三方云的文件集合」从「用户显式点名的」变成「目录里所有的」。必须复用 `.vaultignore`、
-    `config.exclude_patterns`、产物目录排除（`worker.py:48` 的 `_EXCLUDED_DIR_NAMES` 是现成的可复用清单），
-    否则会摄取用户明确排除过的文件。
-  - `auto_watch` 已开且 cap 仍为 0 → hint 提醒可能一次上传大文件、有额度风险（D2 后默认 20，此情形只会在显式设 0 时出现）。
-- 额度安全（**判据已修正，评审 A14**）：
-  - **自动模式不得重试 failed 任务**：现 `scan_pending()` 只把 `state == "done"` 当已处理
-    （`ingest/worker.py:149-194`），瞬时失败（429/超时）会在下一次事件被反复重提 → 限流与额度风险。
-  - **走新函数 `_auto_pending()`，不要改 `scan_pending()`**：后者的返回是 `kb_ingest(action='pending')` 的
-    **用户可见契约**，已被 `tests/test_ingest_server.py:184-186`、`tests/test_ingest_worker.py:82-103` 锁定。
-  - 自动模式判据：最新 job 状态 ∈ {done, failed, queued, parsing} 即跳过，仅当源文件 sha256 变化才重新入队。
-  - **⚠ 两处判据细节（评审指出，原计划自相矛盾）**：
-    ① jobs 以 `job_id` 为键，「最新状态」必须**按 `submitted_at` 取 max**，不能取任意一条——
-       且 `_save_state` 在超过 500 条时会剪掉旧 `failed`（`worker.py:136-145`），会让「最新」失真；
-    ② 「仅 sha256 变化才重入队」与「failed 加最小退避」**对 429 是冲突的**——429 场景下 sha 永远不变，
-       所以**退避必须独立于 sha 判定**，不能只靠 sha。
-  - `_auto_pending()` 的跳过理由要能被 `hint` 说明（用户看到「为什么这个文件没被自动处理」）。
-- 测试（全部 mock MineruClient，禁真实网络）：config 默认值与校验（含 0 与负值、bool 拒收）；闸门位置（`channel_for` 之前）；
-  `reason="too_large"` + `skipped_too_large` 计数；显式超限报错文案含修法；**无 key 时保留 PyMuPDF 兜底（A1）**；
-  **`_run_job` 的兜底闸门（A13）**；`_auto_pending()` 的 done/failed/queued/parsing 跳过 + sha 变化重入队 + failed 退避；
-  **`_save_state` 剪枝后判据仍取最新（按 `submitted_at`）**；hook 接线（monkeypatch `IngestManager.submit` 计数）；
-  **`auto_watch=false` 时零调用**；hook 抛异常不死 watcher；**文档事件触发 ingest 标志**；`events=None`（缓冲溢出）路径行为；
-  **自动路径复用 ignore/exclude 过滤（A8）**；**poll 路径的 ingest 节拍（N1，见 C61）**。
-- 文档同步（**⚠ 工作量被低估，评审 A6**）：`config/app.toml.example`；
-  `docs/PROJECT_GUIDE.md` —— **§四 需新增 ingest 模块专节**（现子节为 4.1 config → 4.10 doctor，**没有** ingest）、
-  **§七 需新增 `[ingest]` 小节**（现子节为 embedding/reranker/index/vector/cache，**没有** ingest），
-  且 §八 的 `PROJECT_GUIDE.md:626` 环境变量优先级清单由**三对扩为四对**（+ 缓存根，见 C54）；
-  `QUICKSTART_user.md`（用户向、默认关闭）；`skills/mortis-rag-mcp/SKILL.md`（PDF 摄取章节，现只有 `:49`/`:57` 两句）。
-- **模块文档必须同步改写（评审 A7）**：`ingest/worker.py:1-4` 与 `ingest/__init__.py:3-4` 现在明写
-  「不做 watcher 自动摄取；只有 submit() 被显式调用才启动后台线程」——C58 落地后这句话就是错的。
-  「注释与实现对不上」是本仓库最忌讳的一类问题，必须同批改。
-- **ASCII 图（仓库规约 `PROJECT_GUIDE.md:867` 要求）**：C58 的控制流是隐式的（watch 事件 → hook → server → manager，
-  4 跳），需在 `_indexer/watch.py` 与 `server.py` 两侧各留一张控制流图。
-- 验证：`pytest tests/test_ingest_worker.py tests/test_ingest_server.py tests/test_watch_integration.py tests/test_fsnotify.py -q`
-
-### [ ] C59 — docs: Windows 升级写锁说明（issue #6；评审加强）
-
-- `docs/Quick-start_developer.md` §7 增一条：LSP/IDE 经 stdio 持有 `mortis-rag-mcp.exe` 时，
-  `pip install -e .` 覆盖 console script 会 `[WinError 5]`；先退出 MCP 客户端或结束进程再加装。
-- **评审加强（DX Pass 1/5）**：只说「先退出客户端」用户无从下手 → 补 ① **怎么确认是哪个进程占用**
-  （任务管理器按名称找 `mortis-rag-mcp.exe` / `vault-mcp.exe`）；② **备选升级路径**（先 `pip uninstall` 再装 / 重启终端）。
-  错误消息三要素（问题 + 原因 + 修法）缺了「怎么确认」这一环。
-- `QUICKSTART_user.md` 升级章节加一句用户向说明（大白话，不写函数名/内部名）。
-- 无代码改动、无测试。
-
-### [ ] C60 — chore(release): 0.8.1 收口
-
-- `pyproject.toml` `0.8.0 → 0.8.1`、`SERVER_INFO`、README 徽章、`skills/mortis-rag-mcp/SKILL.md` 头部版本（现 `:4`=5.2.0 / `:7`=0.8.0）；
-- **⚠ 新增必改项（评审盲点 B3，主审已复核）**：`mortis_rag_mcp/diaglog.py` 有**两处**硬编码版本号——
-  `:195` 的 `version: str = "0.8.0"` 与 `:226` 的 `str(version or "0.8.0")`；另有 `tests/test_diaglog.py:120`。
-  原收口清单没列它 → 版本收口会漏掉诊断日志的版本。见新增 **C63**。
-- **⚠ 新增必改项**：三处文档过期行号——`docs/PROJECT_GUIDE.md:432`（「约 1064 行」）、
-  `docs/Quick-start_developer.md:34`（「1126 行」）、`docs/Changelog_developer.md:320`（C49 的「1359→1126」）
-  → `server.py` 实际 **1313 行**。
-- `CHANGELOG_user.md` 新增 `## [0.8.1]`（`tests/test_version_sync.py:18-20` 强制「有条目」，
-  但**不强制「有升级须知」→ 人工保证**）；`docs/PROJECT_GUIDE.md` §十五 版本详录（倒序追加在顶部）；
-- **升级须知必须逐条写清本版的三处行为变更**（DX Pass 5）：① `max_file_size_mb` 默认 20 → 20MB 以上文件在
-  `submit(None)` 里被跳过；② `kb_read(chunk_id=...)` 在多库环境的行为从「报错要求显式 vault_path」变为
-  「唯一命中自动展开」；③ 新增公开环境变量 `MORTIS_RAG_CACHE_DIR`。`QUICKSTART_user.md` 升级章节同步。
-- `docs/Changelog_developer.md` 逐卡记账（编号从 `C53` 起；序列末位现为 `C52`，`FIX-x` 是并行命名线）；
-- **E1 降级形态（发版必填字段）**：C53 的「实机验证：已通过（日期）/ 待实机验证（原因）」必须出现在
-  Changelog 条目**正文**里，不留空、不留给口头承诺。载体沿用 `PROJECT_GUIDE.md:764-769` 的发布 4 步。
-- 版本策略：**一次发 0.8.1，不拆补丁版**（用户裁定 D1=C；本报告不再复议）。
-- 验证：`pytest tests/test_version_sync.py tests/test_diaglog.py -q`；全量回归交 CI（遵守「本地不跑全量」约定）。
-
-### [ ] C61 — fix(watch): poll 路径的 auto_watch 节拍（评审 N1；三轮一致确认为 P1）
-
-- 问题：`_indexer/watch.py:46-59` —— poll（或原生 watcher 启动失败）走 `owner._watch_loop`（第 57 行），
-  **不进 `_native_watch_loop`**（第 51 行）；而 `_fs_scheduler_loop` 的 `_fs_requested` 只由原生事件设置（`:112-117`）。
-  → poll 下 auto_watch 永不触发。**范围**：`fsnotify.py:218-242` 在非 win32 恒不可用 + `config.py:210` 默认 `auto`
-  → **Linux / macOS 100% 走 poll，属常态**。
-- 修法（二选一，建议前者）：① 在 `_watch_loop` 里同样挂 ingest 节拍（复用 `watch_fallback_interval`）；
-  ② 在 poll 模式下明确声明不支持 `auto_watch` 并在 `doctor`/hint 里点明（fail-closed 表态优于静默失效）。
-- 文件：`mortis_rag_mcp/_indexer/watch.py`、`mortis_rag_mcp/doctor.py`、`tests/test_watch_integration.py`
-- 验证：`pytest tests/test_watch_integration.py tests/test_fsnotify.py -q`
-
-### [ ] C62 — fix(server): kb_list_files 的缺省语义与 truncated 命名（评审盲点 B1/B2）
-
-- B1：`kb_list_files.limit` 缺省=全量，而 `kb_search.limit` 缺省=用 top_k（`server.py:257`）——**同名参数相反缺省**，
-  模型必然误判。修法：在 schema `description` 里**显式写明**「缺省返回全部已索引文件，大库请传 limit」（推荐），
-  或改缺省值（但与 C57 的兼容性承诺冲突，需改口径）。
-- B2：`truncated` 已被 v0.8.0 的字节预算截断占用（`fanout.py:50-58` 的 `apply_budget`）。C57 的分页截断**不要复用同名键**
-  → 建议改名 `page_truncated`，或在 `description` 里明确区分。
-- 文件：`mortis_rag_mcp/server.py`、`tests/test_mcp_stdio.py`
-- 验证：`pytest tests/test_mcp_stdio.py tests/test_preview_mode.py -q`
-- 说明：本卡与 C57 同文件同区域，建议**合并进 C57 一次做完**，不单独提交。
-
-### [ ] C63 — fix(diaglog): 版本号去硬编码（评审盲点 B3）
-
-- 问题：`mortis_rag_mcp/diaglog.py:195` 的 `version: str = "0.8.0"` 与 `:226` 的 `str(version or "0.8.0")`
-  两处硬编码（主审已复核，两处均存在）；`tests/test_diaglog.py:120` 也依赖该值。
-- 修法：改为从 `server.SERVER_INFO["version"]` 或 `mortis_rag_mcp.__version__` 取值（单一真源），
-  避免每次发版都要人肉记得改两处。
-- 文件：`mortis_rag_mcp/diaglog.py`、`tests/test_diaglog.py`
-- 验证：`pytest tests/test_diaglog.py tests/test_version_sync.py -q`
-
-### [ ] C64 — perf(indexer): C56 探测的 chunks 层代价（评审盲点 B4）
-
-- 问题：C56 的 `load_vectors=False` 只省掉向量加载；`_init_cache_paths()` 的第 ① 步
-  `_load_chunks_cache()` **仍全量加载文本层**，每个未加载库都要付一次。
-- 需要评估（先量测再决定，不要凭感觉优化）：① 只读 chunks 层的轻量入口；② 进程级「库 → chunk_id 集合」索引（带失效）；
-  ③ 接受现状并加一个库数上限（超过 N 个库只探测已加载的，并在报错里说明）。
-- **前置作业**：先实测「10 个中等库」场景下 `kb_read(chunk_id=...)` 的实际耗时与内存，用数据决定。
-  原报告的「20 库 × 20MB ≈ 400MB」**无实测依据，已撤回**。
-- 文件：`mortis_rag_mcp/indexer.py`、`mortis_rag_mcp/server.py`
-- 验证：靶向单测 + 一次本机量测（记录数值到 Changelog）
-
-## 本地验证策略
-
-- 只跑靶向单文件/单用例（上方各卡的 `pytest` 命令）；全量由 CI 承接，避免 pytest 临时目录碎片膨胀。
-- 不新增真实网络依赖：MinerU / embedding / reranker 一律 mock，或走本机回环。
-- 每卡的「验证」行给的就是最小靶向集；改动跨模块时按需追加相邻文件。
-
-## 风险与回滚
-
-| 卡 | 风险 | 回滚 |
+| 范围 | 当前代码事实 | 执行位置 |
 |---|---|---|
-| C53 | 极低（单行） | revert 该行 |
-| C54 | 全局夹具改变所有测试的配置来源；C54c 若用共享注册表文件会造成跨用例状态泄漏 | 删 fixture；C54c 独立一步、失败可单独回滚 |
-| C56 | 改变 kb_read 既有报错行为（有测试锁定），属契约变更 | 保留旧分支开关（探测全未命中即回落原报错） |
-| C57 | 新增键不影响旧消费者 | 移除新参数即恢复 |
-| C58 | 打开后会真实消耗 MinerU 额度；cap 默认 0 意味着「默认不设上限」 | 默认关闭；出问题置 `auto_watch=false` 立即止血；文档推荐显式设 20 |
+| A4 完成回调 | worker 调 `on_job_finished(source, out_md)`，server 仍定义单参数回调 | C66，与异步 refresh 共用 |
+| C58/C61 | `IngestConfig` 无 `auto_watch/max_file_size_mb`，watch 无 ingest 标志/hook，worker 无 auto_submit | C58a–C58d，**从现行源码实现** |
+| C59 | 没有完整 Windows 升级锁说明 | C59 |
+| C60/T8 | 版本仍0.8.0，用户日志/开发者记账/使用纪律未收口 | C70/C60 |
+| Worklog 的 Lane D | 曾记7个未提交文件与719行增量，但当前工作树干净、HEAD 无这些改动 | 只可参考设计，不得假定代码可直接继续 |
+| “下一步直接 /ship” | 代码尚未完成，不具备发布条件 | 先过所有卡与§7门禁 |
+| 根 TODOS.md | 历史已裁定不建立第二套待办 | 使用 `docs/Execution-plan_developer.md` |
 
-## 已裁定（含 2026-09-29 三轮评审的全部修订）
+### 1.3 Issue #6：逐条核验，不按 RFC 字面重复造轮子
 
-### 用户裁定（4 项，不得复议）
-
-| # | 裁定 | 说明 |
+| #6 项 | 事实/置信度 | 要做的增量 |
 |---|---|---|
-| D1 | **一次发 0.8.1，7 条全落** | 用户明确否决了「拆两批 / 拆三批」的建议。本计划不再复议。 |
-| D2 | **`max_file_size_mb` 默认 20，所有路径统一** | 推翻原计划的「默认 0 = 不限制」。`0` 保留为显式不限制。**这是对存量用户的行为变更**，必须进升级须知。 |
-| D3 | **C54 采用「缓存根 env 覆盖 + 保留 config pin + 修正后全量清单」** | 见 C54 的 C54a' 与 C54b。 |
-| D4 | **P0 搭车 / P1 前置独立 commit / P2 更正为本地清理** | P2 是伪命题：`docs/*` 在 `.gitignore:19` 被整体忽略，那份副本**根本不在仓库内**（`git ls-files docs/` 只有 3 个文件）→ 只需删本地文件，删除动作需单独确认。 |
-| X3 | **延后项用仓库自己的 `docs/Execution-plan_developer.md` 口径** | 该文件被 `Quick-start_developer.md:60/215/251` 三处指向，但**不存在且被 gitignore**。落地方式：新建该文件 + 把它与 `docs/Docs_Folder-descriptions.md` 一起加进 `.gitignore` 白名单（现 3 个 → 5 个）+ 修仓库地图与「只需保留」清单。**不新建根 `TODOS.md`**（避免第二套约定）。 |
-| D5 | **C56：solo 库参与 `chunk_id` 跨库探测，但只以「库名」标识该库，其 chunk 不进入 `kb_search`** | 2026-09-29 用户裁定：显式寻址（用户已指名具体切片）与 fan-out 搜索是两条独立口径——探测**必须覆盖 solo 库**；命中/报错文案只给**库名**（不展开 solo 库的绝对路径），并点明该库是 solo；`kb_search` 的 `excluded_solo` 语义**完全不变**。据此替代 C56 卡内「本卡必须拍板的一处」。 |
+| 精简初筛投影 | `Chunk.to_dict(preview=True)` 仍带 id/score/title/metadata/char_count 等，事实成立 | C67：新增 opt-in `compact`，不默认破坏旧 preview |
+| 完整 chunk 预算 | `apply_budget` 已对 dict/list 裁剪、JSON 合法；**首条超限会二分裁正文/摘要** | C68：去首条字符串裁剪，明确放不下与分组续页；不是“修损坏 JSON” |
+| 读取行号越界 | `indexer.read` 在 `start>end` 时直接 `""` | C69a：具名诊断、文件实际总行数、修复动作 |
+| heading 直读 | schema 与 handler **已经有 heading**；当前为同名 chunk 的 min/max 行号并集 | C69b：物理原文标题定位、同级/更高级边界、重复标题歧义、未索引文件 |
+| 40s+ 搜索毛刺 | `try_sync_with_guard` 只限制 acquire，拿锁后同步 `_sync_locked()` 可执行网络补嵌 | C66：MCP 读路径请求异步 refresh，读取已有索引；40s生产现象本轮未实测复现 |
 
-### 技术裁定（三轮评审累积）
+具体基线锚点：`models.py::Chunk.to_dict`(99)、`fanout.py::apply_budget`(36)、`indexer.py::try_sync_with_guard`(510)、`indexer.py::read`(958)、`server.py::_kb_read`(1175，heading并集1299)、`server.py::_ingest_manager_for`(785，单参回调792)。
 
-1. **#4 多命中** → fail-closed（列候选报错）；单命中追加库归属；探测必须覆盖未加载的库（**不走** `_indexer_for`）。
-2. **#4 探测代价** → 用 `load_vectors=False` 开关（两行），**不新增只读层抽象**；chunks 层代价另立 C64 先量测。
-3. **`auto_watch=true` + `enabled=false`** → 不抛错，忽略该键并在 doctor/STATUS.md 与 hint 点明。
-4. **提交编号** → 从 `C53` 起顺延（主序列末位 `C52`；另有 `FIX-x` 并行命名线，不冲突）。
-5. **发版节奏** → 一次发 0.8.1，不拆补丁版（D1）。
-6. **体积闸门** → 只拦「用户自己设的 cap」；channel 强加的限额维持 PyMuPDF 兜底语义（A1）。
-7. **自动路径判据** → 走新函数 `_auto_pending()`，不改 `scan_pending()` 的用户可见契约（A14）。
-8. **C55** → handler 别名保留；重心移到 schema `description` 与报错文案的可发现性；**不改 schema properties**（≤10% 体积门禁）。
-9. **C57** → `total` = 过滤后切片前条目数；补 `next_offset`；`truncated` 改名避免与字节截断撞名；`limit` **不加**上限。
-10. **C54b** → 判据更正为「`cache.enabled` 默认 true 且未显式设 `dir`」；`enabled = false` 的配置本来就安全。
-11. **E1** → 不进 CI（单 job、零 secret、烧额度）；降级为 C53/C60 的**发版必填字段**「实机验证 / 或显式声明未验证」。
-12. **E2** → 不单列卡，作为 C58 的子项（hint 带 pending 清单 + SKILL.md 一句纪律）。
+### 1.4 已提交功能中本轮新增审核缺口
 
-## 仍待裁定
+1. **C56 未完整探测却宣称唯一**：32库/2s预算、目录缺失、无可用文本缓存等会跳过候选库；当前只要 `hits==1` 即展开。这不能证明另一个未探测库没有同 ID。C65 改为 incomplete 时要求显式库，不自动猜。
+2. **零注册库 IndexError**：`_locate_chunk_for_read` 的 `len(entries)<=1` 分支访问 `entries[0]`。C65 改为正常工具错误，引导注册。
+3. **load_vectors=False 不是全路径保证**：配置 sqlite_vec、可选后端不可用后回退 memory 时，构造器仍调用 `_load_vectors_cache()`。C65 补 gate 与专项用例。
+4. **大库全局分页不是无限游标**：fan-out 每库最多取 `max(top_k,20)`，深 offset 可能候选池先耗尽；现有 grouped next_offset 还把“总返回数”当“各组偏移”。C68 给预算内明确续页契约，不承诺无限遍历全库。
+5. **自动失败免重试不能靠500条 job历史**：被剪枝的 failed 会再次被当新文档。C58b 增 source/hash 的有界于源文件数的独立账本，不能沿用“取 max 就绕开剪枝”的旧论断。
+6. **标题读取不能依赖切块产物行号**：图片注入、chunk_overlap、同名标题/空章节会让并集与物理章节不同。C69b 读原文定位，不改 chunker 或缓存。
 
-- **无。** 原「仍待裁定」的 REPORT.md P0/P1/P2 已由 D4 裁定：
-  P0（CI flaky）搭车成卡；P1（PROJECT_GUIDE 转义清理）作前置独立 commit（**必须排在 C58/C59 的文档改动之前**，
-  否则同一文件里大段机械 diff 与语义编辑互相遮蔽）；P2 更正为「只删本地文件」（不在仓库内）。
-- 本轮新出现的**一处待你拍板**：C56 的 solo 库是否参与 `chunk_id` 跨库探测（见 C56 卡内标注「本卡必须拍板的一处」）。
-  评审建议：**参与**（用户已指名具体切片），但在结果与报错里说明该库是 solo。
-  → **2026-09-29 已裁定（见上表 D5）**：参与探测；只以「库名」标识该 solo 库（不展开绝对路径）；其 chunk 不进 `kb_search`。
+## 2. 范围与契约
 
-## 独立审阅记录（2026-09-29）
+### 2.1 保留的历史用户裁定
 
-方式：独立子代理**只读源码与测试**、不读本文件、不跑全量测试，对 7 组工程问题各自独立下结论并给证据行号。
-
-- **被修订**（原判断 → 修订后）：
-  1. `auto_watch` 矛盾键：抛 `ValueError` → 忽略 + doctor/hint 点明（依据：`config.py:219-273` 全为单键校验、无跨键先例；
-     `doctor.py:449-455` 有「静默忽略但必须点出」范式；抛错会让整个服务起不来）。
-  2. `max_file_size_mb` 默认 20MB → 0 = 不限制（依据：`batch_size<=0` / `max_age_days=0` / `watch_fallback_interval<=0`
-     的既定「0 = 关闭」语义）。
-  3. 显式 `sources` 超限「绕过 cap」→「报错」（fail-closed，避免静默上传超限文件或出现半状态）。
-- **被确认**：#4 多命中 fail-closed（另获两条歧义报错先例 `server.py:453-459`、`1084-1087`）；仓库无「修复必须独立发版」
-  的成文条文 → 一批发更贴既有实践。
-- **审阅加固**：探测范围必须覆盖未加载库（`_indexers` 惰性、可能缺条目）；C54 的真实痛点是 stdio 用例缺 `[cache] dir`
-  （本机累积 18153 个孤儿文件，`Changelog_developer.md:418`），比宿主 config 影响更大。
-- **审阅未证实事项（保留为风险）**：provider 构造期是否绝对不发网络请求（若探活，轻量探测的代价需上调）；
-  `docs/PROJECT_GUIDE.md`（103KB）未通读，可能有更细的记账条文；pytest 临时目录膨胀只有历史观测
-  （18153 个孤儿缓存 / 单轮 837~1262 文件），本轮无实测量化。
-
----
----
-
-# GSTACK REVIEW REPORT — /autoplan
-
-> 2026-09-29 · 分支 `main` · HEAD `82989c8` · 标的 `docs/v0.8.1/PLAN.md`
-> 还原点：`~/.gstack/projects/moton16-Mortis-RAG-MCP/main-autoplan-restore-20260929-080941.md`
-> 流水线：Phase 0（intake）→ Phase 1（CEO）→ ~~Phase 2（Design，无 UI 范围）~~ → Phase 3（Eng）→ Phase 3.5（DX）→ Phase 4（最终门）
-> 双声部状态：**Codex CLI 未安装**（`command -v codex` 无输出）→ 全部阶段降级为 `[subagent-only]`。
-> 主审 + 三个独立只读子代理（战略声部 / 工程声部 / 事实核验声部，共 165 次工具调用），下文所有代码断言均经实际阅读源码复核。
-
-## 范围检测（Phase 0 Step 2）
-
-| 检测项 | 结果 | 判定 |
-|---|---|---|
-| UI 范围 | 视图/渲染类词仅 `form` 命中 3 次，全为 `format`/`transform` 类误报；无第二类词命中 | **无** → Phase 2 跳过 |
-| DX 范围 | `MCP`×24、`config`×21、`developer`×9、`SKILL.md`×3、`error`×6；且产品本体即开发者工具（MCP 服务器 + CLI + agent skill） | **有** → Phase 3.5 执行 |
-| 系统上下文 | 无 `CLAUDE.md`、无 `TODOS.md`、无 `AGENTS.md`；无历史设计文档；工作区仅未跟踪 `review_diff.txt` | 上下文取自 `PROJECT_GUIDE.md` / `Quick-start_developer.md` / `Changelog_developer.md` |
-| 先决技能 | 无 design doc → 建议 `/office-hours`。**自动裁决：跳过**（P6 偏向行动；计划已自带前提挑战、替代方案表与一次独立审阅记录，再补 10 分钟设计文档的边际收益低于中断成本） | 机械 |
-| 还原点 | 已捕获（21,053 字节），计划文件顶部已写注释标记 | 完成 |
-
----
-
-## 决策审计轨迹（Decision Audit Trail）
-
-| # | 阶段 | 决策 | 分类 | 原则 | 理由 | 已否决的替代 |
-|---|---|---|---|---|---|---|
-| D0-1 | Phase 0 | 跳过 `/office-hours` 先决技能 | 机械 | P6 | 计划已含前提挑战与替代方案，且已过一次独立审阅 | 先跑 office-hours |
-| D0-2 | Phase 0 | Windows 下 gstack bash 前言/遥测/学习记录脚本不硬跑，改为等价手工探测 | 机械 | P3 | 环境无 `bash` 于 PATH（git bash 存在但前言脚本输出异常），探测目标（分支/slug/设计文档/learnings）已全部手工达成 | 反复调试 bash 桥接 |
-| D1 | Phase 1 前提门 | **用户裁定 C：保持一次发 0.8.1，7 条全落** | 用户 | — | 与两声部建议相反，用户方向为准；本报告不复议，仅在风险表保留 C58 真机零验证的敞口 | 拆两批 / 拆三批 |
-| D2 | Phase 1 前提门 | **用户裁定 C：`max_file_size_mb` 默认 20，所有路径统一** | 用户 | — | 原计划「默认 0 = 不限制」被推翻；需 release notes 显式声明对存量用户的行为变更 | 手动 0 + 自动自带上限 |
-| D3 | Phase 1 前提门 | **用户裁定 A：新增缓存根 env 覆盖 + 保留 config pin + 修正后的全量清单** | 用户 | P2 | 产品级一行修法优于逐文件补丁；原清单漏 10 个 stdio 用例 + 全部进程内用例 | 只按原计划 / 只加 env |
-| D4 | Phase 1 前提门 | **用户裁定 A：P0 搭车、P1 前置独立 commit、P2 更正为本地清理** | 用户 | P2 | 本版验证策略押在 CI 上，门禁不可信等于没有门禁；P1 须排在 C58 文档改动之前 | 三条都不并入 / 三条全并入 |
-| A1 | Phase 1 | 硬闸门只拦「用户自己配置的 cap」；channel 强加的 10MB 上限维持今天的 PyMuPDF 兜底语义 | 机械 | P5 | 用户 D2 选的是尺寸闸门，不等于「无 key 用户的兜底路径变硬失败」——后者是计划未申报的行为变更 | 统一硬报错 |
-| A2 | Phase 1 | C58 的 `_ingest_hook` 接受（显式可注入 + 默认 None），但追加两条硬约束：`auto_watch` 关闭时零调用；hook 不得在 watcher/调度线程内同步执行全库扫描 | 机械 | P5 | 否则每个文件事件都会在防抖线程里跑一次全库扫描，饿死文本 sync | 拒绝 hook / 接受原样 |
-| A3 | Phase 1 | C56 的跨库探测必须复用 F5b 短名寻址的「唯一命中→展开 / 多命中→列候选」范式，不新造第三套口径 | 机械 | P4 | 仓库已有一套同形范式（`server.py:1084-1087`） | 新造独立口径 |
-| A4 | Phase 1 | 修 `on_job_finished` 参数不匹配。**⚠ 第二轮修正：降为 P2，且撤回「C58 依赖它」的因果判断** | 机械 | P1 | 该回调确实 100% 抛 `TypeError` 并被 `except Exception: pass` 吞掉（`worker.py:395` 传 2 参 / `server.py:766` 收 1 参）；但它是**既有缺陷**，不在 C58 的触发路径上——C58 的 hook 直连 `_ingest_manager_for().submit(None)`，「解析完可检索」由各 `kb_*` 自带的 `try_sync_with_guard` 保证。真正被它影响的是 `server.py:794-795` 那句对用户说谎的 hint | 留作 TODO |
-| A5 | Phase 1 | C54b 的判据：**任何「`cache.enabled` 为真且未显式设 `[cache] dir`」的配置**都会写真实缓存根。**⚠ 第二轮修正：原判据「无条件 mkdir，与 cache.enabled 无关」是错的** | 机械 | P1 | `indexer.py:195` 是 `if self.config.cache.enabled and self.config.cache.dir:`，198-203 另有 `except OSError` 降级。正确机制：`cache.enabled` 经 `load_config` 默认 true，`dir` 未设时回落到真实 home。故 **`[cache] enabled = false` 的配置本来就安全**（如 `tests/test_search_filters.py:182`）；有风险的是**完全没有 `[cache]` 段**的文件（默认 enabled=true） | 把「空目录」当「写文件」混为一谈 |
-| A6 | Phase 1 | C58 的文档同步从「改 `[ingest]` 段」更正为「**新增** PROJECT_GUIDE §四 ingest 模块专节与 §七 `[ingest]` 小节」 | 机械 | P1 | 实测 §四子节为 4.1 config→4.10 doctor，无 ingest；§七子节为 embedding/reranker/index/vector/cache，无 ingest | 按「修改」估算工作量 |
-| A7 | Phase 1 | C58 必须改写 `ingest/worker.py:1-4` 的模块硬设计文档与 `ingest/__init__.py` docstring | 机械 | P1 | 否则代码与「不做 watcher 自动摄取」的成文设计直接矛盾——本项目最忌讳注释与实现对不上 | 只改用户文档 |
-| A8 | Phase 1 | 自动模式的跳过必须复用 ignore/exclude 过滤（`.vaultignore`、`exclude_patterns`、产物目录） | 机械 | P1 | 隐私边界变化：打开 auto_watch 后「被上传到第三方云的文件集合」从「用户点名的」变成「目录里所有的」 | 只按 INGEST_EXTS 扫 |
-| A9 | Phase 3 | C56 的探测不得用 `MarkdownIndexer(path, config)` 全量构造。**⚠ 第二轮修正：优先采用两行改动，而非新只读层** | 机械 | P5 | 事实成立：`cache.enabled` 为真时 `__init__` → `_init_cache_paths` → 全量加载 chunks/vectors 缓存 → `FtsIndex`（`fts.py:43-50` 会真建 sqlite）→ 可能 `_fts_ensure_populated` 写盘。但原判据的「20 库 ≈ 400MB」**无实测依据**；且「新增只读文本层入口」是重构而非缺陷修复，与报告自称的「过度工程：无」自相矛盾。**最小修法：给 `MarkdownIndexer.__init__` 加一个 `load_vectors=False` 开关** | 「新增只读文本层」这种带新抽象的方案 |
-| A10 | Phase 3 | C57 的 `total` 语义钉死为「过滤后、切片前的条目数」，并补 `next_offset` 与 `kb_search` 同形 | 机械 | P5 | 否则消费方无法判断是否还有下一页 | 只加 `total` |
-| A11 | Phase 3 | `kb_list_files.path_prefix` 与 `kb_search.path_prefix` 共用同一实现。**⚠ 第二轮修正：撤回「逃出库 = High 安全风险」** | 机械 | P4 | 安全面判据是错的：`models.py:143-166` 是 `chunk.source.startswith(prefix)`，而 `source` 恒为库内相对 posix 路径，「字符串前缀比较」不可能发生路径穿越——`../` 或绝对路径只会**零命中**，即天然 fail-closed。保留的只是 DRY 价值（避免两套前缀语义漂移） | 把它当安全漏洞处理 |
-| A12 | Phase 3 | C58 的事件分类改动保留，但**更正计划中的理由**：PDF 事件今天本来就不触发 sync。**⚠ 第二轮新增：poll 模式下 auto_watch 永不触发（真 bug）** | 机械 | P3→**P1** | `watch.py:134` 只对 `{".md",".txt"}` 返 True 成立；poll 模式同样看不见 PDF（`_markdown_files()`）。**但计划写「`watch_method="poll"` 情况由 `_native_watch_loop` 的 30s 兜底节拍补一次 ingest 扫描」是错的**：`watch.py:46-58` 显示 poll（或非 Windows / native 启动失败）走的是 `_watch_loop`（第 57 行），根本不进 `_native_watch_loop`。→ 见新增任务 T22 | 保留错误理由与缺失的 poll 路径 |
-| A13 | Phase 3 | C58 的体积闸门在 `_run_job` 再校验一次。**⚠ 第二轮修正机制描述 + 降级** | 机械 | P2 | `_recover_zombie_jobs` 实际只把 `parsing → queued`；真正绕过闸门是下次 `submit` 启动 worker 时按 `state` 取首个 queued（`worker.py:300`，不看本次 targets）；「排队后文件变大」是真 TOCTOU。修法廉价，但不是 CRITICAL | 只在扫描路径设闸 |
-| A14 | Phase 3 | 自动模式的 pending 判据走**新函数** `_auto_pending()`，不改动 `scan_pending()` | 机械 | P5 | `scan_pending()` 的返回是 `kb_ingest(action='pending')` 的用户可见契约，有测试锁定 | 直接改 `scan_pending` |
-| A15 | Phase 3 | C53 的回环测试除断言「非 form-urlencoded」外，再加 `req.has_header("Content-type")` 为真。**⚠ 第二轮澄清「自相矛盾」的质疑** | 机械 | P2 | 质疑方指出：既然空值与缺省在 OSS 语义上等价，为何还要锁头存在？答：语义等价 ≠ 回归安全。断言要锁的是「我们**显式**发了这个头」，防止未来重构退回 `urllib` 的自动注入——即防的是回归，不是当前行为 | 保持宽松断言 |
-| A19 | Phase 3（第二轮） | C55 必须在 `inputSchema.properties` 里**增加 `vault_path`**，否则别名对模型不可见、对校验型客户端不可用 | 机械 | P1 | `kb_init_solo` 的 schema（`server.py:192-195`）只有 `path` 属性且 `required: ["path"]`；模型读的是 schema，`vault_path` 不在 properties 里它就永远不会传。且 `kb_remove` 已有同样的 schema/handler 分歧（schema 只 `path`，handler 兜四别名），说明这是既存口径不一致。**原计划「required 保持不动（契约不变）」与 C55 的目标（消除参数名不一致）自相矛盾** → 见新增任务 T23 |
-| A20 | Phase 3（第二轮） | D3 的缓存根 env 覆盖必须**短路在 `resolve_default_cache_dir()` 的目录改名逻辑之前** | 机械 | P1 | `config.py:72-84` 的 `resolve_default_cache_dir()` 有 `os.rename` 副作用（旧目录独占存在时把宿主 `~/.vault_mcp_cache` 搬成新名）。若 env 覆盖落在它之后、或它先被调用，跑测试会**搬走宿主真实数据目录**——比写孤儿文件严重得多 → 见新增任务 T24 |
-| A21 | Phase 3（第二轮） | C57 的 `limit` 必须设上限（或复用 `max_top_k` 夹取），并写清与 `budget_bytes` 的关系 | 机械 | P1 | `kb_search` 的 `limit` 在 schema 里只有 `minimum: 1`、**无 maximum**（`server.py:257`），而 `budget_bytes` 是 `[500, 100000]`（`:259`）。C57 若照抄无上限 `limit`，大库一次可拉全量 → 撞 v0.8.0 建立的 payload 预算不变量 → 见新增任务 T25 | 照抄 kb_search 的无上限 limit |
-| A16 | Phase 3 | 新增回归测试锁定 `on_job_finished` 回调被真实调用（spy 计数） | 机械 | P1 | 回归测试铁律：既有行为已坏且新计划依赖它 | 只修不加测试 |
-| A17 | Phase 3 | 自动路径的生效状态必须在 `doctor`/`STATUS.md` 可见 | 机械 | P1 | 否则用户无法判断 auto_watch 是「已关」还是「坏了」 | 只靠 hint |
-| A18 | Phase 1 | 云端链路验收闸门（真机 smoke / 发版清单）**升为本计划扩张候选，交最终门** | 品味 | P1 | 本次事故的真教训是「付费云路径没有验收闸门」，而 7 张卡没有一张朝这个方向移动 | 记入 TODOS 不讨论 |
-
-**自动裁决合计 20 项**（机械 19 / 品味 1 = A18），**用户裁定 4 项**（D1-D4），**用户挑战 1 项已由用户裁定关闭**（D1 的拆版建议被否决，本报告不再复议），**遗留待定 3 项**（E1 云端验收闸门 / E2 agent 约定式摄取 / X3 是否新建 `TODOS.md`，均在最终门裁决）。
-
----
-
-## Phase 1 — CEO 评审（SELECTIVE EXPANSION，全 11 节）
-
-### Step 0A — 前提挑战
-
-| # | 前提 | 状态 | 裁定 |
-|---|---|---|---|
-| P1 | 一次发 0.8.1，7 条全落 | **用户已确认**（D1=C）；原为两句部挑战项 | 保留。风险敞口记入风险表 |
-| P2 | `auto_watch` 默认关闭即可控风险 | **不成立**：默认关 ≠ 风险已控——它是「一旦打开就无上限」 | 由 D2 修复（新闸门 safe-by-default） |
-| P3 | `max_file_size_mb` 默认 0 = 不限制 | **被推翻**（D2=C 改判默认 20，全路径统一） | 改写；release notes 必须声明行为变更 |
-| P4 | `auto_watch=true` + `enabled=false` 不抛错，仅忽略并点明 | 成立（`doctor.py:449-457` 有同款「静默忽略但必须点出」范式；`config.py` 无跨键校验先例） | 保留 |
-| P5 | #4 多命中 fail-closed | 成立（`server.py:453-459`、`1084-1087` 两条歧义报错先例） | 保留 |
-| P6 | 提交编号从 `C53` 顺延 | 成立（`Changelog_developer.md:361` 末位为 C52；`C5[3-9]|C6[0-9]` 零命中） | 保留 |
-| P7 | C54 三子项（a 必做 / b 补 app.toml / c 可选） | **范围被 D3 修订** | 改为 a + 产品级 env 覆盖 + 修正后的全量清单 |
-
-**新增前提（计划未声明、但已被裁定影响）**：
-- P8「本版含 3 处用户可见行为变更」（默认尺寸闸门 20MB、`kb_read(chunk_id)` 多库行为、新增公开环境变量名）→ 三份用户侧文档必须逐条写。
-- P9「C58 的真机验证为零」——计划自己承认全部测试 mock `MineruClient`。这与本次 403 事故的成因同构（付费云路径无真机验收）。
-
-### Step 0B — 已有代码杠杆表
-
-| 子问题 | 已有代码 | 计划是否复用 |
-|---|---|---|
-| MinerU 预签名 403 | `_put_upload` 单点，v4(`mineru.py:159`) 与 Agent(`:215`) 共用 | **复用**（一处修全局） |
-| 测试配置隔离 | `config.py:346-362` 的 `MORTIS_RAG_CONFIG`/`VAULT_MCP_CONFIG` 优先链已存在 | 复用 |
-| 测试缓存落点 | `resolve_default_cache_dir()`（`config.py:72-84`）已是**运行时求值**的扩展点，「严禁模块顶层副作用」的注释说明它就是为这类需求留的 | **计划漏用** → D3 补上 |
-| `path`/`vault_path` 别名 | `kb_remove`(`709-716`)、`_indexer_for`(`565-572`)、`_kb_describe`(`744-750`)、`kb_ingest`(`778-784`)、`kb_read`(`907-913`) 全是四别名 | 复用 ✔ |
-| chunk_id 跨库寻址 | F5b 短名寻址已实现「全库遍历 + 唯一命中展开 / 多义列最多 5 个候选」（`server.py:1084-1087`） | **计划未点名复用** → A3 |
-| 前缀过滤语义 | `kb_search.path_prefix`（`SearchFilter.matches()`，casefold 归一化） | 复用（计划已声明对齐） |
-| 分页 | `SearchFilter.page_slice()` / `kb_search` 的 `next_offset` | 部分复用 → A10 |
-| 解析完成通知 | `on_job_finished` 已接线（`server.py:766-771`） | **链路已死**（见 A4） |
-| 「agent 主动摄取」 | `server.py:645-649`、`687-698` 的 hint 已在引导 agent 调 `kb_ingest(action='pending'/'submit')`；`SKILL.md:57` 已写 | **计划未列为 C58 的替代方案** → 见 0C-bis 与最终门 |
-
-### Step 0C — 梦状态映射
-
-```
-   当前状态 (v0.8.0 @ 82989c8)              本计划 (v0.8.1)                          12 个月理想态
-   ───────────────────────────────          ─────────────────────────────           ─────────────────────────────
-   PDF 摄取旗舰功能 100% 传不上去    ──▶     403 修好，用户能传文件了         ──▶     付费云链路有验收闸门：
-   （OSS 403，发版 3 天无人察觉）             （但闸门仍交给一次自愿的人工确认）        真机 smoke 进 CI / 发版清单自动卡
-   测试往真实 home 写盘，累积       ──▶     缓存根可被 env 整体重定向         ──▶     任何嵌入方零污染；
-   18153 个孤儿文件                           测试不再碰真实目录                       新写的用例天然不踩坑
-   kb_read(chunk_id) 只能单库       ──▶     跨库自动寻址 + fail-closed       ──▶     「检索→精读」闭环零摩擦
-   kb_list_files 大库一次吐数万字符 ──▶     分页 + 子树过滤                   ──▶     万级文件库输出可控
-   参数名在 3 个工具间不一致        ──▶     与 15 个工具口径统一             ──▶     契约面零歧义
-   （无）                          ──▶     auto_watch（默认关）              ──▶     agent 主动摄取成为默认路径
-```
-
-**梦状态落差（Dream state delta）**：本计划把**存量缺陷清干净了**，但没有任何一张卡朝「付费云路径可验收」这个 12 个月理想态的关键位移动。本次事故的真正教训（旗舰功能 100% 坏 3 天没人发现）在计划里只对应一句「需人工确认一次」——这是本计划最大的战略缺口。已升级为扩张候选 A18 交最终门。
-
-### Step 0C-bis — 实施方案对照
-
-```
-方案 A：原计划（7 条一轮，测试侧补丁）
-  Effort: M   Risk: Med-High
-  Pros: 一轮版本仪式；CHANGELOG 按 Added/Fixed 混排符合既有实践
-  Cons: C58 真机零验证；C54b 清单漏 10 个 stdio 用例 + 全部进程内用例；
-        C56 未复用 F5b 已有范式；on_job_finished 死链未被发现
-  Reuses: kb_remove 别名模式、MORTIS_RAG_* env 链
-
-方案 B：原计划 + 三处根因修正（D2/D3/D4 + A1-A18）      ← 采纳（= 用户裁定 A + 修正）
-  Effort: M   Risk: Low-Med
-  Pros: 尊重用户「一次发」的裁定；D3 把缓存污染从「测试侧补丁」升级为「产品级可重定向」；
-        D2 让新增成本闸门 safe-by-default；A9 砍掉 C56 的最大性能陷阱
-  Cons: 单版承载 7 条 + 1 处产品级配置面变更 + 2 处契约/行为变更，release notes 必须写清三处变化
-  Reuses: 同上 + resolve_default_cache_dir()
-
-方案 C：拆版（0.8.1 = 止血 / 0.9.0 = 风险项）
-  Effort: M   Risk: Low
-  Pros: 止血最快、回滚点最清晰
-  Cons: 多一轮版本收口仪式
-  → 用户已明确否决（D1=C）。记录为已裁定，本报告不再重提。
-```
-
-**RECOMMENDATION：方案 B。** 映射到工程偏好：*「Right-sized diff：选择能清晰表达改动的最小 diff，但不把必要的重写硬压成最小补丁」* —— D3 与 A9 都不是最小补丁，但它们是根因修法；而 D2 是安全默认值的正确取舍。
-
-### Step 0D — SELECTIVE EXPANSION 分析
-
-**复杂度检查（HOLD 分析先行）**：本计划触及 12 个以上源码/配置文件、12+ 测试文件、5 份文档、2 份 CHANGELOG → **远超 8 文件阈值，标为 smell**。但范围已由用户裁定（D1=C），不缩。作为缓解：要求 C58 与 C56 各自独立 commit 且顺序置于 C53/C54/C55/C57 之后，使「低风险 5 张」具备独立可 revert 的提交边界。
-
-**最小集检查**：可延后而不阻塞核心目标的项 → 无（D1 已裁定全做）。
-
-**扩张扫描（候选，未加入范围）**：
-
-| ID | 候选 | 依据 | Effort | Risk |
-|---|---|---|---|---|
-| E1 | 云端摄取路径验收闸门（真机 smoke 脚本 / 发版清单条目，可手动触发） | 本次事故教训；P9 | S | Low |
-| E2 | agent 约定式摄取：注册库时返回「待解析清单 + 建议动作」，让 agent 按纪律主动调 `kb_ingest` | `server.py:645-649`、`687-698`、`SKILL.md:57` 已有基础设施，零线程、零意外扣费、不违硬设计 | S | Low |
-| E3 | `kb_ingest(action='pending')` 返回 `next_offset`/`total`，与 C57 的分页口径统一 | 同一次改动里顺手对齐，避免两套口径 | S | Low |
-
-（E2/E3 记为候选，是否采纳见最终门。）
-
-### Step 0E — 时间审讯（人类工时；CC 压缩约 10-20x）
-
-```
-HOUR 1  (地基):      C53 的「空 Content-Type」到底是「不发这个头」还是「发一个空值头」？
-                     答（已核验）：http.client 会发出 `Content-type: `（空值），不是不发。
-                     OSS V1 StringToSign 下空值与缺省等价，故修法可用；但测试必须按此断言（A15）。
-                     另需知道：urllib 无法真正「不发头」（传 None 会 ValueError）。
-
-HOUR 2-3 (核心逻辑): C54 的 fixture 依赖顺序 —— function 级 fixture 必须**显式依赖** session 级 fixture，
-                     否则 env 指向尚未创建的文件，`resolve_config_path` 会静默回落宿主 config
-                     （`config.py:346-355`）——正是要修的那个 bug 会以「测试看起来是绿的」的方式复现。
-                     另：pop("MORTIS_RAG_REGISTRY") 会让 conftest.py:15 的守卫失效，
-                     使 `pytest_sessionfinish` 可能去写真实的 `~/.mortis_rag_mcp/status.json`。
-
-HOUR 4-5 (集成):     C58 的 hook 挂在 `_fs_scheduler_loop`（watch.py:71-93）这条线程上。
-                     若 hook 内同步跑全库扫描，文本 sync 会被饿死。必须早退 + 不可重入 + 可合并。
-                     `_ingest_manager_for` 还会经 `_recover_zombie_jobs` 拉起跨进程文件锁并 mkdir
-                     `<vault>/.mortis-parsed/` —— 这是计划未记账的副作用。
-
-HOUR 6+ (打磨/测试): C56 的两条新分支（「未加载库探测」「有库未探测则不得谎报文件已修改」）目前零测试：
-                     现有 test_kb_read_chunkid.py:263-270 全部先走 `_indexer_for`，从未覆盖新路径。
-                     C58 只列 3 个测试文件不够（见 Phase 3 测试图）。
-```
-
-### Step 0F — 模式确认
-
-**SELECTIVE EXPANSION**（autoplan 固定 override）。已按 HOLD 分析打底 + 扩张扫描（E1/E2/E3 交最终门）。
-
-### Step 0.5 — 双声部
-
-**双声部状态：`[subagent-only]`。** Codex CLI 未安装于本机（`Get-Command codex` 无输出）→ 按降级矩阵，CEO 阶段为「Claude 子代理单声部」。以下为独立子代理（未接触本报告任何先行结论）的原始产出：
-
-#### CLAUDE SUBAGENT（CEO — 战略独立性）
-
-**1. 是不是正确的问题 —— 否。** v0.8.0 把付费 PDF 摄取做成旗舰功能，却 100% 传不上去（`ingest/mineru.py:79-81`），发版 3 天无人察觉。10 倍杠杆的重框定不是「落 7 条」，而是「给云路径建立验收闸门」（真机 smoke 或发版清单）；计划只写「需人工确认后写进 changelog」，把发版闸门交给一次自愿动作。
-
-**2. 前提：三条都是「裁定」而非证据。**
-- 不拆补丁版：计划称「无成文规则」，但实际节奏是 0.7.0→0.7.3 九天三连补丁（`CHANGELOG_user.md:37-68`）。所谓「成本可数」是维护者记账成本，代价是用户等待。
-- 「auto_watch 默认关」≠ 风险已控：它与 `ingest/worker.py:3-4` 硬设计正面冲突，且全部测试 mock `MineruClient` → 新自动路径零真机验证，正是 403 事故的同构复刻。
-- `max_file_size_mb=0`：邻域类比关掉的是「机制」，此处关掉的是唯一成本闸门，而闸门服务对象恰是新增的自动花钱路径。
-
-**3. 六个月后悔场景。** C58：watcher + 付费 API + 同步盘回灌（iCloud/Dropbox 一夜恢复大批文件）＝无人值守上传与扣费；用户分不清「已关」与「坏了」。C54：全局 session 夹具让「无配置可用」这一真实场景在整套测试中永久消失，未来测试因错误原因变绿。真根因是缓存根无 env 可覆盖（`config.py:436-437` 一带）——产品级修一处，测试一套不必动。
-
-**4. 被草率排除的替代。** P0 不该排除：计划的验证策略靠 CI，却放任已知 flaky，发版闸门本身不可信。真正漏项是 **agent 约定式摄取**：`server.py:647,696` 已在提示 agent 调 `kb_ingest`，`SKILL.md:57` 已写——让 agent 主动 ingest，零线程、零意外扣费、不违硬设计。计划从未把它列为候选。
-
-**5. 市场/竞争。** 全被动：7 条全来自两个用户，无外部信号。差异化「本地 + 零依赖」正被 MinerU 付费云依赖稀释；计划没有任何一张卡回答「为什么还要装这个 MCP」。且无成功判据，半年后无法复盘这版是赚是亏。
-
-#### CODEX SAYS（CEO — strategy challenge）
-
-`[codex-unavailable: binary not found]` — 未执行，未消耗 token。降级矩阵标注：CEO 阶段 = `[subagent-only]`。
-
-#### CEO 双声部共识表
-
-```
-CEO DUAL VOICES — CONSENSUS TABLE:
-═══════════════════════════════════════════════════════════════════════════════
-  Dimension                            Claude  Codex  Consensus
-  ──────────────────────────────────── ─────── ─────── ─────────────────────────
-  1. Premises valid?                    NO      N/A    DISAGREE（计划前提被推翻 3 条：
-                                                        P2/P3/P9，P3 已由用户改判）
-  2. Right problem to solve?            NO      N/A    DISAGREE（缺口 = 云路径验收闸门，
-                                                       已升为扩张候选 A18/E1）
-  3. Scope calibration correct?          NO      N/A    用户裁定为准（D1=C）；子声部
-                                                       认为 C58+C56 应独立发版 → 关闭
-  4. Alternatives sufficiently explored? NO      N/A    CONFIRMED（agent 约定式摄取
-                                                       从未入候选 → E2）
-  5. Competitive/market risks covered?   NO      N/A    DISAGREE（零外部信号、无成功
-                                                       判据 → 记入风险）
-  6. 6-month trajectory sound?           NO      N/A    CONFIRMED（C58 无人值守扣费 /
-                                                       C54 全局夹具永久遮蔽真实场景）
-═══════════════════════════════════════════════════════════════════════════════
-CONFIRMED = 双方一致。DISAGREE = 有声部缺席（Codex 未安装）故不计为已确认。
-缺席声部 = N/A（不计入 CONFIRMED）。单声部 critical finding 照常上报。
-```
-
-### Section 1 — 架构评审
-
-**新增依赖图（before → after）**
-
-```
-BEFORE (v0.8.0)                                    AFTER (v0.8.1, 本计划)
-──────────────────────────────                     ──────────────────────────────────────────
-server.py                                          server.py
-  _indexer_for ─▶ MarkdownIndexer(vault,cfg)          _indexer_for ─▶ MarkdownIndexer(vault,cfg)
-                    │                                     │   ├─ indexer._ingest_hook = f   ◀── 新
-                    └─ start_watching()                   │   └─ start_watching()
-                     │                                    │
-  _ingest_manager_for ─▶ IngestManager                _ingest_manager_for ─▶ IngestManager
-       ▲  on_job_finished=_on_job_finished                 ▲  on_job_finished=_on_job_finished(←已死链)
-       │       （1 参签名 / 2 参实参 → TypeError 被吞）     │
-       └──────────────────────────────────────────────────┘
-                                                     _indexer/watch.py  ◀── 新引用方向
-                                                       _fs_event_matters: 文本/文档 两级分类
-                                                       文档事件 ─▶ owner._ingest_hook()
-                                                                    │
-                                                                    └─▶ server._ingest_manager_for
-                                                                         .submit(None)
-                                                                          │
-                                                                          ├─ scan_pending 全库扫描
-                                                                          ├─ _recover_zombie_jobs
-                                                                          └─ mkdir <vault>/.mortis-parsed/
-```
-
-**耦合判决**：`_indexer/` 的成文规约是「仅自底向上依赖，严禁运行时反向导入 Facade」（`Quick-start_developer.md:168`）。`_ingest_hook` 是**回调**而非 import，字面上不违规；但它让 `indexer` 第一次持有「指向 server 的可调用对象」，等于把 server 侧的生命周期（`_ingest_managers` 双检锁、跨进程 `.ingest.lock`、产物目录 mkdir）拖进 watcher 线程。**判决：接受（显式、可注入、默认 None 优于硬耦合），但必须配 A2 的两条硬约束。**
-
-**扩展性（10x / 100x 首个崩点）**：
-- 10x = 库数 × 文件数。首个崩点是 **C56**：每次 `kb_read(chunk_id=…)` 构造 N 个 indexer → 读 N 份 chunks+vectors 缓存（A9 修）。第二个是 **C58**：每个文件事件一次全库扫描 + 首轮对每个 PDF 做 sha256（A2 修）。
-- 100x：`kb_list_files` 的 `list_files()` 仍是先构造全量列表再切片（`indexer.py:961-962`）→ 内存峰值随文件数线性，切片只省序列化不省扫描。记为已知边界（本版不修）。
-
-**单点故障**：无新增。`_ingest_hook` 若抛异常会打死 watcher 线程（计划已要求 hook 内 try/except 全吞，保持）。
-
-**安全架构**：新增两个输入面。
-- `kb_list_files.path_prefix` → 必须与 `kb_search.path_prefix` 同款（库内相对 posix 前缀，不得逃出库）。
-- `kb_read(chunk_id)` 的跨库探测把读取范围从「单库」扩到「所有注册库」→ 必须逐库仍过注册表白名单与 `_safe_path` 沙箱（否则等于绕过 §十 的信任边界）。**定为高危待确认项 S3-1。**
-
-**生产失败场景**：MinerU 429 → 自动模式反复重提（计划已识别）；hook 打死 watcher（计划已 try/except）；`_recover_zombie_jobs` 在用户不知情时恢复旧 job 并上传（计划未覆盖 → A13）。
-
-**回滚姿态**：C53 revert 一行 / C54 revert fixture + env（新 env 名可保留为空操作）/ C55 revert 取参 / C56 保留旧分支开关 / C57 移除参数即恢复 / C58 `auto_watch=false` 立即止血 + revert。**全部为 git revert 级，无需数据迁移。**
-
-*本节制图：上文依赖图（新增组件与既有组件关系）。*
-
-### Section 2 — 错误与救援映射表
-
-```
-  METHOD/CODEPATH                     | WHAT CAN GO WRONG                    | EXCEPTION CLASS
-  ────────────────────────────────────|──────────────────────────────────────|──────────────────
-  mineru._put_upload (C53)            | OSS 校验头不匹配                     | HTTPError 403
-                                      | 网络中断 (v4/Agent 共用)             | URLError/socket
-  indexer.sync (既有)                 | 单文件读失败                         | OSError
-  indexer._embed_missing (既有)       | 429 / 5xx / 超时                     | ProviderError
-  ── 新增 ──                          |                                      |
-  _kb_read 跨库探测 (C56)             | 某库缓存损坏/不可读                  | OSError / zlib.error
-                                      | 库目录已删（注册表未清）             | FileNotFoundError
-                                      | 构造 indexer 期间被并发删除          | RuntimeError
-  _kb_list_files 分页 (C57)           | path_prefix 非法（逃出库）           | ValueError
-                                      | offset 越界                          | （应返回空 + total）
-  watch._ingest_hook (C58)            | hook 抛异常 → watcher 线程死         | Exception
-                                      | submit 扫描期间库被删                | OSError
-  ingest.scan_pending 闸门 (C58)      | 文件 stat 失败                       | OSError
-                                      | 状态文件损坏                         | JSONDecodeError
-  ────────────────────────────────────|──────────────────────────────────────|──────────────────
-
-  EXCEPTION CLASS        | RESCUED?                | RESCUE ACTION                    | USER SEES
-  ───────────────────────|─────────────────────────|──────────────────────────────────|──────────────────
-  HTTPError 403 (C53)    | Y（修好后 200）          | 不再发生                          | 正常上传
-  URLError (C53)         | Y（providers 重试循环）  | 指数退避重试                      | 成功或可读错误
-  OSError (读文件)        | Y                       | 记 failed_files，继续             | kb_stats.failed_files
-  ProviderError 429      | Y                       | 尊重 Retry-After 退避             | 静默（透明）
-  OSError / zlib.error   | **计划未指定 ← GAP**     | 应跳过该库并记入「未探测」         | 「N 个库未探测」
-  （C56 探测失败）        |                         |                                  |
-  FileNotFoundError      | **计划未指定 ← GAP**     | 同上：跳过 + 计入未探测            | 同上
-  ValueError (prefix)    | Y（应为 fail-closed）    | 报错并给修法                      | 可读错误
-  offset 越界            | **计划未指定 ← GAP**     | 返回空 files + total 原值          | 空列表 + total
-  Exception (hook)       | Y（计划已要求全吞）      | 吞掉 + 不打断 watcher             | 静默（隐性失败风险）
-  JSONDecodeError        | Y（既有 state 容错）     | 重建空状态                        | 重新解析
-  ───────────────────────|─────────────────────────|──────────────────────────────────|──────────────────
-```
-
-**规则复核**：
-- 计划要求 hook 内 `try/except` 全吞 → 按本节的规则，「吞掉并继续」几乎从不可接受。但此处是**派生数据路径 + 线程保命**约束，与仓库既有的「派生数据失败一律吞掉降级」（`PROJECT_GUIDE.md:739`）一致，**接受**；代价是必须补 A17 的可观测性（否则是静默失败）。
-- **catch-all 检查**：`except Exception` 在本仓库已有 3 处既成事实（hook、`_run_sync_quietly`、`on_job_finished`）。本计划新增的 hook 再添 1 处 → 总数上升。已在 A17 用「必须可见」对冲。
-
-### Section 3 — 数据流与交互边界
-
-**新数据流（C56 跨库 chunk_id 寻址）**
-
-```
-  INPUT                VALIDATION            TRANSFORM                 PERSIST          OUTPUT
-  chunk_id ──▶ ①非空校验 ──▶ ②遍历 registry.load() ──▶ ③逐库探测 ──▶ （只读，无落盘）──▶ 结果
-     │              │                    │                      │
-     ▼              ▼                    ▼                      ▼
-  [nil?]      [与 start_line/      [注册表条目目录         [库缓存损坏?
-   报错          end_line/heading     不存在 → 跳过          → 跳过 + 计入
-  [empty?]      互斥 → 报错]        [solo 库是否参与?        未探测]
-   报错                             ← 计划未指定 ← GAP]    [并发 sync 中?
-  [超长?]                                                  → 乐观快照容忍]
-   未定义 ← GAP
-
-  命中数判定：
-    唯一命中 ──▶ 用该库展开 + 追加 vault/vault_path
-    多命中   ──▶ fail-closed，列候选（对齐 server.py:453-459）
-    零命中 + 全部探过 ──▶ 沿用「chunk_id not found: …（文件可能已修改…）」
-    零命中 + 有库未探测 ──▶ 必须如实说明，不得谎报「文件已修改」  ← 新文案分支
-```
-
-**交互边界表**
-
-```
-  INTERACTION                     | EDGE CASE                          | HANDLED? | HOW?
-  ────────────────────────────────|────────────────────────────────────|──────────|──────────────
-  kb_read(chunk_id) 跨库寻址 C56   | 同一文件复制进两库 → 撞 id          | Y（计划） | fail-closed
-                                  | 某库未加载/未索引                    | Y（计划） | 如实说明
-                                  | 某库目录已删（注册表未清）           | **N ← GAP** | 需按 OSError 跳过
-                                  | solo 库是否参与探测                  | **N ← GAP** | 见下方问题 3A
-                                  | 探测期间另一进程在重建该库缓存        | **N ← GAP** | 乐观快照
-  kb_list_files 分页 C57           | offset 越界                          | **N ← GAP** | 返回空 + total
-                                  | path_prefix 逃出库（`..`/绝对路径）  | **N ← GAP** | fail-closed
-                                  | 过滤后 0 条                         | Y（隐含） | 空 files
-                                  | 未传参数 → 与现状完全一致            | Y（计划） | 已声明
-  auto_watch C58                  | 缓冲溢出 events=None                | **N ← GAP** | 是否也触发 ingest
-                                  | 用户手动删库/改 ignore 规则          | **N ← GAP** | 需复用 ignore 过滤
-                                  | hook 触发时上一次扫描未结束（重入）   | **N ← GAP** | A2 要求可合并
-                                  | 同步盘一夜回灌 500 个 PDF            | **N ← GAP** | 需单轮上限/节流
-  Windows 升级锁 C59              | 用户不知道是哪个进程占用             | Y（部分） | 计划只写「先退出客户端」
-```
-
-### Section 4 — 代码质量评审
-
-| 项 | 判定 | 说明 |
-|---|---|---|
-| DRY | **1 处违规** | C56 新造跨库探测口径，未复用 F5b 短名寻址的「唯一/多义」范式（`server.py:1084-1087`）→ A3 |
-| DRY | **1 处违规** | C57 的 `path_prefix` 若无共用实现，将成为第三套前缀语义（`kb_search` / `fts.py:128-130` 的 `.mortis-parsed/` 穿透 / 新增）→ A11 |
-| 命名 | 可接受 | `_ingest_hook` 与既有 `_fs_*`/`_watch_*` 前缀不冲突；建议在字段旁写一行「null object 模式，默认 None」 |
-| 组织 | 一致 | 新配置键落在 `IngestConfig`（既有 11 键），符合「加配置键四步法」 |
-| 过度工程 | 无 | 未引入抽象层 |
-| 欠工程 | **1 处** | C57 的 `total` 语义未定义（是「已索引文件数」还是「过滤后总数」）→ A10 |
-| 圈复杂度 | **1 处超阈** | `_kb_read` 重构后分支数 = 2(入参) × 4(命中判定) × 2(有无未探测库) ≈ 8+ 分支，超 5 分支阈值 → 拆出纯函数 `_locate_chunk_across_vaults()` |
-| 依赖铁律 | 遵守 | 无新增第三方依赖（`dependencies = []` 未动） |
-
-### Section 5 — 测试评审（CEO 视角的新增清单）
-
-```
-  NEW CODEPATHS / FLOWS                                  计划是否给了测试？
-  ────────────────────────────────────────────────────── ───────────────────
-  C53  _put_upload 显式空 Content-Type                    Y（1 条回环）→ 但需 A15 加固
-  C54a session 级 app.toml + function 级 env pin          N ← GAP（计划只列验证命令）
-  C54a' 缓存根 env 覆盖（D3 新增）                         N ← GAP（D3 后需补）
-  C54b 12 个 stdio 用例 + 进程内用例的 app.toml            N ← GAP（无「不再写真实 home」断言）
-  C54c 注册表隔离                                        Y（可选，由用户单独评估）
-  C55  kb_init/kb_init_solo 的 vault_path 别名            Y（2 条）
-  C56  唯一命中 / 多命中 / 零命中全探过 / 零命中有未探测库   N ← GAP（4 条中计划只提 2 条）
-  C57  默认全量一致 / 切片 / 前缀 / total / truncated      Y（部分；缺 total 与越界）
-  C58  配置默认值与校验 / 闸门与 skipped 报告 / 显式超限报错 | Y（部分）
-       / 自动模式跳过 failed / hook 接线与关闭时零调用       |
-  C58' forward: 自动模式不重试 failed 的退避策略           部分（「最小退避」未定义可测行为）
-  C58'' 闸门在 _run_job 的兜底（A13）                       N ← GAP
-  回归：on_job_finished 回调被调用（A16）                    N ← GAP ← CRITICAL
-  ────────────────────────────────────────────────────── ───────────────────
-```
-
-### Section 6 — 性能评审
-
-| 路径 | 代价 | 判定 |
-|---|---|---|
-| C56 `kb_read(chunk_id)` 探测 | 每次构造 N 个 `MarkdownIndexer` → 全量加载 chunks(+vectors) 缓存 + 打开/可能重建 FTS sqlite。20 库 × 20MB 缓存 ≈ 400MB 读放 | **High → A9 必修** |
-| C58 hook 全库扫描 | `submit(None)` → `scan_pending()` 递归全库 + 首轮每 PDF sha256。万级文件库：秒级到十秒级，且落在防抖调度线程上 | **High → A2 必修** |
-| C57 切片 | `list_files()` 读内存 `_chunks`，切片零额外 IO | 通过 |
-| C57 全量构造 | 仍先构造全量列表再切片（内存 O(文件数)） | 已知边界，本版不修，记 TODO |
-| C54 fixture | session 级单文件（计划刻意避免每用例 mktemp） | 通过（设计正确） |
-
-### Section 7 — 可观测性与可调试性
-
-| 项 | 判定 |
+| 裁定 | 本版执行口径 |
 |---|---|
-| 结构化日志 | 无新增日志需求（本地 stdio 工具，日志走 stderr）；`[diag]` 模块已存在可复用 |
-| 指标 | C58 的 `skipped_too_large` 计数与 `reason="too_large"`（计划已有）✔ |
-| 告警 | 不适用（无服务端） |
-| 可调试性 | **GAP 1**：自动模式「本次是否真的自动触发过扫描」无任何痕迹 → 用户分不清「已关」与「坏了」→ A17 |
-| 可调试性 | **GAP 2**：C56 的「探测了几个库、跳过几个库」不可观测 → 零命中报错无从排障 |
-| Runbook | `doctor`/`STATUS.md` 是既有载体，应挂 A17 的 auto_watch 状态 |
+| D1 | 一次发布0.8.1，#5七组需求全部完成；本轮增加#6，不拆版 |
+| D2 | `max_file_size_mb=20`，所有摄取入口统一策略上限；`0`显式不限；以 `1024*1024` 计字节，文档注明MiB |
+| D3 | 保留配置pin、缓存env、宿主隔离，不逐个大改安全测试配置 |
+| D4 | P0竞态搭车已完成；转义清理前置已完成；不再删除其他本地文件 |
+| D5 | chunk_id显式寻址覆盖solo；solo结果/候选只显示库名和solo标记，不能展开该库绝对路径；全局搜索仍排除solo，显式Scoped仍可搜solo |
+| X3 | 待办用 `docs/Execution-plan_developer.md`，不新建根TODOS/CLAUDE/AGENTS；v0.8.1版本目录已获跟踪例外 |
 
-### Section 8 — 部署与放量
+### 2.2 本轮推荐的确定契约
 
-| 项 | 判定 |
+以下是施工默认方案，用户可在最终确认时覆盖；开发者不要二次选型。
+
+| 维度 | 固定方案 |
 |---|---|
-| 迁移安全 | 无 DB 迁移；新增配置键全部带默认值 |
-| 功能开关 | C58 的 `auto_watch = false` 天然即 feature flag ✔ |
-| 放量顺序 | C53 → C54/C55/C57/P0 → P1 → C56 → C58 → C59 → C60。**C53 必须最先合入**（用户 D1 裁定一次发版后，C53 的尽早合入是唯一的时延对冲） |
-| 回滚方案 | 逐卡 git revert 级，见 Section 1 |
-| 放量风险窗 | 无（本地 stdio，用户各自升级） |
-| 环境对齐 | 无 staging 概念；CI 五矩阵即放量前验证 |
-| Post-deploy 验证 | 应在 CHANGELOG 条目里显式记「真机 OSS 200 已验证 / 待实机验证」，而不是留给口头承诺（计划已提及，加固为必须出现在 CHANGELOG 正文） |
-| Smoke test | 计划无。E1 候选即为补此项 |
+| 搜索呈现 | 新增 `compact:boolean=false`；true隐含preview，四键投影 `source/heading/lines/snippet`；普通preview/full的chunk字段不删不改，C66刷新状态可加在外层 |
+| compact单库 | 顶层带 `vault`、`vault_name` 以便回读；source始终库内相对posix路径，不含绝对库路径 |
+| compact跨库平铺 | 每条另带 `vault`（绝对库标识）供寻址，不重复vault_name；显式Scoped solo遵循原搜索输出口径 |
+| compact分组 | vault/vault_name仅在group；每条四键，无重复库字段；不依赖已移除score排序，排序在投影前完成 |
+| budget | 保留整个已投影chunk的最长前缀；绝不跳过大的首条，也不裁正文/snippet；预算包括 `_text_content` 的MCP content包装，不包括JSON-RPC id外壳/换行 |
+| 分组续页 | 新增可选 `group_offsets:object`，仅group_by_vault=true可用；键为返回的vault标识，值为该组0-based偏移，原样接收group_next_offsets；继续走同一fan-out路径，不切单库排序 |
+| 首条放不下 | 空chunks，`truncated=true/returned=0/next_offset=原offset`，短 `budget_hint` 提示开compact或增加预算；不把游标推进到没给用户的chunk |
+| envelope放不下 | 合法结果，`budget_exceeded=true`，声明不可满足元数据最低字节数；不删除searched/errors/solo，不假称硬预算已满足 |
+| heading | 已有参数升级实现；trim后精确、区分大小写；含选中标题到下一个同级或更高级标题之前；包含子标题 |
+| 重复heading | `ValueError` 列出最多5个物理起始行，改用行区间；不默选第一，不新增occurrence参数 |
+| 标题语法 | 复用现有ATX/中文章节/Chapter判据、围栏/表格/frontmatter保护；不承诺Setext、GitHub slug、完整Markdown解析器 |
+| heading+行号 | 行区间继续优先，heading不参与定位；保持旧参数组合语义，description写清；chunk_id仍与三者互斥 |
+| bounds | 行号1-based闭区间；end超EOF钳制；非空文件start超EOF报错；空文件无显式区间合法空读取，显式区间报错且total_lines=0 |
+| MCP warm reads | `kb_search`、文件读取、chunk定位、list_files、stats前台不再承担sync；request_refresh后按现有索引读 |
+| empty vs cold | 不用 `len(_chunks)==0` 单独判首次构建；`last_sync is None`且无可用缓存才返回indexing，合法空库/全豁免库正常空结果 |
+| fresh保证 | “读优先”不是“即时新鲜”或“上一轮完整事务快照”；单请求取稳定chunk集合，FTS/向量仍最终一致，刷新中可含已更新文件与旧文件；query embedding/rerank仍可能联网 |
+| auto_watch | 默认false、必须enabled才生效；原生+poll+原生失败回退+启动扫描均支持；0.25s poll不扫描/哈希PDF |
+| failed自动重试 | 连续未变的最新源版本，done/failed/active均不自动重提；A→B→A是两次实际sha变化，可再次入队A，不承诺所有历史hash永久封存；手动可重试、force不绕cap/沙箱 |
+| 摄取队列 | 复用现有IngestManager与state文件锁；本版不新增worker独占/租约/恢复机制，保留现有恢复语义 |
+| disable | `enabled=false`时保留手工pending/status读取能力；`auto_watch=true`仅提示无效，不使服务启动失败 |
 
-### Section 9 — 长期轨迹
+### 2.3 不变量与 NOT In Scope
 
-**技术债**：
-- 文档债（必须本版清）：`ingest/worker.py:1-4` 与 `ingest/__init__.py:3-4` 的「不做 watcher 自动摄取」硬设计必须改写（A7）。否则本仓库最忌讳的「注释与实现对不上」当场成立。
-- 文档债：`PROJECT_GUIDE` §四 ingest 专节 / §七 `[ingest]` 小节 = **新增**而非修改（A6）。§八 `PROJECT_GUIDE.md:626` 的环境变量优先级清单是三对，新增缓存根后变四对。
-- 测试债：C54 后若 `test_diaglog` 的 external 慢分支永久失去覆盖，需补一条显式 external 用例。
+必须保持：`dependencies=[]`、15个工具名称与协议版本、包 `__all__` 7项、Chunk字段顺序、chunk id公式、缓存二进制格式/代际、单次fan-out query embedding、过滤/去重先于rerank、权重乘回、solo选择语义、注册表与 `_safe_path` 沙箱、`_sync_lock -> _cache_lock`。
 
-**路径依赖**：`auto_watch` 一旦被用户真机用起来，关闭时需要清理 pending 状态（`.ingest_state.json` 里的 queued/parsing 条目）→ 回滚成本从「改一行」升到「改一行 + 状态清理」。
+本版不做：新REST服务、新CLI shutdown命令、分布式任务队列、Linux/macOS原生监听、全CommonMark解析、按事件局部索引重写、完整检索后端代际/事务快照、SQLite chunk主键数据库（当前文本缓存是bin，不是“现成SQLite chunk表”）、无限深度搜索游标、切块/评分算法优化、真实API自动CI、删除用户home/cache、自动改真实配置、默认打开自动上传。
 
-**可逆性评分**：C53 = 5/5 · C54 = 4/5（env 是公开面，改名有成本）· C55 = 5/5 · C56 = 3/5（契约变更）· C57 = 4/5 · C58 = 3/5 · C59 = 5/5 · C60 = 5/5。
+上述延后项在C70同步到 `docs/Execution-plan_developer.md`，记录问题/证据/触发/验收；不能写成“v0.8.1已实现”。
 
-**1 年后的新人能看懂吗**：C58 的控制流是隐式的（watch 事件 → hook → server → manager ×4 跳）。仓库规约要求复杂设计配 ASCII 图（`PROJECT_GUIDE.md:867`）→ 必须在 `watch.py` 与 `server.py` 两侧各留一张。
+### 2.4 方案取舍与时间审讯
 
-**平台潜力**：E1（云端验收闸门）是平台级；C58 不是。
-
-### Section 10 — 设计/UX
-
-**SKIPPED — 无 UI 范围**（Phase 0 范围检测：视图/渲染类词仅 1 类命中且全为误报）。开发者体验另见 Phase 3.5。
-
-### 失败模式登记表（Failure Modes Registry）
-
-```
-CODEPATH                      | FAILURE MODE                    | RESCUED? | TEST? | USER SEES?            | LOGGED?
-──────────────────────────────|─────────────────────────────────|──────────|───────|───────────────────────|────────
-C53 mineru._put_upload        | OSS 403（当前 100% 复现）        | N → 本卡修 | Y     | HTTPError 403 trace   | Y(stderr)
-C53 mineru._put_upload        | 真实云 200 未被任何测试覆盖       | N        | **N** | 上传失败或静默降级      | 部分
-                              |                                 |          |       | ← **CRITICAL GAP**（P9）|
-C54 conftest fixture          | function 级未依赖 session 级，    | N        | **N** | 测试仍读真实宿主 config  | N
-                              | env 指向未创建文件→静默回落       |          |       | 且显示为绿              |
-                              |                                 |          |       | ← **CRITICAL GAP**      |
-C54 conftest                  | pop(REGISTRY) 使 sessionfinish    | N        | **N** | 测试跑完写真 home 的     | N
-                              | 守卫失效 → 写真实 status.json     |          |       | ~/.mortis_rag_mcp/      |
-                              |                                 |          |       | ← **CRITICAL GAP**      |
-C54b app.toml（12 个 stdio +   | 缓存根持续被写（18153 孤儿）      | N        | **N** | 无（静默磁盘增长）       | N
-   进程内用例）                |                                 |          |       | ← **CRITICAL GAP**      |
-C55 _kb_init/_kb_init_solo    | 调用方传 vault_path → 参数丢失    | N → 本卡修 | Y     | 可读 ValueError          | Y
-C56 _kb_read 跨库探测          | 未加载库被漏探 → 谎报零命中       | N → 本卡修 | **N** | 「文件可能已修改」（假） | N
-                              |                                 |          |       | ← **CRITICAL GAP**      |
-C56 _kb_read 跨库探测          | 探测期 OSError/缓存损坏 → 中断    | **N**    | **N** | 裸异常或误报            | N
-                              |                                 |          |       | ← **CRITICAL GAP**      |
-C56 _kb_read 跨库探测          | 连接 vault 缓存体积 × 库数（400MB）| N      | **N** | kb_read 变慢数十秒       | N
-                              |                                 |          |       | ← **CRITICAL GAP**（A9）|
-C57 _kb_list_files            | path_prefix 逃出库                | **N**    | **N** | 可能列到库外条目         | N
-                              |                                 |          |       | ← **CRITICAL GAP**      |
-C57 _kb_list_files            | offset 越界 → 语义未定义           | **N**    | **N** | 结果不确定              | N
-                              |                                 |          |       | ← **CRITICAL GAP**      |
-C58 _ingest_hook              | hook 抛异常 → watcher 线程死       | Y（全吞） | **N** | 静默（自动摄取失效）      | N
-                              |                                 |          |       | ← **CRITICAL GAP**（A17）|
-C58 hook 挂载                  | 全库扫描阻塞防抖线程 → 文本 sync 饿死 | N     | **N** | 笔记改动长时间不被索引   | N
-                              |                                 |          |       | ← **CRITICAL GAP**（A2）|
-C58 自动路径                    | 未经 ignore 过滤，上传被排除文件    | **N**    | **N** | 无（隐私边界被越过）      | N
-                              |                                 |          |       | ← **CRITICAL GAP**（A8）|
-C58 自动路径                    | 同步盘回灌 500 PDF → 无人值守扣费  | **N**    | **N** | 账单                        | N
-                              |                                 |          |       | ← **CRITICAL GAP**      |
-C58 _run_job 闸门              | _recover_zombie_jobs 恢复的旧 job  | **N**    | **N** | 静默上传超限文件          | N
-                              | 绕过扫描期闸门                    |          |       | ← **CRITICAL GAP**（A13）|
-C58 状态机                    | _save_state 超 500 条剪掉旧 failed | N      | **N** | 莫名重试 → 额度浪费        | N
-                              | →「最新 job 状态」判据失真         |          |       | ← **CRITICAL GAP**      |
-C58→C56 共用链                | on_job_finished 参数不匹配        | Y（吞掉） | **N** | 静默（解析产物延迟入索引） | N
-                              |                                 |          |       | ← **CRITICAL GAP**（A4）|
-C59 文档                      | 用户仍不知哪个进程占锁             | —        | —     | 卡在 WinError 5 反复重试  | —
-──────────────────────────────|─────────────────────────────────|──────────|───────|───────────────────────|────────
-合计 19 行，CRITICAL GAP（RESCUED=N 且 TEST=N 且 USER SEES=静默或错误）共 14 处。
-```
-
-### CEO 扩张决策（SELECTIVE EXPANSION）
-
-| # | 提案 | Effort | 决策 | 理由 |
-|---|---|---|---|---|
-| E1 | 云端摄取路径验收闸门 | S | **交最终门**（品味） | 本次事故教训；计划无对应卡 |
-| E2 | agent 约定式摄取（复用既有 hint 基础设施） | S | **交最终门**（品味） | 独立声部指出计划从未列为候选；零线程零意外扣费 |
-| E3 | `kb_ingest(pending)` 补 `total`/`next_offset`，与 C57 口径统一 | S | **接受（并入 C57）** | 同一次改动顺手对齐，避免两套分页口径（DRY，P4） |
-
-### CEO 必产出清单
-
-- **NOT in scope**：拆版（D1 已裁定，不复议）· P2 的仓库处置（实测不在仓库内）· `kb_rebuild` 的 Windows 回收站已知红（`Quick-start_developer.md:201-203` 明确要求独立任务）· `list_files()` 的全量构造内存优化（Section 6 已知边界）· 非 Windows 平台的 `path_prefix` casefold（既有边界）· MCP 认证（明确的非目标）。
-- **What already exists**：见 Step 0B 表（9 行）。其中 3 行计划未复用（`resolve_default_cache_dir()`、F5b 范式、agent 摄取 hint）。
-- **Dream state delta**：见 Step 0C。本计划清理存量缺陷，但零位移于「付费云路径可验收」。
-- **Error & Rescue Registry**：见 Section 2（12 行，3 处 GAP）。
-- **Failure Modes Registry**：见上（19 行，14 处 CRITICAL GAP）。
-- **Completion Summary**：见下。
-
-```
-  +====================================================================+
-  |            MEGA PLAN REVIEW — COMPLETION SUMMARY                   |
-  +====================================================================+
-  | Mode selected        | SELECTIVE EXPANSION (autoplan override)      |
-  | System Audit         | server.py 实为 1313 行（文档写 1126 已过期）；  |
-  |                      | 无 CLAUDE.md/TODOS.md；无设计文档；工作区干净   |
-  | Step 0               | 前提 7 条 → 3 条被推翻/修订；扩张候选 3 条       |
-  | Section 1  (Arch)    | 4 issues found（hook 反向持有/探测代价/         |
-  |                      | 安全边界/回滚姿态齐备）                        |
-  | Section 2  (Errors)  | 12 条路径映射，3 GAPS                          |
-  | Section 3  (Security)| 4 issues found, 2 High severity               |
-  | Section 4  (Data/UX) | 17 edge cases mapped, 11 unhandled            |
-  | Section 5  (Quality) | 5 issues found（2 DRY / 1 欠工程 / 1 复杂度）    |
-  | Section 6  (Tests)   | Diagram produced, 7 gaps（2 CRITICAL 回归）     |
-  | Section 7  (Perf)    | 2 issues found（均为 High，已有 A9/A2 修法）    |
-  | Section 8  (Observ)  | 2 gaps found（auto_watch 状态 / 探测可见性）     |
-  | Section 9  (Deploy)  | 3 risks flagged（3 处行为变更需 release notes） |
-  | Section 10 (Future)  | Reversibility: 3/5 最低（C56/C58），debt 3 项  |
-  | Section 11 (Design)  | SKIPPED (no UI scope)                        |
-  +--------------------------------------------------------------------+
-  | NOT in scope         | written (6 items)                            |
-  | What already exists  | written (9 items, 3 unreused)                |
-  | Dream state delta    | written                                      |
-  | Error/rescue registry| 12 methods, 3 GAPS                           |
-  | Failure modes        | 19 total, 14 CRITICAL GAPS                   |
-  | TODOS.md updates     | 3 items proposed（仓库无 TODOS.md → 见最终门） |
-  | Scope proposals      | 3 proposed, 1 accepted (E3), 2 → gate        |
-  | CEO plan             | written（本节即持久化）                        |
-  | Outside voice        | subagent-only（codex 未安装）                 |
-  | Lake Score           | 4/4 推荐均选了完整选项（A1/A9/A2/A13）          |
-  | Diagrams produced    | 依赖图 / 数据流图 / 边界表 / 失败模式登记表      |
-  | Stale diagrams found | 3（PROJECT_GUIDE:432"1064行"、             |
-  |                      | Quick-start:34"1126行"、Changelog:320 同）    |
-  | Unresolved decisions | 0（D1-D4 已由用户裁定）                        |
-  +====================================================================+
-```
-
-**Phase 1 完成。** Codex：未运行（未安装）。Claude 子代理：5 维战略质疑（4 项与主审一致）。共识：`[subagent-only]`，**2/6 已确认**（第 4 维替代方案、第 6 维 6 个月轨迹）、**4/6 分歧**（第 1/2/3/5 维）。**⚠ 第二轮修正：原写「1/6 已确认、4/6 分歧、1/6 不计」与本节共识表自身矛盾（表内两处 CONFIRMED）**。通过至 Phase 2。
-
-> 注：`tasks-*.jsonl` 与 `main-reviews.jsonl` 里写入的 `consensus_confirmed:1` 沿用了当时的错误计数，未回改（日志为追加式，回改会造成双份记录）。以本节为准。
-
-> **Phase 2 跳过** —— 无 UI 范围。`Phase 2 complete. skipped, no UI scope.`
-
----
-
-## Phase 3 — Eng 评审（全 4 节）
-
-### Step 0 — 范围挑战（读实际代码）
-
-已读源码：`ingest/mineru.py`、`ingest/worker.py`、`server.py`（`_indexer_for`/`_kb_ingest`/`_kb_list_files`/`_kb_read`/`_ingest_manager_for`）、`indexer.py`（`_init_cache_paths`/`_cache_root`/`_list_files`）、`_indexer/watch.py`、`_indexer/chunking.py`、`model`、`config.py`、`tests/conftest.py`、`fts.py`、`doctor.py`、`skills/mortis-rag-mcp/SKILL.md`、`docs/PROJECT_GUIDE.md`、`.gitignore`、`config/app.toml.example`、`docs/Changelog_developer.md`。
-
-**核心发现（本版最大的一条，计划完全未提）**：
-
-```python
-# mortis_rag_mcp/ingest/worker.py:393-397
-        if self.on_job_finished is not None:
-            try:
-                self.on_job_finished(job["source"], out_md)   # ← 传 2 个位置参数
-            except Exception:
-                pass                                          # ← 静默吞掉
-
-# mortis_rag_mcp/server.py:766
-                    def _on_job_finished(out_path: str) -> None:  # ← 只收 1 个参数
-                        indexer = self._indexers.get(key)
-                        if indexer is not None:
-                            threading.Thread(target=indexer.sync, ...).start()
-```
-
-`_on_job_finished()` 每次调用都抛 `TypeError: takes 1 positional argument but 2 were given`，被 `except Exception: pass` 吞掉。**该回调从未生效过一次。** 影响：PDF 解析完成后不会触发索引同步（实际靠每个 `kb_*` 调用自带的 `try_sync_with_guard` 与 30s 兜底节拍补救，所以现象被掩盖）；`_kb_ingest` 的 hint（`server.py:794-795`）声称「done 的文档已写入 .mortis-parsed/ 并可被 kb_search 检索」实际不成立。C58 的设计（「解析完立即可检索」）正建立在这条链上 → A4 + A16。
-
-**范围挑战结论**：不缩（D1 已裁定），但要求按 Section 8 的顺序落地，使低风险 5 张具备独立可 revert 的提交边界。
-
-### Section 1 — 架构评审
-
-依赖图见 Phase 1 Section 1（同一张图，此处不重复）。
-
-**耦合新增**：
-1. `indexer._ingest_hook` → `server._ingest_manager_for`：**indexer 首次持有指向 server 的可调用对象**。判决：接受（回调优于硬耦合），配 A2 两条硬约束。
-2. `watch.py` 的事件分类 → 两级：文本事件走既有 sync 防抖路径（**不变**）；可摄取文档事件走独立的 ingest 请求标志。判决：接受。
-3. `IngestManager` 从「仅 `kb_ingest` 显式触发」变成「watcher 可触发」→ 引入 server 侧生命周期依赖（`_ingest_managers` 双检锁、`.ingest.lock` 跨进程锁、`<vault>/.mortis-parsed/` mkdir）。判决：接受但必须记账（A7 文档改写）。
-
-**注意——计划的一条理由与事实不符（A12）**：计划写「可摄取文档（INGEST_EXTS）事件 → 单独的 ingest 请求标志，与 sync 解耦，避免 PDF 事件白跑一次全量 sha256 对账」。实测 `_indexer/watch.py:120-134`：
-
-```python
-    return any(lower.endswith(ext) for ext in _INDEXABLE_TEXT_EXTS)   # = {".md", ".txt"}
-```
-
-PDF 事件**今天什么也不触发**（返回 False → 不唤醒防抖 sync）。不存在「白跑一次全量对账」。改动本身无害且必需，但理由是错的——意味着计划作者对事件路径的模型有偏差，需重查 `events=None`（内核缓冲溢出）分支与 ignore/cache 子目录过滤是否也要带 ingest 标志。
-
-### Section 2 — 代码质量评审
-
-| 项 | 判定 | 证据与修法 |
+| 方案 | 完整度/风险 | 取舍 |
 |---|---|---|
-| DRY | 违规 | C56 未复用 F5b 的「唯一/多义」范式（`server.py:1084-1087`）→ A3 |
-| DRY | 违规 | C57 的 `path_prefix` 需与 `kb_search` 共用实现 → A11 |
-| DRY | 违规 | `scan_pending()` 的用户可见契约被 C58 复用 → A14 改用新函数 `_auto_pending()`，避免改既有返回语义（`test_ingest_server.py:184-186`、`test_ingest_worker.py:82-103` 已锁定） |
-| 命名 | 通过 | 新配置键 `auto_watch` / `max_file_size_mb` 落在 `IngestConfig`（既有 11 键），命名风格一致 |
-| 复杂度过高 | 违规 | `_kb_read` 重构后 8+ 分支 → 拆纯函数 `_locate_chunk_across_vaults()` |
-| 欠工程 | 违规 | C57 的 `total` 语义未定 → A10 |
-| 过度工程 | 无 | — |
-| 依赖铁律 | 通过 | 无新增第三方依赖 |
+| A 只补#6参数、缩短等锁 | 低；拿锁后仍同步补嵌，重复heading仍错 | 拒绝，未解决根因 |
+| B 复用Facade与私有包，投影、预算、原文读取、可合并后台刷新、opt-in摄取 | 本版完整；状态与生命周期有测试成本 | **采用**；标准库、现有持久化与测试入口 |
+| C 新SQLite chunk表、完整Markdown AST、任务框架、新同步引擎 | 长期弹性高，但数据迁移/依赖/回滚代价高 | 延后；不符合补丁版本边界 |
 
-### Section 3 — 测试评审（**不跳过、不压缩**）
-
-**框架检测**：`pyproject.toml` 声明 pytest（RUNTIME:python）；无 `pytest.ini`，`tests/` 目录存在；无 `CLAUDE.md` → 以 `Quick-start_developer.md:192-203` 为权威约定（靶向跑，全量交 CI）。
-
-**Step 1-4：覆盖图（代码路径 × 用户流）**
-
-```
-CODE PATHS                                                      USER FLOWS
-[+] ingest/mineru.py                                            [+] 用户传 PDF 到 MinerU
-  ├── _put_upload() [C53]                                         ├── [GAP] 真机 OSS 200（P9，CRITICAL）
-  │   ├── [★★★ TESTED] v4 通道解析/重试/错误码（test_ingest_mineru.py）  └── [★★ TESTED] 403 文案可读
-  │   ├── [GAP] 显式空 Content-Type 被发出                          [+] 用户配置 [ingest]
-  │   └── [GAP] 200 不抛错 + has_header 断言（A15）                    ├── [★★ TESTED] enabled/默认值（部分）
-[+] server.py                                                     │   ├── [GAP] auto_watch 默认 false
-  ├── _indexer_for() → _ingest_hook 挂载 [C58]                     │   └── [GAP] max_file_size_mb=20 默认与校验
-  │   ├── [GAP] auto_watch=false 时零调用                          ├── [GAP] 跨键矛盾（auto_watch+enabled=false）
-  │   ├── [GAP] hook 抛异常不死 watcher                             [+] 用户在库上加 PDF（C58）
-  │   └── [GAP] hook 不在防抖线程内同步全库扫描（A2）                 ├── [GAP] 自动触发一次扫描
-  ├── _kb_read() [C56]                                             ├── [GAP] 同步盘回灌 500 个 PDF
-  │   ├── [★★★ TESTED] 单库 chunk_id 原地展开（test_kb_read_chunkid.py:72-78）  └── [GAP] 被 ignore 的文件不上传（A8）
-  │   ├── [★★★ TESTED] 多库+无 vault_path 报错（:278-280 → 需改写） [+] 用户读 chunk（C56）
-  │   ├── [GAP] 唯一命中自动跨库展开 + 追加 vault/vault_path         ├── [GAP] 唯一命中 → 自动展开
-  │   ├── [GAP] 多命中 fail-closed 列候选                          ├── [GAP] 多命中 → 可读错误列候选
-  │   ├── [GAP] 未加载库被探到（现有 :263-270 全先走 _indexer_for）  └── [GAP] 零命中有未探测库 → 如实说明
-  │   └── [GAP] 有库未探测时不谎报「文件已修改」
-  ├── _kb_list_files() [C57]
-  │   ├── [★★ TESTED] files[0]["source"]（test_mcp_stdio.py）
-  │   ├── [GAP] 默认全量行为与现状一致
-  │   ├── [GAP] limit/offset 切片 + total + truncated + next_offset（A10）
-  │   ├── [GAP] path_prefix 过滤 + 逃逸 fail-closed（A11）
-  │   └── [GAP] offset 越界
-  └── _on_job_finished() [A4]
-      ├── [GAP] ← **CRITICAL 回归** 回调被真实调用（spy 计数，A16）
-      └── [GAP] 2 参→1 参签名对齐后同步被触发
-[+] ingest/worker.py [C58]
-  ├── scan_pending()/submit(None)
-  │   ├── [★★ TESTED] 幂等跳过（test_ingest_worker.py:82-103）
-  │   ├── [GAP] 闸门在 channel_for 之前（否则超 200MB 走 pymupdf 静默降级）
-  │   ├── [GAP] reason="too_large" + skipped_too_large 计数
-  │   └── [GAP] 不塞进 kb_stats.skipped_unsupported（test_ingest_server.py:194-218 已锁定排除 INGEST_EXTS）
-  ├── 显式 sources 超限
-  │   ├── [GAP] 报错文案含修法
-  │   └── [GAP] **无 key 时保留既有 pymupdf 兜底语义**（A1；否则 15MB PDF 从「粗糙结果」变硬失败）
-  ├── _run_job() 兜底闸门（A13）
-  │   ├── [GAP] _recover_zombie_jobs 恢复的旧 job 也过闸门
-  │   └── [GAP] 排队后文件变大也过闸门
-  ├── _auto_pending()（A14，新函数）
-  │   ├── [GAP] 自动模式跳过 done/failed/queued/parsing
-  │   ├── [GAP] 仅 sha256 变化才重入队
-  │   ├── [GAP] failed 的最小退避（429 场景：sha 不变 → 必须靠退避而非 sha）
-  │   └── [GAP] _save_state 超 500 剪旧 failed → 判据按 submitted_at 取 max 而非「某条」
-  └── _ingest_hook 接线
-      ├── [GAP] monkeypatch IngestManager.submit 计数
-      └── [GAP] auto_watch=false 时零调用
-[+] _indexer/watch.py [C58]
-  ├── _fs_event_matters()
-  │   ├── [★★ TESTED] 缓存子目录自激防护（test_watch_integration/test_fsnotify）
-  │   ├── [GAP] 文档事件（INGEST_EXTS）走独立 ingest 标志
-  │   └── [GAP] events=None（缓冲溢出）路径是否带 ingest 标志（A12 遗留问题）
-[+] conftest.py / tests [C54]
-  ├── [GAP] ← **CRITICAL** function 级 fixture 显式依赖 session 级（否则静默回落宿主 config）
-  ├── [GAP] ← **CRITICAL** 缓存根 env 覆盖生效（D3）
-  ├── [GAP] ← **CRITICAL** 12 个 stdio 用例 + 进程内用例不再写真实 home
-  ├── [GAP] pop(REGISTRY) 不破坏 pytest_sessionfinish 守卫（否则写真 home status.json）
-  └── [GAP] test_diaglog 的 external 慢分支补一条显式 external 用例（避免永久失去覆盖）
-
-COVERAGE: 18/52 路径已覆盖（35%）  |  Code paths: 14/40 (35%)  |  User flows: 4/12 (33%)
-QUALITY: ★★★:6 ★★:5 ★:3  |  GAPS: 34（2 标 CRITICAL 回归，1 标 [→E2E] 真机）
-[→E2E] = 需要真机/集成测试（P9 云端 200）  |  本项目无 LLM eval 套件（Embedding 用 static/mock）
+```text
+CURRENT                         THIS RELEASE                     12-MONTH IDEAL
+已修部分#5 + 旧preview     ->    完整#5 + 紧凑初筛/可恢复阅读  ->    局部对账/可量测延迟
+增量同步占请求线程               现有索引先读、刷新后台            更强一致性与深分页
+默认手动摄取                     明确授权的自动摄取                更细额度/队列治理
 ```
 
-**Step 5：需补进计划的测试（按卡）**
+小时1（人类）：确认真实分支、现有测试与契约，不续接不存在的Lane D。小时2–3：完成refresh与摄取边界，解决线程停止和failed免重试。小时4–5：实现投影/预算/标题/越界，处理分组游标与原文行号。小时6+：协议集成、云端授权验收、文档和CI。实际工作量超过6小时：人类约4–7工作日；agent执行估计5–10小时，均为排期估计，不是测试或性能事实。
 
-| 卡 | 新增测试文件/用例 | 类型 | 断言要点 | 优先级 |
-|---|---|---|---|---|
-| C53 | `tests/test_ingest_mineru.py` 追加 | 集成（本机回环，端口 0） | 收到的 `Content-Type != application/x-www-form-urlencoded`；**且 `req.has_header("Content-type")` 为真**（A15）；200 不抛错 | P1 |
-| C54 | `tests/conftest.py` + 新增 `tests/test_isolation_guard.py` | 单元 | ① session app.toml 存在且 `resolve_config_path` 指向它；② function 级 fixture 依赖 session 级（否则该断言会失败）；③ 缓存根落在 session tmp；④ `pytest_sessionfinish` 守卫未被破坏 | P1 |
-| C54b | 逐文件（12 stdio + 进程内） | 集成 | 每个 app.toml 含可用 `[cache] dir`（或断言走 env 覆盖） | P1 |
-| C55 | `tests/test_scoped_search.py` 追加 | 单元 | `vault_path=` 调 `kb_init_solo` 成功；旧 `path` 回归 | P2 |
-| C56 | `tests/test_kb_read_chunkid.py` 改写+追加 | 单元 + stdio | ① 唯一命中跨库展开并含 `vault`/`vault_path`；② 撞 id → fail-closed 列候选；③ **未加载库也被探到**；④ 有库未探测时文案**不含**「文件可能已修改」；⑤ 探测期 OSError → 跳过该库并计入未探测 | P1 |
-| C57 | `tests/test_mcp_stdio.py` 追加 | 集成 | ① 不传参行为与现状一致；② limit/offset 切片 + `total` = 过滤后切片前条目数 + `truncated` + `next_offset`；③ `path_prefix` 过滤；④ `path_prefix` 逃逸（`../`、绝对路径）fail-closed；⑤ offset 越界 → 空 + total 原值 | P1 |
-| C58 | `tests/test_ingest_worker.py` + `test_ingest_server.py` + `test_watch_integration.py` + `test_fsnotify.py` + `test_config`（追加） | 单元 + 集成 | 见下「C58 专项」 | P1 |
-| C58 专项 | 配置默认值与校验（含 0 与负值）；闸门位置（`channel_for` 之前）；`reason="too_large"` + `skipped_too_large`；**显式超限报错文案含修法**；**无 key 时保留 pymupdf 兜底（A1）**；`_run_job` 兜底闸门（A13）；`_auto_pending` 的 done/failed/queued/parsing 跳过 + sha 变化重入队 + failed 退避；`_save_state` 剪枝后判据仍取最新（按 `submitted_at` max）；hook 接线 monkeypatch 计数；**`auto_watch=false` 时零调用**；hook 抛异常不死 watcher；**文档事件触发 ingest 标志**；`events=None` 路径行为；**自动路径复用 ignore/exclude 过滤（A8）** | 单元 + 集成 | 全流程 mock `MineruClient` | P1 |
-| A4 回归 | `tests/test_ingest_worker.py` 追加 | 单元（spy） | **`on_job_finished` 被真实调用**（当前 100% 失败，属 REGRESSION RULE 强制项）；签名对齐后触发一次 sync | **P1 CRITICAL** |
-| P0 | `tests/test_adversarial_v070.py::test_gate_9_retryable_mineru_error` | 集成 | 状态断言改为带超时的轮询等待 | P1 |
+## 3. 执行顺序与所有权
 
-**回归铁律（REGRESSION RULE）**：`on_job_finished` 参数不匹配属「既有行为已坏 + 新计划依赖它」→ 回归测试为强制项，**无 AskUserQuestion、不可跳过**（已落 A4/A16）。
+| 顺序 | 状态 | 卡 | 目标 | 依赖 | 估计：人类 / agent |
+|---|---|---|---|---|---|
+| 0 | [x] | Intake | 基线/需求/73项验证/旧计划还原点 | 无 | 已完成 |
+| 1 | [x] | C65 | 已提交跨库寻址的fail-closed补强 | Intake | 2–4h / 30–60m |
+| 2 | [ ] | C66 | 可合并后台refresh、所有MCP只读路径、A4回调 | C65 | 1–2d / 1.5–3h |
+| 3 | [ ] | C58a | auto_watch与size配置 | Intake | 1–2h / 20–40m |
+| 4 | [ ] | C58b | 统一size闸门、自动判据账本、单队列 | C58a | 0.5–1d / 1–2h |
+| 5 | [ ] | C58c+C61 | native/poll触发、扫描合并与生命周期 | C66,C58b | 0.5–1d / 1–2h |
+| 6 | [ ] | C58d | server/doctor/hint接线与集成 | C58c | 2–4h / 30–60m |
+| 7 | [ ] | C67 | compact全路由投影 | C66 | 2–4h / 30–60m |
+| 8 | [ ] | C68 | 完整chunk预算与续页 | C67 | 4–6h / 45–90m |
+| 9 | [ ] | C69a | 原文读范围/越界/总行数 | C66 | 2–4h / 30–60m |
+| 10 | [ ] | C69b | 物理heading章节读取 | C69a | 4–6h / 45–90m |
+| 11 | [ ] | C59 | Windows升级占用说明 | 任意；代码不变 | 0.5–1h / 10–20m |
+| 12 | [ ] | C70/T8 | 使用纪律、现状文档、欠账、离线评测 | 所有代码卡 | 2–4h / 30–60m |
+| 13 | [ ] | C60 | 版本/最终验收/CI/发布交接 | C70 | 2–4h+CI / 30–60m+CI |
 
-**Flakiness 风险**：
-- P0 的竞态（`force=True` 重试后立即 `mgr.status()`）→ 带超时轮询是正解。
-- C58 的自动模式测试若依赖真实计时（防抖 0.5s / 兜底 30s）→ 必须注入可控节拍或 monkeypatch 时钟。
-- C56 的跨库探测若依赖 `_indexers` 字典的加载顺序 → 测试必须显式构造「已加载/未加载」两种前置态。
+以上编号沿用C53–C64；新增C65–C70。C58拆成子卡但不占新的主编号；C61合入C58c，A4合入C66。C60编号旧但**最后执行**。
 
-**测试金字塔**：轻度倒置风险——本计划新增的单元测试与集成/stdio 测试数量接近（计划偏向 stdio 集成）。可接受（该项目 stdio 集成是主要回归网），但 C58 的分支组合应用单元测试覆盖，不要都塞进 stdio。
+推荐单人顺序执行。多人只可在互不重叠的文件中并行准备测试；`server.py/indexer.py/watch.py/worker.py` 单一负责人。禁止C66与C58c同时编辑watch，禁止C67与C68同时编辑fanout，禁止C69a与C69b同时编辑read。每笔代码提交只stage该卡文件，配套Changelog条目跟随；不要 `git add -A`。
 
-**Load/stress**：C56 的 N 库探测与 C58 的全库扫描都属「频繁调用 + 处理显著数据量」→ 计划未列任何性能断言。建议 C56 至少补一条「N=10 库时 kb_read(chunk_id) 耗时 < X」的冒烟断言（可用 mock 的空缓存构造）。
+## 4. 逐卡施工
 
-**LLM/提示变更**：本计划改动 `skills/mortis-rag-mcp/SKILL.md`（agent 使用纪律 = 提示面）→ 按框架规则属 `[→EVAL]`。仓库无 eval 套件，替代验证为：`skan` 手工对照 + `Quick-start_developer.md:233` 的 `scripts/eval_search.py --golden tests/eval/golden_queries.json`（记录 Hit@K 基线）。**C56 改变了 agent 的阅读纪律 → 必须跑一次 eval 确认检索侧零回退。**
+### [x] C65：跨库 chunk 寻址的完整性与探测边界
 
-### Test Plan Artifact
+**目标**：修已提交 C56/C64 的未覆盖路径，不重写寻址架构。P1，先于全部阅读新功能。
 
-已写入 `~/.gstack/projects/moton16-Mortis-RAG-MCP/14166-main-eng-review-test-plan-20260929.md`（见同目录产物）。
+**文件/符号**：
+`server.py::_locate_chunk_for_read/_chunk_miss_message/_chunk_attribution/_close_probe_indexer`；
+`indexer.py::__init__/_load_chunks_cache`；
+`tests/test_kb_read_chunkid.py`。不要改注册表格式、solo字段或chunk id。
 
-### Section 4 — 性能评审
+**步骤**：
 
-| 路径 | 最坏情况 | 结论 |
+1. 先加测试：零注册库 `kb_read(chunk_id=...)` 经 `handle` 必须 `isError=true`，文本含 `kb_init`，不能协议 `-32000` / IndexError。
+2. 在解析默认单库之前显式检查 entries为空。保留显式库白名单解析；不要把参数当路径直接构造indexer。
+3. 临时构造器记录文本缓存是否**成功加载且meta匹配**。新增私有 `_chunks_cache_loaded=False`，在 `_load_chunks_cache` 接受有效文件后设true，合法空缓存也true；缺失/损坏/代际不符保持false。不改变codec。
+4. 未加载且无有效文本缓存的库计 `skipped(...,"尚无可探测文本索引")`，不是已探测零命中。不得触发sync/provider/watcher来“补证据”。
+5. 遍历全部已加载候选库；临时库仍按32个、循环间2s软预算。已经加载但`last_sync=None`且无有效缓存/可用chunks的库也记未完成，不把空初始态当证明。
+6. 汇总按顺序裁决：两个以上命中 → 已证实歧义；存在skipped且命中不足两个 → **incomplete**，列已命中/未探测库名、原因、总数，要求 `vault_path`；无skipped且单命中 → 展开；完整零命中 → not found。不要为返回一个结果而默选已加载库。
+7. solo候选/跳过原因只给库名、solo标记，不把原始exception中的绝对路径拼进去；普通库沿用既有库归属字段。
+8. 临时probe收集与finally统一清理：零命中、单命中、歧义、异常、incomplete都关闭FTS/vector连接。不关闭server已有常驻indexer。
+9. `__init__` 中sqlite_vec不可用→memory回退的 `_load_vectors_cache` 也必须受 `load_vectors` gate；真正load_vectors=True时原行为不变。
+10. 命中临时库需提升常驻实例时，重新按id取chunk；若取不到，不用旧probe chunk兜底，而是明确“索引已变化，重新kb_search”，避免旧行号冒充现行命中。
+11. 维持探测入口不加provider调用、不写向量、不开始监听的契约；**FTS构造可能写派生数据仍是已申报残余**，不能把它写成严格只读或2s硬上限。
+
+**测试规格**：
+
+| 新用例 | 设置 | 断言 |
 |---|---|---|
-| C56 探测 | 20 库 × 全量加载 chunks(+vectors) + 打开/可能重建 FTS sqlite ≈ 数百 MB 读放，重复于**每次** chunk_id 读取 | **High**，A9 必修 |
-| C58 hook | 每个文档事件一次全库递归 + 首轮每 PDF sha256；落在防抖调度线程 | **High**，A2 必修 |
-| C58 首轮 | `_recover_zombie_jobs` 拉起 `.ingest.lock` 并 mkdir 产物目录（副作用，非性能） | 需记账（A7） |
-| C57 切片 | 读内存 `_chunks`，零额外 IO | 通过 |
-| C57 全量列表 | 内存 O(文件数)，切片不省扫描 | 已知边界，记 TODO |
-| C54 fixture | session 级单文件（刻意避免每用例 mktemp） | 通过 |
+| `test_chunk_read_no_registered_vaults` | 空注册表 | 具名工具错误，不IndexError |
+| `test_chunk_probe_one_hit_with_unprobed_vault_is_incomplete` | 唯一已探命中+超库数/超时间两种 | 要求显式库，不能返回content |
+| `test_chunk_probe_missing_cache_is_unprobed` | 未加载库无bin | skipped说明，不谎报已修改 |
+| `test_chunk_probe_valid_empty_cache_is_complete` | 合法空缓存 | 是完整已探零命中 |
+| `test_chunk_probe_solo_diagnostics_do_not_leak_path` | solo缺目录/坏缓存/碰撞 | 文本无solo绝对路径 |
+| `test_probe_load_vectors_false_survives_backend_fallback` | 强制sqlite_vec→memory | `_load_vectors_cache`调用0 |
+| `test_chunk_probe_closes_resources_on_all_outcomes` | 带close spy的probe | 各退出路径恰当释放，不关常驻 |
+| `test_probe_promoted_chunk_disappeared` | promote前换缓存 | 重新搜索提示，不使用旧chunk |
 
-### Eng 必产出清单
-
-- **NOT in scope**：`list_files()` 全量构造优化 · 三级以上前缀语义统一（`fts.py:128-130` 的 `.mortis-parsed/` 穿透）· `_save_state` 500 条剪枝策略本身的重构（本版只在判据侧绕开）· Windows 回收站 `SAFE_DELETE_FAIL_CLOSED` · 多平台 watcher。
-- **What already exists**：见 Phase 1 Step 0B。
-- **Diagrams**：依赖图（Phase 1 S1）· C56 数据流四径图（Phase 1 S3）· 覆盖图（本节 Step 4）· 失败模式登记表（Phase 1）。
-- **Failure modes**：19 行，14 CRITICAL GAP（见登记表）。
-- **Worktree 并行化策略**：
-
-| Step | 触及模块 | 依赖 |
-|---|---|---|
-| C53 修 Content-Type | `ingest/` | — |
-| C54 测试隔离 + 缓存根 env | `tests/`、`config.py` | — |
-| C55 参数别名 | `server.py` | — |
-| C56 kb_read 跨库 | `server.py`、`_indexer/` | — |
-| C57 kb_list_files 分页 | `server.py`、`indexer.py` | — |
-| C58 auto_watch | `config.py`、`_indexer/watch.py`、`server.py`、`ingest/` | 依赖 C54（测试基建）与 A4 修链 |
-| A4 回调修链 | `ingest/worker.py`、`server.py` | — |
-| P0 flaky | `tests/` | — |
-| P1 文档清理 | `docs/` | — |
-| C60 收口 | `pyproject.toml`、`README`、`CHANGELOG` | 全部 |
-
-**并行通道**：`Lane A: C53 → C58(ingest 部分)` / `Lane B: C54 + P0（tests/ 独占）` / `Lane C: C55 → C56 → C57（server.py 顺序，共享文件）` / `Lane D: A4 → C58(server/hook 部分)` / `Lane E: P1 文档清理（docs/，必须先于 C58 的文档改动）` / 最后 `C60`。
-**冲突标记**：Lane C 与 Lane D 都改 `server.py`；Lane B 与 Lane D 都改 `tests/`；**Lane E 必须先于 C58 的 §四/§七 新增**。建议 A+B 并行（互不重叠），C 与 D 顺序执行，E 最先，C60 最后。
-
-### Eng 完成小结
-
-```
-  +====================================================================+
-  |            ENG PLAN REVIEW — COMPLETION SUMMARY                     |
-  +====================================================================+
-  | Scope challenge      | 不缩（用户 D1 裁定）；新增 1 条 CRITICAL 发现     |
-  |                      | （on_job_finished 死链）                        |
-  | S1 Architecture      | 3 处新增耦合，全部判决为接受 + 约束              |
-  | S2 Code quality      | 7 项检查，4 项违规（3 DRY + 1 复杂度 + 1 欠工程） |
-  | S3 Tests             | 覆盖图 52 路径 / 18 覆盖（35%）；GAPS 34        |
-  | S4 Performance       | 2 High（C56 探测、C58 hook），均已有修法         |
-  | Failure modes        | 19 行，14 CRITICAL GAP                         |
-  | Test plan artifact   | written                                        |
-  | Worktree strategy    | written（5 通道 + 3 冲突标记）                   |
-  | Unresolved decisions | 0                                              |
-  +====================================================================+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests/test_kb_read_chunkid.py tests/test_facade_freeze.py tests/test_vector_backend.py -q
 ```
 
-**Phase 3 完成。** Codex：未运行（未安装）。Claude 子代理：5 维（架构/边界/测试/安全/隐藏复杂度），提出 12 条 finding，其中 5 条 High。共识：`[subagent-only]`。通过至 Phase 3.5。
+**完成标准**：上表与原有跨库/solo/歧义/显式库用例通过；C64保留软预算说明。提交建议 `fix(read): fail closed on incomplete chunk probes`，附C65技术账。
 
-#### ENG 双声部共识表
+### [ ] C66：读优先后台刷新 + A4摄取完成回调
 
-```
-ENG DUAL VOICES — CONSENSUS TABLE:
-═══════════════════════════════════════════════════════════════════════════════
-  Dimension                            Claude  Codex  Consensus
-  ──────────────────────────────────── ─────── ─────── ─────────────────────────
-  1. Architecture sound?                NO      N/A    DISAGREE（C56「轻量构造」不轻、
-                                                       C58 hook 线程归属；均已修法）
-  2. Test coverage sufficient?          NO      N/A    DISAGREE（34 GAP，2 CRITICAL 回归）
-  3. Performance risks addressed?       NO      N/A    DISAGREE（2 High 未在计划中）
-  4. Security threats covered?          NO      N/A    DISAGREE（跨库探测沙箱 + 自动摄取
-                                                       隐私边界）
-  5. Error paths handled?               NO      N/A    DISAGREE（14 CRITICAL GAP）
-  6. Deployment risk manageable?        YES     N/A    CONFIRMED（默认关 + git revert 级）
-═══════════════════════════════════════════════════════════════════════════════
-```
+**目标**：只读MCP前台不跑全库sync、不等待_sync_lock；合并刷新请求；保留编程API同步语义。P1。
 
----
+**文件/符号**：
+`indexer.py` 的状态初始化、Facade方法；
+`_indexer/watch.py::_start_fs_scheduler/_fs_scheduler_loop/_run_sync_quietly/stop_watching`；
+`_server/search_dispatch.py::dispatch_search`；
+`_server/fanout.py::fanout_search`；
+`server.py::_locate_chunk_for_read/_kb_read/_kb_list_files/_kb_stats/_ingest_manager_for/shutdown`。
+新建 `tests/test_read_stale.py`，补 `tests/test_anti_contention.py/test_diaglog.py/test_ingest_server.py/test_p5_lifecycle.py`。
 
-## Phase 3.5 — DX 评审（DX POLISH 模式，全 8 轮）
+**使用现有线程的设计**：
 
-### Step 0A — 开发者画像卡
+```text
+MCP read/request_refresh -> brief condition lock -> set dirty -> return immediately
+                                                     |
+existing vault-fs-debounce thread <-------------------+
+  wait/debounce/throttle -> _run_sync_quietly -> sync (_sync_lock -> _cache_lock)
+                                     |
+                               success/error + progress
+                                     |
+               dirty arriving DURING sync -> one subsequent pass
 
-```
-DEVELOPER PERSONA CARD
-======================
-角色          : 本地优先的 AI agent 重度用户 / 二次开发者
-环境          : Windows 10/11，单人维护，Obsidian 风格 Markdown 笔记库 1k~10k 文件
-已有工具      : Claude Code / Codex / WorkBuddy 等 MCP 客户端（stdio 连接）
-技术水平      : 会用 venv + pip，会手写 TOML；不读源码，读 README/QUICKSTART/SKILL.md
-主要诉求      : ① 笔记不出本机 ② 装完就能用 ③ 大库检索可控 ④ 出问题能自己查明白
-痛点来源      : 本版 7 条中有 2 条（#6 Windows 写锁、#2 测试宿主隔离）正是这类用户/贡献者踩的
-第二个用户画像 : 贡献者/评估者（README → clone → pytest），看 CI 是否可信
+MCP search -> existing chunks/FTS/vectors -> serialize
+             no wait for sync; NOT a cross-backend transaction snapshot
 ```
 
-### Step 0B — 开发者共情叙事
+**步骤**：
 
-> 我在笔记本上装了 Obsidian，攒了三年笔记。看到这个 MCP，第一反应是「终于有个不把笔记传出去的东西」。照 README 建 venv、`pip install -e .`、在客户端配置里粘上 exe 路径，重启，`kb_init` —— 搜索出来了，感觉不错。
->
-> 然后我有一堆教材 PDF。文档说要开 `[ingest] enabled = true`、要配 MinerU key。我照做了。点 `kb_ingest(action='submit')`。**一个文件都传不上去。** 我去看 `kb_stats`，`failed_files` 有一堆 403。我不知道 403 是我的 key 问题、额度问题，还是这个工具本身坏了——错误信息没告诉我。
->
-> 后来我看到 issue 里说这是工具自己的 bug。我有点生气：这个功能在发布说明里是「旗舰」。三天了。
->
-> 另外我是个愿意提 PR 的人。我 clone 下来跑 `pytest tests/ -q`，跑完之后发现我的 `~/.mortis_rag_mcp_cache` 里多了几百个文件，`~/.mortis_rag_mcp` 里多了个 `status.json`。**我只是想跑个测试。** 我不知道哪些文件是工具故意留的、哪些是它忘了收拾的，所以我一个都不敢删。
->
-> 我想升级到新版修 403。`pip install -e .` 报 `[WinError 5]`。文档里没写这是因为我开着的 MCP 客户端占着 exe。我搜了半天才明白。
+1. 测试先固定“不等同步”的正确性，而非只改timeout：用 `Event` 卡住 `_sync_locked`，请求线程必须在release Event之前返回已有结果。test teardown无条件release并join。设2s上限只用于发现死锁，不把本机毫秒作为CI门禁。
+2. Facade新增 `request_refresh(*, immediate: bool=False) -> bool` 薄委托至watch；true表示请求已接受/合并，**不表示已刷新完成**。false仅表示正在停止、不接受。保留 `sync()`、`try_sync_with_guard(timeout=...)` 的既有API，不能让旧调用者以为sync完成了。
+3. 复用 `_fs_requested/_fs_debounce_cv`，增加最少状态：`_fs_refresh_immediate`、`_fs_scheduler_start_lock`、`_refresh_error`、`_refresh_requested_at`。初始化默认空/False，全部短锁读写；调度器启动双检，必须先保存thread引用再start，防并发请求各起一条。
+4. `request_refresh` 检查 `_stopping/_watch_stop`，停止后不得clear stop自行复活；无调度器的独立indexer可以首次启动一个调度线程，调用方最终须stop。不创建每请求Timer/Thread。
+5. dirty在进入sync前清零，释放条件锁后才执行sync；sync期间新请求重新置dirty，结束后最多合并一轮。调度器不持条件锁等待_sync_lock或网络；请求线程只持短锁，不触碰同步锁。
+6. 为连续warm reads设置私有 `_READ_REFRESH_MIN_INTERVAL_SECONDS=1.0`，成功刷新之后1s内的普通read请求合并/延后，不能每个query都全库扫描。原生文本事件、完成回调 `immediate=True` 可提前唤醒，但仍保留dirty合并；sync失败沿用现有指数退避上限5s，immediate不得绕过失败冷却。
+7. `_run_sync_quietly` 保留线程不死与失败计数，额外记录简短可观测 `_refresh_error`；成功清零。不把原文/key写diag，错误详情只在显式kb_stats诊断中展示并限长。
+8. 新增只读 `refresh_status()` 返回快照：
+   `last_sync`、`refresh_pending`、`indexing_in_progress`（pending或_indexing/_sync_state非idle）、`indexing_progress`拷贝、`refresh_error`。
+   复用条件锁保护新增调度字段，进度直接复制既有dict；不获取_sync_lock，不新增状态锁/集合锁，不改同步引擎逐文件发布方式。沿用现有all_chunks与检索实现；这些观测字段不是跨后端原子快照。文档只承诺“当前可用索引先返回，刷新在后台”，不承诺上一轮完整事务。
+9. 替换显式单库、缺省单库、Scoped多库、全局fan-out中的 **每一处** `try_sync_with_guard` 为 `request_refresh`+现存search。单库两分支应共用一个小helper/一致逻辑，不新建service。
+10. 首次索引判定：`last_sync is None`且无可用文本缓存/chunks → 返回原 `status="indexing"/retry_after=3/chunks=[]`。warm缓存即使last_sync未建立也允许读；完成过的空库/全豁免库正常 `chunks=[]`，不是无限indexing。
+11. warm检索在pending/active时追加现有 `indexing_in_progress` 与进度；仅有后台错误时追加简短 `indexing_error`。这些字段表示“结果来自本请求所取当前可用chunk集合，后端可处刷新中”，不保证请求结束即最新。
+12. fan-out新增 `indexing_vaults`（库标识→进度/错误），总标记true表示至少一库刷新；cold库计入errors但不阻断其他warm库。单次query embedding仍只一次，不在cold库上重复尝试逐库embedding。不把cached-score排序改成投影后排序。
+13. source文件读取在路径解析后直接读磁盘，不前台sync；直接合法文件未索引也能读。短名解析仍仅按现存索引消歧，cold未命中返回明确indexing/重试信息而非虚构“文件不存在”。
+14. chunk显式定位先请求刷新、查当前chunk。无命中且cold时返回明确重试；warm未命中说明ID可能过期。C65跨库完整性规则保持不变。
+15. stale chunk元数据不能悄悄读错章节：读取该文件原文快照；若当前内容级sha256与indexer记录签名不符，返回“chunk_id stale，重新kb_search/改source+heading”的工具错误，不把旧行号范围中的新正文当旧chunk。未记录签名也fail-visible；不等待刷新替它决定。
+16. list_files/stats同样请求后台刷新后返回现有结果并带状态，冷库计数可能为0，必须说明pending；手工 `kb_rebuild/kb_import/kb_export` 的一致性/破坏性操作仍保留原同步锁行为。
+17. **A4**：`_on_job_finished(source: str, out_md: Path)` 与worker二参数契约对齐，只从已存在indexer请求 `immediate=True` refresh；不要再起一条 `ingest-sync` 直接跑sync。不存在indexer时不在回调中创建它，后续显式读取/启动流程负责构造。
+18. shutdown/remove按现有stop_watching流程停止本卡新增的刷新调度；停止标志、notify、锁外join继续复用既有生命周期。不要借此重构server启动线程/注册表remove流程。新增线程的停止测试留在本卡，完整服务级启动竞态另记后续。
+19. 更新诊断埋点：前台sync阶段只计调度耗时，不把query embedding时间重复算入sync/retrieve；保留四阶段顺序与corr_id，调整现有monkeypatch测试入口而不是删测试。
 
-### Step 0C — 竞争基准
+**需要新增/修订的分支测试**：
 
-| 维度 | 同类参考做法 | 本项目当前 | 本计划后 |
-|---|---|---|---|
-| 安装 | uv/pipx 一行装 | `venv + pip install -e .`（4 步） | 不变 |
-| 首次可用 | 装完即跑出结果 | 需配 MCP 客户端 + `kb_init` + 等首建索引 | 不变 |
-| 付费云依赖的失败可见性 | 明确的鉴权/额度/网络三分文案 | `HTTPError 403` 直出 | 不变（C53 只修成功路径） |
-| 测试环境洁净 | 默认全隔离 | 写真实 home（18153 孤儿文件） | **修复**（D3） |
-| 升级安心度 | CHANGELOG + 升级须知 | 有 CHANGELOG，无锁占用说明 | **补**（C59） |
-| 契约变更公告 | 迁移指南 + 弃用警告 | 无 | **需补**（C56 为契约变更） |
-
-### Step 0D — 魔法时刻设计
-
-**候选**：`kb_init` 扫到 PDF 时，直接返回「检测到 N 个 PDF/Office 文档，其中 M 个可立即解析；运行 `kb_ingest(action='submit')` 开始」——用户零配置就知道下一步。
-
-**交付载体**：**已存在**。`server.py:645-649`、`687-698` 的 `hint` 已经在做这件事（「可调用 kb_ingest(action='pending') 查看待解析列表」）。→ **不需要新建，只需在 C55/C58 改动 hint 时不要破坏它**。这也是扩张候选 E2 的现成底座。
-
-**判定**：`Magical Moment: 已设计（复用既有 hint），交付载体 = kb_init/kb_init_solo 的返回 hint`。
-
-### Step 0E — 模式选择
-
-**DX POLISH**（autoplan 固定 override）。
-
-### Step 0F — 开发者旅程地图（9 阶段）
-
-| # | 阶段 | 本计划触及 | 摩擦点 | 是否解决 |
-|---|---|---|---|---|
-| 1 | 发现 | 否 | README 无「和别的 RAG 方案比，为什么选这个」 | 否 |
-| 2 | 评估 | 否 | 无成功判据 / 无 benchmark | 否 |
-| 3 | 安装 | 否 | 4 步 + 可选依赖说明 | 否 |
-| 4 | Hello World | 否 | TTHW 约 8-12 分钟 | 否 |
-| 5 | 集成 | **是** | C59：`pip install -e .` WinError 5 无解释 | **部分**（只写「先退出客户端」，无「怎么确认占用」） |
-| 6 | 调试 | **是** | C56 的跨库零命中报错必须区分「真没找到」vs「有库未探测」；C58 的自动模式状态不可见 | **部分**（C56 计划已提文案分支；C58 未提） |
-| 7 | 升级 | **是** | 本版含 3 处行为变更（默认 20MB / kb_read 多库 / 新增 env） | **否 ← GAP**（计划未列 release notes 条目） |
-| 8 | 扩展 | 否 | 无插件/无 SDK | 否 |
-| 9 | 迁移 | 否 | 无 | — |
-
-### Step 0G — 首次接触者困惑报告（角色扮演）
-
-| # | 困惑 | 本计划是否消除 |
-|---|---|---|
-| 1 | 「403 到底是我的问题还是工具的问题？」 | **否**——C53 只修成功路径，错误文案未改 |
-| 2 | 「跑完测试之后这些文件是谁的？能删吗？」 | **是**（D3+C54b） |
-| 3 | 「`pip install -e .` 报 WinError 5 我该关哪个进程？」 | **部分**——C59 只给方向不给确认方法 |
-| 4 | 「`kb_read(chunk_id=...)` 以前报错让我传 vault_path，现在又能自动找到了，我原来的脚本还行吗？」 | **否 ← GAP**——契约变更无迁移说明 |
-| 5 | 「为什么这个 50MB 的 PDF 突然被跳过了？」 | **部分**——`reason="too_large"` 有了，但「默认值从无到 20」这件事只在 release notes 里（计划未列） |
-| 6 | 「我打开了 auto_watch，怎么知道它在工作？」 | **否 ← GAP**（A17） |
-
-### 8 轮评审（Pass 1-8）
-
-**Pass 1 — 上手体验（零摩擦）：4/10**
-10 分长这样：`pipx install mortis-rag-mcp` 一行 + 客户端配置片段可直接复制 + 首条检索结果 < 2 分钟。
-当前实测路径：clone → `python -m venv .venv` → `pip install -e .` → 手写 MCP 客户端配置 → 重启客户端 → `kb_init` → **等首建索引（大库分钟级）** → 才有第一条结果。TTHW ≈ **8-12 分钟**（Competitive 区间下沿 / Needs Work）。
-计划触及：C59 只解决升级路径的锁问题，不触碰首次上手。
-**结论：本计划不改善 TTHW。记 DX 债（最终门候选）。**
-
-**Pass 2 — API/CLI/SDK 设计：6/10 → 8/10**
-- 改善 1（C55）：`kb_init`/`kb_init_solo` 补齐四别名，与另外 5 个工具口径统一。命名可猜性从「3 个例外」变「一致」。
-- 改善 2（C57）：`limit`/`offset`/`path_prefix` 与 `kb_search` 同形 → 猜得出来。
-- 风险 1（C57）：若 `total` 语义不明（A10），猜不出「还有没有下一页」。
-- 风险 2（E3 已接受）：`kb_ingest(action='pending')` 应与 C57 同形补 `total`/`next_offset`，否则同一个包里两套分页口径。
-- **改进后 8/10**（扣分项：`_kb_ingest` 的 `hint` 文案目前是错的，见 Pass 3）。
-
-**Pass 3 — 错误信息与调试：5/10 → 7/10**
-仓库规约要求「人类可读的 ValueError」；本计划的错误面变化：
-- 好：C58 的 `reason="too_large"`（带 size/limit）+ `skipped_too_large` 计数 + hint；显式超限「报错文案给出修法」。
-- 差 1 ← **GAP**：`_kb_ingest` 的 hint（`server.py:794-795`）声称「done 的文档…可被 kb_search 检索」，**实际因 `on_job_finished` 死链不成立**。这在修 `on_job_finished`（A4）后变成真的，但在此之前它是错误承诺 → 修链与文案必须同批。
-- 差 2 ← **GAP**：C56 的新文案分支（「有库未探测」）计划提了，但没定义具体措辞。必须有：问题（哪个库没探）+ 原因（未加载/未索引）+ 修法（先对该库调一次 `kb_stats` 或传 `vault_path`）。
-- 差 3 ← **GAP**：C53 的 403 在**修好之前**无法自诊断。建议（可选）：403 时 hint 提示「若为预签名上传失败，升级到 0.8.1」——属可选，不列为 P1。
-- **改进后 7/10**。
-
-**Pass 4 — 文档与学习：5/10 → 7/10**
-- 计划已列：`app.toml.example`、`PROJECT_GUIDE` §四/§七、`QUICKSTART_user.md`、`SKILL.md`。
-- 更正（A6）：PROJECT_GUIDE §四**无 ingest 专节**、§七**无 `[ingest]` 小节** → 是**新增**，不是修改。工作量被低估。
-- 补充（A6'）：§八 的 `PROJECT_GUIDE.md:626` 环境变量优先级清单是三对（API_KEY/CONFIG/REGISTRY），新增缓存根后变四对 → 必须同步。
-- 补充：`Quick-start_developer.md:34`（`server.py` 1126 行）、`:192-203`（测试章节）与 `docs/PROJECT_GUIDE.md:432`（1064 行）都是过期数字（实际 1313 行）→ 顺手订正。
-- SKILL.md 需改的具体位置（实测）：`SKILL.md:30`（判定表 #7 的 kb_read 纪律）、`:39`（反模式）、`:47`（工具清单）；建议同步 `:25`、`:28`。
-- **改进后 7/10**（扣分：无搜索引擎、无 copy-paste 完整的 MCP 客户端配置示例）。
-
-**Pass 5 — 升级与迁移：4/10 → 7/10**
-- C59 给了 Windows 写锁说明 ✔
-- ← **GAP**：本版含 **3 处行为变更**，计划未把它们组织成升级须知：
-  1. `max_file_size_mb` 默认 20 → 20MB 以上文件在 `submit(None)` 里被跳过（D2=C 的必然后果）
-  2. `kb_read(chunk_id=...)` 多库行为从「报错要求显式 vault_path」变「唯一命中自动展开」
-  3. 新增公开环境变量 `MORTIS_RAG_CACHE_DIR`
-  → `CHANGELOG_user.md` 的 `## [0.8.1]` 段必须逐条写「升级须知」，`QUICKSTART_user.md` 升级章节同步。`tests/test_version_sync.py:18-20` 只强制「有条目」，不强制「有须知」——需人工保证。
-- C58 的 `auto_watch` 默认关 = 无升级冲击 ✔
-- **改进后 7/10**。
-
-**Pass 6 — 开发者环境与工具：6/10 → 9/10**
-- D3 落地的缓存根 env 覆盖，是本计划**对 DX 贡献最大的一项**：测试与任何嵌入方都不再污染真实 home。
-- C54 的 session 级 fixture 减少 tmp 碎片（对开发者机器的实际体感）。
-- P0 修 flaky → CI 绿灯可信（对贡献者是高价值）。
-- **改进后 9/10**（扣分：本地不跑全量的约定使贡献者无法自查全量回归，只能等 CI）。
-
-**Pass 7 — 社区与生态：2/10**
-7 条全来自 2 个用户；无外部信号；无「为什么选这个而不是别家」的回答。本计划不触及。
-**结论：记为长期 DX 债，不列入本版。**
-
-**Pass 8 — DX 度量与反馈闭环：2/10**
-无 TTHW 度量、无成功判据、无 issue 模板、无「本次改动是否改善了什么」的复盘口径。
-**结论：记为长期 DX 债。** E1（云端验收闸门）若采纳，可顺带落地最小闭环：每次发版记录一条真机 smoke 结果。
-
-### DX 记分卡
-
-```
-+====================================================================+
-|              DX PLAN REVIEW — SCORECARD                             |
-+====================================================================+
-| Dimension            | Score  | Prior  | Trend  |
-|----------------------|--------|--------|--------|
-| Getting Started      |  4/10  |  4/10  |  →     |
-| API/CLI/SDK          |  8/10  |  6/10  |  ↑     |
-| Error Messages       |  7/10  |  5/10  |  ↑     |
-| Documentation        |  7/10  |  5/10  |  ↑     |
-| Upgrade Path         |  7/10  |  4/10  |  ↑     |
-| Dev Environment      |  9/10  |  6/10  |  ↑     |
-| Community            |  2/10  |  2/10  |  →     |
-| DX Measurement       |  2/10  |  2/10  |  →     |
-+--------------------------------------------------------------------+
-| TTHW                 | 8-12 min | 8-12 min |  →               |
-| Competitive Rank     | Needs Work（1-5 min 是 Competitive 区间）    |
-| Magical Moment       | designed via kb_init/kb_init_solo 返回 hint  |
-| Product Type         | developer tool / MCP server + CLI + agent skill |
-| Mode                 | POLISH                                       |
-| Overall DX           |  5.8/10 |  4.3/10 |  ↑                     |
-+====================================================================+
-| DX PRINCIPLE COVERAGE                                               |
-| Zero Friction      | gap（TTHW 未改善）                             |
-| Learn by Doing     | partial（QUICKSTART 有，但无示例库/示例查询）      |
-| Fight Uncertainty  | partial（C56 文案分支 / C58 状态可见性仍缺）       |
-| Opinionated + Escape Hatches | covered（新增 env + 0/负值语义 + 显式 cap）|
-| Code in Context    | partial（SKILL.md 需改 3-5 处具体行）             |
-| Magical Moments    | covered（复用既有 hint 底座）                    |
-+====================================================================+
-```
-
-**低于 6 分的项判为关键 DX 债**：Getting Started（4）、Community（2）、DX Measurement（2）。TTHW 8-12 分钟未超 10 分钟硬阈值但落在 Needs Work 区间。**均不阻塞本版**（本版是 bug 修复批次），已在最终门列为扩张候选。
-
-### DX 实施清单
-
-```
-DX IMPLEMENTATION CHECKLIST
-============================
-[x] 每个错误信息含「问题 + 原因 + 修法」        ← C58 显式超限文案已含；C56 需补
-[ ] 文档有可直接复制粘贴、且实际可跑的示例        ← MCP 客户端配置片段仍缺
-[x] 每个参数都有合理默认值
-[ ] API/CLI 命名无需文档即可猜到                 ← C55 后达标；C57 的 total 语义待钉（A10）
-[ ] 升级路径有迁移指南                          ← 3 处行为变更需写进升级须知
-[ ] 破坏性变更有弃用警告                        ← C56 无过渡期（见最终门）
-[ ] 文档内可搜索                                ← 无搜索引擎
-[ ] 有社区渠道且有人值守                        ← 无
-[ ] 免费层无需信用卡                            ← 不适用（本地工具）；但 MinerU 是付费云
-[x] 有 CHANGELOG 且持续维护
-[x] 在 CI/CD 中无需特殊配置即可运行
-[ ] 首次运行产出有意义的输出                    ← 大库首建索引期间无进度反馈
-```
-（`[x]` = 已满足或本计划已覆盖；`[ ]` = 未满足，其中多数属长期债）
-
-### DX 必产出清单
-
-- **Developer Persona Card** ✔ · **Developer Empathy Narrative** ✔ · **Competitive DX Benchmark** ✔ · **Magical Moment Specification** ✔（复用既有 hint）· **Developer Journey Map** ✔（9 阶段）· **First-Time Developer Confusion Report** ✔（6 条，4 条未消除）
-- **NOT in scope**：TTHW 压缩（pipx/uv 一行装）· 文档搜索引擎 · 社区渠道 · DX 度量体系 · MCP 客户端配置片段生成器 · 首建索引进度反馈 · 无 SDK/多语言。理由：本版是 bug 修复批次，且这些都不是 issue #5 的范围。
-- **What already exists**：`kb_init`/`kb_init_solo` 的 PDF 提示 hint（`server.py:645-649`、`687-698`）· `QUICKSTART_user.md` 的 5 分钟颗粒度部署指南 · `CHANGELOG_user.md` + `test_version_sync.py` 的版本一致性守卫 · `doctor`/`STATUS.md` 作为 agent 信任锚 · `SKILL.md` 的工具判定表与反模式清单 · `scripts/eval_search.py` 的 Hit@K harness。
-- **TODOS.md updates**：仓库**无 `TODOS.md`**。候选 3 项（TTHW 压缩 / 云路径验收闸门 / 自动摄取状态可见性）→ 交最终门决定是否新建该文件。**注意：新建 `TODOS.md` 等于新增一个仓库根文件，需你显式同意。**
-
-```
-  +====================================================================+
-  |            DX PLAN REVIEW — COMPLETION SUMMARY                      |
-  +====================================================================+
-  | Mode                 | POLISH                                      |
-  | Persona              | 本地优先 AI agent 重度用户 / 二次开发者         |
-  | Passes 1-8           | 4/8/7/7/7/9/2/2                             |
-  | TTHW                 | 8-12 min → 目标 < 5 min（本版不改善）          |
-  | Gaps                 | 6 项（升级须知 / C56 文案 / C58 状态可见性 /   |
-  |                      | 403 自诊断 / SKILL.md 位置 / 文档工作量低估）   |
-  | Magical moment       | 已存在，复用                                    |
-  | Competitive rank     | Needs Work                                   |
-  | Overall              | 5.8/10（提升 +1.5）                            |
-  +====================================================================+
-```
-
-**Phase 3.5 完成。** DX 总分 5.8/10，TTHW 8-12 分钟（目标 < 5）。Codex：未运行。Claude 子代理：5 维 DX 独立评审（并入上文 Pass 结论）。共识：`[subagent-only]`，1/6 已确认（升级路径安全）。通过至 Phase 4。
-
----
-
-## 交叉阶段主题（Cross-Phase Themes）
-
-在两个及以上阶段的独立声部中**各自独立浮现**的问题（最高置信度信号）：
-
-**主题 1：缓存根不可重定向是根因，不是症状** —— 出现在 Phase 1（CEO 子代理：「真根因是缓存根无 env 可覆盖，产品级修一处，测试一套不必动」）与 Phase 3（事实核验：「`_init_cache_paths()` 无条件 mkdir，与 `cache.enabled` 无关」；工程声部：「改全局夹具让『无配置可用』这一真实场景在整套测试中永久消失」）。**已由 D3 采纳。**
-
-**主题 2：付费云路径没有验收闸门** —— 出现在 Phase 1（CEO 子代理：「10 倍杠杆的重框定是给云路径建立验收闸门」）与 Phase 3.5（Pass 5/Pass 8：无升级须知、无 DX 度量、无发版 smoke）。两个阶段独立指向同一处：**7 张卡没有一张让「下次 403 类事故」更早被发现**。→ 扩张候选 E1。
-
-**主题 3：隐式控制流 + 全吞异常 = 静默失败** —— 出现在 Phase 3 工程声部（`on_job_finished` 参数不匹配被 `except Exception: pass` 吞掉，链死而无人知）与 Phase 1 Section 7（C58 的 hook 状态不可见）。同一代码库里两个独立位置、同一种失败形状。
-
-**主题 4（第二轮修正后）：计划作者的行号引用精确度极高，两处「看似失真」经复核都不是计划的问题** —— 原判据被推翻：①「1126 行」来自 `docs/Quick-start_developer.md:34` 与 `docs/Changelog_developer.md:320`，**PLAN.md 全文没有声称任何行数** → 是既存文档过期，不是计划失真；②计划 C54b 写的是「逐一排查**所有** stdio 用例的 app.toml」，指令本身完整，被点名的两个文件来自 changelog 举例 → 「清单漏了 10 个」是稻草人。**真正成立的一条**：`PROJECT_GUIDE` §四/§七 需**新增**而非修改 ingest 内容（Phase 3.5 Pass 4 低估了工作量）。教训记在第二阶段审核里：**事实核验声部容易把「文档过期」误记为「计划失真」，也容易把「举例」误读为「穷举」**。
-
----
-
-## 实施任务（跨阶段聚合）
-
-来源标记：`CEO` = Phase 1 · `ENG` = Phase 3 · `DX` = Phase 3.5。P1 阻塞发版；P2 应同分支落地；P3 为后续 TODO。
-
-### 卡内改动（修正后的计划）
-
-- [ ] **T1 (P1, human: ~2h / CC: ~15min) — `ingest/worker.py` + `server.py` — 修 `on_job_finished` 参数不匹配死链并按回归铁律加测试**（ENG，CRITICAL）
-  - 依据：`worker.py:393-397` 传 2 个位置参数，`server.py:766` 的 `_on_job_finished(out_path)` 只收 1 个 → `TypeError` 被 `except Exception: pass` 吞掉，回调从未生效
-  - 修法：统一签名（建议 `_on_job_finished(source: str, out_path: Path)` 或 worker 只传 `out_path`）；保留「同步失败不打死 worker 线程」的兜底，但把吞异常改为可观测（计数或 diag）
-  - 文件：`mortis_rag_mcp/ingest/worker.py`、`mortis_rag_mcp/server.py`、`tests/test_ingest_worker.py`
-  - 验证：`pytest tests/test_ingest_worker.py -q`（新增 spy 断言回调被调用 + 触发 sync）
-
-- [ ] **T2 (P1, human: ~1d / CC: ~1h) — `config.py` + `tests/conftest.py` + 12 个 stdio 用例 — C54 三件套 + 缓存根 env 覆盖**（用户 D3；CEO+ENG 交叉主题 1）
-  - C54a：session 级 fixture 生成真实存在的 app.toml（含 `[cache] dir`）；function 级 autouse fixture **显式依赖 session 级**（否则 env 指向未创建文件 → `resolve_config_path` 静默回落宿主配置，`config.py:346-355`）
-  - C54a'：新增 `MORTIS_RAG_CACHE_DIR`（新名优先 / `VAULT_MCP_CACHE_DIR` 兼容），在 `resolve_default_cache_dir()` 或 `load_config()` 的 cache.dir 回落处生效；`config/app.toml.example` 补注释
-  - C54b：按修正清单补 `[cache] dir`——12 个 stdio 用例（`test_wikilink_read.py`、`test_ingest_server.py:202`、`test_txt_indexing.py:51,119`、`test_subvaults.py:99,123`、`test_scoped_search.py:34`、`test_exempt.py:223`、`test_preview_mode.py:106`、`test_diaglog.py:333-345`、`test_mcp_stdio.py:28`、`test_kb_read_chunkid.py:89,260`、`test_budget_bytes.py`（8 处）、`test_anti_contention.py:133`）+ 进程内用例
-  - C54b'：会话启动 `os.environ.pop("MORTIS_RAG_REGISTRY", None)` 会破坏 `conftest.py:15` 的守卫 → 必须改为「pop 后由 fixture 设置自己的临时注册表」，否则 `pytest_sessionfinish` 会写真 home 的 `status.json`
-  - 文件：`mortis_rag_mcp/config.py`、`config/app.toml.example`、`tests/conftest.py`、12 个测试文件、新增 `tests/test_isolation_guard.py`
-  - 验证：`pytest tests/test_diaglog.py tests/test_path_migration.py tests/test_doctor.py -q`，再单跑 `test_improvements.py`、`test_adversarial_v070.py`、`test_exempt.py`、`test_mcp_stdio.py`、`test_isolation_guard.py`
-
-- [ ] **T3 (P1, human: ~4h / CC: ~30min) — `server.py` — C56 重构：只读探测 + 复用 F5b 范式 + 拆纯函数**（ENG；A3/A9）
-  - 禁止 `MarkdownIndexer(path, config)` 全量构造（`__init__` 会全量加载 chunks/vectors 缓存 + 打开/重建 FTS sqlite，`indexer.py:249-282`）→ 新增只读文本层入口，或进程级带失效的 chunk_id 索引
-  - 复用 `server.py:1084-1087` 的「唯一命中→展开 / 多命中→列候选」口径
-  - 拆出纯函数 `_locate_chunk_across_vaults()`（当前 8+ 分支超阈值）
-  - 逐库仍过注册表白名单与 `_safe_path` 沙箱（跨库 = 读取范围扩大，不得绕过信任边界）
-  - 零命中文案分支：全部探过 → 沿用现有；有库未探测 → 如实说明（不得谎报「文件可能已修改」）
-  - 探测期 OSError / 缓存损坏 → 跳过该库并计入「未探测」；明确 solo 库是否参与探测
-  - 文件：`mortis_rag_mcp/server.py`、`mortis_rag_mcp/_indexer/`（只读入口）、`tests/test_kb_read_chunkid.py`、`skills/mortis-rag-mcp/SKILL.md`（`:30`/`:39`/`:47`）
-  - 验证：`pytest tests/test_kb_read_chunkid.py tests/test_mcp_stdio.py -q` + `python scripts/eval_search.py --golden tests/eval/golden_queries.json`（记 Hit@K 基线）
-
-- [ ] **T4 (P1, human: ~4h / CC: ~30min) — `server.py` + `indexer.py` — C57 分页：钉死 `total` 语义 + 前缀复用 + 越界**（ENG；A10/A11/E3）
-  - `total` = **过滤后、切片前的条目数**；补 `next_offset`（与 `kb_search` 同形）；`truncated`
-  - `path_prefix` 与 `kb_search.path_prefix` **共用同一校验与匹配实现**；逃逸（`../`、绝对路径）fail-closed
-  - `offset` 越界 → 返回空 `files` + `total` 原值
-  - 顺手（E3）：`kb_ingest(action='pending')` 补 `total`/`next_offset`，与 C57 口径统一
-  - 文件：`mortis_rag_mcp/server.py`、`mortis_rag_mcp/indexer.py`、`tests/test_mcp_stdio.py`
-  - 验证：`pytest tests/test_mcp_stdio.py tests/test_preview_mode.py -q`
-
-- [ ] **T5 (P1, human: ~1.5d / CC: ~1.5h) — `config.py` + `_indexer/watch.py` + `server.py` + `ingest/worker.py` — C58 auto_watch（含 6 处修正）**（用户 D1/D2；A1/A2/A7/A8/A13/A14/A17）
-  - **修正 1**（A2）：`_ingest_hook` 早退（`auto_watch` 关闭时零调用）+ 不在 watcher/防抖调度线程内同步跑全库扫描（丢给一次性 worker 线程或可合并的 dirty 标志）
-  - **修正 2**（A1）：硬闸门只拦「用户自己设的 cap」；channel 强加的 10MB 上限**维持今天的 PyMuPDF 兜底语义**（否则无 key 用户的 15MB PDF 从「粗糙结果」变硬失败）
-  - **修正 3**（D2=C）：`max_file_size_mb` 默认 **20**（非 0）；`0` 保留为显式不限制
-  - **修正 4**（A13）：`_run_job` 再兜一次闸门（覆盖 `_recover_zombie_jobs` 恢复的旧 job 与「排队后文件变大」）
-  - **修正 5**（A14）：自动模式判据走新函数 `_auto_pending()`，不动 `scan_pending()`（后者是 `kb_ingest(action='pending')` 的用户可见契约，`test_ingest_server.py:184-186` 已锁定）；「最新 job 状态」按 `submitted_at` 取 max（`_save_state` 超 500 会剪旧 failed）；failed 的退避策略必须独立于 sha（429 场景 sha 不变）
-  - **修正 6**（A8）：自动路径必须复用 ignore/exclude 过滤（`.vaultignore`、`exclude_patterns`、产物目录）——隐私边界不得扩大
-  - **修正 7**（A7）：改写 `ingest/worker.py:1-4` 与 `ingest/__init__.py:3-4` 的「不做 watcher 自动摄取」硬设计；`watch.py` 与 `server.py` 各留一张 ASCII 控制流图
-  - **修正 8**（A17）：`doctor`/`STATUS.md` 报 `auto_watch` 生效状态；自动触发写可见痕迹
-  - **修正 9**（A12）：更正计划中「避免 PDF 事件白跑一次全量 sha256 对账」的理由（`watch.py:134` 只对 `.md/.txt` 返 True，PDF 事件今天什么也不触发）；补 `events=None`（缓冲溢出）分支行为
-  - 文件：`mortis_rag_mcp/config.py`、`config/app.toml.example`、`mortis_rag_mcp/_indexer/watch.py`、`mortis_rag_mcp/server.py`、`mortis_rag_mcp/ingest/worker.py`、`mortis_rag_mcp/ingest/__init__.py`、`tests/`（5 个文件）
-  - 验证：`pytest tests/test_ingest_worker.py tests/test_ingest_server.py tests/test_watch_integration.py tests/test_fsnotify.py -q`
-
-- [ ] **T6 (P1, human: ~30min / CC: ~5min) — `tests/test_ingest_mineru.py` — C53 测试加固**（ENG；A15）
-  - 断言收到的 `Content-Type != application/x-www-form-urlencoded`，**且 `req.has_header("Content-type")` 为真**（锁死「显式空值」；http.client 会发出 `Content-type: `（空值），不是不发头——原测试对「空值或缺省」都放行 = 没锁定任何行为）
-  - 文件：`tests/test_ingest_mineru.py`
-  - 验证：`pytest tests/test_ingest_mineru.py -q`
-
-- [ ] **T7 (P1, human: ~1h / CC: ~10min) — `docs/PROJECT_GUIDE.md` — 转义污染清理（前置独立 commit）**（用户 D4；CEO 主题）
-  - 必须**排在 C58/C59 的文档改动之前**（否则同一文件里大段机械 diff 与语义编辑互相遮蔽）
-  - 方式：`grep -n '\\\[\|\\_'` 全量定位后批量还原；实测 §3.2 标题、§4.5、§六/§七 多处表格与代码引用行
-  - 顺手订正过期数字：`docs/PROJECT_GUIDE.md:432`「server.py 约 1064 行」→ 1313；`docs/Quick-start_developer.md:34`「1126 行」→ 1313
-  - 文件：`docs/PROJECT_GUIDE.md`、`docs/Quick-start_developer.md`
-  - 验证：渲染预览抽查 + `grep -c '\\\[\|\\_'` 归零
-
-- [ ] **T8 (P1, human: ~1d / CC: ~1h) — 四份文档 — C58/C59/C56 的文档同步（含新增小节 + 升级须知）**（DX Pass 4/Pass 5；A6）
-  - **新增**（不是修改）：`PROJECT_GUIDE.md` §四 ingest 模块专节（当前 §四 子节为 4.1 config → 4.10 doctor，无 ingest）、§七 `[ingest]` 小节（当前为 embedding/reranker/index/vector/cache）
-  - **补**：`PROJECT_GUIDE.md:626` 的环境变量优先级清单由三对扩为四对（+ 缓存根）
-  - **升级须知（3 处行为变更，逐条写）**：① `max_file_size_mb` 默认 20 → 20MB 以上文件在 `submit(None)` 里被跳过；② `kb_read(chunk_id=...)` 多库行为从「报错要求显式 vault_path」变「唯一命中自动展开」；③ 新增公开环境变量 `MORTIS_RAG_CACHE_DIR`
-  - `CHANGELOG_user.md` 的 `## [0.8.1]` 段：`tests/test_version_sync.py:18-20` 只强制「有条目」，不强制「有须知」→ 人工保证
-  - `QUICKSTART_user.md`：升级章节 + `auto_watch` 用户向说明（大白话，不写函数名/内部名）
-  - `skills/mortis-rag-mcp/SKILL.md`：C56 纪律（`:30`/`:39`/`:47`，建议 `:25`/`:28`）+ PDF 摄取章节
-  - 文件：`docs/PROJECT_GUIDE.md`、`docs/Quick-start_developer.md`、`QUICKSTART_user.md`、`CHANGELOG_user.md`、`skills/mortis-rag-mcp/SKILL.md`
-  - 验证：`pytest tests/test_version_sync.py -q`
-
-- [ ] **T9 (P1, human: ~2h / CC: ~15min) — `tests/test_adversarial_v070.py` — P0 竞态修复**（用户 D4）
-  - `test_gate_9_retryable_mineru_error`：`force=True` 重试后立即 `mgr.status()`，worker 尚未把 job 从 `failed` 翻回 `queued/parsing` → 改为带超时的轮询等待（参考 `test_stdio_wikilink_read` 的修法）
-  - 文件：`tests/test_adversarial_v070.py`
-  - 验证：本地单文件多轮 + CI 连续观察
-
-- [ ] **T10 (P2, human: ~1h / CC: ~10min) — `server.py` — C55 参数别名**（原计划，无修正）
-  - `_kb_init`(`612-613`)、`_kb_init_solo`(`652`/取参 `661-663`) 改为 `path or vault_path or vault or vault_name`；`inputSchema.required` 不动
-  - 文件：`mortis_rag_mcp/server.py`、`tests/test_scoped_search.py`
-  - 验证：`pytest tests/test_scoped_search.py tests/test_solo_vault.py -q`
-
-- [ ] **T11 (P2, human: ~1h / CC: ~10min) — `QUICKSTART_user.md` + `docs/Quick-start_developer.md` — C59 Windows 写锁说明（加强版）**（DX Pass 1/Pass 5）
-  - 除「先退出 MCP 客户端或结束进程」外，补**怎么确认是哪个进程占用**（如任务管理器按名称查 `mortis-rag-mcp.exe` / `vault-mcp.exe`）+ 备选路径（先 `pip uninstall` 再装 / 重启终端）
-  - 文件：`QUICKSTART_user.md`、`docs/Quick-start_developer.md`
-  - 验证：无代码改动，人工核对
-
-- [ ] **T12 (P2, human: ~2h / CC: ~15min) — `pyproject.toml` + `server.py` + `README`×2 + `CHANGELOG`×2 — C60 版本收口**
-  - `0.8.0 → 0.8.1`、`SERVER_INFO`、README 徽章、`SKILL.md` 头部版本（当前 `:4` 为 5.2.0 / `:7` 为 0.8.0）
-  - `CHANGELOG_user.md` 新增 `## [0.8.1]`（含 T8 的升级须知）；`PROJECT_GUIDE.md` §十五 版本详录（`837` 行起，倒序追加在顶部）
-  - `docs/Changelog_developer.md` 逐卡记账（从 `C53` 起；末位现为 `C52`）
-  - **把「真机 OSS 200 已验证 / 待实机验证」写进 CHANGELOG 正文**，而非留给口头承诺
-  - 文件：`pyproject.toml`、`mortis_rag_mcp/server.py`、`README.md`、`README_EN.md`、`CHANGELOG_user.md`、`docs/PROJECT_GUIDE.md`、`docs/Changelog_developer.md`、`skills/mortis-rag-mcp/SKILL.md`
-  - 验证：`pytest tests/test_version_sync.py -q`；全量回归交 CI
-
-### 扩张候选（交最终门决定）
-
-- [ ] **X1 (P1 候选, human: ~4h / CC: ~30min) — 云端摄取路径验收闸门**（E1；CEO 主题 2 + DX Pass 5/8）
-  - 交付物：一个可手动触发的真机 smoke（真实 `_put_upload` 对 OSS 预签名 URL 的 200 验证），或发版清单里一条不可跳过的检查项
-  - 理由：本次 403 事故（旗舰功能 100% 坏、3 天无人察觉）的**唯一**结构化成因是「付费云路径零真机验收」；7 张卡没有一张改变这一点
-  - 风险：需要维护者持 MinerU key；不引入第三方依赖（脚本用 stdlib）
-
-- [ ] **X2 (P1 候选, human: ~3h / CC: ~20min) — agent 约定式摄取**（E2；CEO 子代理独立提出 + DX Pass 3）
-  - 内容：注册库时返回「待解析清单 + 建议动作」，并在 `SKILL.md` 写死纪律（`kb_init` 后若见 PDF 提示，先问用户再 `kb_ingest`）
-  - 理由：`server.py:645-649`/`687-698` 的 hint 与 `SKILL.md:57` 已存在基础设施；**零线程、零意外扣费、不违 `worker.py:1-4` 硬设计**——是 C58 的可行替代或补充
-  - 风险：依赖 agent 遵守纪律，无强制力
-
-- [ ] **X3 (P3 候选, human: ~2h / CC: ~15min) — 新建 `TODOS.md`**（ENG + DX）
-  - 现状：仓库**无 `TODOS.md`**（也无 `CLAUDE.md`），所有延后项只能靠 changelog 承接
-  - 内容：TTHW 压缩、`list_files()` 全量构造优化、`_save_state` 剪枝重构、多平台 watcher、DX 度量体系、社区与外部信号
-  - 注意：**这是新增仓库根文件，需你显式同意**
-
-### 不需要行动的检查项（已核验通过）
-
-| 项 | 结论 |
+| 流程 | 必测情况 |
 |---|---|
-| C53 修法正确性 | **正确**。`has_header('Content-type')` 是精确键匹配（`urllib/request.py`），传空串确实抑制 urllib 的 `application/x-www-form-urlencoded` 注入；`http.client` 会发出空值头，OSS V1 StringToSign 下空值与缺省等价 |
-| 零第三方依赖铁律 | 遵守（`dependencies = []` 未动） |
-| 版本一致性守卫 | 存在（`tests/test_version_sync.py:14-20`） |
-| 编号无冲突 | `C53` 起未被占用（`C52` 为末位；`FIX-x` 并行线不冲突） |
-| `docs/*` gitignore | 正确（`.gitignore:19` + 3 条白名单） |
-| P2 的「副本文件」 | **伪命题**：`git ls-files docs/` 只有 3 个文件，副本不在仓库内 → 只需删本地文件（破坏性操作，需你单独确认） |
-| C58 的 per-channel 硬闸门先例 | 存在（`mineru.py:25-26` 200MB/10MB，错误码 `-60005`/`-30001`） |
-| 「0 = 关闭」邻域语义 | 存在（`batch_size<=0`、`max_age_days=0`、`watch_fallback_interval<=0`） |
-| C58 的 `channel_for` 闸门位置论证 | **准确**（`worker.py:352-365` 的 `except MineruError` → pymupdf 降级链路） |
-| `_ingest_hook` 是否破坏 Facade 冻结测试 | **不破坏**（冻结的 7 项在 `mortis_rag_mcp/__init__.py:6`，`test_facade_freeze.py` 只做 hasattr/集合断言） |
+| 前台隔离 | warm锁空闲但sync人为慢；warm锁已占用；cold static/external；暖缓存last_sync=None |
+| 完成语义 | 合法空库、全豁免库；后台失败后仍读旧结果并报错误 |
+| 合并 | 100请求只一调度线程；sync中有事件只一后续轮；1s内reads不100次扫描 |
+| 生命周期 | stop中拒请求；shutdown不重启；活线程保引用；重复start/stop幂等 |
+| fan-out | 两库cold/warm混合、Scoped solo、全局排除solo、query只embed一次 |
+| 读 | 直连未索引文件、短名cold、stale chunk签名、chunk不存在、索引变空 |
+| A4 | 真worker mock解析落盘→双参回调→request_refresh spy→后续能搜索；回调异常记录不杀队列 |
+| 可观测性 | status快照不等锁；diag四阶段顺序、无正文/路径/key |
 
-### 已过期的文档引用（顺手订正，不影响发版）
-
-`server.py` 实际 **1313 行**；`docs/PROJECT_GUIDE.md:432` 写「约 1064 行」、`docs/Quick-start_developer.md:34` 写「1126 行」、`docs/Changelog_developer.md:320`（C49 记录「1359→1126」）均过期。计划引用的其他 40+ 处行号全部准确（详见 Phase 3 事实核验清单）。
-
-> **⚠ 归因修正**：这三个数字是**文档过期**，不是「计划的失真」——`PLAN.md` 全文没有声称任何行数。原报告的「3 处规模性失真」表述已撤回，见下方第二轮审核。
-
----
-
-# 第二轮：独立对抗审核（用户要求）
-
-> 2026-09-29 · 用户裁定「起一个子代理独立审核方案」。审核方式：全新上下文的子代理，**把上述评审报告的全部断言当作需要证伪的主张**（而非事实），逐条回源码核验，按 5 维（完备性/一致性/清晰度/范围/可行性）评分。
-> 主审随后亲自复核了它提出的 4 条最关键证伪——**4 条全部成立**。
-
-## 审核裁决
-
-```
-审查对象：GSTACK REVIEW REPORT（第一轮）
-可信度：中偏低（5/10）
-理由：源码行号核验扎实、C53/C56/PDF 事件的硬事实基本对，但因果推断与严重度分级系统性夸大——
-      把既有缺陷、未量化的假设、设计权衡一律升格为 CRITICAL GAP，至少 6 条断言可被源码直接证伪。
-首轮质量分：5/10
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests/test_read_stale.py tests/test_anti_contention.py tests/test_diaglog.py tests/test_multivault.py tests/test_scoped_search.py tests/test_ingest_server.py tests/test_p5_lifecycle.py tests/test_sync_engine.py tests/test_concurrency_hardening.py tests/test_search_oracle.py -q
 ```
 
-## 被证伪的断言（主审已逐条回源码复核，全部确认审核方正确）
+**完成标准**：测试用Event证明前台返回早于sync release；不是把1.5s变0.1s。现有同期排序/去重/筛选oracle通过。提交 `fix(search): serve existing indexes while refresh runs in background`，A4记同一条技术账。残余：构造未加载大库、FTS短事务竞争、query embedding/rerank仍可能慢，分别可观测，不宣称都已解决。
 
-| # | 原报告断言 | 实际事实 | 影响 |
-|---|---|---|---|
-| F1 | 「`_init_cache_paths()` **无条件** mkdir 缓存根，与 `cache.enabled` 无关」 | `indexer.py:195` = `if self.config.cache.enabled and self.config.cache.dir:`，198-203 另有 `except OSError` 降级 | A5 判据重写；`[cache] enabled = false` 的文件（如 `test_search_filters.py:182`）本来就安全；「18153 个孤儿文件」是**文件**数，原报告把「建空目录」与「写文件」混为一谈 |
-| F2 | 「C58 的设计正建立在这条链上」（指 `on_job_finished` 死链） | C58 的 hook 直连 `_ingest_manager_for().submit(None)`，与之无关；「解析完可检索」由各 `kb_*` 的 `try_sync_with_guard`（`server.py:965/972/1132` 等）保证 | A4 因果判断撤回；缺陷仍真实（既有 bug + `server.py:794-795` 的 hint 对用户说谎），但**降为既有缺陷 P2**，不借 C58 搭车 |
-| F3 | 「`path_prefix` 逃出库 = High severity 新攻击面」 | `models.py:143-166` 是 `chunk.source.startswith(prefix)`，`source` 恒为库内相对 posix 路径 → 字符串比较**不可能**路径穿越，`../`/绝对路径只零命中 = 天生 fail-closed | A11 保留 DRY 价值，**撤回安全严重度**；Step 3 的「2 High severity」夸大，实际 0 |
-| F4 | 「计划的 3 处规模性失真」中的两处 | ①「1126 行」来自文档而非计划（计划未声称行数）；② 计划 C54b 写的是「逐一排查**所有** stdio 用例」，两个文件名是 changelog 举例 → 非穷举声明 | 交叉主题 4 重写；12 个文件的清单保留为**可执行清单**（省去逐个排查），不再是「计划漏项」 |
-| F5 | C58 的事件分类只影响「理由错但改动无害」 | 方向对，**但漏了 poll 路径**：`watch.py:46-58` 显示 poll（或非 Windows / native 启动失败）走 `_watch_loop`（第 57 行），不进 `_native_watch_loop` → 计划写的「poll 情况由 `_native_watch_loop` 30s 兜底补 ingest 扫描」**不成立，auto_watch 在 poll 下永不触发** | 见新增 T22（P1） |
-| F6 | 「显式超限报错砍掉 pymupdf 兜底」是未申报的行为变更 | 链路属实，但这是**偏好取舍**，且与用户 D2「全路径统一 20」存在张力 | A1 保留（区分「用户自设 cap」与「channel 强加 cap」），但明确标注它与 D2 的张力需你知情 |
+### [ ] C58a：自动摄取配置与统一size策略
 
-## 审核方挖出、原报告完全漏掉的 4 条（已复核成立）
+**前置**：无代码前置，可在C66后顺序做。文件：`config.py::IngestConfig/AppConfig.__post_init__/load_config`、worker的ImportError fallback dataclass、`config/app.toml.example`；新建 `tests/test_ingest_auto.py`。
 
-| # | 新发现 | 证据 | 严重度 |
-|---|---|---|---|
-| **N1** | **poll 模式下 auto_watch 永不触发** | `watch.py:46-58`：poll / 非 Windows / native 启动失败 → `owner._watch_loop`（57 行），`_native_watch_loop`（51 行）不参与。计划 C58 明确把 poll 交给该循环的兜底节拍 | **P1（真 bug，计划自相矛盾）** |
-| **N2** | **C55 的别名对模型与校验型客户端都不可见** | `server.py:192-195`：`kb_init_solo` 的 schema 只有 `path` 属性且 `required: ["path"]`。模型读的是 `inputSchema`，`vault_path` 不在 properties 里它就永远不会传；且计划要求「required 保持不动」与 C55 目标（消除参数名不一致）自相矛盾 | **P1（目标落空）** |
-| **N3** | **D3 的 env 覆盖若落在目录改名逻辑之后，跑测试会搬走宿主真实数据目录** | `config.py:72-84` 的 `resolve_default_cache_dir()` 有 `os.rename` 副作用（旧 `~/.vault_mcp_cache` 独占存在时原子搬迁）。env 覆盖必须**短路在它之前**，否则比写孤儿文件严重得多 | **P1（数据搬迁风险）** |
-| **N4** | **C57 的 `limit` 无上限会撞 payload 预算不变量** | `server.py:257`：`limit` 只有 `minimum: 1`、无 `maximum`；`budget_bytes` 是 `[500, 100000]`（`:259`）。C57 若照抄，大库一次可拉全量 | **P1（v0.8.0 不变量回退）** |
+1. dataclass尾部新增 `auto_watch: bool=False`、`max_file_size_mb: int=20`，不改变原字段位置与默认enabled。
+2. `load_config` 从 `[ingest]` 读取。auto_watch只接受真正bool；字符串 `"false"`不得经bool变True并授权上传，错误为具名ValueError。max用 `_numeric(...int,20,minimum=0)`，拒绝bool、负数、非整数、NaN/Inf。
+3. 编程构造AppConfig也校验这两个值；worker fallback dataclass同步同默认。`enabled=false + auto_watch=true`合法但不生效，doctor/hint警告，不使服务起不来。
+4. 尺寸上限按 `cap_bytes = max_file_size_mb * 1024 * 1024`，0返回不限。边界 `size==cap`允许，`size>cap`拦。
+5. example增明确注释：默认不上传、自动扫描会包含启用时既有文档、所有格式 `INGEST_EXTS`、20MiB上限、0不限、上传可能产生云端费用/隐私影响、修改后重启。
+6. 只新增配置，不改chunker/meta，不触发全库重嵌。不得新增默认enabled=true或代用户填写api_key。
 
-## 原报告的内部不一致（审核方指出，全部成立，已在本节上方逐条修正）
-
-1. Section 2 自评「过度工程：无」，却同时要求新增「只读文本层入口 + 纯函数拆分」→ A9 已改为两行开关方案。
-2. Failure Modes Registry 把「C58 的事件分类理由」标为 CRITICAL GAP，正文却说「改动无害」→ 理由错误本身不是 gap，**漏掉 poll 路径**才是（已拆分为 N1）。
-3. Section 3 说 C54 的 session 级单文件「设计正确」，Registry 却给同一设计两条 CRITICAL GAP → 区分「设计方向正确」与「执行细节有坑」。
-4. 「1/6 已确认」与共识表内两处 CONFIRMED 不符 → 已改为 2/6。
-5. **既有缺陷与本计划新引入风险混在同一张表、同一套评级里** → 本次拆表（见下）。
-6. A15 被指「自相矛盾」（既然空值与缺省等价，为何还锁头存在）→ 已澄清：锁的是**回归安全**，不是当前行为。
-
-## 拆表：既有缺陷 vs 本计划新引入风险
-
-> 这张区分决定了「该不该在本版修」的结论完全不同。原报告把两者混在一起并统一标 P1，是它最主要的方法论错误。
-
-**A 类 — 既有缺陷（本计划之前就已存在）**
-
-| 项 | 证据 | 原评级 | 修正后 | 是否本版修 |
-|---|---|---|---|---|
-| `on_job_finished` 参数不匹配，回调从未生效 | `worker.py:395` / `server.py:766` | P1 CRITICAL | **P2** | 是（用户 D4 已定「搭车修 P0」的同一精神；且它让 `server.py:794-795` 的 hint 说谎） |
-| 测试往真实缓存根写文件 | `indexer.py:195` + `cache.enabled` 默认 true | P1 CRITICAL | **P2** | 是（用户 D3 已裁定） |
-| `test_gate_9_retryable_mineru_error` flaky | `REPORT.md` P0 | P1 CRITICAL | **P2** | 是（用户 D4 已裁定搭车） |
-| `_save_state` 超 500 条剪掉旧 failed | `worker.py:136-145` | P1 CRITICAL | **P3** | 否（记入延后项） |
-| `list_files()` 先构造全量列表再切片 | `indexer.py:961-962` | 已知边界 | **P3** | 否 |
-| `_fts_ensure_populated` 在构造期可能写盘 | `indexer.py:216` | 计入 C56 代价 | **P3** | 否（但 A9 的开关会顺带绕开） |
-| 文档过期行号（1064/1126） | 三处文档 | 「计划失真」 | **P3** | 是（顺手，零风险） |
-
-**B 类 — 本计划新引入的风险（真正该进 P1 的）**
-
-| 项 | 来源 | 评级 |
-|---|---|---|
-| poll 模式下 auto_watch 永不触发（N1） | C58 | **P1** |
-| C55 别名对模型不可见（N2） | C55 | **P1** |
-| env 覆盖若位置不对会搬走宿主数据目录（N3） | D3 | **P1** |
-| C57 `limit` 无上限撞预算不变量（N4） | C57 | **P1** |
-| 自动路径若不复用 ignore 过滤 = 隐私边界扩大 | C58 | **P1** |
-| hook 在防抖线程内同步全库扫描 → 饿死文本 sync | C58 | **P1** |
-| 无 key 时 channel 强加 10MB 上限变硬失败（与 D2 有张力） | C58 | **P1** |
-| `_run_job` 闸门可被恢复的 queued job 与 TOCTOU 绕过 | C58 | **P2** |
-| C56 探测的全量构造代价（量级未实测） | C56 | **P2** |
-| `auto_watch` 状态不可观测 | C58 | **P2** |
-| 三处行为变更未写升级须知 | D2/C56/D3 | **P1** |
-| PROJECT_GUIDE §四/§七 需新增（非修改）ingest 内容 | C58 | **P1** |
-
-**结论**：A 类 7 项里只有 3 项建议本版修（且都因你的裁定 D3/D4 已在内）；**P1 的真正来源是 B 类的 12 项**，而原报告把注意力分给了 A 类的既有债。
-
-## 第二轮新增任务
-
-- [ ] **T22 (P1, human: ~3h / CC: ~20min) — `_indexer/watch.py` — poll 模式的 auto_watch 节拍（N1）**
-  - 问题：`watch.py:46-58` 的 poll 分支走 `_watch_loop`，计划指定的 `_native_watch_loop` 兜底节拍不存在 → poll 下 auto_watch 永不触发
-  - 修法：在 `_watch_loop` 里同样挂 ingest 节拍（复用 `watch_fallback_interval`），**或**在 poll 模式下明确不支持 auto_watch 并在 `doctor`/hint 里点明（fail-closed 的表态优于静默失效）
-  - 文件：`mortis_rag_mcp/_indexer/watch.py`、`mortis_rag_mcp/config.py`、`mortis_rag_mcp/doctor.py`、`tests/test_watch_integration.py`
-  - 验证：`pytest tests/test_watch_integration.py tests/test_fsnotify.py -q`
-
-- [ ] **T23 (P1, human: ~1h / CC: ~10min) — `server.py` — C55 的 schema 也要补 `vault_path`（N2）**
-  - 问题：`server.py:192-195` 的 `kb_init_solo` schema 只有 `path` 属性 + `required: ["path"]` → 模型看不到 `vault_path`，校验型客户端也会拒；原计划「required 保持不动」使 C55 目标落空
-  - 修法：`kb_init`/`kb_init_solo` 的 schema 增加可选 `vault_path` 属性（additive，向后兼容），描述里写明两种写法等价；`required` 放宽为 `[]` 或保留 `path` 但在描述中指明 `vault_path` 亦可。**顺带评估 `kb_remove` 的同类 schema/handler 分歧**（`server.py:179-182`）是否一并对齐
-  - 文件：`mortis_rag_mcp/server.py`、`tests/test_scoped_search.py`、`skills/mortis-rag-mcp/SKILL.md`
-  - 验证：`pytest tests/test_scoped_search.py tests/test_solo_vault.py -q` + `tools/list` 的 schema 体积复测（v0.8.0 有 ≤10% 门槛）
-
-- [ ] **T24 (P1, human: ~1h / CC: ~10min) — `config.py` — env 覆盖必须短路在目录改名之前（N3）**
-  - 问题：`config.py:72-84` 的 `resolve_default_cache_dir()` 有 `os.rename` 副作用；env 覆盖若在其后应用，跑测试会把宿主 `~/.vault_mcp_cache` 搬成新名
-  - 修法：env 存在时**直接返回，不进入改名分支**（在函数最前短路）；补一条测试断言「env 存在时不会调用 `os.rename`」
-  - 文件：`mortis_rag_mcp/config.py`、`tests/test_isolation_guard.py`
-  - 验证：`pytest tests/test_isolation_guard.py tests/test_path_migration.py -q`
-
-- [ ] **T25 (P1, human: ~1h / CC: ~10min) — `server.py` — C57 的 `limit` 加上限（N4）**
-  - 问题：`kb_search` 的 `limit` 只有 `minimum: 1` 无 `maximum`；C57 若照抄，大库一次拉全量 → 撞 v0.8.0 的 payload 预算不变量
-  - 修法：`kb_list_files.limit` 走与 `top_k` 同款夹取（`max_top_k`）或显式设 `maximum`；并写清 `limit` 与 `budget_bytes` 的关系
-  - 文件：`mortis_rag_mcp/server.py`、`tests/test_mcp_stdio.py`
-  - 验证：`pytest tests/test_mcp_stdio.py tests/test_preview_mode.py -q`
-
-## 第二轮修正后的完成小结
-
-```
-  +====================================================================+
-  |     SECOND-ROUND ADVERSARIAL REVIEW — CORRECTED SUMMARY            |
-  +====================================================================+
-  | 首轮质量分（对抗审核方给） | 5/10（可信度中偏低）                     |
-  | 被证伪的断言              | 6 条（F1-F6），主审已逐条回源码复核        |
-  | 审核方新挖出的问题         | 4 条（N1-N4），全部成立且均为 P1           |
-  | 内部不一致                | 6 处，已在本报告内逐条修正                 |
-  | 评级重构                  | 既有缺陷 7 项降级为 P2/P3；P1 来源改为     |
-  |                          | 「本计划新引入风险」12 项                   |
-  | 修正后自动裁决数           | 23 项（原 20 + A19/A20/A21）              |
-  | 修正后任务数              | 25 项（原 21 + T22/T23/T24/T25）          |
-  | 修正后 P1 数              | 12（B 类）+ 3（A 类中建议本版修者）= 15     |
-  +====================================================================+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests/test_ingest_auto.py tests/test_path_migration.py tests/test_doctor.py -q
 ```
 
-**这一轮的元教训（值得写进后续评审的方法论）**：单声部评审（Codex 缺席）时，主审的严重度分级会系统性漂移——把「既有缺陷」当「本计划引入的风险」、把「无法穿越的字符串比较」当「安全漏洞」、把「未实测的估计」当「High 性能问题」。**用户主动要求「起一个子代理独立审核方案」是本次的关键动作**：如果没有它，上述 6 条错误断言会原样进入施工图。
+**验收**：默认双关闭、20MiB；bool拒收、零/边界校验与TOML/Python3.10 fallback通过。建议提交 `feat(config): add opt-in ingest auto watch and size policy`。
 
----
+### [ ] C58b：size闸门、自动候选与持久化免重试
 
-# 第三轮：对抗审核的对抗审核（用户要求）
+**前置**：C58a。文件：`ingest/worker.py`，`tests/test_ingest_auto.py/test_ingest_worker.py/test_adversarial_v070.py`。新增逻辑留在manager，不让watch直接负责job状态；不改registry锁API。
 
-> 2026-09-29 · 用户裁定「再打一轮对抗审核，专门去证伪第二轮（含 N1-N4），并审 E1/E2 本身值不值得做」。
-> 方式：第三个全新上下文的子代理，明确要求「不要因为第二轮推翻了第一轮就认为第二轮更可信」。主审随后复核了它最关键的两条硬事实——**两条均成立**。
+**状态数据契约**：
 
-## 三轮可信度裁决
+```text
+.ingest_state.json                 (保留 version/jobs，旧数据可读)
+  jobs: <原任务历史，仍最多约500终态记录>
+  auto_seen:
+    relative_source: {sha256, state, submitted_at, last_job_id}
+  auto_watch:
+    {last_scan_at, last_error, submitted, skipped_too_large,
+     skipped_seen, skipped_ignored}
 
-| 轮次 | 可信度 | 评价 |
-|---|---|---|
-| 第一轮（主审 + 三子代理） | **中** | F1/F3/F4/F6 的原始判断确有夸大与归因错误；但范围清单（NOT-in-scope、延后项）与对 C58 风险面的覆盖**更完整** |
-| 第二轮（对抗审） | **中偏低** | F1-F5 的证伪正确；但「N1-N4 全部成立且均 P1」被本轮**证伪 3 条**（N2 严重度错、N3 定性错、N4 全错），降级也有过度处 |
-| 综合 | — | **第二轮方向更接近真相**（拆「既有缺陷 vs 新风险」的方法论正确、F 系列基本可信），**但其 N 系列的评级理由不可信**；**第一轮在「本版该做什么」上更可靠** |
-
-## N1-N4 终裁（第三轮证伪第二轮）
-
-| # | 终裁 | 证据与理由 | 终评级 |
-|---|---|---|---|
-| **N1** | **成立，且比第二轮说的更严重** | `watch.py:46-59` 成立。**关键补充**：`fsnotify.py:218-242` 非 win32 恒 False + `config.py:210` 默认 `auto` ⇒ **Linux/macOS 是 100% poll，属常态而非极端回退**；Windows 上才是异常路径。另：`_fs_scheduler_loop`（`:71-93`）在 poll 下也会启动，但 `_fs_requested` 只由原生事件设置（`:112-117`）→ poll 下永假 | **P1 维持**（范围扩大到「非 Windows 平台 auto_watch 完全不可用」） |
-| **N2** | **部分成立，降级** | schema 事实成立（`server.py:170-174`/`192-195`），且**无任何测试用别名**（正则扫 tests 零命中）、`PROJECT_GUIDE.md:496-500` 也只写 `path`、`kb_remove` 的四别名（`:709-716`）同样零测试 → 证据支持「既存口径不一致、从没人用过」。但「做了等于没做」不成立：MCP 客户端通常不拒收 properties 之外的参数（未禁 `additionalProperties`），handler 别名对「模型受其余 15 个工具的 `vault_path` 习惯影响而误传」**是有效的**——那正是 issue #3 的痛点。且 `PROJECT_GUIDE.md:1099` 有 ≤10% schema 体积门禁 → 不改 schema 属保守取舍 | **P2**（降级）；真正该补的是 **description 与报错文案**（`server.py:615`/`663`）——这一点**三轮都没提** |
-| **N3** | **部分成立，定性错误** | `config.py:77` 的 rename 条件苛刻（new 不存在且 old 存在）；**关键**：`config.py:437` 显示 `resolve_default_cache_dir()` **今天已在每次 `load_config()` 生效** → 这不是 D3 新引入的风险，而是**既有行为**；且 rename 是 v0.7.1 设计内的原子迁移（`CHANGELOG_user.md:70,86-87`），**不是数据销毁**。`tests/conftest.py:26-28` 那条注释针对的是 **registry 目录**，不是 cache 目录 | **P3**（降级）；短路的做法仍值得做（严格更优），但不阻塞发版 |
-| **N4** | **不成立** | ① `budget_bytes` 是 `kb_search` 的专属可选参数（`server.py:259`；`fanout.py:43-44` 仅非 None 时生效），`kb_list_files` **没有**这条通道（`server.py:238-241`/`963-966`）；② `kb_search.limit` **实际已被夹取**——`server.py:92-107` 的 `_search_filter` 有 `limit = min(limit, max_limit)`（**主审已亲自复核，确认属实**）；③ `list_files()` 返回摘要 `{source,title,chunks}`（`indexer.py:962`），与返回全文 chunk 的 kb_search 差几个数量级；④ C57 默认全量 = 现状（`PLAN.md` C57 卡原文） | **P3**（降级），且**理由错误**：「撞不变量」是把现状说成回归 |
-
-## F1-F6 复核（第三轮的判断）
-
-F1 成立（`indexer.py:195`/`198-203`）· F2 成立**但「hint 说谎」夸大**——`server.py:794-795` 的产物确实落盘，各 `kb_*` 自带 `try_sync_with_guard`（`:965/972/1132`），所以是**时延问题而非说谎**（措辞已在 A 类表修正）· F3 成立（`models.py:148-166`）· F4 基本成立 · F5 = N1，成立 · F6 部分成立（「未申报行为变更」改判为偏好取舍成立，但与 D2 的张力真实）。
-
-## 过度修正检查
-
-- 大部分降级合理：`_save_state`（C58 用 `_auto_pending` 绕开）、`list_files` 全量构造（已在 NOT-in-scope）、`_fts_ensure_populated`（A9 顺带绕开）——维持 P3。
-- **降过头的一项：`on_job_finished`**。第二轮降 P2 并「留作 TODO」是过头的：修法 1 行、与用户 D4「P0 搭车」的精神一致，且它的缺席使「解析完立即可检索」退化为「下次调用才同步」。→ **改为：进本版（P2，不升 P1）**。
-- 用户问题 17 的答案：4 项未决里「文档过期行号」已在 T7 覆盖；其余 3 项维持不进本版正确。
-
-## E1 / E2 终裁（第三轮独立评估）
-
-**E1 —— 降级做（不进 CI）**
-- `ci.yml` 只有**单 job**（19-67）、**零 secret 注入**、无双跑 → 真机 smoke 需要付费 MinerU key，**不适合进 CI**（每次运行烧额度，且无 secret 通道）。
-- 「清单条目」**有载体**，不是自我安慰：`PROJECT_GUIDE.md:764-769` 的发布 4 步 + `docs/Changelog_developer.md` 的「验证：」记账先例（C13/C14 都有）。
-- 落地形态：**C53 与 C60 卡各加一个发版必填字段「实机验证 / 或显式声明未验证」**；可选 `scripts/smoke_mineru.py`；`ci.yml:10` 已声明 `workflow_dispatch`，需要时可挂一个**手动触发**的真机 job。
-- 观察点：**不加 CI 自动 job**——无 secret 通道且烧额度。
-
-**E2 —— 降级并入 C58（不单列卡）**
-- hint **已存在且被测试锁定**：`server.py:638-649`/`687-698`；`tests/test_ingest_server.py:65,83,99` 断言 `ingestible_docs`。`SKILL.md` 关于摄取只有 `:49`、`:57` 两句。C58 的文档项**已含** SKILL.md PDF 章节。
-- E2 的独特价值只剩「`auto_watch` 默认关时的默认路径」；**增量 ≈ hint 带上 pending 清单 + 一句纪律（S）**。
-- 判定依据：**纪律不可测、机制可测** → 作为 C58 子项，不单列卡。
-- → 原 X2/E2 任务从扩张候选**降为 C58 内的一条子项**。
-
-## 两轮共同盲点（第三轮挖出，主审已复核 B3）
-
-| # | 盲点 | 证据 | 严重度 |
-|---|---|---|---|
-| **B1** | **同名参数、相反缺省**：`kb_list_files.limit` 缺省=全量，而 `kb_search.limit` 缺省=top_k | `server.py:257` vs C57 卡原文「不传参数时行为与现在完全一致」 | **P1**（模型必然误判） |
-| **B2** | **`truncated` 一词两个语义**：C57 新增的 `truncated` 是「被分页截断」，而 v0.8.0 的 `apply_budget.truncated` 是「字节预算截断」 | `fanout.py:50-58` | **P1**（消费方会误读） |
-| **B3** | **C60 会漏掉日志版本号**：`diaglog.py:195` 的 `version: str = "0.8.0"` **与** `:226` 的 `str(version or "0.8.0")` 两处硬编码 | **主审已亲自复核，两处均确认存在**；另有 `tests/test_diaglog.py:120` | **P1**（版本收口不完整） |
-| **B4** | **C56 的 A9 只解决向量部分**：每个未加载库的 **chunks 缓存**仍会全量加载 | `indexer.py:249-282` 的 `_init_cache_paths` 无条件调 `_load_chunks_cache()`；`load_vectors=False` 开关覆盖不到 | **P2** |
-
-第三轮自陈的两项不确定（如实保留）：
-1. 主流 MCP 客户端对 `inputSchema` 之外参数的实际校验行为——**仓库内无证据可证**，其判断基于「JSON Schema 默认放行」。
-2. C56 的临时 `MarkdownIndexer` 是否会泄漏 `FtsIndex` 的 sqlite 连接/句柄——未读完 `_init_cache_paths` 与 FtsIndex 的完整生命周期，`load_vectors=False` 只覆盖向量部分（与 B4 同源）。
-
-## 第三轮修正后的任务调整
-
-| 任务 | 原评级 | 终评级 | 变化 |
-|---|---|---|---|
-| T22（poll 模式 auto_watch） | P1 | **P1** | 保留，**范围扩大到「非 Windows 平台 auto_watch 完全不可用」** |
-| T23（C55 schema） | P1 | **P2** | 改写：**不改 schema**，改为补 `description` 与 `server.py:615`/`663` 的报错文案（提及 `vault_path` 亦可）；依据 `PROJECT_GUIDE.md:1099` 的 schema 体积门禁 |
-| T24（缓存根 env 短路位置） | P1 | **P3** | 降级：`resolve_default_cache_dir()` 今天已在每次 `load_config` 生效，rename 是 v0.7.1 设计内迁移而非数据销毁 |
-| T25（C57 limit 上限） | P1 | **P3** | 降级且理由重写：`limit` 实际已被 `_search_filter` 夹取（`server.py:98`）；禁 `kb_search.limit` 无 max 属口径问题而非风险 |
-| **T26（新）** | — | **P1** | **`diaglog.py:195` + `:226` 的硬编码版本号纳入 C60 收口清单**（含 `tests/test_diaglog.py:120`） |
-| **T27（新）** | — | **P1** | **C57 的 `limit` 缺省语义与 `truncated` 语义去重**：要么让 `kb_list_files.limit` 缺省对齐 `kb_search`（取 top_k 风格默认），要么在 schema 描述里显式写明「缺省返回全量」；同时把 `truncated` 换成不与字节截断撞名的键（如 `page_truncated`），或在描述里明确两者区别 |
-| **T28（新）** | — | **P2** | **C56 的探测代价需覆盖 chunks 部分**：`load_vectors=False` 之外，评估「只读 chunks 层」或进程级 chunk_id 索引（A9 的 B4 补充） |
-
-**第三轮元教训（与方法论有关，值得留下）**：**「对抗审核」本身也会过度修正**。第二轮的 4 条新发现里有 3 条的严重度或定性是错的——它把「既有行为」当「新风险」（N3）、把「已被夹取」当「无上限」（N4）、把「保守取舍」当「目标落空」（N2）。三轮下来最稳的结论是：**F 系列（证伪第一轮）基本可信，N 系列（新发现）需要逐条回源码复核严重度**。→ 若还有第四轮，应该审「第二轮的 N 系列评级」而不是再审事实。
-
----
-
-# 最终状态：APPROVED + 施工图
-
-> 2026-09-29 · 状态：**APPROVED**（用户裁定 A：先写回卡片正文，再批）
-> 本文件现由三部分组成：① 原始计划（已按三轮评审改写卡片正文）② 三轮评审报告（审计链）③ 本节（施工图收口）
-> 改动范围：11 张卡（C53-C64，其中 C61-C64 为本轮新增）+ 4 份文档 + 2 份 CHANGELOG + `.gitignore` 白名单
-
-## 最终优先级拆表
-
-原报告最大的方法论错误是把「既有缺陷」与「本计划新引入的风险」混在一张表、统一标 P1。拆开如下。
-
-### B 类 — 本计划新引入的风险（**真正的 P1，阻塞发版**）
-
-| # | 项 | 卡 | 证据 |
-|---|---|---|---|
-| 1 | poll / 非 Windows 下 auto_watch 完全不可用 | C61（C58） | `watch.py:46-59` + `fsnotify.py:218-242` + `config.py:210` |
-| 2 | hook 在防抖线程内同步全库扫描 → 饿死文本 sync | C58 | `watch.py:71-93` |
-| 3 | 自动路径不复用 ignore 过滤 = 隐私边界扩大 | C58 | `worker.py:48` 有现成清单 |
-| 4 | 无 key 时 channel 强加 10MB 上限变硬失败（与 D2 有张力） | C58（A1） | `mineru.py:118-122` + `worker.py:352-365` |
-| 5 | `_run_job` 闸门可被恢复的 queued job 与 TOCTOU 绕过 | C58（A13） | `worker.py:300` |
-| 6 | `kb_list_files.limit` 与 `kb_search.limit` 同名相反缺省 | C62（C57） | `server.py:257` vs C57 承诺 |
-| 7 | `truncated` 一词两个语义（分页 vs 字节预算） | C62（C57） | `fanout.py:50-58` |
-| 8 | `diaglog.py` 两处硬编码版本号，收口会漏 | C63（C60） | `diaglog.py:195`/`:226`（**主审已复核**）+ `test_diaglog.py:120` |
-| 9 | 三处行为变更未写升级须知 | C60（T8） | `test_version_sync.py:18-20` 只强制「有条目」 |
-| 10 | PROJECT_GUIDE §四/§七 需**新增** ingest 内容（非修改） | C58（A6） | §四 子节 4.1→4.10 无 ingest；§七 子节无 ingest |
-| 11 | 真机 OSS 200 无任何验收手段 | C53/C60（E1） | `ci.yml` 单 job、零 secret |
-| 12 | C55 别名不可发现（模型读 schema） | C55（N2） | `server.py:192-195` |
-
-### A 类 — 既有缺陷（本版之前就存在；3 项因 D3/D4 已在内）
-
-| # | 项 | 终评级 | 是否本版修 | 说明 |
-|---|---|---|---|---|
-| 1 | `on_job_finished` 参数不匹配（回调从未生效） | **P2** | **是** | 1 行修法；与 D4「P0 搭车」同精神；修后 `server.py:794-795` 的 hint 才为真 |
-| 2 | 测试往真实缓存根写文件 | **P2** | **是**（D3） | 真实机制见 C54b |
-| 3 | `test_gate_9_retryable_mineru_error` flaky | **P2** | **是**（D4） | 带超时轮询 |
-| 4 | `_save_state` 超 500 条剪掉旧 failed | P3 | 否 | C58 用 `_auto_pending()` 按 `submitted_at` 绕开 |
-| 5 | `list_files()` 全量构造后才切片 | P3 | 否 | 已在 NOT-in-scope |
-| 6 | `_fts_ensure_populated` 构造期可能写盘 | P3 | 否 | C56 的开关顺带绕开 |
-| 7 | 文档过期行号（1064/1126） | P3 | **是**（随手） | `server.py` 实际 1313 行 |
-| 8 | C54 的 env 覆盖若位置不对会触发目录改名 | **P3** | 是 | `resolve_default_cache_dir()` 今天已在每次 `load_config` 生效；rename 是 v0.7.1 设计内迁移，非数据销毁 |
-| 9 | `kb_list_files.limit` 无 schema 上限 | **P3** | 否 | handler 侧已有夹取口径；加上限反而改默认行为 |
-
-## 开工顺序（冲突已标注）
-
-```
-Lane E（最先，独占 docs/）      P1 转义清理 + 过期行号订正 + 仓库地图/白名单修齐（X3）
-                                 ↓ 必须完成后再动 PROJECT_GUIDE
-Lane A（可并行）                C53 → C63（diagnlog 版本）
-Lane B（可并行，独占 tests/）    C54（a/a'/b/c）+ P0 flaky + 新增 tests/test_isolation_guard.py
-Lane C（server.py 顺序）        C55 → C56 → C57(+C62) → C64
-Lane D（依赖 A/B 与 A4 修复）    A4 修回调链 → C58（含 C61）→ C59
-最后                            T8 文档同步（依赖 E 与 C58）→ C60 收口
+auto_seen <= 当前/历史源文件数，不复制正文/路径绝对值/key
+连续源未变 + done/failed/queued/parsing -> skip
+源hash变 -> eligible -> under lock recheck -> enqueue one
+手动submit -> 同步账本当前状态，允许失败重试
+.ingest.lock -> 复用现有state文件锁
 ```
 
-**进度**（2026-09-29）：**Lane E 已完成** —— 分支 `feat/v0.8.1`，三笔提交：`e5eb33d`（FIX-9 转义清理）、
-`96e205f`（FIX-10 行号+仓库地图/白名单+新建 Execution-plan）、`eaceabf`（记账）。下一步 Lane A（C53 → C63）。
+1. **先加size测试**：分别覆盖显式、扫描、auto、force、恢复queued、入队后变大。mock `_client_or_make/channel_for/_pymupdf_fallback` 计数，超策略cap必须全为0。
+2. 新增manager私有 `_size_limit_bytes/_check_file_size`（名字可按已有风格，语义固定）。显式sources先全部_validate/stat/size，再算hash/创建任何job；任一超限整批ValueError，不“先入一半再失败”。
+3. 扫描size检查放在sha256之前；pending保留new/changed条目结构，对超限项返回 `reason="too_large"`、`size`、`limit_bytes`，无需hash。submit(None)过滤超限并返回 `skipped_too_large`；不是所有pending项都可直接入队。
+4. `_run_job` 在沙箱校验后、创建产物目录/构造client/parse前再stat+size；恢复旧queued仍拦。force只强制解析，不绕过size或沙箱。
+5. 策略cap不替代MinerU通道cap：配置20MiB内但Agent通道>10MB触发原MineruError时，保留PDF/PyMuPDF既有fallback；不是PDF不启用本地兜底。retryable网络失败依旧failed，不固化fallback。
+6. 保持 `_validate_safe_source` 路径检查，拒绝绝对路径、`..`、出vault symlink。自动扫描 `scandir(...follow_symlinks=False)`，不跟随目录/文件链接；工作入口再resolve校验。后缀限INGEST_EXTS。
+7. 不把 `scan_pending()` 改成“自动失败免重试”。它仍是用户pending清单；仅按size扩充拒绝原因。自动新增 `_auto_pending()`，在其内部复用现有遍历/默认排除清单与新的可选ignore predicate。
+8. ignore来源：server把indexer的IgnoreMatcher规则供应器注入manager，扫描每轮重取最新 `.vaultignore/config.exclude_patterns`；不是构造时永久快照。默认排除 `_EXCLUDED_DIR_NAMES`、output_dirname与assets/temp/state目录。
+9. 对自动候选先stat+size+ignore，再算hash；重复扫描可用本轮/manager内stat缓存优化，但粗刻度/mtime回拨仍需保守复核。不要仅mtime+size就永远信任PDF未改，优先正确性。
+10. 账本与job一并复用现有 `_lock -> _process_file_lock` 事务load/recheck/save；auto_submit只有enabled && auto_watch才工作。锁内重验active_sources/auto_seen，避免同一manager重复扫描重复入队；不新增文件锁API或跨进程消费者框架。
+11. 旧state缺auto_seen时从jobs按submitted_at最新构建；不能用dict最后一条替代max。done且hash相同不重复传；failed/active同hash也记账。保留旧state读写/恢复方式，仅补新增字段兼容，不重构损坏state的整体恢复策略。
+12. `_save_state` 剪job不能剪auto_seen。账本允许对**本轮成功完整扫描证实已删的源**清理；扫描有OSError/中断时不清理，避免一次权限问题清空去重证据。无需新数据库。
+13. `_worker_loop` queued/parsing/done/failed转换时同事务更新auto_seen（手动job也更新），每源只存最新版本sha。若旧job完成而源已有新版本排队，旧job终态更新自己的jobs，但不能覆盖新sha的auto_seen。A→B→A按版本变化再次eligible；不是永久保存每个历史hash的黑名单。不要因failed.retryable=True自动重提连续未变版本。
+14. 明确auto_seen丢失的边界：用户主动删除/损坏全部state且又启用auto_watch，可能重新上传；状态诊断要显示恢复/重建，文档告知不要删state解决问题。不能承诺跨状态全丢失仍exactly-once。
+15. 新公共 `auto_submit()` 调 `_auto_pending` → 共用现有submit队列入队逻辑，不新建第二worker；零候选不创建无用worker。活任务去重与手动force维持既有语义。
+16. 默认关闭路径零扫描/零hash/零client/零worker。读取status允许报告，但不得借status隐式上传。
+17. 限制auto_watch诊断摘要长度，status返回计数+最多5个拒绝样例，不塞全库pending。字段不写到kb_stats.skipped_unsupported（原语义明确排除可摄取格式）。
+18. 更新worker与ingest/__init__.py的“仅显式submit、不做watcher”的旧docstring：改成“默认手动，显式授权后可自动”，不能留旧硬性设计相互矛盾。
 
-**冲突提示**：Lane C 与 Lane D 都改 `server.py` → 顺序执行；Lane B 与 Lane D 都改 `tests/` → 顺序执行；
-**Lane E 必须先于 C58 的 §四/§七 新增**（否则机械 diff 与语义编辑互相遮蔽）。
+**测试清单**：
+默认关闭零副作用；20MiB±1/0无限；sources混合超限整批不入队；扫描保留too_large诊断；
+Agent限额PDFfallback；queued恢复/源变大二次闸门；ignore配置与动态 `.vaultignore`；
+符号链接逃逸/排除目录；同hash四种状态skip；changed hash新job；>500历史剪枝免重传；
+旧state迁移；手动失败重试/force不越cap；A→B→A契约；旧job终态不覆盖新sha；
+同manager重复auto_submit只一新job；读status不启动新自动任务；既有恢复用例继续通过。
 
-## 25 项任务聚合（跨三轮评审）
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests/test_ingest_auto.py tests/test_ingest_worker.py tests/test_adversarial_v070.py tests/test_ingest_server.py tests/test_registry.py -q
+```
 
-**P1（15 项，阻塞发版）**
-- 云端验收发版必填字段（C53/C60，E1 降级形态）· agent 约定式摄取并入 C58（E2 降级）
-- poll 路径 ingest 节拍（C61）· C58 的体积闸门四条修正（A1/A8/A13/A14）
-- `kb_list_files` 缺省语义 + `truncated` 改名（C62）· diaglog 版本去硬编码（C63）
-- C54 三件套 + 缓存根 env 覆盖 + 全量清单（C54a/a'/b）· 修 `on_job_finished` 死链 + 回归测试（A4）
-- 三处行为变更的升级须知（T8）· PROJECT_GUIDE 新增 ingest 内容（A6）· C56 探测改两行开关 + 错误路径 + 可观测性
-- C57 的 `total`/`next_offset`/`prefix` 复用 · C55 的 description + 报错文案 · P1 转义清理（前置 commit）· P0 flaky
+**验收/提交**：所有网络mock；静态failed不自动重试；>500用例必须通过。提交 `feat(ingest): enforce size policy and persist automatic submission dedupe`。明确账本状态落盘与既有state兼容，不更改缓存协议。
 
-**P2（6 项）** · **P3（4 项）** —— 明细见 `~/.gstack/projects/moton16-Mortis-RAG-MCP/tasks-*.jsonl`
+### [ ] C58c + C61：原生/poll自动触发与扫描合并
 
-## 产物清单
+**前置**：C66、C58b。文件：`_indexer/watch.py`、indexer初始化/Facade、`tests/test_watch_integration.py/test_fsnotify.py/test_ingest_auto.py/test_p5_lifecycle.py`。
 
-| 产物 | 位置 |
+**设计**：文本refresh与PDF自动扫描不同工作单元。事件线程只能置标志；PDF扫描不可占用唯一文本防抖线程。增加每库一个按需 `vault-ingest-scan` 合并worker，不每事件创建线程。
+
+```text
+native event  .md/.txt       -> existing refresh flag -> vault-fs-debounce -> sync
+              PDF/Office    -> ingest dirty flag ----> vault-ingest-scan -> auto_submit
+poll/start/fallback cadence -+                                  |
+                                                         ingest-worker parse
+                                                               |
+                                          A4 callback -> immediate request_refresh
+```
+
+1. indexer增加 `_ingest_hook=None`、ingest短锁/Condition、dirty、worker引用、停止状态与最近scan时间；hook由server注入。无hook时全部自动分支早退，不扫描文档。
+2. 新私有 `request_ingest_scan()`：仅做锁/置dirty/notify，按需启动最多一条扫描worker。先保存thread引用再start；同库100事件只一worker。handler中不调scan_pending/auto_submit。
+3. 扫描worker在锁外调hook；开始前清dirty，期间新事件置dirty，完成后合并下一轮。失败记诊断、退避复用0.5→5s；不得 tight-loop重复扫描/上传。
+4. 原生事件逐条判断text/ingest两类，不能“遇到text就break导致后续PDF漏掉”。缓存目录/默认排除/ignore中的事件两类均排除，**最终上传授权仍由manager重新校验**。
+5. 只PDF事件不触发全库文本sync；只有解析完成后A4触发refresh。文本事件不调用ingest扫描，除非同批还有文档事件。目录rename/空路径/`events=None`无法确定类型时请求两类；自动关时仍仅文本路径。
+6. `_native_watch_loop` 启动请求一次ingest扫描；每 `watch_fallback_interval>0` 节拍请求扫描，事件丢失有兜底；不把hook放在 `_run_sync_quietly`（否则每次纯文本sync都会扫描PDF）。
+7. `_watch_loop` 启动同样请求一次；PDF不在 `_quick_signatures` 的0.25s文本集里，自动扫描另用monotonic节拍。**明确0规则**：`watch_fallback_interval=0`关闭native文本兜底，但开启auto_watch的poll文档扫描仍采用私有30s默认节拍，避免0使功能失效；doctor/hint回显effective_interval。
+8. 原生启动失败/运行中死亡回退poll后保持自动扫描；不能因fallback又建第二scan worker。Linux/macOS默认auto→poll也必须有测试模拟覆盖。
+9. 复制尚在进行的文档：扫描发现(stat size/mtime)后至少间隔一次debounce采样稳定才哈希入队；仍在变化则延后本源，不阻塞其他源。
+10. worker解析前哈希与入队hash不符时标source_changed，等待下一扫描按新hash入队；不引入上传临时副本。
+11. stop先set停止、清dirty、notify，再join扫描线程；hook慢于2s则保留引用与_stopping，停止后不再次调hook/入新job。所有测试解除Event后等待资源清理。
+12. manager parse任务已开始的云上传不能由关auto_watch撤回；停止scan只禁止新自动入队。不宣传即时取消云端请求，runtime改配置以重启生效。
+13. 为上述流在watch/server附近写小ASCII控制图，注释解释“扫描与文本sync分离”的理由，不复制整份计划。
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests/test_watch_integration.py tests/test_fsnotify.py tests/test_ingest_auto.py tests/test_p5_lifecycle.py -q
+```
+
+**验收**：native、poll、非win回退、watcher死亡、events=None、interval0、启动既有文档、慢hook不阻文本、事件风暴合并、stop后零新上传均通过。提交 `feat(watch): trigger coalesced automatic ingest across native and poll modes`；C61记为同批完成。
+
+### [ ] C58d：server接线、hint、doctor与实时状态
+
+**前置**：C58c。文件：`server.py::_indexer_for/_ingest_manager_for/_kb_init/_kb_init_solo/_kb_ingest/_kb_stats/shutdown`、`doctor.py::check_config/render_md`，`tests/test_ingest_server.py/test_doctor.py/test_ingest_auto.py`。
+
+1. `_indexer_for` 在 `start_watching()`之前挂hook，仅effective=`enabled && auto_watch`时挂；不在hook闭包定义阶段构造manager，不默认创建 .mortis-parsed。
+2. hook闭包惰性获取manager后auto_submit；manager注入最新ignore供应器时不反向拿 `_indexers_lock`。锁顺序：禁止持 `_ingest_managers_lock` 再调用 `_indexer_for`，避免反向嵌套死锁；完成回调也只用已存在引用。
+3. `enabled=false/auto_watch=false`返回hook None；矛盾键在kb_init/kb_ingest hint点明“自动设置不生效”。不把调用status当许可。
+4. 保留 `kb_ingest action=submit/status/pending` 三态，**不把schema写成scan_pending/source**。当前submit参数是 `sources`列表，文档/skill全部使用实际名字。
+5. init/solo hint保留 `ingestible_docs`，新增auto effective、size cap、授权风险与建议动作；默认手动给 `pending`→用户确认→submit流程。pending摘要最多5条且避免启动时全量hash；不得重复输出数千路径。
+6. `kb_stats` 新增 `ingest_auto` 小对象：configured/effective、max_file_size_mb、watch_method/effective_interval、last_scan_at、last_error、拒绝计数；只读现有manager状态，manager不存在则last_scan=null。不为stats启动扫描/worker。
+7. doctor `check_config` 报配置effective/size/cadence与矛盾警告；保持VALID判定不因auto关而失败。STATUS中的“最近自动扫描”只可写已有state的最后记录、标“报告生成时快照”，不能冒充实时更新、不能构造manager/联网。
+8. runtime最近scan通过kb_stats/status拿；doctor不循环刷新信任锚，不给STATUS注入全pending列表。
+9. `shutdown/_kb_remove` 停scan hook、新refresh，再停止watch；保留已开始任务的不可撤回说明。不要删产物和 `.ingest_state.json`。
+10. 新增一条mock端到端集成：enabled+auto true→放PDF→扫描一次→fake parse→md原子落盘→A4刷新→kb_search命中；native与poll各测，负路径自动关明确未调用parse。
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests/test_ingest_server.py tests/test_ingest_auto.py tests/test_doctor.py tests/test_watch_integration.py -q
+```
+
+**验收**：默认零副作用；矛盾键不阻启动；诊断可判定；所有层只授权后上传。提交 `feat(server): wire automatic ingest with explicit status and safe defaults`。
+
+### [ ] C67：compact初筛投影，全路由一致
+
+**前置**：C66。文件：`server.py::_tool_definitions/_fanout_search`、`_server/search_dispatch.py`、`_server/fanout.py`、`_indexer/models.py::Chunk.to_dict`；新建 `tests/test_compact_search.py`，保留preview/budget/oracle测试。
+
+**示例**（单库，顶层归属只写一次）：
+
+```json
+{
+  "vault": "D:/corpus",
+  "vault_name": "小说库",
+  "chunks": [
+    {
+      "source": "vol08/part03.txt",
+      "heading": "Chapter 907: Section Title",
+      "lines": [697, 720],
+      "snippet": "目标实体出现的上下文..."
+    }
+  ]
+}
+```
+
+1. schema新增 `compact` bool default false，description写“极简预览，隐含preview，返回source/heading/lines/snippet；按行号+库回读，不返回id”。不新增mode第三值或改full/preview enum。
+2. dispatch按现有bool字符串容错解析compact（true/1/yes/on，false/0/no/off）；compact=true强制preview=true，即使mode=full也以compact显式请求优先。compact=false完全保留原preview/mode规则。
+3. `Chunk.to_dict` 添加**keyword-only** `compact=False`，原两个位置参数继续可用；不改dataclass字段。compact直接构造四键，不先构造full再删；snippet复用 `_extract_snippet`，lines取metadata物理起止（旧值fallback与现有一致）。
+4. 不输出id/score/title/metadata/char_count/source_pdf/content；不改chunk原对象、不改score/metadata、不改缓存或embedding。compact仅投影。
+5. 单库顶层vault/vault_name只在compact时加；普通preview/full保持旧键集。单库明确库寻址不依赖可能重复的库名，vault用已解析注册绝对路径。
+6. fanout给函数新增默认false关键字compact，Facade `_fanout_search`转发保持旧调用兼容。Scoped/global/默认单库全部接通，不只改单路由。
+7. 平铺跨库每chunk加vault，不重复vault_name；groups只在group放库标识/名称。**排序与最高分分组顺序在Chunk/pairs层完成**，投影后不可 `chunk["score"]` 排序（compact无此键）。
+8. 投影完成、状态字段/hint构建完成后才预算。cold `status=indexing`统一经过预算路径（C68补），不要返回早退绕过budget。
+9. `exact_terms/path_prefix/offset/limit/dedupe/weights/rerank`不变。测试比较compact/full同一查询的source+lines+顺序，不能仅比较结果数。
+10. fixture：30个中文标题/中文路径/150字snippet、多库两种形状。量测 `_measure_payload_bytes`，compact对普通preview至少减少冗余开销；选定可复现fixture目标>=30%缩小，不宣称所有真实数据都缩小30%、也不承诺任何宿主绝不dump。
+11. 每条compact都做回读集成：单库顶层或平铺条目/group的vault + source + lines → kb_read，正确命中原文；消除id后不能仍要求chunk_id作为唯一阅读方式。
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests/test_compact_search.py tests/test_preview_mode.py tests/test_budget_bytes.py tests/test_multivault.py tests/test_scoped_search.py tests/test_search_oracle.py tests/test_facade_freeze.py -q
+```
+
+**验收**：普通默认字段不变；四种路由+分组都可读回；排序不依赖投影字段；量测记账。提交 `feat(search): add opt-in compact result projection`。
+
+### [ ] C68：完整chunk预算、最低envelope与分组续页
+
+**前置**：C67。文件：`_server/fanout.py::_measure_payload_bytes/apply_budget/fanout_search`、
+`_server/search_dispatch.py`、schema descriptions；
+`tests/test_budget_bytes.py/test_compact_search.py/test_multivault.py`。P1，旧测试的“首条二分截断”须改为本卡明确的新行为。
+
+**步骤与精确返回契约**：
+
+1. 保留 `_parse_budget_bytes` 范围500..100000、None/bool/非法值回退语义。budget=None仍不追加任何budget字段，不新加全局默认budget。
+2. 保留MCP包装计量 `_measure_payload_bytes`，不要仅count内层JSON/字符串长度；CJK、反斜杠、引号、换行、四字节emoji都算真实UTF-8包装后大小。
+3. 所有候选先按最终投影变dict；apply_budget只复制外层/列表，**不修改chunk的任何键/内容**，full与preview/compact一视同仁。
+4. 平铺选择最长可容纳前缀；附 `truncated`、`returned`、`next_offset=orig_offset+kept_count`，字段也参与预算。不能跳过首个大chunk继续放后面小chunk，不能clip source/heading/snippet。
+5. 全部放得下返回truncated=false、returned=N、next_offset=offset+N，保持既有兼容值；它不是“整个库已经结束”的证明。搜索候选宽度仍受top_k/各route cap约束。
+6. 首条放不下但空envelope可满足预算：chunks=[]、truncated=true、returned=0、next_offset不变；加短 `budget_hint="use compact or increase budget_bytes"`，hint计量；不返回不完整chunk，不死循环重试同预算。可以用更短等价hint，但须测试文本有明确动作。
+7. 最小envelope指保留已有searched/errors/excluded_solo/indexing/status等控制信息、清空结果列表、附budget计数后的实际字节数。它也放不下则合法返回空结果、`budget_exceeded=true`、`minimum_budget_bytes`、`budget_hint="narrow vaults or increase budget_bytes"`；minimum为**含这些诊断字段的最终响应**所需字节数，迭代到数值稳定（最多3次）。不得返回非法JSON或假称<=budget。
+8. overflow是metadata不可压缩的声明，不是另一个工具错误：保留每个库诊断，允许响应超过用户预算且显式标记；用户可缩小vault_paths/重试。该例外必须写schema/升级须知，不能继续宣传无例外硬上限。
+9. 固定候选池后先测全量N；不满足才对**正整数前缀1..N-1**二分，使用同一truncated=true/无budget_hint的响应构造函数，每次将计数/游标/groups的字段都填好再真实wrapper计量。大小随更多chunk与数字位数非减；不要把N的truncated=false或0条专用hint形状混进二分判定。正前缀一个也不满足时才构造0条hint/overflow，防0条hint反而比1条大时误判空包络不可满足。N受max_top_k/目标库数限制；复杂度O(logN)次最终计量，不手拼JSON、不缓存不同形状的错误计量。
+10. 分组先保持既有每库分页，再按既有组顺序/组内顺序保留整个chunk前缀；空桶删除。保留group vault/vault_name，不改组归属。
+11. 分组预算不能用 `offset+全组总returned` 恢复。budget启用且groups返回时新增每组 `next_offset`、`returned`、`truncated`，以及顶层 `group_next_offsets`（vault→下一偏移，**包括本页一条也没放下的候选组**）。
+12. 分组顶层 `next_offset=null`。schema新增 `group_offsets:object`，additionalProperties为integer、minimum0；只允许group_by_vault=true（否则具名ValueError），不加required、不改工具数。server严格拒bool/负数/小数，键必须解析到本次已授权搜索entries（未知/未定向solo/未注册键报错），每库最多一值；没传的库回落原offset。group_offsets优先对应库offset，不叠加两者。
+    原样把 `group_next_offsets` 传回同一次query/vault_paths/group_by_vault/top_k/use_rerank/filters/dedupe参数，继续fanout同一排序流程。不要转vault_path单库后声称“同一组游标”。budget=None且未传group_offsets保留旧外层形状。
+    group_offsets不要求budget_bytes；不带预算时只按各组偏移取页，不新增budget计数/游标字段，调用者按每组本次实际条数推进。带预算时以group_next_offsets为准，文档分别给出这两个组合。
+13. 分组top returned=实际所有组返回总数；truncated只表示预算裁掉本页候选，group.truncated表示本组本页裁掉。未放下组cursor=该组本次group_offsets或offset，不能推进；partial/full分别按该组实际returned推进。传给apply_budget新增私有group_orig_offsets映射，不误用统一orig_offset。
+14. group_next_offsets与全部诊断本身也要计量；若它使最小envelope超预算同第7步显式overflow，不丢失cursor；分组response原地不覆盖输入。
+15. 单库cold status/indexing响应统一走apply_budget（chunks为空），保证指定预算时的控制字段/最低尺寸例外一致。fan-out cold/warm混合响应亦一致。
+16. 平铺把per_vault_k提高到 `min(max_top_k, max(top_k, offset+(limit or top_k),20))`，filters分页最后全局做一次。分组为避免续页扩宽候选池导致重新rerank/跨库dedupe改变排序，**固定** `per_vault_k=min(max_top_k,max(top_k,20))`，group_offsets仅切各组相同候选窗口，不每页扩大。每页最多limit或top_k条；达到窗口末尾只说明本次候选耗尽，不宣称整库结束。
+    文档明示这不是snapshot cursor：文件变化、provider重排非确定、更改top_k/目标库都会改变序列；无这些变化时mock确定排序与同一固定候选池才要求无漏读。想扩大窗口显式调top_k（至max_top_k）并从头开始；无限深页/稳定opaque cursor另立待办，不改RRF/rerank算法。
+17. 更新旧 `test_budget_bytes_first_chunk_exceeds_budget`：full/preview首条巨大→returned0、原游标、hint；新加compact能够放下一整条的对照。保留“无预算零增量字段”和合法JSON断言。
+
+**测试边界**：
+
+| 分支 | 断言 |
 |---|---|
-| 计划 + 三轮评审 + 施工图 | 本文件（`docs/v0.8.1/PLAN.md`，约 2200 行） |
-| 还原点（原始计划逐字副本） | `~/.gstack/projects/moton16-Mortis-RAG-MCP/main-autoplan-restore-20260929-080941.md` |
-| 测试计划（供 `/qa` 消费） | 同目录 `14166-main-eng-review-test-plan-20260929.md` |
-| 任务聚合（JSONL） | 同目录 `tasks-ceo-review/eng-review/devex-review-*.jsonl` |
-| 评审日志（供 `/ship` 仪表盘） | 同目录 `main-reviews.jsonl`（6 条） |
+| 全部/部分/零放下 | 返回完整dict与原chunk字节内容相等，prefix保序 |
+| 边界budget±1 | 计数/游标正确，非overflow响应<=budget |
+| UTF-8/JSON逃逸 | 内容含中文、引号、反斜杠、CRLF、emoji，双层可json.loads |
+| 不可满足metadata | 保留errors/solo/status，budget_exceeded+最终minimum准确 |
+| 空列表/cold/offset超末尾 | 合法响应；不制造可用新chunk/不让游标越过未返回内容 |
+| 分组部分/一组零返回 | 每组cursor正确，top next_offset=None，不重复/漏读 |
+| 不可变 | apply_budget输入深比较不变，metadata/Chunk对象不改 |
+| 兼容 | budget=None/full/preview字段集合与基线一致 |
+| 相同查询续页 | group_next_offsets→group_offsets同路由续页，固定语料/候选池/mock确定重排下本页未返项不漏；不承诺事务游标 |
+| group_offsets校验 | 未知/solo越授权/负数/bool/浮点/非group模式拒收；缺库键继承offset，预算零返回不推进 |
 
-**下一步建议**：`/ship` 创建 PR；或直接按「开工顺序」从 Lane E 开始动手。
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests/test_budget_bytes.py tests/test_compact_search.py tests/test_multivault.py tests/test_preview_mode.py tests/test_search_filters.py -q
+```
+
+**验收**：不存在二分裁正文/snippet代码；每个零进展响应都提供恢复动作；包络无法满足时显式申报。提交 `fix(search): enforce whole-result budgeting and explicit grouped cursors`。
+
+### [ ] C69a：物理原文读范围、越界诊断与字符上限
+
+**前置**：C66。文件：新私有 `_indexer/reading.py`、indexer::read及新增私有薄委托、`server.py::_kb_read`；
+新建 `tests/test_read_ranges.py`，保留txt/wiki/chunk/facade测试。
+
+内部返回值指定为私有 `@dataclass(frozen=True, slots=True) ReadResult`，字段至少为 `source_sha256/content/total_lines/effective_start_line/effective_end_line/content_end_line/truncated/next_start_line/next_start_char`。原请求行号由server回显，不让纯读取helper知道MCP参数字典。新增 `indexer._read_result(source,start_line=None,end_line=None,*,heading=None,start_char=0,max_chars=None,expected_sha256=None)` 私有薄委托；公共 `read()`传max_chars=None只取 `.content`，保留旧API不截字符的行为。server明确传配置cap；`start_char`仅MCP私有路径支持，不扩原Facade签名。
+
+1. 先用fixture固定：10行文件start=11340/end=11450必须工具错误，文本含requested11340、actual10、source与“核对分卷行号或用heading”；不得content空白成功。
+2. 新私有纯数据helper置reading.py；只依赖标准库/底层chunking纯函数，不运行时导入Facade。使用上述指定的内部ReadResult，不导出包顶层、不改Chunk字段。
+3. 路径权威仍先由 `indexer._safe_path(source)` 检查白名单后缀/resolve在vault内，helper只接已校验Path；不因为未索引而绕沙箱。
+4. 一次 `path.read_bytes()` 得原字节+sha256；`utf-8-sig` 解码、splitlines得到物理lines；同一快照算total/heading/span/content，不先计数再另读文件。空文件total=0；BOM不占标题字符，CRLF不制造额外行。
+5. Facade `read(source,start_line,end_line)->str`保留参数与返回str，薄委托新helper；范围越界具名ValueError是本版修复，不返回dict。server走新增内部 `_read_result`薄委托拿元数据，避免读取两次。
+6. `start_line/end_line` schema minimum1保持；server解析拒显式bool、非整数字符串/浮点、零/负数、end<start（缺省start=1也检查），不能 `_parse_int(True)==1` 默默通过。兼容整数与合法整数字符串。
+7. 非空：effective_start=1或请求start；start>total→ValueError；effective_end=min(requested_end或total,total)。end超EOF正常钳制。空文件无显式范围返回content=""；有范围时明确total0越界。
+8. MCP成功返回保留source/content/truncated与原请求start_line/end_line回显（缺省仍null，兼容旧调用）；**新增** `total_lines`、`effective_start_line/effective_end_line`。空全文effective两者null，不能谎造第1行。
+9. MCP full/range/heading/chunk全部显式传 `indexer.config.index.read_max_chars`，100..1,000,000范围的既有规则不变；公共编程read保持不截字符，不能把server已有上限倒灌成Facade新增breaking。去掉server重复读取配置fallback造成口径分歧，参数已由load_config校验。
+10. 字符截断保持既有 `text[:max_chars]` 语义，不改成字节预算，也不因完整行长>cap而无限越限；追加 `content_end_line`、`next_start_line` 与 `next_start_char`（0-based）描述真实已返回范围。
+11. 为单行超过cap能续读，schema给kb_read新增可选 `start_char:integer=0`，定义为start_line内0-based Unicode字符偏移，非零只与显式start_line合法组合；chunk_id/heading模式不能显式带此参数（即使0）。未传或full/range显式0不改变起点；无start_line且start_char非0报错。不新增end_char，参数显式bool/浮点拒绝。
+12. 正文规范化为 `"\n".join(lines[start-1:end])`，cursor映射使用所选行的前缀字符累计长度，不含原文件末尾换行。**分隔符前**（刚返回行内最后一个字符、尚未返回`\n`）为 `(本行,len(line))`；**分隔符后**为 `(下一行,0)`。不得把两者合称“行边界”。空行长度0同样遵循这两个位置；处于选定end的最后行末尾且正文已尽则next=null。
+    例：`abc\ndef`，返回上限3→content=`abc`/next=(1,3)，下一页从该位置返回`\ndef`；上限4→content=`abc\n`/next=(2,0)，下一页返回`def`。两次拼接必须分别复原相同`abc\ndef`，不能丢/重复分隔符。当前read_max_chars下限100，因此测试可用100字符首行配cap100/101做真实集成断言，纯helper可用上述3/4示例。
+13. start_char<0/超过该行长度→具名ValueError；==该行长度允许从行末换行继续。不要用start_char跳过first heading/chunk的安全/互斥检查。
+14. chunk路径用同原文sha256对比C66stale检查、再合法裁区间。没有两次读导致“检查的是旧bytes、返回的是新bytes”；所有read modes的total来自当前文件，不是索引chunk最大行号。
+15. 文件在路径检查后消失/不可读/无法UTF8解码，helper边界捕获具名OSError/UnicodeDecodeError，带相对source、异常类别及修法raise ValueError from exc供MCP工具错误；不能直接str(OSError)把绝对文件名泄露给solo调用方，也不输出坏UTF8附近原文字节。内部cause保留，不吞成空内容。
+16. 文档明确start_line/end_line回显与effective/content_end/next区分，不能把整个请求end当实际content末尾。
+
+```json
+{
+  "source": "volume15_part2.txt",
+  "start_line": 3,
+  "end_line": 999,
+  "effective_start_line": 3,
+  "effective_end_line": 10,
+  "total_lines": 10,
+  "content": "...",
+  "truncated": false,
+  "content_end_line": 10,
+  "next_start_line": null,
+  "next_start_char": null
+}
+```
+
+**测试**：start1/EOF/EOF+1、end省略/超EOF/倒置、空文件两分支、BOM/CRLF/Unicode、只end、非法bool/小数、未索引直连、沙箱/symlink、range超字符cap、截在行中/换行边界、长单行多页拼接严格复原（允许已有join去末尾换行语义）、stale chunk原bytes一致性、丢失/编码错误、isError协议。
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests/test_read_ranges.py tests/test_indexer.py tests/test_txt_indexing.py tests/test_wikilink_read.py tests/test_kb_read_chunkid.py tests/test_facade_freeze.py -q
+```
+
+**验收**：物理行数准确、越界不再静默成功、长单行可续读、不扩包导出/缓存代际。提交 `fix(read): diagnose bounds and expose accurate continuation positions`。
+
+### [ ] C69b：heading按原文章节定位
+
+**前置**：C69a。文件：`_indexer/reading.py`、server::_kb_read/schema、`tests/test_read_heading.py/test_wikilink_read.py/test_txt_indexing.py`。
+
+1. 不给schema再加一个heading字段，它已存在；补description说明精确标题、子标题包含、重复标题报错、range优先、物理行号。
+2. reading helper在已读原文快照上扫描，不用 `all_chunks()` 的heading min/max并集；heading读未索引直连文件也可工作，后台sync仍可继续。
+3. 复用 `chunking.frontmatter/_HEADING_RE/_FENCE_START_RE/clean_heading/_is_chapter_heading` 与表格块边界。helper必须跳过frontmatter、代码围栏、表格内部假标题；不用图片注入结果，不删除原始行，不影响物理行号。
+4. 支持当前标题语法：ATX层级=len(#)；章节类视level1，按当前判据支持中文/Chapter。无标题/普通TXT传heading→not found；不把文件stem/title fallback当物理heading。
+5. scan生成 `(title,level,start_line)` 轻量列表，不构造chunk/embedding。trim用户heading后精确匹配，保留内部空格与大小写；搜索返回heading字符串可直接用于同一文件读取。
+6. 零命中ValueError含heading、source、total_lines、最多5个候选标题和起始行，提示核对标题/改行号；列表过多给总数，不整篇回显。
+7. 多命中ValueError含最多5个起始行与总命中数，指示用start_line/end_line；不合并两个不同章节，不默选第一。包括不同level同名也计歧义。
+8. 单命中start=标题行，end=下一个 `level<=selected_level` 的标题行-1或EOF；深层子标题与其正文包含，空小节仅标题+中间空行合法。
+9. 依次保留wikilink归一化：`[[Target|Label]]`、`[[Target#Section]]`、显式heading覆盖anchor、文件名含`#`优先按真实文件现有判断；先正确定位source再扫描标题。
+10. `heading+显式range`继续range优先，不因这次增强制造新的互斥breaking；仅 `chunk_id`仍与heading/range/start_char互斥。更新工具说明。
+11. 章节结果同C69a字符上限/continuation；next_start_line/start_char可接续用range读取，用户不必反复标题查询重新取第一页。
+12. 不改 `_chunk_file` 解析器/缓存代际；如果为读取需要新内部heading helper，只在reading中实现最小扫描并调用现有原语。新增Setext等语法另立待办，不随手改切块。
+
+**固定fixture**：
+
+```markdown
+# A
+## Target
+目标正文
+### Child
+子节正文
+## Sibling
+不能混入
+# End
+```
+
+Target预期lines=[2,5]，Child=[4,5]，A=[1,7]；这是必须锁定的精确断言。
+
+**其他测试**：同名隔远章节；code fence里`## Target`；更长同字符闭围栏；frontmatter假heading；
+HTML table假heading；Markdown空标题边界；TXT中文/Chapter+普通正文误判门禁；末尾章节；
+BOM/CRLF；未索引文件；正文变更但chunk缓存旧；注入图片/overlap配置不影响物理区间；
+wikilink#anchor与`C#教程.md`；range优先；chunk互斥；cap长章节续读；
+not found/ambiguous错误均经handle返回isError且候选有限。
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests/test_read_heading.py tests/test_read_ranges.py tests/test_wikilink_read.py tests/test_txt_indexing.py tests/test_chunking_seam.py tests/test_facade_freeze.py -q
+```
+
+**验收**：无全局chunk并集定位；完整子章节、歧义fail-closed、物理行号与续读精准。提交 `feat(read): resolve heading sections from current source text`。
+
+## 5. 测试矩阵与故障登记
+
+独立QA交接产物：[工程测试清单](C:/Users/芝士雪豹/.gstack/projects/moton16-Mortis-RAG-MCP/feat-v0.8.1-eng-review-test-plan-20261005.md)。它是本轮审查快照，移交其他机器不依赖此个人路径：本节与逐卡测试规格才是仓库中的权威验收要求。
+
+### 5.1 测试设置与执行纪律
+
+- 每卡先写可失败的回归测试，再实现，再跑该卡命令。现有pytest与tmp_path/monkeypatch模式优先，不新引测试框架。
+- conftest全局隔离保留；新server用例必须再明确把新旧registry env均指向自己的tmp文件，不能依赖宿主home/默认库。
+- app配置静态embedding、reranker关、ingest默认关；测试要开启ingest时仅fake client。subprocess继承UTF-8与缓存env。
+- server/watcher测试用try/finally shutdown；Event release、join也在finally，断言失败不能残留线程锁住tmp目录。
+- 时间只做宽松死锁看门狗，优先断言前台在释放阻塞Event前返回、调用次数、线程数量、dirty状态；不让网络快慢/机器CPU成为正确性。
+- 文件修改用不同长度或显式os.utime配合既有Fast-Stat测试约定；不靠“写两次刚好跨NTFS刻度”。
+- sqlite-vec/numpy有无各一组通过CI/指定靶向验证；缺可选依赖允许有理由skip，不能skip基础契约。
+- 新用例失败不放宽旧oracle、不删freeze断言、不临时屏蔽autouse夹具。根因、假设、修法三者写技术账。
+
+### 5.2 分支到测试的覆盖图
+
+`EXISTING`只说明已有基础用例，不说明新增行为已覆盖；`NEW`全部是实施时要补的验收规格。
+
+```text
+C65 chunk locator                         -> test_kb_read_chunkid.py
+  no registry / bad target                -> NEW tool error
+  complete: 0 / 1 / multiple hits          -> EXISTING + NEW precise diagnostics
+  incomplete: limit / time / cache / cold -> NEW fail-closed + solo privacy
+  temp probe close / promote missing      -> NEW resource + stale transition
+  vector fallback w load_vectors=False    -> NEW zero vector-load
+
+C66 request_refresh                       -> NEW test_read_stale.py
+  missing/empty input: normal read route  -> EXISTING normalization
+  cold static/external / warm cache       -> NEW state distinction
+  warm ready/locked/slow sync/error       -> NEW Event ordering + old result
+  bursts / during-sync dirty / throttle   -> NEW single-flight + follow-up pass
+  stop/start/remove/shutdown              -> test_p5_lifecycle.py + NEW
+  scoped/global query once/weight/solo    -> EXISTING + NEW state metadata
+  stale chunk signature                  -> NEW physical snapshot validation
+  parse -> double-argument callback       -> test_ingest_server.py + NEW E2E
+
+C58 config + manager                      -> NEW test_ingest_auto.py
+  absent/false / true+disabled            -> NEW no side effects + diagnostics
+  cap0 / boundary±1 / invalid             -> NEW all entrances + config fallback
+  scan / explicit / force / recovered     -> NEW policy-before-HTTP
+  ignore / symlink / changing copy        -> NEW privacy + source_changed
+  ledger absent/migrated/>500/pruned       -> NEW persistent dedupe
+  repeated auto-submit                    -> NEW same-manager dedupe
+  native/poll/start/overflow/fallback/0    -> test_watch_integration.py + NEW
+
+C67 projection                            -> NEW test_compact_search.py
+  default/full/preview/compact conflicts  -> NEW exact shape + old compatibility
+  single/scoped/global/grouped            -> NEW stable order + read back E2E
+  filters/dedupe/weight/exact_terms        -> EXISTING oracle + projection parity
+
+C68 budget                                -> test_budget_bytes.py + NEW
+  none / all / partial / first too large  -> NEW whole-prefix, zero-progress hint
+  metadata impossible / cold / empty      -> NEW envelope exception truthful
+  CJK/escapes/emoji/boundary±1             -> NEW double serialization
+  grouped partial / empty group/cursors   -> NEW continuation E2E
+  source mutation / deep offset bound     -> NEW immutable input + scoped advice
+
+C69 physical read                         -> NEW test_read_ranges/read_heading.py
+  no span / valid / beyond / reversed     -> NEW exact effective lines + errors
+  empty / BOM / CRLF / invalid UTF-8      -> NEW nil-vs-empty distinction
+  cap / long single line / continuation   -> NEW concatenation round trip
+  direct/short/wiki/#filename/chunk stale -> EXISTING + NEW route integration
+  heading absent/duplicate/levels/fences  -> NEW bounds exact, limited diagnostics
+  tables/frontmatter/TXT chapters         -> NEW shared parsing primitives
+
+Schema/skill/release                      -> test_mcp_stdio/version_sync/facade_*.py
+  15 tools / immutable exports / stdio    -> EXISTING + NEW optional fields
+  initialize0.8.1 / errors isError         -> NEW protocol smoke
+  docs examples -> search/read/auto       -> NEW fixture workflow + manual check
+```
+
+### 5.3 Error & Rescue Registry
+
+| 方法/路径 | 失败与异常 | 捕获/处理 | 用户看到/恢复动作 | 必测卡 |
+|---|---|---|---|---|
+| locator默认库 | 无注册条目，ValueError | tools/call工具错误 | 先kb_init，不是IndexError | C65 |
+| locator probes | bin缺失/codec损坏/目录消失，OSError/ValueError/zlib.error | 记未探测，finally关闭临时句柄 | 指定vault_path，不假称唯一 | C65 |
+| probe promotion | 目标ID已消失，ValueError | 停止展开 | 重新kb_search | C65 |
+| request_refresh | 已停止 | 返回未接受，不启动线程 | stats显示stop/pending口径；显式重启服务 | C66 |
+| background sync | OSError/ProviderError/意外异常 | worker边界捕获、失败计数/退避、error状态 | 现有结果+刷新错误；修配置再刷新 | C66 |
+| cold search | 无可用索引 | indexing结构化响应 | retry_after后重试/查看stats | C66 |
+| query embedding/rerank | ProviderError、超时、429 | 保持现有词法/基础排序降级 | 不改本版provider重试策略 | C66 |
+| size gate explicit | 超cap，ValueError | 整批入队前拒绝 | 实际size/limit，增cap或改小文件 | C58b |
+| size gate scan | 超cap | skip，pending reason=too_large | 看limit/拒绝计数；不上传 | C58b |
+| path validation | 出vault/链接/非支持格式，ValueError | 入队与执行双闸门 | 相对source+原因；不能绕过 | C58b |
+| state读写 | OSError/JSONDecodeError/非法结构 | 具名安全回退+诊断；写失败不宣称已入队 | 检查权限/状态，不删状态盲重试 | C58b |
+| cloud transient | MineruError(retryable) | failed，保持hash免自动重试 | 手动重试，不自动429风暴 | C58b |
+| cloud permanent | MineruError(nonretryable) | 按既有仅PDF可选fallback | parse_quality/fallback说明 | C58b |
+| copy changed | hash不符，source_changed | 旧job失败，后续新hash候选 | 文件稳定后自动新任务 | C58c |
+| auto hook/scan | worker边界异常 | 记last_error+退避，不杀文本线程 | stats/status诊断，检查配置/权限 | C58c/d |
+| apply_budget first | 整条放不下 | 零结果、原cursor、hint | 开compact/增加预算 | C68 |
+| apply_budget envelope | 最小控制信息>budget | 显式budget_exceeded+minimum | 缩小目标库或增加预算 | C68 |
+| read range | start超EOF/非法span，ValueError | 工具错误 | actual total、核对分卷/用heading | C69a |
+| read source | FileNotFoundError/PermissionError/UnicodeDecodeError | 工具错误，不吞为空 | 修source/权限/UTF-8 | C69a |
+| read stale chunk | 磁盘hash≠索引签名，ValueError | 拒旧行号展开 | source+heading或重新kb_search | C66/C69a |
+| heading | 不存在/重复，ValueError | 有限候选/行号提示 | 改标题或用行区间 | C69b |
+| stdio serialization | 孤立Unicode代理、UnicodeEncodeError | 保留现有ensure_ascii降级 | 合法JSON，不stdout日志 | C60 |
+
+catch-all只允许线程/任务最外层的“保服务可用”边界，必须记状态与计数；内部逻辑优先具名异常。diag仍仅原10键白名单，不为丰富诊断泄露内容；用户显式取status才给限长详情。
+
+### 5.4 Failure Modes Registry
+
+| 失败模式 | 风险 | 防护 | 测试/可见性 | 发布阻塞 |
+|---|---|---|---|---|
+| 部分库未探，却读“唯一”chunk | 错库/隐私歧义 | incomplete拒绝 | C65 / skipped候选 | 是 |
+| warm request同步补嵌40s | 交互阻塞 | 前台只置dirty | C66 / Event释放顺序 | 是 |
+| 100query起100线程/100扫描 | 额度/CPU | 单调度器+1s节流 | C66 / 次数断言 | 是 |
+| query API本身很慢 | 有限外部残余 | 既有provider timeout/降级 | stub/eval、明确不是sync修复范围 | 不新增承诺 |
+| failed被500历史剪掉重传 | 付费重复上传 | 独立auto_seen | C58b / >500跨重启 | 是 |
+| 多进程同时操作同一摄取队列 | 既有并发边界 | 后续专项，不新增本版owner/lease | 记Execution-plan，不阻塞本版 | 否 |
+| ignored/private PDF自动上传 | 隐私不可逆 | matcher+symlink+运行时再校验 | C58b/c / parse调用0 | 是 |
+| 大文件scan/force/recovery越cap | 额度 | 双闸门，先size后hash/client | C58b / all entrances | 是 |
+| hook拖死文本防抖 | 搜索新内容迟滞 | 独立单扫描worker | C58c / slow hook屏障 | 是 |
+| poll/interval0自动静默无效 | 多平台功能缺失 | effective cadence定义 | C58c/d / fallback/0 | 是 |
+| 首条巨大但游标推进 | 丢失证据 | whole-prefix，零结果cursor不动 | C68 / zero progress | 是 |
+| grouped cursor用总returned | 重复/漏读 | per-vault cursors | C68 / 单库续页 | 是 |
+| metadata>预算却声称硬上限 | 宿主响应异常 | budget_exceeded | C68 / wrapper测量 | 是 |
+| 同名heading并集跨章节 | 错读正文 | 原文scan+歧义拒绝 | C69b / precise lines | 是 |
+| 超EOF静默空内容 | Agent误判文件空 | actual total诊断 | C69a / 1850 vs11340 | 是 |
+| 单行被cap截却无续读入口 | 无法获取剩余证据 | start_char continuation | C69a / roundtrip | 是 |
+| stale chunk行号读到另一段 | 错证据 | 同bytes签名检查 | C66/C69a | 是 |
+| stop后线程复活/引用丢弃 | 句柄/并发写 | retain alive references | C66/C58c / lifecycle | 是 |
+| 本地自动测试真联网 | 泄露key/费用/flaky | tmp配置、FakeProvider/client | C54守卫+新卡全程 | 是 |
+
+只验证本版实际改动，不为审查建议另起防御性架构；多进程worker治理、完整检索事务快照与无限历史hash去重均不纳入本版。
+
+## 6. 文档、评测与发布施工
+
+### [ ] C59：Windows升级占用说明
+
+**改动**：`docs/Quick-start_developer.md` §7/§9与 `QUICKSTART_user.md`新增“升级已有部署”，README不塞内部排查细节。纯文档，所有命令需在隔离进程或只读方式核对。
+
+1. 说明现象：Windows运行中的console入口exe被占用，editable安装替换入口可出现WinError5。`git pull`只更新源码，不保证运行进程/已安装入口已重新加载。
+2. 正常路径：关闭/停用对应MCP连接器；确认该项目进程退出；再安装；重新启用连接器；initialize版本/kb_list验证。不要说“重启终端”就一定解除IDE持有的锁。
+3. 用下面只读进程清单定位具体PID与CommandLine，不按名称全杀python：
+
+```powershell
+Get-CimInstance Win32_Process |
+    Where-Object { $_.Name -in @('mortis-rag-mcp.exe', 'vault-mcp.exe') -or $_.CommandLine -like '*mortis_rag_mcp*' } |
+    Select-Object ProcessId, Name, ExecutablePath, CommandLine
+```
+
+4. 首选在客户端停服务。只有用户已确认确为本项目且客户端无法关闭时，才文档化 `Stop-Process -Id <确认过的PID>`；不是执行本卡时主动杀进程。客户端自动拉起的要先关连接器，不循环kill。
+5. 安装命令用本venv python，避免装到另一个环境：
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -e .
+```
+
+6. 推荐后续连接器用该venv `python.exe` + `-m mortis_rag_mcp --serve-mcp-stdio`，减少console exe覆盖冲突；**运行中模块不会自动热更新，仍须重启**。保留旧console连接器兼容，不删entry point。
+7. 不推荐“先pip uninstall”规避写锁：锁未解时卸载也会失败。系统重启仅作占用无法解除的最后排障，不作为常规升级步骤。
+8. 验证新文档中的命令路径/entrypoints与当前pyproject一致，示例不含真实vault/key。不写新CLI shutdown命令。
+
+提交 `docs: explain Windows MCP process locks during upgrades`。验收：用户知道哪个进程、如何安全停、怎么装、怎么确认新版本，不需要猜命令。
+
+### [ ] C70/T8：文档、使用纪律、历史欠账与离线评测
+
+**前置**：所有代码卡。本卡必须在版本bump前完成行为描述；版本文字在C60统一更新。
+
+#### C70.1 文档逐处同步
+
+| 文件/节 | 执行动作 | 必须包含 |
+|---|---|---|
+| PROJECT_GUIDE顶部/§一/§二 | 改活的旧包名/旧“不索引非Markdown”描述，不改历史记录 | mortis_rag_mcp、MD/TXT、PDF先转MD、setuptools>=77、真实entrypoint |
+| PROJECT_GUIDE §三/§五/§九 | 改“search先同步”时序与锁说明 | read-existing→background refresh、state/cold、条件锁不跨sync、scan worker |
+| PROJECT_GUIDE §4.5/§4.8 | 更新Facade/read/search/watch responsibilities | compact投影、whole budget、physical heading/range、A4双参 |
+| PROJECT_GUIDE §四 | 新增ingest模块专节（原只有4.1–4.10） | state/auto_seen、单队列、size/ignore、默认授权、fallback |
+| PROJECT_GUIDE §六API | 逐工具对齐真实schema | compact/start_char/group_offsets、group游标、pending/sources、list_files分页、chunk跨库solo |
+| PROJECT_GUIDE §七 | 新增ingest与已有index/diag参考 | auto_watch=false、20MiB、0、不生效组合、read_max_chars |
+| PROJECT_GUIDE §八 | env与状态文件布局 | 新旧CACHE_DIR对、explicit TOML优先、auto_seen字段不是chunk缓存 |
+| PROJECT_GUIDE §十/§十一 | 更新实际摄取与测试说明 | 默认关、既有ignore/沙箱、size策略与新增测试文件，不写未实现worker所有权 |
+| PROJECT_GUIDE §十五 | 倒序新增0.8.1技术详录 | 实际editor/agent、各卡与测试证据，不伪造model/日期 |
+| Quick-start_developer | 重新核对地图/流程/测试命令/Windows | 按实际行数/文件数；不要沿用49文件416用例，UTF-8与靶向本地策略 |
+| Docs_Folder-descriptions | 保留5主文档与v0.8.1例外 | 明确PLAN跟踪，不说全部版本目录均获例外 |
+| Execution-plan_developer | 已完成打勾，未实现“现状”订正 | FTS探测仍非严格只读、无限深页延后、watcher原生延后、控制正确TODO |
+| QUICKSTART_user | 简单可运行例子与升级说明 | 紧凑初筛→原文、heading重名改行号、自动默认关、size、Windows；删无样本依据的preview“70%+”数字 |
+| README/README_EN | 面向用户的新能力摘要 | 删除无样本限定的preview“降低70%+”承诺；不承诺所有数据零上传/搜索固定毫秒 |
+| config/app.toml.example | 复核新增配置注释 | 自动成本/隐私、初启既有文档、各格式、0与cadence |
+| skills/mortis-rag-mcp/SKILL.md | 可判定if-then纪律 | 以下C70.2六条 |
+| Changelog_developer | 补已提交C53/C54/C55/C56/C57/C62/C63/C64欠账，记新卡 | 实际commit；C53真实云端验证或待验证原因 |
+| CHANGELOG_user | 留到C60按release追加 | 仅用户功能/体验和必要升级变化，不写底层函数/线程细节 |
+
+不对历史CHANGELOG里的旧版本号/旧包名作全局替换；它们是发生过的事实。当前API引用必须真实，主文档的历史章按版本保留。
+
+#### C70.2 Skill调用纪律与样例
+
+1. 大候选初筛：已知库必须定向；`top_k>=5`优先 `compact=true,budget_bytes=3500,use_rerank=false`，不继续沿用“preview必省70%”的无条件量化承诺。
+2. compact没有chunk_id：用顶层/条目/group的vault + source + lines回读，不能调不存在的ID。普通preview/full保留id，唯一完整命中可chunk读取。
+3. budget返回returned0且truncated：不得同参数无限重试；开compact/增budget/缩库。budget_exceeded按minimum或缩目标，group把group_next_offsets原样作为group_offsets同路由续页，不切单库后沿用旧排序游标。
+4. read越界：以actual total核对分卷行号；已知标题改heading；ambiguous heading用候选物理行消歧；truncated用next_start_line+next_start_char而不是旧end_line+1。
+5. indexing/cold/stale chunk：看stats与retry_after；无用户指令不kb_rebuild；源已更新可source+heading直接读，不用陈旧chunk行号佐证。
+6. 自动摄取默认关：仅解释如何opt-in，用户授权前不修改enabled/auto_watch、不自动手动submit；失败同hash要用户主动重试。pending/status本身不是云上传授权。
+
+复制样例用实际库名占位与实际参数，不能`preview=True`作为JSON布尔：
+
+```json
+{"query":"目标实体","vault_path":"小说库","path_prefix":"vol08","top_k":30,"compact":true,"budget_bytes":3500,"use_rerank":false}
+```
+
+```json
+{"source":"vol08/part03.txt","vault_path":"小说库","start_line":697,"end_line":720}
+```
+
+```json
+{"source":"vol08/part03.txt","vault_path":"小说库","heading":"Chapter 907: Section Title"}
+```
+
+```toml
+[ingest]
+enabled = true
+auto_watch = true
+max_file_size_mb = 20
+api_key = "${MINERU_API_TOKEN}"
+```
+
+最后一个仅供用户主动授权配置；无key时原有通道/fallback语义保留，文档不承诺公共额度或服务端限额永不变化。
+
+#### C70.3 离线质量与payload量测
+
+1. 在临时目录创建配置，embedding.static、reranker=false、cache临时、ingest=false。**脚本直接调用load_config，不能指望pytest的conftest来隔离**；明确传 `--config`，避免宿主配置。
+2. 对 `tests/eval/golden_queries.json` 与其仓库fixture跑 `--k 5`。若golden引用外部私人路径，改用临时fixture及本地golden副本，不改用户真实vault、不伪造100%。
+3. 本轮代码未改前记录基线Hit@5/MRR@5；全部卡后同配置同语料复测，不低于基线。现有历史100%不能替代这次实际输出。
+4. `test_search_oracle/test_golden_v073/test_facade_freeze/test_cache_codec_roundtrip`验证排名、缓存和导出不变量；投影及线程变化不允许破坏这些。
+5. 用固定30候选fixture输出full/preview/compact字节、budget3500最终字节/returned；记录Python/OS/可选依赖、语料规模、cold/warm。
+6. refresh延迟隔离量测：FakeProvider为sync补嵌设Event暂停，query不联网；测30连续查询的p50/p95/max和indexing标志。报告“无前台sync”，而非推导外网端到端毫秒保证。
+7. tools/list schema体积采用 `len(json.dumps(_tool_definitions(),ensure_ascii=False).encode("utf-8"))`，分别对origin/main(v0.8.0)与本轮a8fbb4d基线测量；基线已实测12563/13412 bytes、+6.758%。同时说明是否测整个tools/list包装，不能混比较口径。
+8. 目标守住历史≤10%增量门禁；compact/start_char/group_offsets/必要安全描述优先，精简重复description。当前距10%只剩约407 bytes（12563*1.1向下取整-13412），新增三参数及说明极可能超额，实施时先量测。若超限，**记录准确字节/百分比并提交用户例外确认**，不删必要能力、不把工具required伪造、不悄悄换基线冒充达标。
+9. 不扩C55 schema属性/required（历史裁定）。注明vault_path handler别名对严格schema客户端仍有限，不把description支持宣传成所有客户端可校验的替代参数。
+10. 技能规则变动至少用mock语料实测“compact→read、越界→heading、零预算进展→增预算、自动关→无上传”四流程；不用付费LLM evaluator或真实MinerU做自动测试。
+
+可直接执行的隔离量测配置生成命令，先在项目根目录运行§0.3的UTF-8设置。只创建本轮临时目录，不改变用户配置；显式禁用所有外部服务与诊断输出。使用UTF-8无BOM，兼容Windows PowerShell 5的TOML读取：
+
+```powershell
+$qaRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('mortis-v081-qa-' + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $qaRoot
+$qaConfig = Join-Path $qaRoot 'app.toml'
+$qaCache = (Join-Path $qaRoot 'cache').Replace('\', '/')
+$qaToml = @"
+[embedding]
+mode = "static"
+dimension = 384
+[reranker]
+enabled = false
+[ingest]
+enabled = false
+[cache]
+enabled = true
+dir = "$qaCache"
+placement = "home"
+max_age_days = 0
+[vector]
+backend = "memory"
+[diag]
+enabled = false
+"@
+[System.IO.File]::WriteAllText($qaConfig, $qaToml, [System.Text.UTF8Encoding]::new($false))
+.\.venv\Scripts\python.exe scripts/eval_search.py --golden tests/eval/golden_queries.json --config $qaConfig --k 5
+.\.venv\Scripts\python.exe -m pytest tests/test_search_oracle.py tests/test_golden_v073.py tests/test_facade_freeze.py tests/test_cache_codec_roundtrip.py -q
+git diff --check
+```
+
+Golden预期目前仅 `HIT(#1) / Hit@5 1/1 / MRR@5 1.000`；只有1条公共语料，不外推大库。后续payload/时延量测也沿用该隔离配置，但必须另准备卡片指定的30候选/多库/长单行fixture，而非把1条Golden当综合性能基准。
+
+**提交**：文档分两笔可读变更（开发者现状/技术账，用户指南/skill）；C70状态仅在两笔及全部验证通过后打勾。不要把新功能提前写成已发布。
+
+### [ ] C60：0.8.1版本收口与发布交接
+
+**前置**：C65–C70、C58全子卡、C59已完成。不是当前审核轮要执行的git发布命令。
+
+1. 同批更新 `pyproject.toml version`与 `mortis_rag_mcp.__version__` 到0.8.1；SERVER_INFO/diaglog应引用包真源，不重新加硬编码。
+2. README中英文badge、Skill标题包版本0.8.0→0.8.1；Skill自己的frontmatter version当前5.2.0，行为纪律增强独立递增为**5.3.0**，不误改成包0.8.1。历史能力标题保留历史首次加入版本。
+3. CHANGELOG_user顶部新增0.8.1，实际发布日期以发布当天为准，非自动照抄审核日期；大白话描述修复上传、自动摄取、阅读/初筛/升级体验。
+4. 必须列升级变化：20MiB默认影响手动/自动全部入口；0不限需用户显式设；完整chunk预算可能放不下一条；分组预算有独立续页位置；read越界提示实际行数、heading读取完整章节；检索先返回可用结果再后台刷新。用户CHANGELOG用大白话，参数名/响应字段放QUICKSTART与API文档；不改变旧parsing恢复行为。
+5. `MORTIS_RAG_CACHE_DIR`说明放用户指南/配置表，不把env实现逻辑写进用户CHANGELOG。C56多库唯一寻址升级可用户可读说明，D5保持。
+6. C53真实云端验收写二选一：`实机验证：已通过（日期/通道/样本）`或`待实机验证（原因/由谁后续确认）`；不使用test回环200冒充OSS成功。
+7. `tests/test_version_sync.py`增加README badge、Skill包版本、diaglog版本的对应检查，但不要求历史每一版本字符串全相等。现有三项仍保留。
+8. 运行靶向发布集与Python语法编译：
+
+```powershell
+.\.venv\Scripts\python.exe -m compileall -q mortis_rag_mcp
+.\.venv\Scripts\python.exe -m pytest tests/test_version_sync.py tests/test_diaglog.py tests/test_mcp_stdio.py tests/test_facade_freeze.py tests/test_cache_codec_roundtrip.py -q
+git diff --check
+git diff --stat
+git status --short --branch
+```
+
+9. stdio smoke：initialize版本0.8.1、15工具列表、新参数可见、ping正常、invalid range与heading歧义返回isError、无stdout日志。测试用临时registry/config，stderr净或只既有允许诊断，不探真实API。
+10. 全量回归交CI：现workflow是**一个test job、5个matrix实例**（Ubuntu3.10–3.13+Windows3.12），不是“单job意味着只有一组”、也不是feature分支push自动跑。需PR或workflow_dispatch才触发。
+11. 这轮只交接计划；下个开发者未获用户发布授权不要push/创建PR/tag。获授权走 `/ship`，PR正文清楚关联#5/#6与真实云端验收状态；确认GitHub所有矩阵，不以本机targeted绿替代。
+12. 发布前检查尚未解决的schema例外/实机风险，披露或等待用户；不能把“计划审阅通过”写成“代码审阅通过”。最终tag/合并由授权发布流程执行。
+
+**完成记账模板**：
+
+```text
+卡：Cxx / commit：
+操作者：实际GitHub账户，日期，agent；仅确知时写模型名
+改动：函数/数据流/兼容性
+验证：实际命令、passed/skipped、是否外部网络
+量测：语料规模/环境/字节或延迟，不以估计当结果
+残余：已验证与未验证的边界
+```
+
+### 6.1 真机验收与回滚运行簿
+
+**授权真机验收**只在用户确认样本可上传且可消耗额度后进行。用非私密小样本库，不自动从真实课程/小说/工作库选PDF；不输出key/预签名URL。步骤：
+
+1. 先单独验证MinerU两通道实际上传、完成产物与parse_quality（缺key只能Agent，不冒充v4验收）。
+2. 手动submit后status到done，产物存在、A4刷新后search命中；记录源size、输出相对路径、时间，不上传不必要文件。
+3. auto_watch关时新放PDF不parse；显式授权开启+重启后仅可用样本自动入队，同hash失败/成功不重提、超cap与ignore不上传。
+4. 文本编辑仍可索引；慢parse不能阻止warm查询，search返回状态诚实。
+5. 完毕关闭自动、停止样本连接器；样本库/产物是否保留由用户决定，不擅自清理。
+
+```text
+异常 -> 是否自动上传风险?
+          yes -> 用户将auto_watch=false并停客户端/重启 -> 禁止新入队
+          no  -> 保存诊断/状态 -> 对应卡具名修复
+              -> 需要回退?
+                  -> 停客户端 -> 安装用户指定旧版本 -> 重启 -> 隔离smoke
+                  -> 保留源文档/.mortis-parsed/.ingest_state/注册表与缓存
+```
+
+回退不做git reset、不删状态来“变干净”。新auto_seen为旧版本可忽略字段；原bin缓存未变；旧版本预算策略/heading并集语义会恢复，用户须知。已提交云端文件不能由本地回滚撤销，绝不承诺撤回隐私泄露。
+
+## 7. 完成门禁与交接
+
+### 7.1 Issue覆盖表
+
+| 需求 | 验收卡 | 可关闭Issue的证明 |
+|---|---|---|
+| #5.1 上传403 | C53已有+C60真机字段 | 请求头回环测试+真实成功或未验证披露 |
+| #5.2 测试隔离 | C54已有+C70 | UTF-8靶向、宿主隔离守卫、不联网 |
+| #5.3 路径别名 | C55已有+C70 | handler测试、schema限制诚实描述 |
+| #5.4 chunk跨库 | C56/C64已有+C65/C66 | 完整唯一/歧义/incomplete/solo/旧ID |
+| #5.5 list分页 | C57/C62已有+C66 | prefix/offset/total/cursor+读优先 |
+| #5.6 Windows写锁 | C59 | 正确定位PID/停连接器/安装/验证 |
+| #5.7 auto_watch | C58a–d+C61 | opt-in、多平台节拍、cap/ignore/ledger、完成检索 |
+| #6.1 compact与budget | C67/C68 | 四路投影、whole chunk、不可满足envelope/游标 |
+| #6.2 bounds | C69a | actual总行数、越界工具错误、续读 |
+| #6.3 heading | C69b | 物理章节/子章节/重复/保护/未索引 |
+| #6.4 stale/read优先 | C66 | 慢sync Event下前台返回、状态、单flight |
+
+### 7.2 本版本发布清单
+
+- [ ] §3所有卡按依赖完成，记录真实commit，无“代码写了但测试没跑绿”卡。
+- [ ] 本版新增路径靶向通过，重点完整预算、failed历史剪枝、章节/越界与watch触发；不扩到新owner/lease测试。
+- [ ] 已提交功能回归与新功能一起靶向绿，基础可选依赖缺失路径有证据。
+- [ ] search排序/权重/dedupe/exact_terms、bin roundtrip、Facade导出冻结通过。
+- [ ] CLI/stdio initialize0.8.1、15工具、isError、UTF-8、纯JSON输出通过。
+- [ ] 零新运行时依赖；不变注册表/缓存代际；不会全库重嵌。
+- [ ] 用户指南/Skill示例与schema逐条对上，没有ghost参数scan_pending/source。
+- [ ] schema字节门禁通过或有用户显式例外；没有换比较基线掩盖超限。
+- [ ] C53真机字段不空，auto_watch费用/隐私与默认关说明到位。
+- [ ] 版本同步/用户升级变化/开发者技术账/主文档现状更新完成。
+- [ ] 本地不跑全量的约定保留，PR/手动CI五matrix通过；发布授权独立确认。
+- [ ] git diff --check绿；stage仅本卡文件；没有个人路径/key/用户真实配置或生成缓存入仓库。
+
+### 7.3 每卡交接与阻塞处理
+
+每完成一张卡追加一段到本版本Worklog，必须写：当前HEAD/分支、已完成卡、刚执行的测试命令/输出、下一卡及依赖、待验证云端/schema例外。代码与文档不同步时该卡不标完成。
+
+遇到阻塞先用最小单用例复现、记录具体异常与现有相关改动；只能回到该卡指定文件修。若需要改变D1–D5、上传授权、缓存格式或引新依赖，停下向用户提一个具体问题；不偷换方案、不牺牲隐私闸门、不循环重试真实API。用户选择后修本文件契约/测试/记账三处。
+
+下一个开发者的第一件实施工作是**C65的失败用例**，不是从Lane E重来，也不是把旧stash应用进来。
+
+## 8. Autoplan 审核与决策日志
+
+### 8.1 Phase 1：CEO / SELECTIVE EXPANSION
+
+前提挑战：#6描述的“heading不存在”和“字符串裁剪破坏JSON”不成立，已根据源码修正为章节语义与完整chunk契约。#5已完成部分不能重做，未提交历史也不能当当前代码。一次0.8.1与默认opt-in仍按历史裁定，补全#6不改变发布节奏。
+
+1. **架构**：检查Facade/私有子包、watcher与manager边界；复用既有对象，拒绝新增任务框架与持久化索引。新refresh/自动扫描按每库合并，不把耗时操作塞防抖线程。
+2. **错误救援**：检查首chunk预算、行号/heading、缓存缺失与无key通道；要求可判定结果、修法与测试。具体异常和用户动作见§5，不以“吞异常不崩”代替验收。
+3. **安全**：检查自动上传的授权范围、ignore、symlink、size二次校验与solo歧义。自动路径比手动更严格，失败不会无限重传，部分探测不得假称唯一。
+4. **数据流**：缺省与空值分别定义；空库不是冷启动，空文件不是行号越界，同名标题不是单章节。状态分页必须能告诉agent下一步是重试、加预算还是指定库。
+5. **代码质量**：检查重复入参解析与单库双路由；只抽必要纯函数和状态调度，保留Facade薄委托。禁止反向导入/Chunk字段重排/缓存代际漂移。
+6. **测试**：已有73项证据与新增矩阵分开记账；线程测试用Event屏障，不以sleep猜调度。云端真机验收要写验证或未验证原因，不能冒充本机HTTP回环。
+7. **性能**：扫描、补嵌、query embedding、rerank分别归因；目标是不让同步占前台，不承诺整个搜索固定毫秒。大标题扫描只读一份原文，预算计量不重复序列化无界候选池。
+8. **可观测性**：STATUS/doctor是快照而非实时服务；实时状态由kb_stats/status返回，diag白名单不加原文/key/路径。冷启动、后台错误、自动拒绝原因必须可区分。
+9. **部署**：compact默认关，auto_watch默认关；仍要公开size默认20与预算首条策略的行为变化。Windows先停入口再安装，回滚不删原始文件/解析产物/状态。
+10. **长期轨迹**：把复杂一致性、无限游标、全Markdown解析留后续，当前契约可测试、可回滚。施工正文只保留一个有效方案，历史审计在Git中保留。
+11. **Design**：无浏览器、页面或可视界面，Phase 2不适用；MCP返回结构与错误交互在Eng/DX审核。
+
+CEO独立声部：首次子代理因执行器reasoning参数报错，重试成功。独立审阅确认缺少#6、预算口径、行号/新鲜度风险；其建议新增 `kb_read.preview/read_budget_bytes` **不采纳**，因为#6初筛是kb_search、不应混淆搜索预算与精读字符上限。
+
+| CEO维度 | 主审 | 独立声部 | 裁决 |
+|---|---|---|---|
+| 前提 | 纠正3类失效前提 | 原计划缺#6 | 已修正文 |
+| 问题 | #5剩余+#6四组 | 读契约不完整 | 搜索与读分别落卡 |
+| 范围 | 不加框架/读preview | 提议额外读preview | 按issue原范围，拒绝扩张 |
+| 替代 | A/B/C比较 | 缺替代契约 | B指定为施工方案 |
+| 外部风险 | 云隐私/额度/宿主大小不固定 | 市场项N/A | 不编造市场数据 |
+| 六月后 | 可回滚契约+追踪待办 | stale/预算固化风险 | 测试锁定并记录升级行为 |
+
+注意：这是Codex主审+独立子代理，不声称已运行Claude CLI，不伪造跨模型一致结论。完整新增方案仍待用户确认。
+
+**CEO Completion Summary**：SELECTIVE EXPANSION；接受#5剩余与#6四组增量，拒绝读preview和新持久化框架。既有能力/失效前提在§1，范围与长期差距在§2，error/rescue和failure登记在§5。没有提出改变用户“一次0.8.1”方向的User Challenge；自动上传授权、云端验证和新增Taste契约仍受最终门禁约束。行业规模/商业收入/市场份额没有可靠项目证据，已检查并标N/A，不编造数字。
+
+<details>
+<summary>收口前的工程与DX审核记录：仅留档，不参与施工</summary>
+
+### 8.2 Phase 3：Eng / FULL REVIEW
+
+**历史审查记录说明**：本节保留范围收口前的独立意见，不是额外施工清单。用户最新明确要求不扩防御性工程；下文涉及集合/状态新锁、worker独占/租约、保守parsing恢复、上传副本的建议均未采纳。本版实施以§0范围声明及§4当前卡为准，不能把本节旧处置说明重新变成发布前置。
+
+**Scope Challenge**：不能把#6当四个schema字段补丁；读优先会扩大并发窗口，已经实施的跨库寻址也有fail-open，自动摄取则必须保护跨进程消费。核实 `sync_engine.run_sync` 的逐文件文本修改、worker构造中的parsing恢复、registry文件锁失败退化、fanout的固定候选窗，因而把安全/生命周期前置，而不是先做compact再补测试。范围不扩到新任务框架或原子检索后端代际。
+
+**架构与依赖图**：
+
+```text
+config.py -> indexer Facade -> private watch / sync_engine / search / reading
+     |           |                 |           |
+     |           |          short chunks/state locks
+     |           +-> request_refresh -> existing scheduler -> sync lock
+     +-> ingest manager <--- separate scan hook
+                |       source -> frozen upload file -> parse -> A4 refresh
+                +-> required state lock + lifetime worker-owner lock
+
+server dispatch -> route -> rank/filter/dedupe -> projection -> whole budget
+      |             |                        |             |
+      |          single/scoped/global      compact      group_offsets
+      +-> source path -> bytes snapshot -> range/heading -> char continuation
+
+C65 -> C66 ------------------> C67 -> C68
+          |                      (projection before budgeting)
+          +------------------> C69a -> C69b
+          +-> C58c <- C58b <- C58a
+                 +-> C58d
+all code + C59 -> C70 -> C60 -> authorized CI/release
+```
+
+1. **Architecture（置信9/10）**：`run_sync` 当前会执行 `owner._chunks[source] = chunks`、`owner._chunks.pop(source,None)`，所以“已有索引”不等于上一轮原子提交的全后端快照。C66改为短锁稳定集合/统一进度状态，公开最终一致性，不无意承诺事务隔离；FTS候选仍按by_id过滤。完整代际构建是独立审阅建议，当前不采用，避免补丁版变成同步引擎迁移；该取舍列Taste和后续待办。
+2. **Code Quality（置信9/10）**：优先watch/reading等私有纯函数，Facade薄委托，保留7导出与Chunk结构。公共read原来不截字符，不能把MCP cap倒灌到其API；C69a明确public无限字符、server显式cap。锁错误不能silent-yield继续写摄取账本，新增required/nonblocking选项但默认注册表行为保持，避免借此重构整套注册表。
+3. **Tests（置信9/10）**：pytest已存在，新增分支与fixture在§4/§5.2逐条指定；真实两进程与Event屏障必要，线程数/调用次数/次序才是CI正确性，不用“应该很快”的sleep断言。既有122项和1条Golden是基线，新测试还未创建；外置QA清单已保存，不能声称实施覆盖率100%。所有nil/empty、bounds、incomplete、锁失败、预算零进展、长单行/分隔符和stop分支都有拟定验收。
+4. **Performance（置信8/10）**：1s普通read节流、native事件合并、PDF扫描离开文本scheduler，阻止请求数线性增加线程/扫描。不把query embedding/rerank时间混作sync，不把32库/2s软probe当硬超时。完整chunk预算对固定候选池做正前缀二分；0条hint和全量形状独立测，避免混入不同包络导致非单调。上传快照增加最多一个源副本的磁盘开销，cap0与磁盘满有明确失败语义；实际大库IO/p95仍需C70量测。
+
+**独立工程声部与处置**：中断前agent恢复查询为not_found，不计成功；恢复后新独立审阅完整给出8项。下表都已写入施工卡，而不是仅留在审核意见中。
+
+| # / 严重度 | 独立意见与代码证据 | 主审处置 | 是否还有施工设计空白 |
+|---|---|---|---|
+| E1/P1 | run_sync逐文件变异/all_chunks乐观重试；建议完整代际读视图 | 接受一致性缺口，C66短集合快照+诚实最终一致；重后端代际不选 | 无；较强一致性延后/Taste |
+| E2/P2 | `_sync_progress`写入与copy无共同锁 | C66独立短状态锁，全写点一起修改 | 无 |
+| E3/P1 | vault-startup线程未保存，shutdown后可构造新库 | C66服务stop event/创建双检/startup句柄/移除防复活 | 无 |
+| E4/P1 | `_process_file_lock` open或locking失败仍yield | C58b required锁，IO失败拒绝写/入队 | 无 |
+| E5/P1 | constructor把活parsing改queued；建议续租owner | 接受；采用更简单OS生命周期独占锁+保守中断失败，无到期抢占 | 无；恢复行为Taste |
+| E6/P2 | 单最新sha无法永久记住A→B→A | 明确契约仅连续未改版本免重提，sha实际变化可入队，不无限存旧hash | 无 |
+| E7/P1 | grouped换单库路由改变dedupe/rerank；候选窗有限 | C68新增group_offsets同路由，固定候选池，明确非事务/无限游标 | 无；额外输入Taste |
+| E8/P2 | newline前后同叫“行边界”会丢/重复换行 | C69a两个坐标与cap100/101拼接测试明确指定 | 无 |
+
+| Eng维度 | 主审 | 独立声部 | Consensus |
+|---|---|---|---|
+| 范围 | 完整安全增量，拒绝重后端迁移 | 原子代际才能称已提交快照 | DISAGREE，改承诺边界并列Taste |
+| 架构 | 复用scheduler与OS独占 | 需要owner/lease | 问题CONFIRMED，具体机制不同 |
+| 质量 | strict锁/稳定集合/字符边界 | 指出silent-lock/state copy | CONFIRMED |
+| 测试 | 进程/Event/换行/group闭环 | 至少8新增分支缺口 | CONFIRMED，均落到卡 |
+| 性能 | 前台无sync，固定池二分 | 固定响应正前缀二分可单调 | CONFIRMED，不承诺所有网络快 |
+| 失败恢复 | parsing未知结果手动恢复 | 禁止把活parsing重排 | 安全需求CONFIRMED，保守恢复新增取舍 |
+
+这是主审+独立子代理的意见比较，不是Claude+Codex双CLI验证。5/6维度在问题层面一致，1处一致性方案取舍已列门禁；具体机制不同不能宣传成完全跨模型一致。
+
+**Eng Completion Summary**：FULL_REVIEW；8独立发现全部有确定处置，未留施工设计空白；8项中的较强代际建议降为诚实契约+待办，未假称已修代码。架构/测试图、failure与error登记、外置QA产物、NOT In Scope、既有能力清单均已保存。实施仍有§7所有发布阻塞待验证；方案Reviewed不等于代码Clean或ship Cleared。
+
+### 8.3 Phase 3.5：DX / POLISH
+
+**产品与人物**：本地Python MCP服务+用户Skill；主要persona是熟悉Python/PowerShell/pytest但第一次接手本仓库的贡献者，另需兼顾通过IDE连接器升级的库主人。已有Python3.10+、已clone项目是“热准备”前提；全新系统安装Python/客户端不计入≤5min的热准备目标，必须分开报时。不新建网站/在线playground，不用新增远程服务降低表面步骤。
+
+**Developer Empathy Narrative（第一人称）**：
+我第一次接手时，先想确认“哪些已经做完，哪些才是下一步”，不想用过期Worklog猜工作树。看到C65第一个失败测试与当前分支证据，我可以先把最小回归跑起来。作为库主人，我愿意显式开启自动解析，但需要知道它会上传启用时已有PDF、失败为什么不自己重试，以及关掉后不能撤回已上传文件。检索给我0条时，我必须知道是预算放不下、索引还没好，还是文件真的不存在，不能靠再问十次碰运气。
+
+**Developer Journey（九阶段）**：
+
+| 阶段 | 本版可观察成果 | 原摩擦 / 计划动作 | 验证 |
+|---|---|---|---|
+| 1 Discover | README知道是本地多库MCP，不把PDF原件当直接索引 | 能力摘要与云上传边界分清 | C70中英文 |
+| 2 Evaluate | 不填key也可static+公共fixture验证 | 历史100%无语料说明→本轮Golden仅1条明确 | C70.3离线输出 |
+| 3 Install | venv editable安装成功 | Windows exe占用→停具体连接器再装 | C59/C60 |
+| 4 Hello World | 公共fixture检索命中并拿到source | 默认配置可能宿主external→显式临时配置 | §0.4/C70.3 |
+| 5 Integrate | 连接器initialize，kb_init/kb_search/kb_read闭环 | required path与handler别名不等价→说明限制 | C55/C70/stdio |
+| 6 Debug | 越界/歧义/预算0/cold能选唯一恢复动作 | 空正文成功/同名并集→具名错误与有限候选 | C65/C68/C69 |
+| 7 Scale | 多库compact与分组预算可续 | 旧group游标混总数→group_offsets同路由，固定窗限制 | C67/C68 |
+| 8 Upgrade | 0.8.1行为变化/worker恢复/回滚数据保留 | “git pull即升级”/删state建议→运行簿 | C59/C60/§6.1 |
+| 9 Contribute | 卡、所有权、靶向集、技术账、CI入口清楚 | 过期未提交代码/无测试记账→逐卡闭环 | §3/§7.3 |
+
+**竞争与参考入口核查（2026-10-05）**：只比较官方文档的onboarding方式，不宣称跑了竞争产品或有真实耗时。选择“简单、本地、无key可试”的参考档，不拿云数据库能力做本仓库补丁版的需求。
+
+| 参考 | 官方入口方式 | 可借用的DX原则 | TTHW事实 |
+|---|---|---|---|
+| [Filesystem MCP](https://github.com/modelcontextprotocol/servers/tree/main/src/filesystem) | 允许目录/Roots配置，npm入口 | 先公开可读范围，范围缺失具名错误 | 本轮未安装量测，不填分钟数 |
+| [MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk) | 小型tool示例+Inspector | 第一个可见结果具体，不让用户先读内部架构 | 本轮未量测；不是本版要新增的依赖 |
+| [Qdrant MCP](https://github.com/qdrant/mcp-server-qdrant) | uvx+集合/本地或远程Qdrant配置 | 配置选择互斥、默认与读取范围可发现 | 本轮未量测，模型下载/DB环境与本库不可直接比 |
+
+参考取自Exa读取的官方README，未采用star数、市场规模、公开宣传分钟数作为性能证据。
+
+**TTHW评估与目标**：当前热准备路径估计5–15min，目标≤5min；冷准备（Python/客户端/网络安装均无）估计15–30min+，不能承诺≤5min。均为人工估计，非计时结果。C70记录从install开始、首次fixture命中、首次真实MCP检索三时间点；首次MCP还含人工客户端接线，单独报告。三阶段：安装环境、跑隔离Golden、连接器注册/检索；原始命令数不得合并成“仅3条命令”的营销断言。
+
+**八遍检查与Scorecard**：以下是计划完成后的预期质量分，不是现行产品评分、不是实测承诺。
+
+| Pass | 现状估计→计划预期 | 已查内容/处置/剩余限制 |
+|---|---|---|
+| 1 Getting Started | 6→7 | 显式venv+UTF-8+无BOM临时配置，Golden命中可见；客户端配置仍需人工，冷环境不保证5分钟 |
+| 2 API/CLI | 6→8 | compact默认关、source/lines回读、group_offsets/start_char精确定义；新增API需用户确认且schema仍有别名限制 |
+| 3 Error Handling | 4→9 | 越界实际行数、heading歧义、budget0/incomplete恢复动作；锁/坏state自动暂停。内部cause保留但不泄露路径/key |
+| 4 Docs | 5→8 | 单一权威卡、主文档映射、旧方案Git还原；不强迫新人先通读全部1500行，先§0–3后首卡 |
+| 5 Upgrade | 4→8 | Windows停连接器、版本检查、20MiB/whole budget/group/heading/崩溃恢复变化公开；云上传不可撤销 |
+| 6 Environment | 7→8 | Python3.10无新依赖、临时pytest隔离、Event/两进程、五矩阵CI；非Win原生watch不新增 |
+| 7 Ecosystem | 5→6 | 现有GitHub Issues/开发者记账/官方skill是反馈渠道，不编造社群规模、未验证收费额度不承诺 |
+| 8 Measurement | 3→8 | Hit/MRR与schema已有本轮基线，payload/p95/TTHW实施后测；不增加埋点上传或付费评测 |
+
+算术平均计划预期 **7.8/10**；Getting Started和生态仍有真实限制，不包装成8维10/10。
+
+**三个具体错误旅程**：
+
+| 路径 | 现状 | 目标用户看到 | 唯一推荐下一步 |
+|---|---|---|---|
+| 行号11340，实际10行 | `content=""`成功 | requested/actual/source+范围错误isError | 核对分卷，已知标题改heading；不要把空白当空文件 |
+| 首chunk超预算 | 首条正文被切，cursor已推进 | returned0/truncated/原cursor+hint | compact或增budget；不可重复同预算循环 |
+| 构造第二manager时已有parsing | 自动转queued，可能重复上传 | 忙/活consumer状态，孤儿明确failed/未知远程结果 | 活任务等status；真正孤儿用户决定是否手動retry |
+
+错误说明/Skill还需指向用户指南相应节，但不把完整URL重复塞每条成功返回；stdio工具错误仍既有text+isError，不在补丁版另造结构化错误SDK。
+
+**DX Implementation Checklist（汇总，不建第二套卡）**：
+
+- [ ] C58/C66：默认关零自动上传、显式冷暖与停止状态；status/pending不授权云操作。
+- [ ] C67/C68/C69：compact回读、同路group续页、bounds/heading/newline/长单行实际mock闭环。
+- [ ] C59/C60：指定PID/客户端升级指南，恢复行为与不可逆上传说明，版本/stdio同步。
+- [ ] C70：public/developer文档分层，所有例子真实参数，临时配置可运行，TTHW计时和基线同口径复测。
+
+**独立DX复核已完成**：覆盖§0–7、开发者Quickstart和关键配置/入口。四项P2建议中，旧enabled严格布尔校验不扩入本版；group_offsets文档组合、用户CHANGELOG避免内部术语、README/Quickstart无依据70%量化分别在C68/C60/C70说明。没有新增防御性开发任务。评分仅是计划预期，未进行新功能实测。
+
+</details>
+
+### 8.4 Cross-Phase Themes / 最终门禁
+
+1. **可恢复而非空成功**：CEO的错误救援、Eng的完整chunk/范围/活任务处置、DX的下一步动作同指一个问题。每个失败都要区分“重试/增预算/指定库/手动恢复”，不靠silent fallback制造成功外观。
+2. **已有不等于已完成**：历史Lane D未提交、heading参数已经存在但语义不足、JSON合法但chunk不完整、测试规格不是通过证据。任务卡状态、旧方案还原点、实际122项结果已分别记账。
+3. **本版摄取规则**：保留默认自动关、既有ignore/沙箱、用户确认的size cap与同hash去重；不新增上传副本或锁框架。真机验证仍按已有授权流程执行，不扩大本轮工作。
+4. **一致性与上下文经济性要公开边界**：compact减字段，预算完整prefix，分组同路但固定候选窗，后台读优先但最终一致；不再用“瞬间最新/硬预算永远达标/无限游标”掩盖不可满足条件。
+
+**文档完成与实施边界**：本轮计划已完成；下一开发者直接按§3与§4实施，不再等待额外架构选型。未实施代码、未跑全量CI或真实云验收，不代表发布已通过。schema≤10%若实施后实测超限，按C70.3记录实际值后处理。
+
+### 8.5 Decision Audit Trail
+
+| # | Phase | 决策 | 分类 | 原则 | 理由 / 不选方案 |
+|---|---|---|---|---|---|
+| A01 | CEO | 重建一份当前施工正文，历史保留Git+还原点 | Mechanical | P5显式 | 不让互相推翻的三轮报告成为执行指令 |
+| A02 | CEO | 保留D1–D5/X3 | User-confirmed | 保留用户方向 | 不复议拆版、size缺省、solo |
+| A03 | CEO | 不续接Worklog未提交Lane D | Mechanical | P3实际 | 当前干净分支无该代码 |
+| A04 | CEO | #6不是新增heading、不是修非法JSON | Mechanical | P4复用 | 改已存能力的语义边界 |
+| A05 | Eng | 探测incomplete不自动展开 | Mechanical | P1完整 | 不能证明唯一就显式选库 |
+| A06 | Eng | 只读请求后台refresh而非缩短等锁 | Taste | P5/P3 | 真正去掉前台sync，保留旧同步API |
+| A07 | Eng | compact opt-in，不改preview默认 | Taste | P3兼容 | 满足瘦身且不删除旧消费者必用字段 |
+| A08 | Eng | 首条超预算返回零chunk、不裁正文 | Taste | P1完整 | 预算与完整性不能靠切字符串兼得；零进展提示 |
+| A09 | Eng | envelope超预算fail-visible | Mechanical | P1诚实 | 不删错误/solo诊断，不假称硬上限 |
+| A10 | Eng | heading读物理原文，同级/更高级边界 | Taste | P4/P5 | 不复用不完整、可变的chunk并集 |
+| A11 | Eng | 重复heading报歧义，不新occurrence参数 | Mechanical | P5 | 用已存在行号消歧 |
+| A12 | Eng | 自动失败账本独立于500job历史 | Mechanical | P1 | 单取最新无法抵抗剪枝 |
+| A13 | Eng | failed同hash不自动重试，手动可重试 | Mechanical | P1 | 防额度/429重提；不加入矛盾的自动failed退避 |
+| A14 | Eng | size cap只管配置策略，不替换channel限额fallback | Mechanical | P3 | 不砍无key用户已有PDF本地兜底 |
+| A15 | DX | UTF-8命令对齐CI，历史fixture不当现存bug | Mechanical | P3 | 本轮73项复跑通过 |
+| A16 | DX | 有限诊断hint，不把pending全文重复塞init | Mechanical | P5 | 修上下文经济性时不能新制造大payload |
+| A17 | DX | 回滚停客户端、配置默认恢复，不删除数据 | Mechanical | P1 | 上传不可逆，保留可恢复产物与状态 |
+| A18 | 用户收口 | 不扩防御性架构，立即完成计划 | User-confirmed | 最新用户指示 | 撤销新增state锁框架/worker owner与lease/上传副本/检索事务代际；既有规则保留 |
+| A19 | DX | 用户日志写体验，参数放指南；删无依据70% | Mechanical | 文档一致 | 不把内部字段当用户更新摘要 |
+
+## GSTACK REVIEW REPORT
+
+| Review | Runs | Status | Findings |
+|---|---|---|---|
+| CEO | 1主审+1独立成功 | REVIEWED | 范围/前提/替代已修，#6纳入施工卡 |
+| Design | 0 | SKIPPED | 无可视UI |
+| Eng | 1主审+1独立成功 | REVIEWED / SCOPE REDUCED | 施工卡与测试已补；额外防御设计按用户指示移出 |
+| DX | 1主审+1独立完成 | REVIEWED | 命令/文档/升级核对完成；不再扩审查 |
+
+VERDICT: 文档编写完成，按当前卡片可执行；不代表功能代码或发布已通过。
+
+**UNRESOLVED DECISIONS:**
+- 实施后若schema实测超过10%，按C70.3处理例外；当前不阻塞文档交付。

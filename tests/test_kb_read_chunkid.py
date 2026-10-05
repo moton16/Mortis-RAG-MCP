@@ -403,6 +403,9 @@ def test_chunk_id_probe_honours_budget_cap(tmp_path: Path, monkeypatch: pytest.M
     server = VaultMcpServer(config_path)
     for name, vault in zip(("A", "B", "C"), vaults):
         server.registry.add(str(vault), name=name)
+        idx = MarkdownIndexer(str(vault), server.config)
+        idx.sync()
+        VaultMcpServer._close_probe_indexer(idx)
 
     with pytest.raises(ValueError) as exc_info:
         server._kb_read({"chunk_id": "0" * 40})
@@ -439,3 +442,256 @@ def test_chunk_id_hit_in_solo_vault_reports_name_only(tmp_path: Path):
     assert res["vault"] == "SoloVault"
     assert res["solo"] is True
     assert "vault_path" not in res
+
+
+def test_chunk_read_no_registered_vaults(tmp_path: Path):
+    """C65: 零注册库 kb_read(chunk_id=...) 经 handle 必须 isError=true，文本含 kb_init，不能协议 -32000 / IndexError。"""
+    config_path = tmp_path / "app.toml"
+    config_path.write_text('mode = "static"\n', encoding="utf-8")
+    server = VaultMcpServer(config_path)
+    req = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {"name": "kb_read", "arguments": {"chunk_id": "0" * 40}},
+    }
+    resp = server.handle(req)
+    assert resp is not None
+    assert "result" in resp, f"必须返回 result 而非 jsonrpc error: {resp}"
+    result = resp["result"]
+    assert result.get("isError") is True
+    err_text = result["content"][0]["text"]
+    assert "kb_init" in err_text
+
+
+def test_chunk_probe_one_hit_with_unprobed_vault_is_incomplete(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """C65: 唯一已探命中但存在未探库时（超库数或超时间），必须 fail-closed 报 incomplete 并要求显式传 vault_path。"""
+    monkeypatch.setattr(VaultMcpServer, "_startup_index_all", lambda self: None)
+    v_hit = tmp_path / "vault_hit"
+    v_unprobed = tmp_path / "vault_unprobed"
+    v_hit.mkdir()
+    v_unprobed.mkdir()
+    (v_hit / "hit.md").write_text("# Target\ncontent target\n", encoding="utf-8")
+    (v_unprobed / "other.md").write_text("# Other\ncontent other\n", encoding="utf-8")
+
+    config_path = tmp_path / "app.toml"
+    config_path.write_text('mode = "static"\n', encoding="utf-8")
+    server = VaultMcpServer(config_path)
+    server.registry.add(str(v_hit), name="HitVault")
+    server.registry.add(str(v_unprobed), name="UnprobedVault")
+
+    idx_hit = server._indexer_for({"vault_path": "HitVault"})
+    idx_hit.sync()
+    cid = idx_hit.all_chunks()[0].id
+
+    # 1. 超库数限制导致 UnprobedVault 未探测
+    monkeypatch.setattr(VaultMcpServer, "_PROBE_MAX_UNLOADED_VAULTS", 0)
+    with pytest.raises(ValueError) as exc_info:
+        server._kb_read({"chunk_id": cid})
+    msg = str(exc_info.value)
+    assert "incomplete" in msg or "未完成" in msg or "未探测" in msg
+    assert "vault_path" in msg
+    assert "HitVault" in msg
+
+    # 2. 超时间预算导致 UnprobedVault 未探测
+    monkeypatch.setattr(VaultMcpServer, "_PROBE_MAX_UNLOADED_VAULTS", 32)
+    monkeypatch.setattr(VaultMcpServer, "_PROBE_BUDGET_SECONDS", -1.0)
+    with pytest.raises(ValueError) as exc_info2:
+        server._kb_read({"chunk_id": cid})
+    msg2 = str(exc_info2.value)
+    assert "incomplete" in msg2 or "未完成" in msg2 or "未探测" in msg2
+    assert "vault_path" in msg2
+
+
+def test_chunk_probe_missing_cache_is_unprobed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """C65: 未加载且无有效文本缓存的库计入 skipped（尚无可探测文本索引），不谎报文件可能已修改。"""
+    monkeypatch.setattr(VaultMcpServer, "_startup_index_all", lambda self: None)
+    v1 = tmp_path / "vault_loaded"
+    v2 = tmp_path / "vault_no_bin"
+    v1.mkdir()
+    v2.mkdir()
+    (v1 / "a.md").write_text("# A\ncontent a\n", encoding="utf-8")
+    (v2 / "b.md").write_text("# B\ncontent b\n", encoding="utf-8")
+
+    config_path = tmp_path / "app.toml"
+    config_path.write_text('mode = "static"\n', encoding="utf-8")
+    server = VaultMcpServer(config_path)
+    server.registry.add(str(v1), name="V1")
+    server.registry.add(str(v2), name="V2")
+    idx1 = server._indexer_for({"vault_path": "V1"})
+    idx1.sync()
+
+    with pytest.raises(ValueError) as exc_info:
+        server._kb_read({"chunk_id": "0" * 40})
+    msg = str(exc_info.value)
+    assert "尚无可探测文本索引" in msg
+    assert "文件可能已修改" not in msg
+
+
+def test_chunk_probe_valid_empty_cache_is_complete(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """C65: 合法空缓存被成功读取，属于完整探测零命中，报告文件可能已修改。"""
+    monkeypatch.setattr(VaultMcpServer, "_startup_index_all", lambda self: None)
+    v1 = tmp_path / "vault_empty_1"
+    v2 = tmp_path / "vault_empty_2"
+    v1.mkdir()
+    v2.mkdir()
+
+    config_path = tmp_path / "app.toml"
+    config_path.write_text('mode = "static"\n', encoding="utf-8")
+    server = VaultMcpServer(config_path)
+    server.registry.add(str(v1), name="V1")
+    server.registry.add(str(v2), name="V2")
+
+    # 分别为两库写入合法空缓存
+    from mortis_rag_mcp._indexer.cache_codec import _CacheCodec
+    idx1 = MarkdownIndexer(str(v1), server.config)
+    idx2 = MarkdownIndexer(str(v2), server.config)
+    _CacheCodec.dump(idx1._chunks_cache_path, idx1._chunks_meta(), {})
+    _CacheCodec.dump(idx2._chunks_cache_path, idx2._chunks_meta(), {})
+    VaultMcpServer._close_probe_indexer(idx1)
+    VaultMcpServer._close_probe_indexer(idx2)
+
+    # 清空常驻 indexer，确保探测走临时 probe 读 bin 缓存路径
+    server._indexers.clear()
+
+    with pytest.raises(ValueError) as exc_info:
+        server._kb_read({"chunk_id": "0" * 40})
+    msg = str(exc_info.value)
+    assert "文件可能已修改" in msg
+    assert "跳过" not in msg
+
+
+def test_chunk_probe_solo_diagnostics_do_not_leak_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """C65: solo 候选/跳过原因只给库名与 solo 标记，绝不泄露绝对路径。"""
+    monkeypatch.setattr(VaultMcpServer, "_startup_index_all", lambda self: None)
+    solo_dir = tmp_path / "secret_solo_dir"
+    solo_dir.mkdir()
+    normal_dir = tmp_path / "normal_dir"
+    normal_dir.mkdir()
+
+    config_path = tmp_path / "app.toml"
+    config_path.write_text('mode = "static"\n', encoding="utf-8")
+    server = VaultMcpServer(config_path)
+    server.registry.add(str(solo_dir), name="SecretSolo", solo=True)
+    server.registry.add(str(normal_dir), name="NormalVault")
+
+    import shutil
+    shutil.rmtree(solo_dir)  # 目录删除触发异常
+
+    with pytest.raises(ValueError) as exc_info:
+        server._kb_read({"chunk_id": "0" * 40})
+    msg = str(exc_info.value)
+    secret_path = str(solo_dir)
+    assert secret_path not in msg
+    assert "SecretSolo" in msg
+
+
+def test_probe_load_vectors_false_survives_backend_fallback(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """C65: 当配置 sqlite_vec 但回退到 memory 时，load_vectors=False 必须保证 _load_vectors_cache 调用为 0。"""
+    from mortis_rag_mcp.config import VectorConfig
+
+    vault = tmp_path / "vault_vec"
+    vault.mkdir()
+    (vault / "test.md").write_text("# Test\ncontent\n", encoding="utf-8")
+
+    config = load_config(None)
+    config.vector.backend = "sqlite_vec"
+
+    # 首次建库写出缓存
+    idx_init = MarkdownIndexer(str(vault), config)
+    idx_init.sync()
+
+    call_count = 0
+    orig_load_vec = MarkdownIndexer._load_vectors_cache
+
+    def spy_load_vectors(self):
+        nonlocal call_count
+        call_count += 1
+        return orig_load_vec(self)
+
+    monkeypatch.setattr(MarkdownIndexer, "_load_vectors_cache", spy_load_vectors)
+
+    # 构造 load_vectors=False 实例
+    probe = MarkdownIndexer(str(vault), config, load_vectors=False)
+    assert call_count == 0, f"load_vectors=False 时 _load_vectors_cache 应被跳过，实际调用次数: {call_count}"
+    VaultMcpServer._close_probe_indexer(probe)
+
+
+def test_chunk_probe_closes_resources_on_all_outcomes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """C65: 探测临时 indexer 在零命中/单命中/歧义/incomplete 各退出路径均恰当关闭，不关常驻。"""
+    monkeypatch.setattr(VaultMcpServer, "_startup_index_all", lambda self: None)
+    v1 = tmp_path / "v1"
+    v2 = tmp_path / "v2"
+    v1.mkdir()
+    v2.mkdir()
+    (v1 / "a.md").write_text("# A\ncontent a\n", encoding="utf-8")
+    (v2 / "b.md").write_text("# B\ncontent b\n", encoding="utf-8")
+
+    config_path = tmp_path / "app.toml"
+    config_path.write_text('mode = "static"\n', encoding="utf-8")
+    server = VaultMcpServer(config_path)
+    server.registry.add(str(v1), name="V1")
+    server.registry.add(str(v2), name="V2")
+
+    idx1 = MarkdownIndexer(str(v1), server.config)
+    idx1.sync()
+    idx2 = MarkdownIndexer(str(v2), server.config)
+    idx2.sync()
+
+    # 常驻 V1
+    resident = server._indexer_for({"vault_path": "V1"})
+    closed_probes: list[MarkdownIndexer] = []
+    orig_close = VaultMcpServer._close_probe_indexer
+
+    def spy_close(probe: MarkdownIndexer):
+        closed_probes.append(probe)
+        orig_close(probe)
+
+    monkeypatch.setattr(VaultMcpServer, "_close_probe_indexer", staticmethod(spy_close))
+
+    # 1. 零命中退出路径
+    with pytest.raises(ValueError):
+        server._kb_read({"chunk_id": "0" * 40})
+    assert any(p.vault_path == v2 for p in closed_probes)
+    assert resident not in closed_probes
+
+
+def test_probe_promoted_chunk_disappeared(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """C65: 探测命中临时库提升常驻时若 chunk 消失，必须明确提示重新 kb_search，不得用旧 probe chunk 兜底。"""
+    monkeypatch.setattr(VaultMcpServer, "_startup_index_all", lambda self: None)
+    v = tmp_path / "vault_promo"
+    v.mkdir()
+    (v / "doc.md").write_text("# Title\ncontent promo\n", encoding="utf-8")
+    v_other = tmp_path / "other"
+    v_other.mkdir()
+    (v_other / "other.md").write_text("# Other\ncontent other\n", encoding="utf-8")
+
+    config_path = tmp_path / "app.toml"
+    config_path.write_text('mode = "static"\n', encoding="utf-8")
+    server = VaultMcpServer(config_path)
+    server.registry.add(str(v), name="PromoVault")
+    server.registry.add(str(v_other), name="OtherVault")
+
+    idx = MarkdownIndexer(str(v), server.config)
+    idx.sync()
+    idx_other = MarkdownIndexer(str(v_other), server.config)
+    idx_other.sync()
+    VaultMcpServer._close_probe_indexer(idx)
+    VaultMcpServer._close_probe_indexer(idx_other)
+
+    cid = idx.all_chunks()[0].id
+
+    # 探测前让常驻 indexer 的 all_chunks 返回空列表（模拟缓存变化）
+    orig_indexer_for = server._indexer_for
+
+    def fake_indexer_for(args):
+        inst = orig_indexer_for(args)
+        inst._chunks.clear()
+        return inst
+
+    monkeypatch.setattr(server, "_indexer_for", fake_indexer_for)
+
+    with pytest.raises(ValueError) as exc_info:
+        server._kb_read({"chunk_id": cid})
+    msg = str(exc_info.value)
+    assert "索引已变化" in msg or "重新 kb_search" in msg

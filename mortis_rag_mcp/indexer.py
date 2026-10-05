@@ -192,6 +192,7 @@ class MarkdownIndexer:
             "chunks_total": 0,
         }
         self._chunks_cache_path: Path | None = None
+        self._chunks_cache_loaded: bool = False
         self._vectors_cache_path: Path | None = None
         self._fts_cache_path: Path | None = None
         self._vectors_db_path: Path | None = None
@@ -230,7 +231,7 @@ class MarkdownIndexer:
         # ids are already persisted so sync never re-embeds them.
         self._vectors_on_disk = bool(getattr(self._vector_backend, "on_disk", False))
         self._disk_vectors: set[str] = set()
-        if not self._vectors_on_disk and self.config.vector.backend == "sqlite_vec":
+        if not self._vectors_on_disk and self.config.vector.backend == "sqlite_vec" and load_vectors:
             # Configured sqlite_vec but import/load failed -> fell back to memory;
             # the vectors cache was skipped during init, so load it now.
             try:
@@ -359,6 +360,7 @@ class MarkdownIndexer:
         meta, files = loaded
         if meta != self._chunks_meta():
             return
+        self._chunks_cache_loaded = True
         self._chunks = {source: chunks for source, (_, chunks) in files.items()}
         self._signatures = {source: signature for source, (signature, _) in files.items()}
 
