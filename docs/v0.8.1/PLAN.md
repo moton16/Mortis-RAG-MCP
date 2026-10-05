@@ -213,7 +213,7 @@ CURRENT                         THIS RELEASE                     12-MONTH IDEAL
 | 1 | [x] | C65 | 已提交跨库寻址的fail-closed补强 | Intake | 2–4h / 30–60m |
 | 2 | [x] | C66 | 可合并后台refresh、所有MCP只读路径、A4回调 | C65 | 1–2d / 1.5–3h |
 | 3 | [x] | C58a | auto_watch与size配置 | Intake | 1–2h / 20–40m |
-| 4 | [ ] | C58b | 统一size闸门、自动判据账本、单队列 | C58a | 0.5–1d / 1–2h |
+| 4 | [x] | C58b | 统一size闸门、自动判据账本、单队列 | C58a | 0.5–1d / 1–2h |
 | 5 | [ ] | C58c+C61 | native/poll触发、扫描合并与生命周期 | C66,C58b | 0.5–1d / 1–2h |
 | 6 | [ ] | C58d | server/doctor/hint接线与集成 | C58c | 2–4h / 30–60m |
 | 7 | [ ] | C67 | compact全路由投影 | C66 | 2–4h / 30–60m |
@@ -360,7 +360,7 @@ MCP search -> existing chunks/FTS/vectors -> serialize
 
 **验收**：默认双关闭、20MiB；bool拒收、零/边界校验与TOML/Python3.10 fallback通过。建议提交 `feat(config): add opt-in ingest auto watch and size policy`。
 
-### [ ] C58b：size闸门、自动候选与持久化免重试
+### [x] C58b：size闸门、自动候选与持久化免重试
 
 **前置**：C58a。文件：`ingest/worker.py`，`tests/test_ingest_auto.py/test_ingest_worker.py/test_adversarial_v070.py`。新增逻辑留在manager，不让watch直接负责job状态；不改registry锁API。
 

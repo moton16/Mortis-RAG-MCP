@@ -1,6 +1,7 @@
 """Unit tests for Ingest auto_watch and max_file_size_mb configuration (Card C58a)."""
 from __future__ import annotations
 
+import json
 import math
 from pathlib import Path
 
@@ -212,3 +213,390 @@ def test_fallback_toml_parser() -> None:
     )
     parsed_str = _fallback_toml(text_str)
     assert parsed_str["ingest"]["auto_watch"] == "false"
+
+
+# ======================================================================
+# Card C58b Tests: Size Gate, Auto Candidates, and Ledger Deduplication
+# ======================================================================
+
+from unittest.mock import MagicMock, patch
+from mortis_rag_mcp.ingest.mineru import MineruError, ParsedDocument
+from mortis_rag_mcp.ingest.worker import IngestManager, _sha256
+
+
+def test_size_gate_explicit_submit_rejects_and_zero_calls(tmp_path: Path) -> None:
+    """Explicit submit rejects oversized file with ValueError; zero client parse calls."""
+    mgr = IngestManager(tmp_path, IngestConfig(enabled=True, max_file_size_mb=20))
+    big_pdf = tmp_path / "big.pdf"
+    # 21 MiB
+    big_pdf.write_bytes(b"%PDF-1.4 " + b"0" * (21 * 1024 * 1024))
+
+    mock_parse = MagicMock()
+    with patch("mortis_rag_mcp.ingest.mineru.MineruClient.parse", mock_parse):
+        with pytest.raises(ValueError, match="exceeds limit"):
+            mgr.submit(["big.pdf"])
+
+    assert mock_parse.call_count == 0
+    st = mgr.status()
+    assert len(st["jobs"]) == 0
+
+
+def test_size_gate_exact_cap_allowed(tmp_path: Path) -> None:
+    """Exact cap boundary size == cap is allowed."""
+    mgr = IngestManager(tmp_path, IngestConfig(enabled=True, max_file_size_mb=1))
+    exact_pdf = tmp_path / "exact.pdf"
+    exact_pdf.write_bytes(b"0" * (1 * 1024 * 1024))
+
+    with patch.object(mgr, "_worker_loop"):
+        res = mgr.submit(["exact.pdf"])
+        assert res["submitted"] == 1
+        assert len(res["jobs"]) == 1
+
+
+def test_size_gate_scan_pending_and_submit_none(tmp_path: Path) -> None:
+    """scan_pending tags oversized files reason='too_large' without sha; submit(None) skips them."""
+    mgr = IngestManager(tmp_path, IngestConfig(enabled=True, max_file_size_mb=20))
+    small_pdf = tmp_path / "small.pdf"
+    small_pdf.write_bytes(b"%PDF-1.4 small content")
+    big_pdf = tmp_path / "big.pdf"
+    big_pdf.write_bytes(b"%PDF-1.4 " + b"X" * (25 * 1024 * 1024))
+
+    pending = mgr.scan_pending()
+    assert len(pending) == 2
+
+    big_item = next(p for p in pending if p["source"] == "big.pdf")
+    assert big_item["reason"] == "too_large"
+    assert big_item["sha256"] == ""
+    assert big_item["limit_bytes"] == 20 * 1024 * 1024
+
+    small_item = next(p for p in pending if p["source"] == "small.pdf")
+    assert small_item["reason"] == "new"
+    assert small_item["sha256"] != ""
+
+    mock_parse = MagicMock()
+    with patch("mortis_rag_mcp.ingest.mineru.MineruClient.parse", mock_parse):
+        with patch.object(mgr, "_worker_loop"):
+            res = mgr.submit(None)
+            assert res["submitted"] == 1
+            assert res["skipped_too_large"] == 1
+            assert res["jobs"][0]["source"] == "small.pdf"
+
+    assert mock_parse.call_count == 0
+
+
+def test_size_gate_auto_submit_and_diagnostics(tmp_path: Path) -> None:
+    """auto_submit skips oversized files, records skipped_too_large and samples in state."""
+    mgr = IngestManager(tmp_path, IngestConfig(enabled=True, auto_watch=True, max_file_size_mb=20))
+    big_pdf = tmp_path / "big.pdf"
+    big_pdf.write_bytes(b"%PDF-1.4 " + b"Z" * (22 * 1024 * 1024))
+
+    mock_parse = MagicMock()
+    with patch("mortis_rag_mcp.ingest.mineru.MineruClient.parse", mock_parse):
+        res = mgr.auto_submit()
+        assert res["submitted"] == 0
+        assert res["skipped_too_large"] == 1
+
+    st = mgr.status()
+    aw = st["auto_watch"]
+    assert aw["skipped_too_large"] == 1
+    assert len(aw["too_large_samples"]) == 1
+    assert aw["too_large_samples"][0]["source"] == "big.pdf"
+    assert mock_parse.call_count == 0
+
+
+def test_size_gate_force_does_not_bypass(tmp_path: Path) -> None:
+    """force=True still enforces size cap."""
+    mgr = IngestManager(tmp_path, IngestConfig(enabled=True, max_file_size_mb=20))
+    big_pdf = tmp_path / "big.pdf"
+    big_pdf.write_bytes(b"%PDF-1.4 " + b"F" * (25 * 1024 * 1024))
+
+    with pytest.raises(ValueError, match="exceeds limit"):
+        mgr.submit(["big.pdf"], force=True)
+
+
+def test_size_gate_recover_queued_blocks_at_run_job(tmp_path: Path) -> None:
+    """Queued jobs recovered from state are blocked at _run_job if physical file > cap."""
+    big_pdf = tmp_path / "big.pdf"
+    big_pdf.write_bytes(b"%PDF-1.4 " + b"Q" * (25 * 1024 * 1024))
+
+    # Pre-populate state with a queued job for big.pdf
+    state_file = tmp_path / ".mortis-parsed" / ".ingest_state.json"
+    state_file.parent.mkdir(parents=True, exist_ok=True)
+    state_file.write_text(
+        '{"version": 1, "jobs": {"job1": {"job_id": "job1", "source": "big.pdf", "sha256": "fake", "state": "queued"}}}',
+        encoding="utf-8",
+    )
+
+    mgr = IngestManager(tmp_path, IngestConfig(enabled=True, max_file_size_mb=20))
+    mock_parse = MagicMock()
+    with patch("mortis_rag_mcp.ingest.mineru.MineruClient.parse", mock_parse):
+        mgr._worker_loop()
+
+    st = mgr.status("job1")
+    assert st["job"]["state"] == "failed"
+    assert "exceeds limit" in st["job"]["error"]
+    assert mock_parse.call_count == 0
+
+
+def test_size_gate_file_grew_after_enqueue(tmp_path: Path) -> None:
+    """If a file was small when enqueued but grew before parsing, _run_job catches it."""
+    mgr = IngestManager(tmp_path, IngestConfig(enabled=True, max_file_size_mb=20))
+    doc_pdf = tmp_path / "grow.pdf"
+    doc_pdf.write_bytes(b"%PDF-1.4 small initially")
+
+    # Enqueue while withholding worker
+    with patch.object(mgr, "_worker_loop"):
+        mgr.submit(["grow.pdf"])
+
+    # Now make it 25 MiB
+    doc_pdf.write_bytes(b"%PDF-1.4 " + b"G" * (25 * 1024 * 1024))
+
+    mock_parse = MagicMock()
+    with patch("mortis_rag_mcp.ingest.mineru.MineruClient.parse", mock_parse):
+        mgr._worker_loop()
+
+    st = mgr.status()
+    job = st["jobs"][0]
+    assert job["state"] == "failed"
+    assert "exceeds limit" in job["error"]
+    assert mock_parse.call_count == 0
+
+
+def test_mixed_sources_all_or_nothing(tmp_path: Path) -> None:
+    """Batch submit with any oversized source fails completely without enrolling valid files."""
+    mgr = IngestManager(tmp_path, IngestConfig(enabled=True, max_file_size_mb=20))
+    (tmp_path / "good.pdf").write_bytes(b"%PDF-1.4 good")
+    (tmp_path / "bad.pdf").write_bytes(b"%PDF-1.4 " + b"B" * (25 * 1024 * 1024))
+
+    with pytest.raises(ValueError, match="exceeds limit"):
+        mgr.submit(["good.pdf", "bad.pdf"])
+
+    st = mgr.status()
+    assert len(st["jobs"]) == 0
+
+
+def test_agent_limit_fallback_within_policy_cap(tmp_path: Path) -> None:
+    """MinerU Agent limit error for PDF within policy cap falls back to PyMuPDF."""
+    mgr = IngestManager(tmp_path, IngestConfig(enabled=True, pymupdf_fallback=True, max_file_size_mb=20))
+    pdf = tmp_path / "agent_limit.pdf"
+    # 12 MiB (< 20 MiB policy cap, but > 10 MiB Agent channel cap)
+    pdf.write_bytes(b"%PDF-1.4 " + b"A" * (12 * 1024 * 1024))
+
+    def fake_parse(*args, **kwargs):
+        raise MineruError("Agent channel file size exceeds 10MB limit", retryable=False)
+
+    with patch("mortis_rag_mcp.ingest.mineru.MineruClient.parse", side_effect=fake_parse):
+        with patch.object(mgr, "_pymupdf_fallback", return_value="# Extracted Local Text"):
+            mgr.submit(["agent_limit.pdf"])
+            assert mgr._worker is not None
+            mgr._worker.join(timeout=5.0)
+
+    st = mgr.status()
+    job = st["jobs"][0]
+    assert job["state"] == "done"
+    assert job["channel"] == "pymupdf"
+    assert job["parse_quality"] == "fallback"
+
+
+def test_ignore_rules_and_dynamic_provider(tmp_path: Path) -> None:
+    """Files matching ignore rules are skipped; dynamic provider updates are honored."""
+    ignored_patterns = ["draft/**"]
+
+    def provider():
+        from mortis_rag_mcp._indexer.scanning import IgnoreMatcher
+        return IgnoreMatcher(ignored_patterns)
+
+    mgr = IngestManager(tmp_path, IngestConfig(enabled=True, auto_watch=True), ignore_provider=provider)
+    draft_dir = tmp_path / "draft"
+    draft_dir.mkdir()
+    (draft_dir / "temp.pdf").write_bytes(b"%PDF-1.4 draft")
+    (tmp_path / "keep.pdf").write_bytes(b"%PDF-1.4 keep")
+
+    with patch.object(mgr, "_worker_loop"):
+        res = mgr.auto_submit()
+        assert res["submitted"] == 1
+        assert res["skipped_ignored"] == 1
+        assert res["jobs"][0]["source"] == "keep.pdf"
+
+    # Dynamically update ignore patterns to ignore keep.pdf
+    ignored_patterns.append("keep.pdf")
+    (tmp_path / "keep.pdf").write_bytes(b"%PDF-1.4 keep modified")
+
+    with patch.object(mgr, "_worker_loop"):
+        res2 = mgr.auto_submit()
+        assert res2["submitted"] == 0
+        assert res2["skipped_ignored"] >= 1
+
+
+def test_auto_seen_dedup_all_four_states(tmp_path: Path) -> None:
+    """Continuous unchanged content is skipped if auto_seen state is queued, parsing, done, or failed."""
+    doc = tmp_path / "test.pdf"
+    doc.write_bytes(b"%PDF-1.4 test")
+    digest = _sha256(doc)
+
+    for st_val in ["queued", "parsing", "done", "failed"]:
+        mgr = IngestManager(tmp_path, IngestConfig(enabled=True, auto_watch=True))
+        state = mgr._load_state()
+        state["auto_seen"]["test.pdf"] = {
+            "sha256": digest,
+            "state": st_val,
+            "submitted_at": 100.0,
+            "last_job_id": "job_x",
+        }
+        mgr._save_state(state)
+
+        targets, scan_stats = mgr._auto_pending()
+        assert len(targets) == 0, f"Expected 0 targets for state {st_val}"
+        assert scan_stats["skipped_seen"] == 1
+
+
+def test_auto_seen_changed_hash_enqueues_new_job(tmp_path: Path) -> None:
+    """When content hash changes, file becomes eligible again for auto_submit."""
+    mgr = IngestManager(tmp_path, IngestConfig(enabled=True, auto_watch=True))
+    doc = tmp_path / "update.pdf"
+    doc.write_bytes(b"%PDF-1.4 v1")
+
+    with patch.object(mgr, "_worker_loop"):
+        r1 = mgr.auto_submit()
+        assert r1["submitted"] == 1
+
+        # Content unchanged -> 0 submitted
+        r2 = mgr.auto_submit()
+        assert r2["submitted"] == 0
+
+        # Modify content
+        doc.write_bytes(b"%PDF-1.4 v2 modified")
+        r3 = mgr.auto_submit()
+        assert r3["submitted"] == 1
+        assert r3["jobs"][0]["source"] == "update.pdf"
+
+
+def test_a_b_a_version_changes_eligible_again(tmp_path: Path) -> None:
+    """A -> B -> A content transitions are both eligible since hash changed from latest known."""
+    mgr = IngestManager(tmp_path, IngestConfig(enabled=True, auto_watch=True))
+    doc = tmp_path / "toggle.pdf"
+
+    with patch.object(mgr, "_worker_loop"):
+        # Version A
+        doc.write_bytes(b"%PDF-1.4 Content A")
+        r1 = mgr.auto_submit()
+        assert r1["submitted"] == 1
+
+        # Version B
+        doc.write_bytes(b"%PDF-1.4 Content B")
+        r2 = mgr.auto_submit()
+        assert r2["submitted"] == 1
+
+        # Version A again
+        doc.write_bytes(b"%PDF-1.4 Content A")
+        r3 = mgr.auto_submit()
+        assert r3["submitted"] == 1
+
+
+def test_old_job_finish_does_not_overwrite_newer_sha(tmp_path: Path) -> None:
+    """When an older job finishes, it does not overwrite auto_seen if a newer job was enqueued."""
+    mgr = IngestManager(tmp_path, IngestConfig(enabled=True, auto_watch=True))
+    state = mgr._load_state()
+    # Job 1 (old) with shaA
+    state["jobs"]["job1"] = {
+        "job_id": "job1", "source": "file.pdf", "sha256": "shaA", "state": "queued"
+    }
+    # But auto_seen was already updated by a newer Job 2 with shaB!
+    state["auto_seen"]["file.pdf"] = {
+        "sha256": "shaB", "state": "queued", "submitted_at": 200.0, "last_job_id": "job2"
+    }
+    mgr._save_state(state)
+
+    # Simulate Job 1 finishing
+    job1 = state["jobs"]["job1"]
+    job1["state"] = "done"
+
+    # Worker finishes Job 1
+    with mgr._lock:
+        st = mgr._load_state()
+        st["jobs"][job1["job_id"]] = job1
+        seen = st.get("auto_seen", {}).get(job1["source"])
+        if seen and seen.get("last_job_id") == job1["job_id"]:
+            seen["state"] = job1["state"]
+        mgr._save_state(st)
+
+    final_state = mgr._load_state()
+    assert final_state["auto_seen"]["file.pdf"]["sha256"] == "shaB"
+    assert final_state["auto_seen"]["file.pdf"]["last_job_id"] == "job2"
+
+
+def test_history_pruning_over_500_preserves_auto_seen(tmp_path: Path) -> None:
+    """Pruning state jobs (>500) preserves all auto_seen records."""
+    mgr = IngestManager(tmp_path, IngestConfig(enabled=True))
+    state = mgr._load_state()
+    for i in range(520):
+        jid = f"j_{i:04d}"
+        src = f"file_{i:04d}.pdf"
+        state["jobs"][jid] = {
+            "job_id": jid, "source": src, "sha256": f"sha_{i}", "state": "done", "submitted_at": float(i)
+        }
+        state["auto_seen"][src] = {
+            "sha256": f"sha_{i}", "state": "done", "submitted_at": float(i), "last_job_id": jid
+        }
+
+    mgr._save_state(state)
+
+    loaded = mgr._load_state()
+    assert len(loaded["jobs"]) == 500
+    assert len(loaded["auto_seen"]) == 520
+
+
+def test_old_state_migration_reconstructs_auto_seen_by_max_submitted_at(tmp_path: Path) -> None:
+    """Legacy state without auto_seen reconstructs ledger choosing maximum submitted_at."""
+    state_file = tmp_path / ".mortis-parsed" / ".ingest_state.json"
+    state_file.parent.mkdir(parents=True, exist_ok=True)
+    legacy_json = json.dumps({
+        "version": 1,
+        "jobs": {
+            "j1": {"job_id": "j1", "source": "same.pdf", "sha256": "sha1", "state": "done", "submitted_at": 10.0},
+            "j2": {"job_id": "j2", "source": "same.pdf", "sha256": "sha2", "state": "done", "submitted_at": 30.0},
+            "j3": {"job_id": "j3", "source": "same.pdf", "sha256": "sha3", "state": "failed", "submitted_at": 20.0},
+        }
+    })
+    state_file.write_text(legacy_json, encoding="utf-8")
+
+    mgr = IngestManager(tmp_path, IngestConfig(enabled=True))
+    state = mgr._load_state()
+    assert "auto_seen" in state
+    assert state["auto_seen"]["same.pdf"]["sha256"] == "sha2"
+    assert state["auto_seen"]["same.pdf"]["last_job_id"] == "j2"
+
+
+def test_clean_scan_prunes_deleted_sources_from_auto_seen(tmp_path: Path) -> None:
+    """When a file is deleted from vault, a clean scan removes it from auto_seen."""
+    mgr = IngestManager(tmp_path, IngestConfig(enabled=True, auto_watch=True))
+    pdf = tmp_path / "temp.pdf"
+    pdf.write_bytes(b"%PDF-1.4 test")
+
+    with patch.object(mgr, "_worker_loop"):
+        mgr.auto_submit()
+        st = mgr._load_state()
+        assert "temp.pdf" in st["auto_seen"]
+
+        # Mark job as completed so it is no longer in active_sources
+        for j in st["jobs"].values():
+            j["state"] = "done"
+        st["auto_seen"]["temp.pdf"]["state"] = "done"
+        mgr._save_state(st)
+
+        # Delete file
+        pdf.unlink()
+        mgr.auto_submit()
+        st2 = mgr._load_state()
+        assert "temp.pdf" not in st2["auto_seen"]
+
+
+def test_disabled_auto_watch_zero_side_effect(tmp_path: Path) -> None:
+    """When auto_watch is False or enabled is False, auto_submit does zero scans and starts zero threads."""
+    mgr = IngestManager(tmp_path, IngestConfig(enabled=False, auto_watch=True))
+    (tmp_path / "doc.pdf").write_bytes(b"%PDF-1.4 doc")
+
+    res = mgr.auto_submit()
+    assert res["status"] == "disabled"
+    assert res["submitted"] == 0
+    assert mgr._worker is None

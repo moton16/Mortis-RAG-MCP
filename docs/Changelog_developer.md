@@ -536,5 +536,28 @@
 >   `.\.venv\Scripts\python.exe -m pytest tests/test_ingest_auto.py tests/test_path_migration.py tests/test_doctor.py -q`
 > - 全局回归测试（479 passed, 2 skipped in 109.16s）。
 
+### C58b — moton16,2026-10-05,Antigravity — feat(ingest): enforce size policy and persist automatic submission dedupe
+> **代码改动概况**：
+> - `mortis_rag_mcp/ingest/worker.py`：
+>   - 统一尺寸上限策略门禁：新增 `_size_limit_bytes()` 与 `_check_file_size()`；显式 `submit(sources)` 在计算哈希和建任务前执行全量路径校验与尺寸判定，任一超限整批抛出 `ValueError`（all-or-nothing）；
+>   - 扫描尺寸过滤：`scan_pending()` 在计算 sha 之前执行尺寸检查，超限文件标记 `reason="too_large"` 且跳过哈希计算；`submit(None)` 过滤超限文件并返回 `skipped_too_large` 计数；
+>   - 运行时二次防御：`_run_job` 在沙箱检查后、创建产物和调用 client 解析前再次校验物理文件尺寸，防止入队后变大或恢复旧 queued 任务越过上限；
+>   - 自动候选与持久化免重试：
+>     - 新增 `_auto_pending()` 与 `auto_submit()`：仅在 `enabled=True && auto_watch=True` 时生效，默认关闭路径零扫描、零哈希、零线程；
+>     - 注入动态 `ignore_provider`，每轮扫描动态获取最新 `.vaultignore`/排除规则，排除临时目录与 `.assets`；
+>     - 引入 `state["auto_seen"]` 去重账本（`{source: {sha256, state, submitted_at, last_job_id}}`）：连续未变版本（含 done/failed/queued/parsing）自动跳过，源文件 sha 发生实际变化或 A->B->A 重新入队；
+>     - 任务状态迁移原子更新：`_worker_loop` 转换状态时仅当 `last_job_id` 匹配时更新 `auto_seen`，防止已完成的旧任务覆盖排队中的新版本；
+>     - 历史任务清理（>500）仅修剪 jobs，严格保留 `auto_seen` 账本去重凭证；完整无异常扫描支持清理已确认物理删除的源；
+>     - 兼容迁移：旧版缺失 `auto_seen` 的 state 自动基于 `jobs` 最新 `submitted_at` 构建。
+> - `mortis_rag_mcp/ingest/__init__.py`：
+>   - 更新设计约束文档注释，从“仅显式触发”更新为“默认手动，显式授权后可自动（auto_watch=True）”。
+> - `tests/test_ingest_auto.py`：
+>   - 扩展 18 个测试用例，覆盖显式提交阻断、精确边界允许、扫描过滤、auto_submit 诊断统计、force 无法绕过上限、queued 恢复与入队后变大二次拦截、混合源全批回滚、Agent 额度 PyMuPDF 兜底、动态 ignore、四种状态去重、sha 变化与 A->B->A 重新入队、500 历史修剪免重传、旧 state 迁移、删除源修剪与零副作用读状态等。
+>
+> **验证**：
+> - 专项测试（91 passed in 5.55s）：
+>   `.\.venv\Scripts\python.exe -m pytest tests/test_ingest_auto.py tests/test_ingest_worker.py tests/test_adversarial_v070.py tests/test_ingest_server.py tests/test_registry.py -q`
+> - 全局回归测试（497 passed, 2 skipped in 113.71s）。
+
 
 
