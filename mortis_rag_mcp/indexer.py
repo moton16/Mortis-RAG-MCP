@@ -83,6 +83,7 @@ from ._indexer.snapshot import (
     _SNAPSHOT_MEMBER_LIMITS,
 )
 from ._indexer import exemptions as _exemptions
+from ._indexer import reading as _reading
 from ._indexer import watch as _watch
 from ._indexer.watch import _FS_MAX_DEBOUNCE_WAIT
 
@@ -975,13 +976,33 @@ class MarkdownIndexer:
         return _cosine_fn(left, right)
 
     def read(self, source: str, start_line: int | None = None, end_line: int | None = None) -> str:
+        res = self._read_result(source, start_line=start_line, end_line=end_line, max_chars=None)
+        return res.content
+
+    def _read_result(
+        self,
+        source: str,
+        start_line: int | None = None,
+        end_line: int | None = None,
+        *,
+        heading: str | None = None,
+        start_char: int = 0,
+        max_chars: int | None = None,
+        expected_sha256: str | None = None,
+        chunk_id_hint: str | None = None,
+    ) -> _reading.ReadResult:
         path = self._safe_path(source)
-        lines = path.read_text(encoding="utf-8").splitlines()
-        start = 1 if start_line is None else max(1, start_line)
-        end = len(lines) if end_line is None else min(len(lines), end_line)
-        if start > end:
-            return ""
-        return "\n".join(lines[start - 1:end])
+        return _reading.read_file_result(
+            path,
+            source,
+            start_line=start_line,
+            end_line=end_line,
+            heading=heading,
+            start_char=start_char,
+            max_chars=max_chars,
+            expected_sha256=expected_sha256,
+            chunk_id_hint=chunk_id_hint,
+        )
 
     def list_files(self) -> list[dict[str, Any]]:
         return [{"source": source, "title": chunks[0].title if chunks else Path(source).stem, "chunks": len(chunks)} for source, chunks in sorted(self._chunks.items())]

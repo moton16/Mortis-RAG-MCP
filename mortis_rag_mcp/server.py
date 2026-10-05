@@ -277,7 +277,10 @@ def _tool_definitions() -> list[dict[str, Any]]:
                 "source": {"type": "string"},
                 "chunk_id": {"type": "string", "description": "可选，命中切片 ID（由 kb_search 返回），自动展开上下文；与 start_line/end_line/heading 互斥"},
                 "expand_lines": {"type": "integer", "default": 30, "minimum": 0, "maximum": 500, "description": "可选，配合 chunk_id 使用：切片前后各展开行数（默认 30，范围 0-500）"},
-                "heading": {"type": "string"}, "start_line": {"type": "integer", "minimum": 1}, "end_line": {"type": "integer", "minimum": 1},
+                "heading": {"type": "string"},
+                "start_line": {"type": "integer", "minimum": 1},
+                "end_line": {"type": "integer", "minimum": 1},
+                "start_char": {"type": "integer", "minimum": 0, "default": 0, "description": "可选，start_line 内 0-based Unicode 字符起始偏移量（默认 0），仅在显式指定 start_line 时有效，用于单行超过 read_max_chars 时的续读"},
                 "vault_path": {"type": "string", "description": vault_path_hint},
             }},
         },
@@ -1304,13 +1307,76 @@ class VaultMcpServer:
         if not source and not chunk_id:
             raise ValueError("source or chunk_id is required for kb_read")
 
+        raw_heading = arguments.get("heading")
+        heading = str(raw_heading).strip() if raw_heading is not None and str(raw_heading).strip() != "" else None
+
+        raw_start_line = arguments.get("start_line")
+        raw_end_line = arguments.get("end_line")
+        raw_start_char = arguments.get("start_char")
+
+        # start_char validation (Req 11)
+        start_char = 0
+        if "start_char" in arguments:
+            if chunk_id or heading:
+                raise ValueError("start_char cannot be used with chunk_id or heading")
+            if raw_start_char is not None:
+                if isinstance(raw_start_char, bool):
+                    raise ValueError(f"start_char must be an integer >= 0, got boolean {raw_start_char!r}")
+                if isinstance(raw_start_char, float):
+                    raise ValueError(f"start_char must be an integer >= 0, got float {raw_start_char!r}")
+                if isinstance(raw_start_char, int):
+                    val = raw_start_char
+                elif isinstance(raw_start_char, str):
+                    try:
+                        val = int(raw_start_char.strip())
+                    except ValueError:
+                        raise ValueError(f"start_char must be an integer >= 0, got {raw_start_char!r}")
+                else:
+                    raise ValueError(f"start_char must be an integer >= 0, got {type(raw_start_char).__name__}")
+                if val < 0:
+                    raise ValueError(f"start_char must be >= 0, got {val}")
+                start_char = val
+
+        # start_line and end_line strict validation (Req 6)
+        def _parse_strict_line(val: Any, name: str) -> int | None:
+            if val is None:
+                return None
+            if isinstance(val, bool):
+                raise ValueError(f"{name} must be an integer >= 1, got boolean {val!r}")
+            if isinstance(val, float):
+                raise ValueError(f"{name} must be an integer >= 1, got float {val!r}")
+            if isinstance(val, int):
+                if val < 1:
+                    raise ValueError(f"{name} must be >= 1, got {val}")
+                return val
+            if isinstance(val, str):
+                s = val.strip()
+                if not s:
+                    return None
+                try:
+                    parsed = int(s)
+                except ValueError:
+                    raise ValueError(f"{name} must be an integer >= 1, got {val!r}")
+                if parsed < 1:
+                    raise ValueError(f"{name} must be >= 1, got {parsed}")
+                return parsed
+            raise ValueError(f"{name} must be an integer >= 1, got {type(val).__name__}")
+
+        req_start_line = _parse_strict_line(raw_start_line, "start_line")
+        req_end_line = _parse_strict_line(raw_end_line, "end_line")
+
+        if req_end_line is not None:
+            cmp_start = req_start_line if req_start_line is not None else 1
+            if req_end_line < cmp_start:
+                raise ValueError(f"end_line must be >= start_line: end_line={req_end_line}, start_line={cmp_start}")
+
+        if start_char != 0 and req_start_line is None:
+            raise ValueError("start_char requires start_line to be specified")
+
         attribution: dict[str, Any] = {}
         if chunk_id:
             # chunk_id 与 start_line/end_line/heading 互斥，避免入参歧义与非预期展开
-            has_start = _parse_int(arguments.get("start_line")) is not None
-            has_end = _parse_int(arguments.get("end_line")) is not None
-            has_heading = bool(str(arguments.get("heading") or "").strip())
-            if has_start or has_end or has_heading:
+            if req_start_line is not None or req_end_line is not None or heading is not None:
                 raise ValueError("chunk_id is mutually exclusive with start_line/end_line/heading")
 
             raw_expand = arguments.get("expand_lines")
@@ -1337,19 +1403,6 @@ class VaultMcpServer:
                     f"chunk_id {chunk_id[:12]}… 所在源文件 {source} 缺失索引签名记录（stale）；"
                     "请重新 kb_search 获取新 id，或改用 source + heading / 行区间读取"
                 )
-            try:
-                phys_path = indexer._safe_path(source)
-                content_bytes = phys_path.read_bytes()
-                current_sig = hashlib.sha256(content_bytes).hexdigest()
-            except Exception as exc:
-                raise ValueError(
-                    f"无法读取 chunk_id {chunk_id[:12]}… 对应的源文件 {source}: {exc}；请重新 kb_search"
-                )
-            if current_sig != recorded_sig:
-                raise ValueError(
-                    f"chunk_id {chunk_id[:12]}… 已过期（stale：物理文件 {source} 内容签名不一致/已修改）；"
-                    "请重新 kb_search 获取新 id，或改用 source + heading / 行区间读取"
-                )
 
             c_start = chunk.metadata.get("start_line", 1)
             c_end = chunk.metadata.get("end_line", c_start)
@@ -1364,18 +1417,20 @@ class VaultMcpServer:
             start_line = max(1, c_start_int - expand_lines)
             end_line = c_end_int + expand_lines
             is_chunk_read = True
+            echo_start_line = start_line
+            echo_end_line = end_line
+            expected_sha256 = recorded_sig
+            chunk_id_hint = f"{chunk_id[:12]}… "
         else:
             indexer = self._indexer_for(arguments)
             indexer.request_refresh()
             is_chunk_read = False
-            raw_heading = arguments.get("heading")
-            heading = str(raw_heading).strip() if raw_heading is not None and str(raw_heading).strip() != "" else None
-            start_line = _parse_int(arguments.get("start_line"))
-            end_line = _parse_int(arguments.get("end_line"))
-            if start_line is not None and start_line < 1:
-                raise ValueError("start_line must be >= 1")
-            if end_line is not None and start_line is not None and end_line < start_line:
-                raise ValueError("end_line must be >= start_line")
+            start_line = req_start_line
+            end_line = req_end_line
+            echo_start_line = req_start_line
+            echo_end_line = req_end_line
+            expected_sha256 = None
+            chunk_id_hint = None
 
             # F5b: 双链与短名寻址
             # 1. 规范化输入：支持 Obsidian [[笔记名]]、[[笔记名|别名]]、[[笔记名#段落]] 语法
@@ -1452,36 +1507,36 @@ class VaultMcpServer:
                     raise ValueError(f"heading not found: {heading}")
                 start_line = min(chunk.metadata["start_line"] for chunk in matches)
                 end_line = max(chunk.metadata["end_line"] for chunk in matches)
+                echo_start_line = start_line
+                echo_end_line = end_line
 
-        text = indexer.read(source, start_line, end_line)
-        # 无范围时整篇塞进单个 text 块会撑爆模型上下文/客户端消息上限，
-        # 优先读取配置 [index] read_max_chars 并明确告知被截断，引导调用方用 start_line 续读。
-        read_max_chars = 20000
-        cfg = getattr(indexer, "config", None) or getattr(self, "config", None)
-        if cfg is not None:
-            idx_cfg = getattr(cfg, "index", None)
-            if idx_cfg is not None and getattr(idx_cfg, "read_max_chars", None):
-                try:
-                    c = int(idx_cfg.read_max_chars)
-                    if 100 <= c <= 1_000_000:
-                        read_max_chars = c
-                except (TypeError, ValueError, OverflowError):
-                    pass
+        read_max_chars = indexer.config.index.read_max_chars
+        read_res = indexer._read_result(
+            source=source,
+            start_line=start_line,
+            end_line=end_line,
+            heading=heading,
+            start_char=start_char,
+            max_chars=read_max_chars,
+            expected_sha256=expected_sha256,
+            chunk_id_hint=chunk_id_hint,
+        )
 
-        truncated = False
-        if len(text) > read_max_chars:
-            text = text[:read_max_chars]
-            truncated = True
         result = {
             "source": source,
-            "start_line": start_line,
-            "end_line": end_line,
-            "content": text,
-            "truncated": truncated,
+            "start_line": echo_start_line,
+            "end_line": echo_end_line,
+            "effective_start_line": read_res.effective_start_line,
+            "effective_end_line": read_res.effective_end_line,
+            "total_lines": read_res.total_lines,
+            "content": read_res.content,
+            "truncated": read_res.truncated,
+            "content_end_line": read_res.content_end_line,
+            "next_start_line": read_res.next_start_line,
+            "next_start_char": read_res.next_start_char,
         }
         if is_chunk_read:
             result["chunk_id"] = chunk.id
-            # 库归属：只加键、不改既有键语义（solo 库只给库名 + solo 标记）
             result.update(attribution)
         return result
 

@@ -655,6 +655,28 @@
 > - 专项与相关测试（46 passed in 23.33s）：
 >   `.\.venv\Scripts\python.exe -m pytest tests/test_budget_bytes.py tests/test_compact_search.py tests/test_multivault.py tests/test_preview_mode.py tests/test_search_filters.py -q`
 
+### C69a — moton16,2026-10-05,Antigravity — fix(read): diagnose bounds and expose accurate continuation positions
+> **代码改动概况**：
+> - `mortis_rag_mcp/_indexer/reading.py`：
+>   - 新增私有模块与冻结数据类 `@dataclass(frozen=True, slots=True) ReadResult`（Req 2）；
+>   - 单次快照读取（`raw = path.read_bytes()`）并计算 sha256、物理总行数 `total_lines`、有效行范围与字符截断游标，杜绝检查陈旧度与读取内容二次读盘产生的不一致窗口（Req 4 & 14）；
+>   - 严格越界诊断（Req 1 & 7）：当 `start_line > total_lines` 时，抛出具名 `ValueError`，明确包含 `requested` 请求行号、`actual` 实际物理行号、相对 `source` 以及「核对分卷行号或用heading定位」的修复建议；空文件无范围返回空内容，带范围明确报错；
+>   - 字符上限与续读游标映射（Req 10, 12, 13）：正文规范化为 `\n.join(lines[start-1:end])`，字符截断时精准区分分隔符前 `(本行, len(line))` 与分隔符后 `(下一行, 0)`，输出 `content_end_line`、`next_start_line` 与 0-based `next_start_char`，支持单行长文本多页续读且无损严格拼接复原；
+>   - 异常安全隔离（Req 15）：引入双继承异常 `ReadFileNotFoundError(FileNotFoundError, ValueError)`，边界捕获 `OSError` 与 `UnicodeDecodeError`，消除物理绝对路径向 solo 客户端的泄漏；
+> - `mortis_rag_mcp/indexer.py`：
+>   - Facade `read(source, start_line, end_line)` 薄委托内部 `_read_result`，保持编程接口完整不截字符契约（Req 5 & 9）；
+>   - 新增私有薄委托 `_read_result(...)` 支持 `start_char`、`max_chars` 与 `expected_sha256` 单次校验；
+> - `mortis_rag_mcp/server.py`：
+>   - `_tool_definitions` 在 `kb_read` 的 inputSchema 中新增 `start_char`（integer, minimum 0, default 0）；
+>   - `_kb_read` 严格入参解析（Req 6 & 11）：显式布尔、浮点、负数、零及 `end < start` 严格校验报错，杜绝布尔隐式转为整数 1 绕过验证；`chunk_id` 与 `heading` 模式显式禁止携带 `start_char`；
+>   - 回显元数据扩充（Req 8）：成功返回结构增加 `total_lines`、`effective_start_line`、`effective_end_line`、`content_end_line`、`next_start_line` 与 `next_start_char`，兼容保留请求回显 `start_line` 与 `end_line`；
+> - `tests/test_read_ranges.py`：
+>   - 新增 13 个专项对抗测试：10行文件越界诊断提示定位要求、start1/EOF/EOF+1与钳制、空文件两分支、BOM/CRLF/Unicode无损解析、严格参数类型校验、未索引直连快速读取、沙箱与白名单后缀防御、单行长文本与多行跨页无损拼接复原、路径丢失与坏编码安全防护、协议级 isError 往返等。
+>
+> **验证**：
+> - 专项与相关测试（61 passed in 12.60s）：
+>   `.\.venv\Scripts\python.exe -m pytest tests/test_read_ranges.py tests/test_indexer.py tests/test_txt_indexing.py tests/test_wikilink_read.py tests/test_kb_read_chunkid.py tests/test_facade_freeze.py -q`
+
 
 
 

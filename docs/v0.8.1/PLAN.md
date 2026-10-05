@@ -218,7 +218,7 @@ CURRENT                         THIS RELEASE                     12-MONTH IDEAL
 | 6 | [x] | C58d | server/doctor/hint接线与集成 | C58c | 2–4h / 30–60m |
 | 7 | [x] | C67 | compact全路由投影 | C66 | 2–4h / 30–60m |
 | 8 | [x] | C68 | 完整chunk预算与续页 | C67 | 4–6h / 45–90m |
-| 9 | [ ] | C69a | 原文读范围/越界/总行数 | C66 | 2–4h / 30–60m |
+| 9 | [x] | C69a | 原文读范围/越界/总行数 | C66 | 2–4h / 30–60m |
 | 10 | [ ] | C69b | 物理heading章节读取 | C69a | 4–6h / 45–90m |
 | 11 | [ ] | C59 | Windows升级占用说明 | 任意；代码不变 | 0.5–1h / 10–20m |
 | 12 | [ ] | C70/T8 | 使用纪律、现状文档、欠账、离线评测 | 所有代码卡 | 2–4h / 30–60m |
@@ -559,7 +559,7 @@ poll/start/fallback cadence -+                                  |
 
 **验收**：不存在二分裁正文/snippet代码；每个零进展响应都提供恢复动作；包络无法满足时显式申报。提交 `fix(search): enforce whole-result budgeting and explicit grouped cursors`。
 
-### [ ] C69a：物理原文读范围、越界诊断与字符上限
+### [x] C69a：物理原文读范围、越界诊断与字符上限
 
 **前置**：C66。文件：新私有 `_indexer/reading.py`、indexer::read及新增私有薄委托、`server.py::_kb_read`；
 新建 `tests/test_read_ranges.py`，保留txt/wiki/chunk/facade测试。
