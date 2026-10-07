@@ -24,9 +24,26 @@ v0.7.2 带来了更自然便捷的检索与交互体验：
 1. **库名直呼**：`kb_search` 的 `vault_path` 支持直接传知识库显示名称（如 `vault_path="我的笔记"`），不用再费力拼装 Windows 漫长路径。
 2. **多库定向圈选**：支持通过 `vault_paths=["知识库A", "知识库B"]` 一次性圈选多个目标库联合检索；即使是被设为私密独立库（solo）的知识库，只要在此显式点名即可参与联合召回。
 3. **二段式精准精读（省 Token 模式）**：
-   - 第一步（找锚点）：调用 `kb_search(..., preview=true)`，检索仅返回高光摘要窗口、行号与字符数，单块 Token 消耗降低 70%+；
+   - 第一步（找锚点）：调用 `kb_search(..., preview=true)`，检索仅返回高光摘要窗口、行号与字符数，大幅精简上下文占用；
    - 第二步（按需精读）：根据命中结果的 `source`、`start_line` 与 `end_line`，按需调用 `kb_read` 读取切题正文，告别全篇冗余注入。
 4. **构建防假死与进度感知**：首次建库或后台构建期间若返回 `status: "indexing"`，会携带构建进度信息，稍候片刻等待后台构建即可，不再发生前台卡死。
+
+### 0.3 0.8.1 新用法速查
+
+v0.8.1 进一步强化了检索初筛、章节直读与后台刷新体验：
+
+1. **紧凑初筛模式（`compact=true`）**：
+   - 适合大候选召回（如 `top_k >= 5`）：调用 `kb_search(query, compact=true, budget_bytes=3500)`，仅返回文档路径、行号区间与标题信息，去除大段正文和 chunk_id，极大减轻宿主上下文与缓冲区压力。
+   - 回读正文：直接根据返回的 `vault`、`source` 与行号调用 `kb_read(source, start_line, end_line, vault_path)` 精准精读。
+2. **物理章节直读与重名消歧**：
+   - `kb_read(source="...", heading="## 章节名", vault_path="...")`：直接读取该章节物理范围（含子章节，直到下一个同级或更高级标题）。
+   - 若文件中存在多个同名标题，系统会返回所有候选章节的起始物理行号（如提示 `ambiguous heading ... candidates at lines [42, 108]`），此时带上 `start_line` 即可直接消歧读取。
+   - 越界安全：若请求行号超出文件末尾，系统会明确报错并附带文件实际总行数（`actual total lines: N`），方便调整。
+3. **后台刷新与只读优先**：
+   - 当知识库后台正在增量同步或嵌入计算时，搜索优先基于当前已就绪的文本索引直接返回结果，不会在前台同步阻塞等待网络请求。
+4. **文档自动摄取安全保障**：
+   - `[ingest] auto_watch` 默认关闭（`false`），绝不未经用户显式配置擅自向云端上传解析文件。
+   - 默认单文件上限 `max_file_size_mb = 20`，超过 20MiB 的文件自动跳过，防误传超大文档。
 
 ## 1. 安装
 
@@ -147,12 +164,12 @@ Copy-Item .\skills\mortis-rag-mcp\SKILL.md "$env:USERPROFILE\.workbuddy\skills\m
 | 注册独立库（不参与全局检索） | `kb_init_solo {path, name?}`（0.6.0） |
 | 看有哪些库 | `kb_list` |
 | 设置库描述（引导定向选库） | `kb_describe {vault_path, description}`（0.7.0） |
-| 搜索（跨库） | `kb_search {query, preview?}` |
-| 搜索（指定库/多库定向） | `kb_search {query, vault_path? vault_paths? preview?}`（0.7.2） |
+| 搜索（跨库） | `kb_search {query, preview?, compact?, budget_bytes?}` |
+| 搜索（指定库/多库定向） | `kb_search {query, vault_path? vault_paths? preview?, compact?}`（0.7.2/0.8.1） |
 | 只搜某目录 / 某标签 / 某时间段 | `kb_search {query, path_prefix? tags? mtime_after? mtime_before?}`（0.5.0） |
-| 翻页 | `kb_search {query, offset, limit}`（0.5.0） |
+| 翻页 / 预算分批 | `kb_search {query, offset, limit, group_offsets?}`（0.5.0/0.8.1） |
 | 「这个库更重要」 | `kb_set_weight {vault_path, weight}` + 可选 `kb_search {group_by_vault: true}`（0.5.0） |
-| 读原文 | `kb_read {source, vault_path}` |
+| 读原文 / 读章节 | `kb_read {source, vault_path, start_line?, end_line?, heading?}`（0.8.1 支持 heading） |
 | 摄取 PDF / Office 文档 | `kb_ingest {action: "pending" / "submit" / "status", vault_path?}`（0.7.0，需配置开启） |
 | 排除私密笔记 | `kb_exempt {action: "add_pattern" / "exempt_file"}` |
 | 索引出错了 | 看 `kb_stats` 的 `failed_files`（0.5.0 起重启也不丢）；反复调 `kb_stats` 触发增量补齐 |
