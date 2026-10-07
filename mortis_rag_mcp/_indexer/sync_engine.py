@@ -284,7 +284,11 @@ def run_sync(owner: MarkdownIndexer) -> list[Chunk]:
     前置条件：调用方必须已持有 owner._sync_lock。
     运行时通过 owner.* 就地变异 22 个内部状态属性。
     """
-    owner.vault_path.mkdir(parents=True, exist_ok=True)
+    if not owner.vault_path.is_dir():
+        with owner._cache_lock:
+            owner._chunks = {}
+            owner._signatures = {}
+        return []
     failed_before = dict(owner.failed_files)
     found: set[str] = set()
     changed: list[tuple[str, str, list[Chunk], tuple[int, int, int], int]] = []

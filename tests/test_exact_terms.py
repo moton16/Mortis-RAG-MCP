@@ -23,6 +23,17 @@ from mortis_rag_mcp.server import VaultMcpServer
 from mortis_rag_mcp._server.search_dispatch import _parse_exact_terms
 
 
+def _kb_init_ready(server: VaultMcpServer, path, name: str) -> None:
+    """kb_init 之后显式同步一次，让索引状态确定。
+
+    C66 起 kb_search 走「优先使用已就绪索引、后台刷新」，不再在前台阻塞等待首建；
+    kb_init 只把首建丢进后台线程，紧跟其后的检索会与后台首建竞态（Windows 侥幸通过、
+    Linux CI 只拿到部分结果）。要断言完整索引的测试必须显式同步。
+    """
+    server.call_tool("kb_init", {"path": str(path), "name": name})
+    server._indexer_for({"vault_path": name}).sync()
+
+
 def test_parse_exact_terms_defensive():
     """验证 exact_terms 防御解析与规范化。"""
     # 1. None 与空值
@@ -253,8 +264,8 @@ def test_exact_terms_mcp_server_single_and_fanout(tmp_path, monkeypatch):
     monkeypatch.setenv("VAULT_MCP_REGISTRY", str(reg_path))
 
     server = VaultMcpServer(config_path)
-    server.call_tool("kb_init", {"path": str(vault1), "name": "V1"})
-    server.call_tool("kb_init", {"path": str(vault2), "name": "V2"})
+    _kb_init_ready(server, vault1, "V1")
+    _kb_init_ready(server, vault2, "V2")
 
     # 1. 单库检索指定 vault_path
     res1 = server.call_tool(
@@ -365,7 +376,7 @@ def test_exact_terms_combined_with_budget_bytes(exact_terms_vault, tmp_path, mon
     monkeypatch.setenv("VAULT_MCP_REGISTRY", str(reg_path))
 
     server = VaultMcpServer(config_path)
-    server.call_tool("kb_init", {"path": str(exact_terms_vault), "name": "ExactVault"})
+    _kb_init_ready(server, exact_terms_vault, "ExactVault")
 
     res = server.call_tool(
         "kb_search",

@@ -16,7 +16,11 @@ def _run_stdio(config: Path, requests: list[dict]) -> list[dict]:
         capture_output=True,
         check=False,
         encoding="utf-8",
-        env={**os.environ, "VAULT_MCP_REGISTRY": str(config.parent / "vaults.toml")},
+        env={
+            **os.environ,
+            "VAULT_MCP_REGISTRY": str(config.parent / "vaults.toml"),
+            "MORTIS_RAG_REGISTRY": str(config.parent / "vaults.toml"),
+        },
     )
     assert proc.returncode == 0, proc.stderr
     assert not proc.stderr, proc.stderr
@@ -162,6 +166,14 @@ def test_stdio_legacy_vault_path_auto_migrates(tmp_path):
     assert len(data["vaults"]) == 1
     assert data["vaults"][0]["path"] == str(vault.resolve())
     search = _payload(responses[2])
+    if search.get("status") == "indexing":
+        import time
+        time.sleep(0.5)
+        resp2 = _run_stdio(config, [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "kb_search", "arguments": {"query": "XYZ999"}}},
+        ])
+        search = _payload(resp2[1])
     assert any("XYZ999" in chunk["content"] for chunk in search["chunks"])
 
 

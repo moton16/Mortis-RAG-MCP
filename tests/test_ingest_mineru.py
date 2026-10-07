@@ -173,6 +173,61 @@ def test_put_upload_status(monkeypatch):
     assert exc_info.value.http_status == 400
 
 
+def test_put_upload_sets_empty_content_type_not_form_urlencoded(monkeypatch):
+    """回归（issue #1）：urllib 在「有 data 且无 Content-type 头」时会注入
+    application/x-www-form-urlencoded；OSS V1 预签名把 CONTENT-TYPE 计入 StringToSign
+    （服务端按实际请求头重算）→ 403 SignatureDoesNotMatch。修法 = 显式置空该头。
+
+    两条断言各司其职：
+    ① 本机回环服务端实测收到的 Content-Type 不是 form-urlencoded；
+    ② 交给 urlopen 的 Request.has_header("Content-type") 为真——urllib 的注入判据就是这一句，
+       若未来重构退回「不传 headers」，② 会先红灯（这是回归安全，不是当前行为）。
+    """
+    import http.server
+    import threading
+
+    captured: dict[str, str] = {}
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def do_PUT(self):  # noqa: N802 —— http.server 的约定命名
+            captured["content_type"] = self.headers.get("Content-Type", "<absent>")
+            length = int(self.headers.get("Content-Length") or 0)
+            if length:
+                self.rfile.read(length)
+            self.send_response(200)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, fmt, *args):  # 静音，避免污染 pytest 输出
+            pass
+
+    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+
+    seen_requests: list[urllib.request.Request] = []
+    real_urlopen = urllib.request.urlopen
+
+    def _spy(req, *args, **kwargs):
+        seen_requests.append(req)
+        return real_urlopen(req, *args, **kwargs)
+
+    monkeypatch.setattr(urllib.request, "urlopen", _spy)
+    try:
+        port = httpd.server_address[1]
+        _put_upload(f"http://127.0.0.1:{port}/upload", b"payload", timeout=5.0)
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=5.0)
+
+    assert seen_requests, "urlopen 未被调用"
+    # ① 线上实测：不能是 urllib 自动注入的 form-urlencoded
+    assert captured["content_type"] != "application/x-www-form-urlencoded"
+    # ② 回归安全：Request 自身已带 Content-type 键（urllib 的注入判据 = has_header）
+    assert seen_requests[0].has_header("Content-type") is True
+
+
 # ---------------------------------------------------------------- Zip Extraction
 
 

@@ -1,23 +1,26 @@
 from __future__ import annotations
 
 import atexit
+import hashlib
 import json
 import os
 import re
 import sys
 import threading
+import time
 from argparse import ArgumentParser
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from . import __version__
 from .config import load_config, resolve_config_path
-from .indexer import Chunk, MarkdownIndexer, SearchFilter
+from .indexer import Chunk, MarkdownIndexer, SearchFilter, path_prefix_match
 from .ingest import IngestManager, INGEST_EXTS
 from ._server import dispatch_search as _dispatch_search, fanout_search as _fanout_search_impl
 from .registry import VaultEntry, VaultRegistry, normalize_vault_key, registry_path
 
-SERVER_INFO = {"name": "mortis-rag-mcp", "version": "0.8.0", "title": "Mortis'RAG MCP"}
+SERVER_INFO = {"name": "mortis-rag-mcp", "version": __version__, "title": "Mortis'RAG MCP"}
 
 SERVER_INSTRUCTIONS = (
     "本服务器提供本地 Markdown 知识库检索。路由纪律："
@@ -168,7 +171,7 @@ def _tool_definitions() -> list[dict[str, Any]]:
             "name": "kb_init",
             "description": "注册（初始化）一个文件夹为知识库：校验目录、写入用户级注册表（跨重启保留）、后台建立索引并启动文件监听。首次使用或要纳入新文件夹时调用；要注册不参与全局检索的独立库用 kb_init_solo。",
             "inputSchema": {"type": "object", "required": ["path"], "properties": {
-                "path": {"type": "string", "description": "必填，要注册为知识库的文件夹绝对路径"},
+                "path": {"type": "string", "description": "必填，要注册为知识库的文件夹绝对路径（等价别名 vault_path/vault/vault_name 亦可，与其余 kb_* 工具同义）"},
                 "name": {"type": "string", "description": "可选，显示名，默认取文件夹名"},
                 "description": {"type": "string", "description": "可选，一句话说明这个库装什么（如 '数电教材+课件'）。写给未来的检索路由看：模型靠它判断该不该定向选库，务必具体。"},
             }},
@@ -190,7 +193,7 @@ def _tool_definitions() -> list[dict[str, Any]]:
             "name": "kb_init_solo",
             "description": "初始化一个 solo（独立）知识库：不参与跨库全局检索（kb_search 不传 vault_path 时跳过它），只有显式传 vault_path 才会被搜索。三种输入：(1) 未注册的文件夹 → 注册为 solo 库并后台建索引；(2) 已注册的普通库 → 原地转为 solo（索引/缓存/监听不动，秒级）；(3) 已是 solo → 幂等确认。取消 solo 用 kb_remove 后重新 kb_init（缓存保留，0 次重新 embedding）。",
             "inputSchema": {"type": "object", "required": ["path"], "properties": {
-                "path": {"type": "string", "description": "必填，文件夹绝对路径（未注册则注册为 solo 库；已注册则转为 solo）"},
+                "path": {"type": "string", "description": "必填，文件夹绝对路径（未注册则注册为 solo 库；已注册则转为 solo）；等价别名 vault_path/vault/vault_name 亦可"},
                 "name": {"type": "string", "description": "可选，显示名，默认取文件夹名（仅未注册时生效）"},
             }},
         },
@@ -236,8 +239,13 @@ def _tool_definitions() -> list[dict[str, Any]]:
         },
         {
             "name": "kb_list_files",
-            "description": "列出已索引的 Markdown 与纯文本文件。可传 vault_path 指定知识库。",
-            "inputSchema": {"type": "object", "properties": {"vault_path": {"type": "string", "description": vault_path_hint}}},
+            "description": "列出已索引的 Markdown 与纯文本文件（可前缀过滤 + 分页）。注意 limit 的缺省语义与 kb_search.limit 不同：这里不传 limit 就是返回全部已索引文件，大库请显式传 limit/offset 分页取用。",
+            "inputSchema": {"type": "object", "properties": {
+                "vault_path": {"type": "string", "description": vault_path_hint},
+                "path_prefix": {"type": "string", "description": "可选，只列 source 以该前缀开头的文件（source 是库内相对 posix 路径），如 '教材/'；语义与 kb_search.path_prefix 一致"},
+                "limit": {"type": "integer", "minimum": 1, "description": "可选，本页最多返回条数；**缺省返回全部已索引文件**（不是 kb_search.limit 的『缺省用 top_k』），大库请显式传"},
+                "offset": {"type": "integer", "minimum": 0, "default": 0, "description": "可选，跳过前 N 条（分页用；配合 next_offset 连续取页）"},
+            }},
         },
         {
             "name": "kb_search",
@@ -247,8 +255,10 @@ def _tool_definitions() -> list[dict[str, Any]]:
                 "vault_path": {"type": "string", "description": "可选，已注册知识库的名称或绝对路径；缺省时跨全部非 solo 注册库检索"},
                 "vault_paths": {"type": "array", "items": {"type": "string"}, "description": "可选，知识库名称或绝对路径数组；用于定向组合检索指定的若干个库（Scoped Multi-Vault）"},
                 "preview": {"type": "boolean", "default": False, "description": "可选，轻量预览模式：设为 true 时仅返回高光摘要与行号区间，不返回全文，有效节约模型上下文"},
+                "compact": {"type": "boolean", "default": False, "description": "可选，极简预览，隐含preview，返回source/heading/lines/snippet；按行号+库回读，不返回id"},
                 "mode": {"type": "string", "enum": ["full", "preview"], "default": "full", "description": "可选，检索结果呈现模式：'full'（默认，返回完整正文 content）或 'preview'（轻量高光预览，仅返回 snippet 与行号区间）"},
                 "group_by_vault": {"type": "boolean", "default": False, "description": "可选，仅跨库检索（不传 vault_path）时生效：结果按知识库分组返回 groups，每组取 top_k 条"},
+                "group_offsets": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 0}, "description": "可选，仅在 group_by_vault=true 时生效：指定各知识库的起始偏移量字典（键为库名或绝对路径，值为非负整数）。未指定的库默认回落到 offset 参数。"},
                 "path_prefix": {"type": "string", "description": "可选，只保留 source 以该前缀开头的 chunk（source 是库内相对 posix 路径）。用户提到具体课程名/文件夹名/主题目录时，用它把检索限定在该子树，如 '教材/'、'数字电路/'"},
                 "tags": {"type": "array", "items": {"type": "string"}, "description": "可选，frontmatter 标签过滤：命中任一标签即保留（大小写不敏感，自动去掉 '#' 前缀）"},
                 "mtime_after": {"type": ["number", "string"], "description": "可选，只保留修改时间 >= 该值的文件；epoch 秒或 ISO 8601 字符串（如 '2026-01-01'）"},
@@ -256,7 +266,7 @@ def _tool_definitions() -> list[dict[str, Any]]:
                 "offset": {"type": "integer", "minimum": 0, "default": 0, "description": "可选，跳过前 N 条结果（分页用）"},
                 "limit": {"type": "integer", "minimum": 1, "description": "可选，本页最多返回条数；缺省时用 top_k"},
                 "dedupe": {"type": "boolean", "default": True, "description": "可选，默认 true：正文完全相同的 chunk 只保留排在最前面的一条（重复备份/复制段落不再占多格 top_k）"},
-                "budget_bytes": {"type": "integer", "description": "可选，输出最大 UTF-8 字节预算（[500, 100000]），超限截断并标 truncated: true"},
+                "budget_bytes": {"type": "integer", "description": "可选，输出最大 UTF-8 字节预算（[500, 100000]），超限截断并标 truncated: true；若元数据包络本身超出预算则返回 budget_exceeded: true 与 minimum_budget_bytes"},
                 "exact_terms": {"type": "array", "items": {"type": "string"}, "description": "可选，专有名词显式硬包含词表（AND 语义，不区分大小写，最多 8 条每条≤100 字符）"},
             }},
         },
@@ -267,7 +277,10 @@ def _tool_definitions() -> list[dict[str, Any]]:
                 "source": {"type": "string"},
                 "chunk_id": {"type": "string", "description": "可选，命中切片 ID（由 kb_search 返回），自动展开上下文；与 start_line/end_line/heading 互斥"},
                 "expand_lines": {"type": "integer", "default": 30, "minimum": 0, "maximum": 500, "description": "可选，配合 chunk_id 使用：切片前后各展开行数（默认 30，范围 0-500）"},
-                "heading": {"type": "string"}, "start_line": {"type": "integer", "minimum": 1}, "end_line": {"type": "integer", "minimum": 1},
+                "heading": {"type": "string", "description": "可选，按原文章节标题精确定位段落（包含子标题）；多处同名标题报错引导改用行号；若同时传入 start_line/end_line 则行区间优先"},
+                "start_line": {"type": "integer", "minimum": 1},
+                "end_line": {"type": "integer", "minimum": 1},
+                "start_char": {"type": "integer", "minimum": 0, "default": 0, "description": "可选，start_line 内 0-based Unicode 字符起始偏移量（默认 0），仅在显式指定 start_line 时有效，用于单行超过 read_max_chars 时的续读"},
                 "vault_path": {"type": "string", "description": vault_path_hint},
             }},
         },
@@ -389,9 +402,10 @@ class VaultMcpServer:
         atexit.register(self.shutdown)
 
     def shutdown(self) -> None:
-        """停掉所有知识库的文件监听（幂等，可重复调用）。"""
+        """停掉所有知识库的文件监听与摄取扫描（幂等，可重复调用）。"""
         for indexer in list(self._indexers.values()):
             try:
+                indexer._ingest_hook = None
                 indexer.stop_watching()
             except Exception:
                 pass
@@ -585,8 +599,21 @@ class VaultMcpServer:
             indexer = self._indexers.get(key)
             if indexer is None:
                 indexer = MarkdownIndexer(vault_path, self.config)
-                indexer.start_watching()
+                # C58d: start_watching 之前挂 hook，仅 effective=enabled && auto_watch 时挂
+                # 惰性获取 manager，不在定义闭包时构造 manager，不默认创建 .mortis-parsed
+                if self.config.ingest.enabled and self.config.ingest.auto_watch:
+                    def _ingest_hook() -> Any:
+                        mgr = self._ingest_manager_for(key)
+                        # 返回 auto_submit 结果供 _ingest_scan_loop 判断是否需要
+                        # 主动重扫（review R3：判稳滞留/扫描不完整时不依赖下一个事件）。
+                        return mgr.auto_submit()
+                    indexer._ingest_hook = _ingest_hook
+                # review R1/F2：先发布进 _indexers 再启动监听。watcher 启动后文件
+                # 事件即可触发 _ingest_hook → _ignore_provider；若此刻本库尚未发布，
+                # provider 拿不到 indexer，auto_submit 会在无法判定豁免规则的窗口里
+                # 提交本应被 .vaultignore/exclude 排除的文档。
                 self._indexers[key] = indexer
+                indexer.start_watching()
         return indexer
 
     def _list_vaults(self) -> dict[str, Any]:
@@ -610,9 +637,20 @@ class VaultMcpServer:
         return {"vaults": items}
 
     def _kb_init(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        path = str(arguments.get("path", "")).strip()
+        # 别名口径与 kb_remove/_indexer_for/kb_read 等五处对齐：模型常按其余工具的习惯
+        # 误传 vault_path（issue #3）。别名不在 schema properties 里（体积门禁），
+        # 但 MCP 客户端不拒收 properties 之外的参数，且 schema description 已注明。
+        path = str(
+            arguments.get("path")
+            or arguments.get("vault_path")
+            or arguments.get("vault")
+            or arguments.get("vault_name")
+            or ""
+        ).strip()
         if not path:
-            raise ValueError("path is required for kb_init")
+            raise ValueError(
+                "path is required for kb_init（等价别名：vault_path / vault / vault_name）"
+            )
         name_arg = str(arguments.get("name", "")).strip() or None
         desc = str(arguments.get("description", "")).strip()
         resolved = self._resolve_vault_path(path, for_registration=True)
@@ -635,19 +673,41 @@ class VaultMcpServer:
         }
         if unsupported:
             res["skipped_unsupported"] = unsupported
-        if doc_files and not self.config.ingest.enabled:
-            res["hint"] = (
+        hint = self._ingest_init_hint(doc_files)
+        if hint:
+            res["hint"] = hint
+        return res
+
+    def _ingest_init_hint(self, doc_files: int) -> str | None:
+        if not doc_files:
+            return None
+        ingest_cfg = self.config.ingest
+        effective_auto = ingest_cfg.enabled and ingest_cfg.auto_watch
+        cap_mb = ingest_cfg.max_file_size_mb
+        cap_str = f"{cap_mb}MiB" if cap_mb > 0 else "无限制"
+        if effective_auto:
+            return (
+                f"检测到 {doc_files} 个 PDF/Office 文档。自动摄取已激活（单文件上限 {cap_str}），"
+                "新文档将自动提交云端解析（云端解析可能产生费用/隐私影响）。"
+                "可用 kb_ingest(action='status') 查看队列进度。"
+            )
+        if not ingest_cfg.enabled and ingest_cfg.auto_watch:
+            return (
+                f"检测到 {doc_files} 个 PDF/Office 文档。auto_watch=true 但 enabled=false，"
+                "自动摄取未生效；需同时在 config/app.toml 设置 [ingest] enabled = true 并重启服务。"
+                "如需检索，请先向用户确认后再开启，或通过 kb_ingest(action='pending') 查看待解析列表。"
+            )
+        if not ingest_cfg.enabled:
+            return (
                 f"检测到 {doc_files} 个 PDF/Office 文档。PDF 摄取层默认未启用；"
                 "若用户需要检索这些文档，请先向用户确认，然后在 config/app.toml 设置 "
-                "[ingest] enabled = true 并重启服务，再调用 kb_ingest(action='submit')。"
+                "[ingest] enabled = true 并重启服务，再调用 kb_ingest(action='pending') 查看待解析列表并在确认后 submit。"
                 "未确认前不要自作主张开启。"
             )
-        elif doc_files:
-            res["hint"] = (
-                f"检测到 {doc_files} 个 PDF/Office 文档，可调用 "
-                "kb_ingest(action='pending') 查看待解析列表。"
-            )
-        return res
+        return (
+            f"检测到 {doc_files} 个 PDF/Office 文档（单文件上限 {cap_str}），当前为手动摄取模式；"
+            "可调用 kb_ingest(action='pending') 查看待解析列表，由用户确认后调用 kb_ingest(action='submit') 提交。"
+        )
 
     def _kb_init_solo(self, arguments: dict[str, Any]) -> dict[str, Any]:
         """kb_init_solo：初始化/确保一个 solo 库（幂等三态）。
@@ -658,9 +718,17 @@ class VaultMcpServer:
         时悄悄把 solo 库转回普通库、恰好暴露用户想隔离的内容——取消 solo
         必须显式走 kb_remove + kb_init 两步（缓存保留，零成本周转）。
         """
-        path = str(arguments.get("path", "")).strip()
+        path = str(
+            arguments.get("path")
+            or arguments.get("vault_path")
+            or arguments.get("vault")
+            or arguments.get("vault_name")
+            or ""
+        ).strip()
         if not path:
-            raise ValueError("path is required for kb_init_solo")
+            raise ValueError(
+                "path is required for kb_init_solo（等价别名：vault_path / vault / vault_name）"
+            )
         name_arg = str(arguments.get("name", "")).strip() or None
         resolved = self._resolve_vault_path(path, for_registration=True)
         existing = self.registry.get(resolved)
@@ -684,18 +752,9 @@ class VaultMcpServer:
             }
             if unsupported:
                 res["skipped_unsupported"] = unsupported
-            if doc_files and not self.config.ingest.enabled:
-                res["hint"] = (
-                    f"检测到 {doc_files} 个 PDF/Office 文档。PDF 摄取层默认未启用；"
-                    "若用户需要检索这些文档，请先向用户确认，然后在 config/app.toml 设置 "
-                    "[ingest] enabled = true 并重启服务，再调用 kb_ingest(action='submit')。"
-                    "未确认前不要自作主张开启。"
-                )
-            elif doc_files:
-                res["hint"] = (
-                    f"检测到 {doc_files} 个 PDF/Office 文档，可调用 "
-                    "kb_ingest(action='pending') 查看待解析列表。"
-                )
+            hint = self._ingest_init_hint(doc_files)
+            if hint:
+                res["hint"] = hint
             return res
         entry = self.registry.set_solo(existing.path, True)
         return {
@@ -727,7 +786,8 @@ class VaultMcpServer:
         indexer = self._indexers.pop(key, None)
         watcher_stopped = False
         if indexer is not None:
-            indexer.stop_watching()  # idempotent; joins the watch thread
+            indexer._ingest_hook = None
+            indexer.stop_watching()  # idempotent; joins the watch thread & scan thread
             watcher_stopped = True
         self.registry.remove(entry.path)
         cache_purged = False
@@ -763,12 +823,29 @@ class VaultMcpServer:
             with self._ingest_managers_lock:
                 manager = self._ingest_managers.get(key)
                 if manager is None:
-                    def _on_job_finished(out_path: str) -> None:
-                        indexer = self._indexers.get(key)
-                        if indexer is not None:
-                            threading.Thread(target=indexer.sync, daemon=True, name="ingest-sync").start()
+                    def _on_job_finished(source: str, out_md: Path | str) -> None:
+                        try:
+                            indexer = self._indexers.get(key)
+                            if indexer is not None:
+                                indexer.request_refresh(immediate=True)
+                        except Exception:
+                            pass
 
-                    manager = IngestManager(vault_path, self.config.ingest, on_job_finished=_on_job_finished)
+                    def _ignore_provider() -> Any:
+                        idx = self._indexers.get(key)
+                        if idx is None:
+                            # fail-closed 信号：auto_submit 本轮拒绝提交（review R1）。
+                            return None
+                        # 动态 matcher：同时覆盖 exclude_patterns 与 .vaultignore
+                        # （此前只拿静态 exclude_patterns，vaultignore 豁免被绕过）。
+                        return idx._ignore_matcher()
+
+                    manager = IngestManager(
+                        vault_path,
+                        self.config.ingest,
+                        on_job_finished=_on_job_finished,
+                        ignore_provider=_ignore_provider,
+                    )
                     self._ingest_managers[key] = manager
         return manager
 
@@ -788,7 +865,10 @@ class VaultMcpServer:
         if action == "pending":
             return {"pending": manager.scan_pending()}
         if action == "status":
-            return manager.status(str(arguments.get("job_id", "")).strip() or None)
+            res = manager.status(str(arguments.get("job_id", "")).strip() or None)
+            if not self.config.ingest.enabled and self.config.ingest.auto_watch:
+                res["warning"] = "ingest.auto_watch=true 但 enabled=false，自动摄取未生效"
+            return res
         force = bool(arguments.get("force", False))
         result = manager.submit(arguments.get("sources") or None, force=force)
         result["hint"] = ("解析在后台进行，用 kb_ingest(action='status') 查进度；"
@@ -805,6 +885,11 @@ class VaultMcpServer:
         dedupe: bool = True,
         target_vaults: list[str] | None = None,
         preview: bool = False,
+        compact: bool = False,
+        *,
+        budget_bytes: int | None = None,
+        exact_terms: list[str] | None = None,
+        group_offsets: dict[str, int] | None = None,
     ) -> dict[str, Any]:
         return _fanout_search_impl(
             self,
@@ -816,6 +901,10 @@ class VaultMcpServer:
             dedupe=dedupe,
             target_vaults=target_vaults,
             preview=preview,
+            compact=compact,
+            budget_bytes=budget_bytes,
+            exact_terms=exact_terms,
+            group_offsets=group_offsets,
         )
 
     # v0.8.0 Phase 1：call_tool 由巨型 if 链改为显式路由表（15 个 kb_* 工具 → 处理方法）。
@@ -962,14 +1051,265 @@ class VaultMcpServer:
 
     def _kb_list_files(self, arguments: dict[str, Any]) -> dict[str, Any]:
         indexer = self._indexer_for(arguments)
-        indexer.try_sync_with_guard(timeout=1.0)
-        return {"files": indexer.list_files()}
+        indexer.request_refresh()
+        r_status = indexer.refresh_status()
+        files = indexer.list_files()
+        # path_prefix 与 kb_search 同口径（共用 path_prefix_match），空值不过滤；
+        # source 恒为库内相对 posix 路径，`../`/绝对路径只会零命中（天生 fail-closed）。
+        prefix = str(arguments.get("path_prefix") or "").strip()
+        if prefix:
+            files = [f for f in files if path_prefix_match(str(f.get("source", "")), prefix)]
+        # total 语义钉死：**前缀过滤后、切片前**的条目数（消费方靠它判断有没有下一页）
+        total = len(files)
+        offset = _parse_int(arguments.get("offset"))
+        offset = max(0, offset) if offset is not None else 0
+        limit = _parse_int(arguments.get("limit"))
+        if limit is not None and limit < 1:
+            limit = None
+        page = files[offset:] if limit is None else files[offset:offset + limit]
+        # 刻意不加 limit 上限：返回的是摘要 {source,title,chunks}（非全文 chunk），
+        # 且「缺省 = 全量」是既有承诺；加上限反而改变默认行为。
+        next_offset = None
+        if limit is not None and offset + len(page) < total:
+            next_offset = offset + len(page)
+        res = {
+            "files": page,
+            "total": total,
+            # 不叫 truncated：v0.8.0 的 truncated 是**字节预算截断**（fanout.apply_budget），
+            # 同名不同义会让消费方误读
+            "page_truncated": next_offset is not None,
+            "next_offset": next_offset,
+        }
+        if r_status["indexing_in_progress"]:
+            res["indexing_in_progress"] = True
+            res["indexing_progress"] = r_status["indexing_progress"]
+        if r_status.get("refresh_error"):
+            res["indexing_error"] = r_status["refresh_error"]
+        return res
+
+    # ------------------------------------------------------------ chunk_id 跨库寻址（C56）
+
+    # 跨库探测上限（C64 量测结论，见 Changelog）：单次 kb_read(chunk_id) 最多为探测
+    # 消耗的库数与墙钟预算——两者先到先停，被裁掉的库计入「未探测」并在报错里如实列出。
+    # 实测（10 库 × 60 文件 / 每库 113KB 文本，本机）：整条 kb_read 82ms、峰值 619KiB；
+    # 单库临时探测约 5ms。限流是为了让「几十个巨型库」的场景不出现秒级无界等待。
+    _PROBE_MAX_UNLOADED_VAULTS = 32
+    _PROBE_BUDGET_SECONDS = 2.0
+
+    @staticmethod
+    def _chunk_attribution(entry: Any, indexer: MarkdownIndexer, chunk: Chunk) -> dict[str, Any]:
+        """单命中时的库归属键。
+
+        solo 库只给库名（用户裁定 D5）：显式寻址与 fan-out 搜索是两条口径——探测覆盖
+        solo 库，但结果里不为它展开绝对路径，只点明「这是 solo」。
+        """
+        name = getattr(entry, "name", None) or Path(indexer.vault_path).name
+        attr: dict[str, Any] = {"vault": name}
+        if getattr(entry, "solo", False):
+            attr["solo"] = True
+        else:
+            attr["vault_path"] = str(indexer.vault_path)
+        return {"indexer": indexer, "chunk": chunk, "attribution": attr}
+
+    @staticmethod
+    def _chunk_miss_message(chunk_id: str, total: int, probed: int, skipped: list[tuple[str, str]]) -> str:
+        """零命中报错：必须带上「共 N 个候选库、探测了 M 个、跳过 K 个（名字与原因）」。
+
+        有库没被探到时，绝不能沿用「文件可能已修改」的判定——那是在谎报结论。
+        """
+        head = f"chunk_id not found: {chunk_id[:12]}…（共 {total} 个候选库，探测了 {probed} 个"
+        if skipped:
+            detail = "；".join(f"{name}（{reason}）" for name, reason in skipped)
+            return (
+                f"{head}，跳过 {len(skipped)} 个：{detail}）；"
+                "有库未被探测，不能据此断定文件已修改，请重新 kb_search 获取新 id"
+            )
+        return f"{head}；文件可能已修改，请重新 kb_search 获取新 id）"
+
+    @staticmethod
+    def _chunk_incomplete_message(
+        chunk_id: str,
+        total: int,
+        probed: int,
+        hits: list[dict[str, Any]],
+        skipped: list[tuple[str, str]],
+    ) -> str:
+        """存在跳过库且已命中不足 2 个时的 incomplete 报错（C65）：
+        无法确认唯一性，必须要求调用方显式传 vault_path。
+        """
+        hit_names = [
+            (getattr(h["entry"], "name", None) or Path(h["entry"].path).name)
+            + ("（solo 库）" if getattr(h["entry"], "solo", False) else "")
+            for h in hits
+        ]
+        hits_str = f"，已在 {len(hits)} 个库中命中（{', '.join(hit_names)}）" if hits else ""
+        detail = "；".join(f"{name}（{reason}）" for name, reason in skipped)
+        return (
+            f"chunk_id 探测未完成（incomplete）: {chunk_id[:12]}…（共 {total} 个候选库，探测了 {probed} 个{hits_str}，"
+            f"跳过 {len(skipped)} 个：{detail}）；"
+            "存在未探测库，无法确认唯一性，请显式传 vault_path 指定目标库"
+        )
+
+    @staticmethod
+    def _close_probe_indexer(probe: MarkdownIndexer) -> None:
+        """关闭临时探测 indexer 持有的 sqlite 连接（探测不该留下句柄）。"""
+        fts = getattr(probe, "_fts", None)
+        if fts is not None:
+            try:
+                fts.close()
+            except Exception:
+                pass
+        backend = getattr(probe, "_vector_backend", None)
+        closer = getattr(backend, "close", None)
+        if callable(closer):
+            try:
+                closer()
+            except Exception:
+                pass
+
+    def _locate_chunk_for_read(self, chunk_id: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        """定位 chunk_id 所属库并返回「可读的 indexer + 归属键」（C56 / C65）。
+
+        - 显式传了库标识（vault_path / vault / vault_name / path）→ **只探该库**，保留既有语义；
+        - 未传且注册表为空 → 抛出具名工具错误（引导 kb_init），不报 IndexError；
+        - 未传且只注册了一个库 → 走既有单库路径（行为与修复前一致）；
+        - 未传且注册了多库 → 遍历**全部注册库（含 solo）**做只读探测：
+          已加载的读内存态，未加载的用 `MarkdownIndexer(..., load_vectors=False)` 临时轻量
+          构造（不起 watcher、不注册 atexit、不触发 sync/embedding）；
+        - 探测边界裁决（C65）：
+          1. 两个以上命中 → 已证实歧义，提示选库；
+          2. 存在 skipped 且命中不足两个 → 报 incomplete 并要求显式传 vault_path；
+          3. 无 skipped 且单命中 → 展开；
+          4. 完整零命中 → not found（文件可能已修改）。
+        """
+        explicit = str(
+            arguments.get("vault_path")
+            or arguments.get("vault")
+            or arguments.get("vault_name")
+            or arguments.get("path")
+            or ""
+        ).strip()
+        entries = self.registry.load()
+
+        if not explicit and not entries:
+            raise ValueError("没有已注册的知识库，请先使用 kb_init 注册知识库")
+
+        if explicit or len(entries) <= 1:
+            target = arguments if explicit else {"vault_path": entries[0].path}
+            indexer = self._indexer_for(target)
+            indexer.request_refresh()
+            r_status = indexer.refresh_status()
+            entry = self.registry.get(str(indexer.vault_path))
+            for c in indexer.all_chunks():
+                if c.id == chunk_id:
+                    return self._chunk_attribution(entry, indexer, c)
+            is_cold = (
+                indexer.last_sync is None
+                and not getattr(indexer, "_chunks_cache_loaded", False)
+                and len(indexer._chunks) == 0
+            )
+            if is_cold:
+                raise ValueError(
+                    f"知识库正在后台进行首次初始化构建，无法定位 chunk_id {chunk_id[:12]}…，请稍后重试"
+                )
+            raise ValueError(self._chunk_miss_message(chunk_id, max(len(entries), 1), 1, []))
+
+        hits: list[dict[str, Any]] = []
+        skipped: list[tuple[str, str]] = []
+        probed = 0
+        probe_started = time.monotonic()
+        unloaded_probes = 0
+        probes_to_close: list[MarkdownIndexer] = []
+        try:
+            for entry in entries:
+                is_solo = bool(getattr(entry, "solo", False))
+                name = getattr(entry, "name", None) or Path(entry.path).name
+                label = f"{name}（solo 库）" if is_solo else (getattr(entry, "name", None) or entry.path)
+                key = str(Path(entry.path).expanduser().resolve())
+                indexer = self._indexers.get(key)
+                probe: MarkdownIndexer | None = None
+                if indexer is None:
+                    # 上限只约束「需要临时构造的库」：已加载库读内存态，零成本且必须探
+                    over_count = unloaded_probes >= self._PROBE_MAX_UNLOADED_VAULTS
+                    over_time = (time.monotonic() - probe_started) > self._PROBE_BUDGET_SECONDS
+                    if over_count or over_time:
+                        reason = ("超过探测库数上限" if over_count else "超过探测时间预算")
+                        skipped.append((label, f"{reason}（本次已探测 {probed} 个）"))
+                        continue
+                    unloaded_probes += 1
+                    if not Path(entry.path).is_dir():
+                        skipped.append((label, "目录已不存在"))
+                        continue
+                    try:
+                        probe = MarkdownIndexer(entry.path, self.config, load_vectors=False)
+                        probes_to_close.append(probe)
+                    except Exception as exc:  # OSError / zlib.error / 缓存损坏 / 构造失败 …
+                        reason = type(exc).__name__ if is_solo else f"{type(exc).__name__}: {exc}"[:100]
+                        skipped.append((label, reason))
+                        continue
+                    if not getattr(probe, "_chunks_cache_loaded", False):
+                        skipped.append((label, "尚无可探测文本索引"))
+                        continue
+                    indexer = probe
+                else:
+                    # review R2：首次同步未完成的库一律视为 incomplete——内存里
+                    # 非空的 _chunks 只是部分扫描结果，不能据此宣告「已探测完整库」，
+                    # 否则跨库 chunk_id 定位会在首次同步期间误报唯一命中。
+                    if indexer.last_sync is None and not getattr(indexer, "_chunks_cache_loaded", False):
+                        skipped.append((label, "尚无可探测文本索引"))
+                        continue
+
+                probed += 1
+                try:
+                    hit = next((c for c in indexer.all_chunks() if c.id == chunk_id), None)
+                except Exception as exc:
+                    reason = type(exc).__name__ if is_solo else f"{type(exc).__name__}: {exc}"[:100]
+                    skipped.append((label, reason))
+                    probed -= 1
+                    continue
+                if hit is not None:
+                    hits.append({"entry": entry, "indexer": indexer, "chunk": hit, "probe": probe})
+
+            if len(hits) > 1:
+                listed = "\n".join(
+                    f"  - {getattr(h['entry'], 'name', None) or Path(h['entry'].path).name}"
+                    + ("（solo 库）" if getattr(h["entry"], "solo", False) else f"：{h['entry'].path}")
+                    for h in hits
+                )
+                raise ValueError(
+                    f"chunk_id {chunk_id[:12]}… 在 {len(hits)} 个库中同时命中"
+                    "（id = sha1(source\\0index\\0content)，同一文件复制进多库会撞 id）。"
+                    f"请显式传 vault_path 指定其中一个：\n{listed}"
+                )
+
+            if skipped:
+                if hits:
+                    raise ValueError(
+                        self._chunk_incomplete_message(chunk_id, len(entries), probed, hits, skipped)
+                    )
+                raise ValueError(self._chunk_miss_message(chunk_id, len(entries), probed, skipped))
+
+            if not hits:
+                raise ValueError(self._chunk_miss_message(chunk_id, len(entries), probed, skipped))
+
+            hit = hits[0]
+            if hit["probe"] is not None:
+                # 命中未加载库：提升为常驻 indexer（与显式传 vault_path 同款），
+                # 并在新 indexer 上按 id 复核一次（缓存态一致时必然命中）。
+                indexer = self._indexer_for({"vault_path": hit["entry"].path})
+                chunk = next((c for c in indexer.all_chunks() if c.id == chunk_id), None)
+                if chunk is None:
+                    raise ValueError(
+                        f"chunk_id {chunk_id[:12]}… 所属库索引已变化，请重新 kb_search 获取新 id"
+                    )
+            else:
+                indexer, chunk = hit["indexer"], hit["chunk"]
+            return self._chunk_attribution(hit["entry"], indexer, chunk)
+        finally:
+            for p in probes_to_close:
+                self._close_probe_indexer(p)
 
     def _kb_read(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        indexer = self._indexer_for(arguments)
-        # 与 kb_search/kb_stats 同款冷启动守护：锁空闲时同步完成首建/增量对账，
-        # 避免后台首建未完成时短名寻址查空 _chunks 而误报 FileNotFound。
-        indexer.try_sync_with_guard(timeout=1.5)
         raw_source = arguments.get("source")
         source = str(raw_source).strip() if raw_source is not None else ""
         raw_chunk_id = arguments.get("chunk_id")
@@ -978,12 +1318,76 @@ class VaultMcpServer:
         if not source and not chunk_id:
             raise ValueError("source or chunk_id is required for kb_read")
 
+        raw_heading = arguments.get("heading")
+        heading = str(raw_heading).strip() if raw_heading is not None and str(raw_heading).strip() != "" else None
+
+        raw_start_line = arguments.get("start_line")
+        raw_end_line = arguments.get("end_line")
+        raw_start_char = arguments.get("start_char")
+
+        # start_char validation (Req 11)
+        start_char = 0
+        if "start_char" in arguments:
+            if chunk_id or heading:
+                raise ValueError("start_char cannot be used with chunk_id or heading")
+            if raw_start_char is not None:
+                if isinstance(raw_start_char, bool):
+                    raise ValueError(f"start_char must be an integer >= 0, got boolean {raw_start_char!r}")
+                if isinstance(raw_start_char, float):
+                    raise ValueError(f"start_char must be an integer >= 0, got float {raw_start_char!r}")
+                if isinstance(raw_start_char, int):
+                    val = raw_start_char
+                elif isinstance(raw_start_char, str):
+                    try:
+                        val = int(raw_start_char.strip())
+                    except ValueError:
+                        raise ValueError(f"start_char must be an integer >= 0, got {raw_start_char!r}")
+                else:
+                    raise ValueError(f"start_char must be an integer >= 0, got {type(raw_start_char).__name__}")
+                if val < 0:
+                    raise ValueError(f"start_char must be >= 0, got {val}")
+                start_char = val
+
+        # start_line and end_line strict validation (Req 6)
+        def _parse_strict_line(val: Any, name: str) -> int | None:
+            if val is None:
+                return None
+            if isinstance(val, bool):
+                raise ValueError(f"{name} must be an integer >= 1, got boolean {val!r}")
+            if isinstance(val, float):
+                raise ValueError(f"{name} must be an integer >= 1, got float {val!r}")
+            if isinstance(val, int):
+                if val < 1:
+                    raise ValueError(f"{name} must be >= 1, got {val}")
+                return val
+            if isinstance(val, str):
+                s = val.strip()
+                if not s:
+                    return None
+                try:
+                    parsed = int(s)
+                except ValueError:
+                    raise ValueError(f"{name} must be an integer >= 1, got {val!r}")
+                if parsed < 1:
+                    raise ValueError(f"{name} must be >= 1, got {parsed}")
+                return parsed
+            raise ValueError(f"{name} must be an integer >= 1, got {type(val).__name__}")
+
+        req_start_line = _parse_strict_line(raw_start_line, "start_line")
+        req_end_line = _parse_strict_line(raw_end_line, "end_line")
+
+        if req_end_line is not None:
+            cmp_start = req_start_line if req_start_line is not None else 1
+            if req_end_line < cmp_start:
+                raise ValueError(f"end_line must be >= start_line: end_line={req_end_line}, start_line={cmp_start}")
+
+        if start_char != 0 and req_start_line is None:
+            raise ValueError("start_char requires start_line to be specified")
+
+        attribution: dict[str, Any] = {}
         if chunk_id:
             # chunk_id 与 start_line/end_line/heading 互斥，避免入参歧义与非预期展开
-            has_start = _parse_int(arguments.get("start_line")) is not None
-            has_end = _parse_int(arguments.get("end_line")) is not None
-            has_heading = bool(str(arguments.get("heading") or "").strip())
-            if has_start or has_end or has_heading:
+            if req_start_line is not None or req_end_line is not None or heading is not None:
                 raise ValueError("chunk_id is mutually exclusive with start_line/end_line/heading")
 
             raw_expand = arguments.get("expand_lines")
@@ -996,16 +1400,21 @@ class VaultMcpServer:
                 else:
                     expand_lines = max(0, min(parsed_expand, 500))
 
-            chunk = None
-            for c in indexer.all_chunks():
-                if c.id == chunk_id:
-                    chunk = c
-                    break
-            if chunk is None:
-                # 提示文件可能已修改导致 sha1 变化，引导调用方重新检索
-                raise ValueError(f"chunk_id not found: {chunk_id[:12]}…（文件可能已修改，请重新 kb_search 获取新 id）")
+            # 跨库自动寻址（C56）：显式指定库时只探该库；未指定且注册了多库时遍历全部
+            # 注册库（含 solo）做只读探测；单库注册时等价于原单库路径。
+            located = self._locate_chunk_for_read(chunk_id, arguments)
+            indexer = located["indexer"]
+            chunk = located["chunk"]
+            attribution = located["attribution"]
 
             source = chunk.source
+            recorded_sig = indexer._signatures.get(source)
+            if not recorded_sig:
+                raise ValueError(
+                    f"chunk_id {chunk_id[:12]}… 所在源文件 {source} 缺失索引签名记录（stale）；"
+                    "请重新 kb_search 获取新 id，或改用 source + heading / 行区间读取"
+                )
+
             c_start = chunk.metadata.get("start_line", 1)
             c_end = chunk.metadata.get("end_line", c_start)
             try:
@@ -1019,16 +1428,20 @@ class VaultMcpServer:
             start_line = max(1, c_start_int - expand_lines)
             end_line = c_end_int + expand_lines
             is_chunk_read = True
+            echo_start_line = start_line
+            echo_end_line = end_line
+            expected_sha256 = recorded_sig
+            chunk_id_hint = f"{chunk_id[:12]}… "
         else:
+            indexer = self._indexer_for(arguments)
+            indexer.request_refresh()
             is_chunk_read = False
-            raw_heading = arguments.get("heading")
-            heading = str(raw_heading).strip() if raw_heading is not None and str(raw_heading).strip() != "" else None
-            start_line = _parse_int(arguments.get("start_line"))
-            end_line = _parse_int(arguments.get("end_line"))
-            if start_line is not None and start_line < 1:
-                raise ValueError("start_line must be >= 1")
-            if end_line is not None and start_line is not None and end_line < start_line:
-                raise ValueError("end_line must be >= start_line")
+            start_line = req_start_line
+            end_line = req_end_line
+            echo_start_line = req_start_line
+            echo_end_line = req_end_line
+            expected_sha256 = None
+            chunk_id_hint = None
 
             # F5b: 双链与短名寻址
             # 1. 规范化输入：支持 Obsidian [[笔记名]]、[[笔记名|别名]]、[[笔记名#段落]] 语法
@@ -1086,51 +1499,103 @@ class VaultMcpServer:
                         f"ambiguous note name '{orig_query}' matches multiple files: {', '.join(candidates[:5])}..."
                     )
                 else:
+                    is_cold = (
+                        not Path(norm_clean).suffix
+                        and indexer.last_sync is None
+                        and not getattr(indexer, "_chunks_cache_loaded", False)
+                        and len(indexer._chunks) == 0
+                    )
+                    if is_cold:
+                        raise ValueError(
+                            f"知识库正在后台进行首次初始化构建，无法解析短文件名 '{orig_query}'，请稍后重试或使用完整路径"
+                        )
                     source = clean_source
             else:
                 source = clean_source
 
-            if heading and start_line is None and end_line is None:
-                matches = [chunk for chunk in indexer.all_chunks() if chunk.source == source and chunk.metadata.get("heading") == heading]
-                if not matches:
-                    raise ValueError(f"heading not found: {heading}")
-                start_line = min(chunk.metadata["start_line"] for chunk in matches)
-                end_line = max(chunk.metadata["end_line"] for chunk in matches)
+        read_max_chars = indexer.config.index.read_max_chars
+        read_res = indexer._read_result(
+            source=source,
+            start_line=start_line,
+            end_line=end_line,
+            heading=heading,
+            start_char=start_char,
+            max_chars=read_max_chars,
+            expected_sha256=expected_sha256,
+            chunk_id_hint=chunk_id_hint,
+        )
 
-        text = indexer.read(source, start_line, end_line)
-        # 无范围时整篇塞进单个 text 块会撑爆模型上下文/客户端消息上限，
-        # 优先读取配置 [index] read_max_chars 并明确告知被截断，引导调用方用 start_line 续读。
-        read_max_chars = 20000
-        cfg = getattr(indexer, "config", None) or getattr(self, "config", None)
-        if cfg is not None:
-            idx_cfg = getattr(cfg, "index", None)
-            if idx_cfg is not None and getattr(idx_cfg, "read_max_chars", None):
-                try:
-                    c = int(idx_cfg.read_max_chars)
-                    if 100 <= c <= 1_000_000:
-                        read_max_chars = c
-                except (TypeError, ValueError, OverflowError):
-                    pass
+        if heading and req_start_line is None and req_end_line is None:
+            echo_start_line = read_res.effective_start_line
+            echo_end_line = read_res.effective_end_line
 
-        truncated = False
-        if len(text) > read_max_chars:
-            text = text[:read_max_chars]
-            truncated = True
         result = {
             "source": source,
-            "start_line": start_line,
-            "end_line": end_line,
-            "content": text,
-            "truncated": truncated,
+            "start_line": echo_start_line,
+            "end_line": echo_end_line,
+            "effective_start_line": read_res.effective_start_line,
+            "effective_end_line": read_res.effective_end_line,
+            "total_lines": read_res.total_lines,
+            "content": read_res.content,
+            "truncated": read_res.truncated,
+            "content_end_line": read_res.content_end_line,
+            "next_start_line": read_res.next_start_line,
+            "next_start_char": read_res.next_start_char,
         }
         if is_chunk_read:
             result["chunk_id"] = chunk.id
+            result.update(attribution)
         return result
 
     def _kb_stats(self, arguments: dict[str, Any]) -> dict[str, Any]:
         indexer = self._indexer_for(arguments)
-        indexer.try_sync_with_guard(timeout=1.0)
-        return indexer.stats()
+        indexer.request_refresh()
+        r_status = indexer.refresh_status()
+        stats = indexer.stats()
+        if r_status["indexing_in_progress"]:
+            stats["indexing_in_progress"] = True
+            stats["indexing_progress"] = r_status["indexing_progress"]
+        if r_status.get("refresh_error"):
+            stats["indexing_error"] = r_status["refresh_error"]
+
+        vault_key = str(indexer.vault_path.resolve())
+        ingest_cfg = self.config.ingest
+        effective_auto = bool(ingest_cfg.enabled and ingest_cfg.auto_watch)
+        watch_method = self.config.watch_method
+        fallback_int = self.config.watch_fallback_interval
+        effective_interval = fallback_int if fallback_int > 0 else 30.0
+
+        manager = self._ingest_managers.get(vault_key)
+        last_scan_at = None
+        last_err = None
+        skipped_too_large = 0
+        skipped_seen = 0
+        skipped_ignored = 0
+        if manager is not None and manager.state_path.exists():
+            try:
+                st_data = manager._load_state()
+                aw_st = st_data.get("auto_watch", {})
+                last_scan_at = aw_st.get("last_scan_at")
+                last_err = aw_st.get("last_error") or None
+                skipped_too_large = aw_st.get("skipped_too_large", 0)
+                skipped_seen = aw_st.get("skipped_seen", 0)
+                skipped_ignored = aw_st.get("skipped_ignored", 0)
+            except Exception:
+                pass
+
+        stats["ingest_auto"] = {
+            "configured": bool(ingest_cfg.auto_watch),
+            "effective": bool(effective_auto),
+            "max_file_size_mb": ingest_cfg.max_file_size_mb,
+            "watch_method": watch_method,
+            "effective_interval": effective_interval,
+            "last_scan_at": last_scan_at,
+            "last_error": last_err,
+            "skipped_too_large": skipped_too_large,
+            "skipped_seen": skipped_seen,
+            "skipped_ignored": skipped_ignored,
+        }
+        return stats
 
     def _kb_exempt(self, arguments: dict[str, Any]) -> dict[str, Any]:
         indexer = self._indexer_for(arguments)

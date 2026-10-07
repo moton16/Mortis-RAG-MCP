@@ -23,6 +23,41 @@ def _run_stdio(config: Path, requests: list[dict]) -> list[dict]:
     return [json.loads(line) for line in proc.stdout.splitlines() if line]
 
 
+def test_stdio_kb_init_accepts_vault_path_alias(tmp_path):
+    """C55：kb_init / kb_init_solo 除 path 外接受 vault_path 别名（issue #3 的误传痛点），
+    且旧的 path 路径继续可用（回归）。"""
+    solo_vault = tmp_path / "alias_solo"
+    plain_vault = tmp_path / "alias_plain"
+    solo_vault.mkdir()
+    plain_vault.mkdir()
+    (solo_vault / "note.md").write_text("# Note\nsolo alias content\n", encoding="utf-8")
+    (plain_vault / "note.md").write_text("# Note\nplain path content\n", encoding="utf-8")
+
+    config = tmp_path / "app.toml"
+    config.write_text('mode = "static"\n', encoding="utf-8")
+
+    responses = _run_stdio(config, [
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+        # 别名路径：vault_path 调 kb_init_solo
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "kb_init_solo", "arguments": {"vault_path": str(solo_vault), "name": "AliasSolo"}}},
+        # 旧路径回归：path 调 kb_init
+        {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "kb_init", "arguments": {"path": str(plain_vault), "name": "PlainPath"}}},
+        {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "kb_list", "arguments": {}}},
+    ])
+
+    solo_res = json.loads(responses[1]["result"]["content"][0]["text"])
+    assert solo_res["registered"] is True and solo_res["solo"] is True
+    assert solo_res["name"] == "AliasSolo"
+
+    plain_res = json.loads(responses[2]["result"]["content"][0]["text"])
+    assert plain_res["registered"] is True
+
+    listed = json.loads(responses[3]["result"]["content"][0]["text"])
+    assert sorted(v["name"] for v in listed["vaults"]) == ["AliasSolo", "PlainPath"]
+    flags = {v["name"]: v["solo"] for v in listed["vaults"]}
+    assert flags == {"AliasSolo": True, "PlainPath": False}
+
+
 def test_scoped_search_by_name_and_array(tmp_path):
     vault_a = tmp_path / "vault_a"
     vault_b = tmp_path / "vault_b"

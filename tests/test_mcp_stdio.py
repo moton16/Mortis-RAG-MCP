@@ -16,7 +16,11 @@ def _run_stdio(config: Path, requests: list[dict]) -> list[dict]:
         capture_output=True,
         check=False,
         encoding="utf-8",
-        env={**os.environ, "VAULT_MCP_REGISTRY": str(config.parent / "vaults.toml")},
+        env={
+            **os.environ,
+            "VAULT_MCP_REGISTRY": str(config.parent / "vaults.toml"),
+            "MORTIS_RAG_REGISTRY": str(config.parent / "vaults.toml"),
+        },
     )
     assert proc.returncode == 0, proc.stderr
     assert not proc.stderr, proc.stderr
@@ -41,12 +45,83 @@ def test_stdio_initialize_tools_and_list_search(tmp_path):
     assert {"kb_list", "kb_list_files", "kb_search", "kb_read", "kb_stats", "kb_describe"} <= names
 
     listed = json.loads(responses[2]["result"]["content"][0]["text"])
+    searched = json.loads(responses[3]["result"]["content"][0]["text"])
+    if not listed.get("files") or searched.get("status") == "indexing":
+        import time
+        time.sleep(0.5)
+        responses2 = _run_stdio(config, [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "kb_list_files", "arguments": {}}},
+            {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "kb_search", "arguments": {"query": "MCP stdio", "top_k": 5, "use_rerank": False}}},
+        ])
+        listed = json.loads(responses2[1]["result"]["content"][0]["text"])
+        searched = json.loads(responses2[2]["result"]["content"][0]["text"])
+
     assert listed["files"][0]["source"] == "知识库.md"
 
-    searched = json.loads(responses[3]["result"]["content"][0]["text"])
     assert searched["chunks"]
     assert searched["chunks"][0]["source"] == "知识库.md"
     assert searched["chunks"][0]["metadata"]["heading"] == "项目笔记"
+
+
+def test_stdio_kb_list_files_pagination_and_prefix(tmp_path):
+    """C57/C62：分页切片、前缀过滤、total/next_offset 语义，以及缺省全量与现状一致。"""
+    vault = tmp_path / "vault"
+    (vault / "教材").mkdir(parents=True)
+    (vault / "杂记").mkdir(parents=True)
+    for i in range(3):
+        (vault / "教材" / f"ch{i}.md").write_text(f"# 教材 {i}\n数字电路内容 {i}\n", encoding="utf-8")
+    for i in range(2):
+        (vault / "杂记" / f"m{i}.md").write_text(f"# 杂记 {i}\n随笔内容 {i}\n", encoding="utf-8")
+
+    config = tmp_path / "app.toml"
+    config.write_text(f'vault_path = "{vault.as_posix()}"\nmode = "static"\n', encoding="utf-8")
+
+    responses = _run_stdio(config, [
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "kb_list_files", "arguments": {}}},
+        {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "kb_list_files", "arguments": {"limit": 2, "offset": 0}}},
+        {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "kb_list_files", "arguments": {"limit": 2, "offset": 2}}},
+        {"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": "kb_list_files", "arguments": {"path_prefix": "教材/"}}},
+        {"jsonrpc": "2.0", "id": 6, "method": "tools/call", "params": {"name": "kb_list_files", "arguments": {"offset": 99}}},
+    ])
+
+    full = json.loads(responses[1]["result"]["content"][0]["text"])
+    if full.get("total") == 0 and full.get("indexing_in_progress"):
+        import time
+        time.sleep(0.5)
+        responses = _run_stdio(config, [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "kb_list_files", "arguments": {}}},
+            {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "kb_list_files", "arguments": {"limit": 2, "offset": 0}}},
+            {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "kb_list_files", "arguments": {"limit": 2, "offset": 2}}},
+            {"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": "kb_list_files", "arguments": {"path_prefix": "教材/"}}},
+            {"jsonrpc": "2.0", "id": 6, "method": "tools/call", "params": {"name": "kb_list_files", "arguments": {"offset": 99}}},
+        ])
+        full = json.loads(responses[1]["result"]["content"][0]["text"])
+    page1 = json.loads(responses[2]["result"]["content"][0]["text"])
+    page2 = json.loads(responses[3]["result"]["content"][0]["text"])
+    pref = json.loads(responses[4]["result"]["content"][0]["text"])
+    beyond = json.loads(responses[5]["result"]["content"][0]["text"])
+
+    # 缺省 = 全量（与修复前一致），且不标分页截断
+    assert full["total"] == 5 and len(full["files"]) == 5
+    assert full["next_offset"] is None and full["page_truncated"] is False
+
+    # 切片 + total（过滤后切片前）+ next_offset
+    assert [f["source"] for f in page1["files"]] == ["教材/ch0.md", "教材/ch1.md"]
+    assert page1["total"] == 5 and page1["next_offset"] == 2 and page1["page_truncated"] is True
+    assert [f["source"] for f in page2["files"]] == ["教材/ch2.md", "杂记/m0.md"]
+    assert page2["next_offset"] == 4
+
+    # 前缀过滤（与 kb_search.path_prefix 同口径）
+    assert pref["total"] == 3
+    assert all(f["source"].startswith("教材/") for f in pref["files"])
+
+    # offset 越界：空页 + total 仍为总数
+    assert beyond["files"] == []
+    assert beyond["total"] == 5
+    assert beyond["next_offset"] is None
 
 
 def test_stdio_kb_describe_updates_description(tmp_path):
@@ -100,3 +175,57 @@ def test_stdio_survives_lone_surrogate_in_notes(tmp_path):
     # 关键：服务没有中途死掉，第 3 个请求（tools/list）仍然有响应。
     assert len(responses) == 3, f"服务在写出代理项时被杀，只回了 {len(responses)} 条"
     assert responses[-1]["result"]["tools"]
+
+
+def test_stdio_release_smoke_v081(tmp_path):
+    """C60/Req 9: stdio smoke:
+    - initialize 版本 0.8.1
+    - 15 工具列表与新参数可见（compact, start_char, group_offsets, heading）
+    - ping 正常
+    - invalid range 与 heading 歧义返回 isError
+    """
+    sample = tmp_path / "notes.md"
+    sample.write_text("# Chapter\nContent line 2\n# Chapter\nContent line 4\n", encoding="utf-8")
+    config = tmp_path / "app.toml"
+    config.write_text(f'vault_path = "{tmp_path.as_posix()}"\nmode = "static"\n', encoding="utf-8")
+
+    responses = _run_stdio(config, [
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+        {"jsonrpc": "2.0", "id": 2, "method": "ping", "params": {}},
+        {"jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {}},
+        {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {
+            "name": "kb_read",
+            "arguments": {"source": "notes.md", "start_line": 999, "end_line": 1000}
+        }},
+        {"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {
+            "name": "kb_read",
+            "arguments": {"source": "notes.md", "heading": "Chapter"}
+        }},
+    ])
+
+    # 1. initialize 检查
+    assert responses[0]["result"]["serverInfo"]["version"] == "0.8.1"
+    assert responses[0]["result"]["serverInfo"]["name"] == "mortis-rag-mcp"
+
+    # 2. ping 检查
+    assert responses[1]["result"] == {}
+
+    # 3. 15 工具列表与新参数检查
+    tools = {t["name"]: t for t in responses[2]["result"]["tools"]}
+    assert len(tools) == 15
+    search_props = tools["kb_search"]["inputSchema"]["properties"]
+    assert "compact" in search_props
+    assert "group_offsets" in search_props
+    read_props = tools["kb_read"]["inputSchema"]["properties"]
+    assert "start_char" in read_props
+    assert "heading" in read_props
+
+    # 4. invalid range 返回 isError
+    assert responses[3]["result"]["isError"] is True
+    err_text_range = responses[3]["result"]["content"][0]["text"]
+    assert "actual" in err_text_range or "lines" in err_text_range
+
+    # 5. ambiguous heading 返回 isError
+    assert responses[4]["result"]["isError"] is True
+    err_text_heading = responses[4]["result"]["content"][0]["text"]
+    assert "存在歧义" in err_text_heading or "同名标题" in err_text_heading

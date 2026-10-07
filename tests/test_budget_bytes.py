@@ -12,32 +12,30 @@
 from __future__ import annotations
 
 import json
-import os
-from pathlib import Path
-import subprocess
-import sys
+
 import pytest
 
-from mortis_rag_mcp.indexer import Chunk
+from mortis_rag_mcp.indexer import Chunk, MarkdownIndexer
 from mortis_rag_mcp.server import VaultMcpServer
 from mortis_rag_mcp._server.fanout import _measure_payload_bytes
 from mortis_rag_mcp._server.search_dispatch import _parse_budget_bytes
 
 
-def _run_stdio(config: Path, requests: list[dict]) -> list[dict]:
-    payload = "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in requests)
-    proc = subprocess.run(
-        [sys.executable, "-m", "mortis_rag_mcp", "--serve-mcp-stdio", "--app-config", str(config)],
-        input=payload,
-        text=True,
-        capture_output=True,
-        check=False,
-        encoding="utf-8",
-        env={**os.environ, "VAULT_MCP_REGISTRY": str(config.parent / "vaults.toml")},
-    )
-    assert proc.returncode == 0, proc.stderr
-    assert not proc.stderr, proc.stderr
-    return [json.loads(line) for line in proc.stdout.splitlines() if line]
+def _kb_init_ready(server: VaultMcpServer, path, name: str) -> None:
+    """kb_init 之后显式同步一次，让索引状态确定。
+
+    C66 起 kb_search 走「优先使用已就绪索引、后台刷新」，不再在前台阻塞等待首建完成；
+    kb_init 只把首建丢进后台线程，因此紧跟其后的检索会与后台首建竞态——Windows 上
+    侥幸拿到完整索引，Linux CI 上只拿到部分结果（本条曾导致 ubuntu 5 连红）。
+    要断言完整索引的测试必须显式同步。
+    """
+    server.call_tool("kb_init", {"path": str(path), "name": name})
+    server._indexer_for({"vault_path": name}).sync()
+
+
+def _is_search_settled(data: dict) -> bool:
+    """首建完成判据：非冷启动(status!=indexing)且后台无在飞构建。"""
+    return data.get("status") != "indexing" and not data.get("indexing_in_progress")
 
 
 def test_parse_budget_bytes():
@@ -145,7 +143,7 @@ def test_budget_bytes_default_behavior_unchanged(budget_vault, tmp_path, monkeyp
     monkeypatch.setenv("VAULT_MCP_REGISTRY", str(reg_path))
 
     server = VaultMcpServer(config_path)
-    server.call_tool("kb_init", {"path": str(budget_vault), "name": "OSVault"})
+    _kb_init_ready(server, budget_vault, "OSVault")
 
     res = server.call_tool("kb_search", {"vault_path": "OSVault", "query": "操作系统", "top_k": 5})
     data = json.loads(res["content"][0]["text"])
@@ -166,7 +164,7 @@ def test_budget_bytes_all_fit(budget_vault, tmp_path, monkeypatch):
     monkeypatch.setenv("VAULT_MCP_REGISTRY", str(reg_path))
 
     server = VaultMcpServer(config_path)
-    server.call_tool("kb_init", {"path": str(budget_vault), "name": "OSVault"})
+    _kb_init_ready(server, budget_vault, "OSVault")
 
     # 预算充足 (50000 字节)，5 条必定能全量返回
     res = server.call_tool(
@@ -191,7 +189,7 @@ def test_budget_bytes_truncation_and_offset_continuity(budget_vault, tmp_path, m
     monkeypatch.setenv("VAULT_MCP_REGISTRY", str(reg_path))
 
     server = VaultMcpServer(config_path)
-    server.call_tool("kb_init", {"path": str(budget_vault), "name": "OSVault"})
+    _kb_init_ready(server, budget_vault, "OSVault")
 
     # 每条 chunk 序列化后约 800-900 字节，设置预算 2200 字节，应该只能返回 2 条左右
     budget = 2200
@@ -227,7 +225,7 @@ def test_budget_bytes_truncation_and_offset_continuity(budget_vault, tmp_path, m
 
 
 def test_budget_bytes_first_chunk_exceeds_budget(tmp_path, monkeypatch):
-    """断言首条即超出预算时，将首条的 content/snippet 二分截断至预算内。"""
+    """断言首条即超出预算时返回 returned=0、原游标、budget_hint，不二分截断；compact 模式下能放下一整条。"""
     vault = tmp_path / "giant_vault"
     vault.mkdir()
     # 构造一篇超长文章 (2500 字符)
@@ -242,9 +240,10 @@ def test_budget_bytes_first_chunk_exceeds_budget(tmp_path, monkeypatch):
 
     server = VaultMcpServer(config_path)
     server.call_tool("kb_init", {"path": str(vault), "name": "Giant"})
+    server._indexer_for({"vault_path": "Giant"}).sync()
 
-    # 1. full 模式下的截断（预算设置 650 字节：大于空元数据 530 字节，小于完整 chunk ~2000 字节）
-    budget_full = 650
+    # 1. full 模式下首条超预算：首条完整 chunk 约 3800+ 字节，1000 字节无法容纳完整 chunk
+    budget_full = 1000
     res_full = server.call_tool(
         "kb_search",
         {"vault_path": "Giant", "query": "填充数据", "top_k": 1, "budget_bytes": budget_full},
@@ -252,15 +251,15 @@ def test_budget_bytes_first_chunk_exceeds_budget(tmp_path, monkeypatch):
     data_full = json.loads(res_full["content"][0]["text"])
 
     assert data_full["truncated"] is True
-    assert data_full["returned"] == 1
-    assert data_full["next_offset"] == 1
-    assert len(data_full["chunks"]) == 1
-    chunk_full = data_full["chunks"][0]
-    assert 0 < len(chunk_full["content"]) < len(giant_content)
+    assert data_full["returned"] == 0
+    assert data_full["next_offset"] == 0
+    assert len(data_full["chunks"]) == 0
+    assert "budget_hint" in data_full
+    assert "use compact or increase budget_bytes" in data_full["budget_hint"]
     assert _measure_payload_bytes(data_full) <= budget_full
 
-    # 2. preview 模式下的截断（预算设置 500 字节：大于空 preview ~380 字节，小于完整 preview ~550 字节）
-    budget_preview = 500
+    # 2. preview 模式下的截断（预算设置 600 字节：小于完整 preview ~800-900 字节）
+    budget_preview = 600
     res_preview = server.call_tool(
         "kb_search",
         {"vault_path": "Giant", "query": "填充数据", "top_k": 1, "preview": True, "budget_bytes": budget_preview},
@@ -268,16 +267,28 @@ def test_budget_bytes_first_chunk_exceeds_budget(tmp_path, monkeypatch):
     data_preview = json.loads(res_preview["content"][0]["text"])
 
     assert data_preview["truncated"] is True
-    assert data_preview["returned"] == 1
-    assert data_preview["next_offset"] == 1
-    assert len(data_preview["chunks"]) == 1
-    chunk_preview = data_preview["chunks"][0]
-    assert "snippet" in chunk_preview
+    assert data_preview["returned"] == 0
+    assert data_preview["next_offset"] == 0
+    assert len(data_preview["chunks"]) == 0
+    assert "budget_hint" in data_preview
     assert _measure_payload_bytes(data_preview) <= budget_preview
+
+    # 3. compact 模式对照：紧凑投影去掉 id/score/title/metadata 等（约 700-850 字节），1000 字节预算下能够完整放下一整条
+    budget_compact = 1000
+    res_compact = server.call_tool(
+        "kb_search",
+        {"vault_path": "Giant", "query": "填充数据", "top_k": 1, "compact": True, "budget_bytes": budget_compact},
+    )
+    data_compact = json.loads(res_compact["content"][0]["text"])
+
+    assert data_compact["returned"] == 1
+    assert len(data_compact["chunks"]) == 1
+    assert "budget_hint" not in data_compact
+    assert _measure_payload_bytes(data_compact) <= budget_compact
 
 
 def test_budget_bytes_fanout_grouped(tmp_path, monkeypatch):
-    """断言跨库分组模式下预算全局共享、组序不变。"""
+    """断言跨库分组模式下预算全局共享、组序不变、各组维护独立游标且顶层 next_offset 为 None。"""
     vault1 = tmp_path / "v1"
     vault1.mkdir()
     for i in range(3):
@@ -295,11 +306,11 @@ def test_budget_bytes_fanout_grouped(tmp_path, monkeypatch):
     monkeypatch.setenv("VAULT_MCP_REGISTRY", str(reg_path))
 
     server = VaultMcpServer(config_path)
-    server.call_tool("kb_init", {"path": str(vault1), "name": "VaultOne"})
-    server.call_tool("kb_init", {"path": str(vault2), "name": "VaultTwo"})
+    _kb_init_ready(server, vault1, "VaultOne")
+    _kb_init_ready(server, vault2, "VaultTwo")
 
-    # 预算 2000 字节，不足以放下两库共 6 条结果
-    budget = 2000
+    # 预算 3500 字节，不足以放下两库共 6 条结果（每条 ~800 字节 + 元数据）
+    budget = 3500
     res = server.call_tool(
         "kb_search",
         {"query": "笔记", "group_by_vault": True, "budget_bytes": budget},
@@ -310,43 +321,89 @@ def test_budget_bytes_fanout_grouped(tmp_path, monkeypatch):
     assert data["truncated"] is True
     total_returned = sum(len(g["chunks"]) for g in data["groups"])
     assert total_returned == data["returned"]
-    assert data["next_offset"] == total_returned
+    assert 1 <= total_returned < 6
+    assert data["next_offset"] is None
+    assert "group_next_offsets" in data
+    for g in data["groups"]:
+        assert "next_offset" in g
+        assert "returned" in g
+        assert "truncated" in g
+        assert g["returned"] == len(g["chunks"])
+        assert g["next_offset"] == data["group_next_offsets"][g["vault"]]
     assert _measure_payload_bytes(data) <= budget
 
+    # 连续翻页验证：原样传回 group_next_offsets 作为 group_offsets
+    res2 = server.call_tool(
+        "kb_search",
+        {
+            "query": "笔记",
+            "group_by_vault": True,
+            "budget_bytes": budget,
+            "group_offsets": data["group_next_offsets"],
+        },
+    )
+    data2 = json.loads(res2["content"][0]["text"])
+    total_returned_2 = sum(len(g["chunks"]) for g in data2["groups"])
+    assert total_returned_2 >= 1
+    assert data2["next_offset"] is None
 
-def test_budget_bytes_stdio_integration(budget_vault, tmp_path):
+    # 两页返回的 chunk 不重复
+    ids1 = {c["id"] for g in data["groups"] for c in g["chunks"]}
+    ids2 = {c["id"] for g in data2["groups"] for c in g["chunks"]}
+    assert not (ids1 & ids2)
+
+
+def test_budget_bytes_stdio_integration(budget_vault, tmp_path, stdio_polling):
     """断言经 stdio 真实命令行调用时，budget_bytes 严格生效且 stderr 为空。"""
     config_path = tmp_path / "app.toml"
     config_path.write_text('mode = "static"\n', encoding="utf-8")
 
-    requests = [
-        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
-        {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "kb_init", "arguments": {"path": str(budget_vault), "name": "OS"}}},
-        {
+    # C66：kb_search 不再阻塞等待首建（读优先）。首建进行中时响应为
+    # status:"indexing"（冷启动）或带 indexing_in_progress（部分索引）；
+    # stdio 子进程没有可用参数让首建同步完成，故按真实客户端契约在一条交互式
+    # 会话里带真实间隔轮询到索引就绪，再断言预算行为。
+    registry = str(config_path.parent / "vaults.toml")
+    session = stdio_polling(
+        config_path,
+        prefix_requests=[
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {"name": "kb_init", "arguments": {"path": str(budget_vault), "name": "OS"}},
+            },
+        ],
+        poll_request={
             "jsonrpc": "2.0",
-            "id": 3,
             "method": "tools/call",
-            "params": {"name": "kb_search", "arguments": {"vault_path": "OS", "query": "操作系统", "top_k": 8, "budget_bytes": 1800}},
+            "params": {
+                "name": "kb_search",
+                "arguments": {"vault_path": "OS", "query": "操作系统", "top_k": 8, "budget_bytes": 1800},
+            },
         },
-    ]
+        is_settled=_is_search_settled,
+        env_overrides={"VAULT_MCP_REGISTRY": registry, "MORTIS_RAG_REGISTRY": registry},
+    )
 
-    responses = _run_stdio(config_path, requests)
-    assert len(responses) == 3
-    search_resp = json.loads(responses[2]["result"]["content"][0]["text"])
+    search_resp = session["observed"][-1]
+    assert _is_search_settled(search_resp), f"首建未在轮询窗口内完成：{search_resp}"
     assert search_resp["truncated"] is True
     assert search_resp["returned"] >= 1
     assert _measure_payload_bytes(search_resp) <= 1800
 
 
 def test_budget_bytes_fanout_flat(tmp_path, monkeypatch):
-    """断言跨库平铺检索（不传 vault_path 且 group_by_vault=False）下预算全局截断生效。"""
+    """断言跨库平铺检索（不传 vault_path 且 group_by_vault=False）下预算完整 chunk 截断生效。"""
     v1 = tmp_path / "vault_flat_1"
     v1.mkdir()
-    (v1 / "doc1.md").write_text("# 库1\n" + "平铺跨库内容段落数据 " * 40, encoding="utf-8")
+    doc1_content = "# 库1\n" + "平铺跨库内容段落数据 " * 40
+    (v1 / "doc1.md").write_text(doc1_content, encoding="utf-8")
 
     v2 = tmp_path / "vault_flat_2"
     v2.mkdir()
-    (v2 / "doc2.md").write_text("# 库2\n" + "平铺跨库内容段落数据 " * 40, encoding="utf-8")
+    doc2_content = "# 库2\n" + "平铺跨库内容段落数据 " * 40
+    (v2 / "doc2.md").write_text(doc2_content, encoding="utf-8")
 
     config_path = tmp_path / "app.toml"
     config_path.write_text('mode = "static"\n', encoding="utf-8")
@@ -355,17 +412,18 @@ def test_budget_bytes_fanout_flat(tmp_path, monkeypatch):
     monkeypatch.setenv("VAULT_MCP_REGISTRY", str(reg_path))
 
     server = VaultMcpServer(config_path)
-    server.call_tool("kb_init", {"path": str(v1), "name": "VFlat1"})
-    server.call_tool("kb_init", {"path": str(v2), "name": "VFlat2"})
+    _kb_init_ready(server, v1, "VFlat1")
+    _kb_init_ready(server, v2, "VFlat2")
 
-    # 预算仅够容纳 1 条，第 2 条被截断
-    res = server.call_tool("kb_search", {"query": "平铺", "budget_bytes": 1500})
+    # 预算 2500 字节仅够容纳 1 条（每条 ~1600 字节 + 元数据），第 2 条被截断
+    budget = 2500
+    res = server.call_tool("kb_search", {"query": "平铺", "budget_bytes": budget})
     data = json.loads(res["content"][0]["text"])
     assert "chunks" in data
     assert data["truncated"] is True
     assert data["returned"] == 1
-    assert data["next_offset"] == 1
-    assert _measure_payload_bytes(data) <= 1500
+    assert data["chunks"][0]["content"] == doc1_content.rstrip()
+    assert _measure_payload_bytes(data) <= budget
 
 
 def test_budget_bytes_offset_beyond_end(budget_vault, tmp_path, monkeypatch):
@@ -377,7 +435,7 @@ def test_budget_bytes_offset_beyond_end(budget_vault, tmp_path, monkeypatch):
     monkeypatch.setenv("VAULT_MCP_REGISTRY", str(reg_path))
 
     server = VaultMcpServer(config_path)
-    server.call_tool("kb_init", {"path": str(budget_vault), "name": "OSVault"})
+    _kb_init_ready(server, budget_vault, "OSVault")
 
     res = server.call_tool(
         "kb_search",
@@ -389,4 +447,193 @@ def test_budget_bytes_offset_beyond_end(budget_vault, tmp_path, monkeypatch):
     assert data["truncated"] is False
     assert data["returned"] == 0
     assert data["next_offset"] == 100
+
+
+def test_budget_bytes_minimum_envelope_overflow(tmp_path, monkeypatch):
+    """断言当最小元数据包络本身超出 budget_bytes 时，返回 budget_exceeded=true 与精确迭代稳定的 minimum_budget_bytes。"""
+    config_path = tmp_path / "app.toml"
+    config_path.write_text('mode = "static"\n', encoding="utf-8")
+    reg_path = tmp_path / "vaults.toml"
+    monkeypatch.setenv("MORTIS_RAG_REGISTRY", str(reg_path))
+    monkeypatch.setenv("VAULT_MCP_REGISTRY", str(reg_path))
+
+    server = VaultMcpServer(config_path)
+    # 注册 3 个名字较长的库以产生大于 500 字节的跨库元数据包络
+    for i in range(3):
+        v = tmp_path / f"long_named_vault_corpus_data_{i}"
+        v.mkdir()
+        (v / "note.md").write_text(f"# 笔记{i}\n内容数据段落测试", encoding="utf-8")
+        _kb_init_ready(server, v, f"CorpusVaultBranch{i}")
+
+    # 设置极小预算 500 字节（最小包络含 searched/errors/hint/group_next_offsets 已大于 600 字节）
+    res = server.call_tool(
+        "kb_search",
+        {"query": "笔记", "group_by_vault": True, "budget_bytes": 500},
+    )
+    data = json.loads(res["content"][0]["text"])
+
+    assert data["budget_exceeded"] is True
+    assert data["truncated"] is True
+    assert data["returned"] == 0
+    assert data["groups"] == []
+    assert data["next_offset"] is None
+    assert "group_next_offsets" in data
+    assert data["budget_hint"] == "narrow vaults or increase budget_bytes"
+    # minimum_budget_bytes 必须与当前响应实际测量值严格相等（迭代稳定）
+    assert data["minimum_budget_bytes"] == _measure_payload_bytes(data)
+    assert data["minimum_budget_bytes"] > 500
+
+
+def test_budget_bytes_group_offsets_validation(tmp_path, monkeypatch):
+    """验证 group_offsets 的防御式类型、范围、授权及互斥校验。"""
+    config_path = tmp_path / "app.toml"
+    config_path.write_text('mode = "static"\n', encoding="utf-8")
+    reg_path = tmp_path / "vaults.toml"
+    monkeypatch.setenv("MORTIS_RAG_REGISTRY", str(reg_path))
+    monkeypatch.setenv("VAULT_MCP_REGISTRY", str(reg_path))
+
+    v1 = tmp_path / "v1"
+    v1.mkdir()
+    (v1 / "a.md").write_text("# A\n内容", encoding="utf-8")
+    v2 = tmp_path / "v2"
+    v2.mkdir()
+    (v2 / "b.md").write_text("# B\n内容", encoding="utf-8")
+    v_solo = tmp_path / "v_solo"
+    v_solo.mkdir()
+    (v_solo / "s.md").write_text("# S\n内容", encoding="utf-8")
+
+    server = VaultMcpServer(config_path)
+    _kb_init_ready(server, v1, "V1")
+    _kb_init_ready(server, v2, "V2")
+    server.call_tool("kb_init_solo", {"path": str(v_solo), "name": "VSolo"})
+
+    # 1. group_by_vault=False 时传入 group_offsets -> ValueError
+    with pytest.raises(ValueError, match="group_offsets is only allowed when group_by_vault=true"):
+        server.call_tool("kb_search", {"query": "内容", "group_by_vault": False, "group_offsets": {"V1": 0}})
+
+    # 2. 负数偏移 -> ValueError
+    with pytest.raises(ValueError, match="group_offsets values must be >= 0"):
+        server.call_tool("kb_search", {"query": "内容", "group_by_vault": True, "group_offsets": {"V1": -1}})
+
+    # 3. 布尔值或浮点数 -> ValueError
+    with pytest.raises(ValueError, match="group_offsets values must be non-negative integers"):
+        server.call_tool("kb_search", {"query": "内容", "group_by_vault": True, "group_offsets": {"V1": True}})
+
+    with pytest.raises(ValueError, match="group_offsets values must be non-negative integers"):
+        server.call_tool("kb_search", {"query": "内容", "group_by_vault": True, "group_offsets": {"V1": 2.5}})
+
+    # 4. 未知/未注册库 -> ValueError
+    with pytest.raises(ValueError, match="unknown or unresolvable vault in group_offsets"):
+        server.call_tool("kb_search", {"query": "内容", "group_by_vault": True, "group_offsets": {"NonExistentVault": 0}})
+
+    # 5. 全局检索中传入 solo 库 -> ValueError
+    with pytest.raises(ValueError, match="solo and not authorized in global search"):
+        server.call_tool("kb_search", {"query": "内容", "group_by_vault": True, "group_offsets": {"VSolo": 0}})
+
+    # 6. 重复库名/路径映射 -> ValueError
+    with pytest.raises(ValueError, match="duplicate vault in group_offsets"):
+        server.call_tool("kb_search", {"query": "内容", "group_by_vault": True, "group_offsets": {"V1": 0, str(v1): 0}})
+
+    # 7. 合法 group_offsets 结合 Scoped Search 访问 solo 库
+    res = server.call_tool(
+        "kb_search",
+        {
+            "query": "内容",
+            "group_by_vault": True,
+            "vault_paths": ["V1", "VSolo"],
+            "group_offsets": {"V1": 0, "VSolo": 0},
+        },
+    )
+    data = json.loads(res["content"][0]["text"])
+    assert "groups" in data
+    assert len(data["groups"]) >= 1
+
+
+def test_budget_bytes_immutability():
+    """断言 apply_budget 严格保证入参字典与 Chunk 结构深层不可变。"""
+    from mortis_rag_mcp._server.fanout import apply_budget
+    import copy
+
+    raw_result = {
+        "chunks": [
+            {"id": "c1", "source": "a.md", "content": "不可变数据正文1" * 8, "score": 0.95},
+            {"id": "c2", "source": "b.md", "content": "不可变数据正文2" * 8, "score": 0.85},
+        ],
+        "searched": ["/vault/a"],
+        "errors": {},
+    }
+    frozen_copy = copy.deepcopy(raw_result)
+
+    # 触发预算截断（每条 ~260 字节，450 字节预算仅容纳 1 条）
+    res = apply_budget(raw_result, budget_bytes=450, orig_offset=0)
+    assert res["returned"] == 1
+    # 原始输入字典及其内部 chunk 未被修改
+    assert raw_result == frozen_copy
+    assert len(raw_result["chunks"]) == 2
+    assert raw_result["chunks"][0]["content"] == "不可变数据正文1" * 8
+
+
+def test_budget_bytes_cold_status(tmp_path, monkeypatch):
+    """断言未初始化完成的单库冷启动状态统一经由 apply_budget 输出一致的 envelope 结构。"""
+    monkeypatch.setattr(VaultMcpServer, "_startup_index_all", lambda self: None)
+    monkeypatch.setattr(MarkdownIndexer, "start_watching", lambda self: None)
+    monkeypatch.setattr(MarkdownIndexer, "request_refresh", lambda self, **kwargs: False)
+    config_path = tmp_path / "app.toml"
+    config_path.write_text('mode = "static"\n', encoding="utf-8")
+    reg_path = tmp_path / "vaults.toml"
+    monkeypatch.setenv("MORTIS_RAG_REGISTRY", str(reg_path))
+    monkeypatch.setenv("VAULT_MCP_REGISTRY", str(reg_path))
+
+    v = tmp_path / "cold_vault"
+    v.mkdir()
+    (v / "doc.md").write_text("# 文档\n内容", encoding="utf-8")
+
+    server = VaultMcpServer(config_path)
+    server.registry.add(str(v), name="ColdVault")
+
+    res = server.call_tool("kb_search", {"vault_path": "ColdVault", "query": "文档", "budget_bytes": 5000})
+    data = json.loads(res["content"][0]["text"])
+
+    assert data["status"] == "indexing"
+    assert data["chunks"] == []
+    assert data["returned"] == 0
+    assert data["truncated"] is False
+    assert data["next_offset"] == 0
+    assert _measure_payload_bytes(data) <= 5000
+    server.shutdown()
+
+
+def test_budget_bytes_cjk_emoji_escaping(tmp_path, monkeypatch):
+    """断言包含复杂中文、四字节 Emoji、CRLF 与转义引号的内容在包装度量下能正确合法 loads 且不超预算。"""
+    config_path = tmp_path / "app.toml"
+    config_path.write_text('mode = "static"\n', encoding="utf-8")
+    reg_path = tmp_path / "vaults.toml"
+    monkeypatch.setenv("MORTIS_RAG_REGISTRY", str(reg_path))
+    monkeypatch.setenv("VAULT_MCP_REGISTRY", str(reg_path))
+
+    v = tmp_path / "cjk_emoji_vault"
+    v.mkdir()
+    # 包含双引号、反斜杠、CRLF、Emoji（🪐、🚀、🦄）与中文
+    complex_text = '# 宇宙\r\n"深空探测"\\星系\\ [🪐 探索 🚀] \r\n 符号测试: "Quotes" and \\Backslash\\ 🦄' * 10
+    (v / "space.md").write_text(complex_text, encoding="utf-8")
+
+    server = VaultMcpServer(config_path)
+    server.call_tool("kb_init", {"path": str(v), "name": "SpaceVault"})
+    server._indexer_for({"vault_path": "SpaceVault"}).sync()
+
+    res = server.call_tool(
+        "kb_search",
+        {"vault_path": "SpaceVault", "query": "深空探测", "budget_bytes": 2000},
+    )
+    data = json.loads(res["content"][0]["text"])
+
+    assert "chunks" in data
+    assert len(data["chunks"]) >= 1
+    # 验证反序列化出的正文包含完整的 emoji 与转义字符
+    content = data["chunks"][0]["content"]
+    assert "🪐" in content and "🚀" in content and "🦄" in content
+    assert '"Quotes"' in content
+    assert "\\Backslash\\" in content
+    assert _measure_payload_bytes(data) <= 2000
+
 

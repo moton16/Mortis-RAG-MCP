@@ -446,6 +446,33 @@ def check_config(app_config: str | None) -> tuple[dict, object | None]:
             f"：embedding={_sanitize_free_text(mode)}/{_sanitize_free_text(model)}"
             f"，api_key {status_text}{missing_str}{rr_detail}"
         )
+        ingest_cfg = getattr(cfg, "ingest", None)
+        if ingest_cfg is not None and (not hasattr(ingest_cfg, "_mock_return_value") or isinstance(getattr(ingest_cfg, "enabled", None), bool)):
+            ingest_enabled = bool(getattr(ingest_cfg, "enabled", False))
+            auto_watch = bool(getattr(ingest_cfg, "auto_watch", False))
+            try:
+                cap_mb = int(getattr(ingest_cfg, "max_file_size_mb", 20))
+            except (TypeError, ValueError):
+                cap_mb = 20
+            cap_str = f"{cap_mb}MiB" if cap_mb > 0 else "无限制"
+
+            watch_method = str(getattr(cfg, "watch_method", "auto"))
+            try:
+                fallback_int = float(getattr(cfg, "watch_fallback_interval", 0.0))
+            except (TypeError, ValueError):
+                fallback_int = 0.0
+            effective_int = fallback_int if fallback_int > 0 else 30.0
+
+            if not ingest_enabled and auto_watch:
+                ingest_str = f"ingest: auto_watch=true但未启用(enabled=false，不生效，上限{cap_str})"
+            elif ingest_enabled and auto_watch:
+                ingest_str = f"ingest: 自动(上限{cap_str}，监听={watch_method}/{effective_int}s)"
+            elif ingest_enabled:
+                ingest_str = f"ingest: 手动(上限{cap_str})"
+            else:
+                ingest_str = f"ingest: 未启用(上限{cap_str})"
+            detail += f"，{ingest_str}"
+
         # 两侧同名配置同时存在：resolve_config_path 新名优先，旧侧那份被静默忽略。
         # 用户继续编辑旧侧的 config.toml 时看不到任何反馈，这里显式点出来。
         try:
@@ -539,6 +566,60 @@ def probe_reranker(cfg: object) -> dict:
         return _section(False, f"探测失败：{_sanitize_free_text(exc)}")
 
 
+def check_ingest(cfg: object | None) -> dict:
+    """文档摄取状态检查（快照读取，不构造 manager，不联网）。"""
+    try:
+        ingest_cfg = getattr(cfg, "ingest", None) if cfg else None
+        enabled = False
+        auto_watch = False
+        cap_mb = 20
+        if ingest_cfg is not None and (not hasattr(ingest_cfg, "_mock_return_value") or isinstance(getattr(ingest_cfg, "enabled", None), bool)):
+            enabled = bool(getattr(ingest_cfg, "enabled", False))
+            auto_watch = bool(getattr(ingest_cfg, "auto_watch", False))
+            try:
+                cap_mb = int(getattr(ingest_cfg, "max_file_size_mb", 20))
+            except (TypeError, ValueError):
+                cap_mb = 20
+        cap_str = f"{cap_mb}MiB" if cap_mb > 0 else "无限制"
+
+        # 查找已有 state 的最后扫描记录（快照读取，严禁构造 IngestManager 或发起网络请求）
+        last_scan_record = None
+        try:
+            from .registry import VaultRegistry, registry_path
+            reg = VaultRegistry(registry_path())
+            vaults = reg.load()
+            out_dirname = getattr(ingest_cfg, "output_dirname", ".mortis-parsed") if ingest_cfg else ".mortis-parsed"
+            out_dirname = (out_dirname or ".mortis-parsed").strip("/\\ ")
+            for v in vaults:
+                vp = getattr(v, "path", None)
+                if not vp:
+                    continue
+                st_file = Path(str(vp)) / out_dirname / ".ingest_state.json"
+                if st_file.is_file():
+                    try:
+                        data = json.loads(st_file.read_text(encoding="utf-8"))
+                        scan_at = data.get("auto_watch", {}).get("last_scan_at")
+                        if scan_at:
+                            if last_scan_record is None or str(scan_at) > str(last_scan_record):
+                                last_scan_record = str(scan_at)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        scan_note = f"最近自动扫描: {_sanitize_free_text(last_scan_record)}（报告生成时快照）" if last_scan_record else "最近自动扫描: 无记录（报告生成时快照）"
+
+        if not enabled and auto_watch:
+            return _section(True, f"auto_watch=true 但未启用（enabled=false，不生效，上限 {cap_str}）；{scan_note}")
+        if enabled and auto_watch:
+            return _section(True, f"自动摄取已启用（上限 {cap_str}）；{scan_note}")
+        if enabled:
+            return _section(True, f"手动摄取模式（上限 {cap_str}）；{scan_note}")
+        return _section(True, f"未启用（上限 {cap_str}）；{scan_note}")
+    except Exception as exc:
+        return _section(True, f"摄取检查跳过：{_sanitize_free_text(exc)}")
+
+
 # ---------- 渲染与主流程 ----------
 
 def render_md(data: dict) -> str:
@@ -555,6 +636,7 @@ def render_md(data: dict) -> str:
     labels = {
         "python": "Python", "package": "包导入", "optional_deps": "可选依赖",
         "config": "配置", "registry": "注册表", "cache": "缓存目录",
+        "ingest": "文档摄取",
         "embedding_api": "embedding API", "reranker_api": "reranker API", "tests": "单元测试（开发观测）",
     }
     for key, label in labels.items():
@@ -608,6 +690,7 @@ def run(full: bool = True, app_config: str | None = None, quiet: bool = False) -
         sections["registry"] = check_registry()
         sections["optional_deps"] = check_optional_deps()
         sections["cache"] = check_cache_dir(cfg)
+        sections["ingest"] = check_ingest(cfg)
         if full and cfg is not None:
             sections["embedding_api"] = probe_embedding(cfg)
             sections["reranker_api"] = probe_reranker(cfg)

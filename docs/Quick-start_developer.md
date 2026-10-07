@@ -3,7 +3,7 @@
 > 面向第一次接触本仓库的开发者（人类或 agent）。**只读这一篇就够上手**：
 > 项目概况 → 架构 → 代码逻辑 → 各模块职责 → 开发约定 → 常见任务食谱。
 > 需要溯源某次具体改动时才去翻 `Changelog_developer.md`；要写新功能先看
-> `Execution-plan_developer.md`（如有对应方案）。
+> 是否已有排期（`PROJECT_GUIDE.md` §15 与 issue / PR 记录）。
 
 ---
 
@@ -27,15 +27,15 @@ Mortis'RAG MCP 是一个**本地 Markdown 知识库 RAG 服务器**，通过 MCP
 
 ```
 Mortis-RAG-MCP/
-├── mortis_rag_mcp/          # 包本体（~5800 行，v0.8.0 模块化拆分架构）
+├── mortis_rag_mcp/          # 包本体（~10850 行，v0.8.0 模块化拆分架构）
 │   ├── __main__.py          # 入口：python -m mortis_rag_mcp --serve-mcp-stdio
-│   ├── config.py            # 配置加载（390 行）
-│   ├── registry.py          # 用户级知识库注册表（304 行）
-│   ├── server.py            # MCP 协议层 + 15 个公开工具路由表与轻量入口（1126 行）
+│   ├── config.py            # 配置加载（526 行）
+│   ├── registry.py          # 用户级知识库注册表（384 行）
+│   ├── server.py            # MCP 协议层 + 15 个公开工具路由表与轻量入口（1312 行）
 │   ├── _server/             # 服务端路由与跨库编排私有包
 │   │   ├── search_dispatch.py # 单库/Scoped/全局检索路由与入参规范化
 │   │   └── fanout.py          # 跨库候选聚合、权重计算、去重、rerank、全局/分组分页
-│   ├── indexer.py           # MarkdownIndexer Facade、向后兼容 re-export 与生命周期（1238 行）
+│   ├── indexer.py           # MarkdownIndexer Facade、向后兼容 re-export 与生命周期（1253 行）
 │   ├── _indexer/            # 索引器核心实现私有包
 │   │   ├── models.py        # Chunk、SearchFilter 数据模型与纯去重逻辑
 │   │   ├── cache_codec.py   # _CacheCodec、_VectorsCodec 二进制编解码持久化
@@ -48,16 +48,17 @@ Mortis-RAG-MCP/
 │   │   └── watch.py         # 文件系统 watcher 监听与防抖生命周期调度
 │   ├── ingest/              # PDF/Office 异步摄取与表格处理（worker, mineru, tables）
 │   ├── providers.py         # embedding / reranker HTTP 封装（230 行）
-│   ├── fts.py               # FTS5 SQLite 封装（149 行）
+│   ├── fts.py               # FTS5 SQLite 封装（152 行）
 │   ├── vector.py            # 向量后端：memory / sqlite_vec（367 行）
 │   └── fsnotify.py          # Windows ReadDirectoryChangesW 原生监听（557 行）
 ├── config/app.toml.example  # 配置模板（app.toml 本体被 gitignore）
 ├── skills/mortis-rag-mcp/   # 配套 agent skill（教 AI 怎么用这套工具）
-├── tests/                   # pytest，340+ 测试用例
+├── tests/                   # pytest，49 个测试文件 / 416 个用例
 ├── docs/
-│   ├── Quick-start_developer.md    # 本文件
-│   ├── Changelog_developer.md      # 每次 commit 的技术变更流水
-│   └── Execution-plan_developer.md # 待执行功能的代码级方案
+│   ├── Quick-start_developer.md       # 本文件
+│   ├── Changelog_developer.md         # 每次 commit 的技术变更流水
+│   ├── PROJECT_GUIDE.md               # 全系统架构指南（代码级现状全貌）
+│   └── Docs_Folder-descriptions.md    # docs/ 目录保留口径说明（本目录的元文档）
 ├── QUICKSTART_user.md       # 用户向：初次部署指南
 ├── CHANGELOG_user.md        # 用户向：release 版本变更（无技术细节）
 └── README.md (中文主页) / README_EN.md (English)
@@ -192,15 +193,17 @@ stdin 一行 JSON → handle() → method=="tools/call"
 ## 7. 测试
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest tests/ -q     # 全量（约 80s）
+# 设置 UTF-8 编码环境后运行靶向测试
+$env:PYTHONUTF8='1'; $env:PYTHONIOENCODING='utf-8'
+.\.venv\Scripts\python.exe -m pytest tests/test_compact_search.py tests/test_read_heading.py -q
 ```
 
-- 22 个测试文件：切块/缓存/多库/子库/豁免/去重/快照/solo/混合检索/过滤器/并发硬化/监听……
-- **约定**：不碰真实网络（embedding 用 `static` 模式或 monkeypatch）；临时库一律 `tmp_path`；
-  Windows 与 Unicode 路径已有专项用例，新功能涉及路径必须补。
+- 56 个测试文件（单机推荐按模块靶向运行；CI 全量矩阵覆盖 Ubuntu 3.10–3.13 与 Windows 3.12）：切块/缓存/多库/紧凑投影/预算/物理读取/章节定位/自动摄取/防抖监听/宿主隔离/快照等。
+- **约定**：不碰真实网络（embedding 用 `static` 模式或注入 FakeProvider）；临时库一律 `tmp_path`；测试注册表与配置经 `MORTIS_RAG_CONFIG` / `MORTIS_RAG_REGISTRY` 严格隔离，绝不污染宿主真实环境。
 - 已知 Windows 平台坑：`kb_rebuild` 删 FTS 缓存走系统回收站，trash 失败会
   `SAFE_DELETE_FAIL_CLOSED`（`test_subvaults.py::test_stdio_kb_rebuild_returns_stats`
   在部分 Windows 环境因此红）——修它是件独立任务，别顺手带在别的 commit 里。
+- **Windows 升级文件写锁**：Windows 环境下 MCP 客户端拉起的 console 入口 exe（`mortis-rag-mcp.exe` 或 `vault-mcp.exe`）运行期间会被系统锁定。此时若执行 editable 重装（`pip install -e .`）会报 `[WinError 5] 拒绝访问`。仅 `git pull` 更新了磁盘源码，运行中未重启的 Python 进程不会自动重新加载模块。排查与安全升级步骤见 §9 食谱。
 
 ## 8. 开发约定
 
@@ -212,7 +215,6 @@ stdin 一行 JSON → handle() → method=="tools/call"
    - `docs/Changelog_developer.md`：commit 级技术流水，必须记录操作者与技术细节。
    - `docs/PROJECT_GUIDE.md`：全系统架构指南，代码级架构变动写在第十五节。
    - `docs/Quick-start_developer.md`：本文件，架构/约定变了就同步。
-   - `docs/Execution-plan_developer.md`：待执行功能方案，做完一个划掉一个。
 3. **Breaking 变更**：工具更名/删工具 = 大版本，README + CHANGELOG_user 顶部必须写
    升级须知，skill 同步改（skill 教 AI 用工具，名字对不上 AI 就会调幽灵工具）。
 4. **skill 同步**：`skills/mortis-rag-mcp/SKILL.md` 是发给 AI 看的"使用纪律"，改工具
@@ -242,10 +244,27 @@ stdin 一行 JSON → handle() → method=="tools/call"
 3. `config/app.toml.example` 加带注释的样例
 4. 若影响切块/embedding → `_cache_meta()` 代际键
 
+### 升级已有部署（Windows 进程占用排查）
+1. **停止客户端连接**：先在对应 MCP 客户端（如 Claude Desktop / Codex / WorkBuddy）中停用或关闭连接器。注意：仅关闭终端或 IDE 窗口不保证后台托管的 Python 子进程完全退出。
+2. **只读排查残留进程**：运行以下只读 PowerShell 命令，精确定位占用进程的 PID、名称与命令行，避免按进程名全杀其他 Python 任务：
+   ```powershell
+   Get-CimInstance Win32_Process |
+       Where-Object { $_.Name -in @('mortis-rag-mcp.exe', 'vault-mcp.exe') -or $_.CommandLine -like '*mortis_rag_mcp*' } |
+       Select-Object ProcessId, Name, ExecutablePath, CommandLine
+   ```
+3. **安全终止进程（仅在客户端无法正常关闭时）**：确认 PID 确实归属本项目后，才针对性执行 `Stop-Process -Id <确认过的PID>`；若客户端配置了自动拉起，必须先关连接器，不要循环 kill。
+4. **使用本虚拟环境 Python 执行重装**：
+   ```powershell
+   .\.venv\Scripts\python.exe -m pip install -e .
+   ```
+   （切勿尝试“先 pip uninstall”，文件被锁时卸载同样会失败；系统重启仅作为句柄死锁无法解除时的最后排障手段）。
+5. **推荐连接器配置方式**：客户端推荐直接使用该 venv `python.exe` 配合参数 `-m mortis_rag_mcp --serve-mcp-stdio`，减少 console exe 被锁冲突。运行中模块不会热更新，每次更新后仍须重启服务生效。
+6. **验证升级**：重新启用连接器，检查 initialize 回显版本号与 `kb_list` 响应。
+
 ## 10. 上手 checklist
 
 - [ ] `pip install -e .` + `pytest tests/ -q` 全绿（Windows 上 rebuild 那个已知红除外）
 - [ ] 读完本文件 §3-§5，能不看代码讲清索引/检索两条管线
 - [ ] 跑过一次 eval（哪怕只有占位查询）
 - [ ] 知道四条文档分工和 commit 记账规则
-- [ ] 动手前确认：`docs/Execution-plan_developer.md` 里是否已有对应方案——有就照着做，别另起炉灶
+- [ ] 动手前确认：`docs/PROJECT_GUIDE.md` §15 或 issue / PR 记录里是否已有排期方案——有就照着做，别另起炉灶

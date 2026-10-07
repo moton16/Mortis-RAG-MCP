@@ -77,6 +77,9 @@ backend = "memory"
 # Disk cache of chunk signatures + embeddings so restarts skip re-embedding.
 # Defaults: enabled = true (when the section is absent it is still enabled),
 # dir = ~/.mortis_rag_mcp_cache (兼容旧名 ~/.vault_mcp_cache), embedding_max_workers = 6.
+# 未在此处显式写 dir 时，默认落点可用环境变量覆盖：
+#   MORTIS_RAG_CACHE_DIR（新名，优先）/ VAULT_MCP_CACHE_DIR（旧名兼容）。
+# 显式写了 dir 则以此处为准。
 enabled = true
 # Concurrent embedding requests during full rebuilds.
 embedding_max_workers = 2
@@ -99,6 +102,16 @@ subdir = ".mcp_cache"
 # 云端都失败且装了 pymupdf（pip install pymupdf）→ 本地纯文本兜底。
 [ingest]
 enabled = false
+# 自动监听并摄取知识库内的 PDF/Office 文档（默认关闭：必须显式配置 enabled=true 与 auto_watch=true 才生效）。
+# 开启后会自动扫描并排队摄取知识库内既有文档及后续新增/修改的文档。
+# 支持所有 INGEST_EXTS 格式（.pdf, .doc, .docx, .ppt, .pptx, .xls, .xlsx）。
+# 注意：自动上传可能会消耗 MinerU 云端配额并产生 API 计费费用，并存在云端数据传输隐私影响。
+# 轮询扫描节奏（cadence）遵循 [index] 的 watch_fallback_interval 周期。
+# 修改此项配置后须重启服务方可生效。
+auto_watch = false
+# 单文件摄取尺寸上限（单位 MiB，以 1024*1024 字节计，默认 20 MiB）。
+# 设为 0 表示不限制单文件尺寸。超过上限的文件将被跳过摄取并记录诊断原因。
+max_file_size_mb = 20
 # api_key = "${MINERU_API_KEY}"
 # model_version = "vlm"
 

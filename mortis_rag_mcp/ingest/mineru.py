@@ -2,7 +2,7 @@
 
 双通道（官方文档 https://mineru.net/apiManage/docs 已核实）：
 - v4 精准 API（需 token）：POST /api/v4/file-urls/batch 申请上传链接 →
-  PUT 上传文件（不设 Content-Type）→ GET /api/v4/extract-results/batch/{batch_id}
+  PUT 上传文件（**显式置空** Content-Type，见 `_put_upload` 注释）→ GET /api/v4/extract-results/batch/{batch_id}
   轮询 → state=done 后下载 full_zip_url（zip，内含 full.md）。
   限制：≤200MB、≤200页；每天 1000 页高优先级额度。
 - Agent 轻量 API（免 token）：POST /api/v1/agent/parse/file 得 (task_id, file_url) →
@@ -77,8 +77,15 @@ def _http_bytes(url: str, timeout: float) -> bytes:
 
 
 def _put_upload(url: str, payload: bytes, timeout: float) -> None:
-    # 官方文档明确：上传无须设置 Content-Type
-    req = urllib.request.Request(url, data=payload, method="PUT")
+    # 官方文档明确：上传自身不需要 Content-Type —— 但**必须显式置空**，不能「不设」：
+    # urllib 的 AbstractHTTPHandler.do_request_ 在「有 data 且 has_header('Content-type') 为假」时
+    # 会注入 application/x-www-form-urlencoded；而 OSS V1 预签名把 CONTENT-TYPE 计入 StringToSign
+    # （服务端按**实际请求头**重算签名），注入即 403 SignatureDoesNotMatch（issue #1）。
+    # 传入空值头后 do_request_ 的 has_header 判据为真 → 不再注入；http.client 实际发出的是
+    # 空值头（`Content-type: `），OSS V1 下空值与缺省等价，故该修法可用。
+    # 注意 Request.add_header 会对键做 capitalize()，故 "Content-Type" 落到 "Content-type"，
+    # 与 do_request_ 内部检查的拼写一致（大小写不匹配会让注入照旧发生）。
+    req = urllib.request.Request(url, data=payload, headers={"Content-Type": ""}, method="PUT")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             if resp.status not in (200, 201):

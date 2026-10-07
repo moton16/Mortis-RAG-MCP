@@ -184,6 +184,7 @@ def _server(tmp_path: Path, monkeypatch, vaults: list[Path]) -> VaultMcpServer:
     server = VaultMcpServer(config)
     for vault in vaults:
         server.registry.add(str(vault))
+        server._indexer_for({"vault_path": str(vault)}).sync()
     return server
 
 

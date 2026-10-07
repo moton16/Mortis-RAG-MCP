@@ -317,7 +317,7 @@
 >   - 坚守活实例契约：直接操作 `server._indexers`，实时观测 `_chunks` 与 `_sync_progress`，绝无静态快照脏读。
 > - `mortis_rag_mcp/indexer.py` 与 `server.py` 瘦身：
 >   - `indexer.py` 由 2289 行降至 2035 行（净减 254 行）；原位保留 `search`、`_fts_query`、`_hybrid_rank`、`_query_tokens`、`_semantic_rank`、`_cosine` 薄委托，显式 re-export `rerank_chunks` 与 `_to_emb`；
->   - `server.py` 由 1359 行降至 1126 行（净减 233 行）；`_fanout_search` 与 `_kb_search` 委托至 `_server/`。
+>   - `server.py` 由 1359 行降至 1126 行（净减 233 行；v0.8.1 实测 1312 行）；`_fanout_search` 与 `_kb_search` 委托至 `_server/`。
 > - Oracle 等价与回归测试：
 >   - 新增 `tests/test_search_oracle.py`（9 个测试：常驻 Chunk `score` 原地不修改断言、SearchEngine 与 Facade 产物 `(id, score, source)` 严格恒等、server 端到端委托校验、向后兼容静态方法测试）。
 > - **验证**：全量单测增至 **338 passed, 4 skipped**（基线 329 + 9 P4 专项，`PYTEST_EXIT=0`）；eval **Hit@5 100.0% / MRR@5 1.000**；金测 `test_golden_v073.py` 严格相等。
@@ -418,7 +418,480 @@
 > - **测试隔离缺陷（不在本批 8 卡范围，仅上报不动）**：`config.py` 的 `DEFAULT_CACHE_DIR` 固定为 `~/.mortis_rag_mcp_cache` 且无环境变量可覆盖，而 `tests/test_exempt.py`、`tests/test_mcp_stdio.py` 等 stdio 用例的 app.toml 未写 `[cache] dir`（`test_registry_server.py`、`test_multivault.py`、`test_snapshot.py` 等则写了），这些用例会把临时库缓存写进使用者的真实缓存目录——本机实测累积 **18153** 个孤儿缓存文件；叠加 pytest 默认只保留 3 轮 `tmp_path`、更早整轮被改名 `garbage-*` 后整目录删除（实测单个目录 837~1262 文件），本机每跑一次全量即触发一次 500+ 文件的批量删除审核。另 `tests/test_budget_bytes.py` 的子进程 env 只设 `VAULT_MCP_REGISTRY`，宿主若导出 `MORTIS_RAG_REGISTRY`（新名优先）会压过测试自身隔离：本会话实测该陷阱令 `test_mcp_stdio.py` 两个用例假失败（`KeyError: 'description'`，真因是复用的注册表已存在、legacy `vault_path` 自动迁移被跳过），故本地验证统一改用「仅重定向 `HOME`/`USERPROFILE`、不导出任何 REGISTRY 变量、独立 `--basetemp` + `-p no:cacheprovider`」的隔离配方（修正后同批用例即全绿）。
 > - **本轮不做**：§4 明确清单（C3/C4/C5/C7/C8 与 46 条 informational）一律未动；`tests/test_subvaults.py` 的 rebuild 已知环境红未顺手修。
 
+### FIX-9 — moton16,2026-9-29,CodeBuddy,Deepseek-V4.1-Flash — docs: PROJECT_GUIDE 转义污染全量清理（805 处反斜杠残留还原）
+
+> **涵盖提交**：`docs: PROJECT_GUIDE 转义污染全量清理（§1–§15 共 805 处反斜杠残留还原）`（`e5eb33d`）
+> **来源**：v0.8.1 计划 Lane E 的前置独立 commit（用户裁定 D4：P1 必须先于 C58 的 §四/§七 文档改动，否则同一文件里大段机械 diff 与语义编辑互相遮蔽）。编号走并行线——`C53`–`C64` 已被 v0.8.1 的 12 张卡占用，故沿用 `FIX-x` 清扫线。
+>
+> **问题（规模实测，与原始描述不一致）**：`REPORT.md` 的 P1 记「§3.2 标题、§4.5、§六/七多处」；实测污染覆盖 §1–§15：**290 / 1103 行、805 个反斜杠 token、21 种形态**。其中 `\_` 的 7 反斜杠形态 592 处、3 反斜杠 19 处、1 反斜杠 103 处，系多轮「转义反斜杠 + 转义标点」叠加而成；GitHub 渲染后表现为标识符前挂着若干反斜杠。
+>
+> **映射与命中数（逐形态定目标后脚本化还原）**：
+> - markdown 标点转义 `\_` `\[` `\]` `\*` `\~` → 去反斜杠：**770** 处
+> - 水平分割线 `\---` → `---`：**16** 处
+> - f-string 空字符 `\0`：8 → 1 反斜杠：**4** 处
+> - 长路径前缀 `\\?\\`：16 → 2 反斜杠：**1** 处
+> - PowerShell 路径分隔符：8 → 1 反斜杠 **3** 处；连缀符 `&&`：7 → 0 反斜杠 **2** 处
+> - JSON 示例 Windows 路径 `D:\\笔记\\工作库`：16 → 2 反斜杠：**2** 处
+> - SQL `ESCAPE '\\'`：8 → 2 反斜杠；同行括号内被转义字符 `\`：8 → 1 反斜杠：各 **1** 处
+> - **刻意保留（合法、非遗留）**：regex `\b` 3 处、Markdown 表格单元格 `\|` 1 处（表格必需）；`Quick-start_developer.md` §7 的 `.\.venv\Scripts\python.exe` 本就是单反斜杠（非污染，未动）。
+>
+> **验证**：清理后对全文重跑反斜杠 token 直方图，残留仅剩上述合法形态（无意外残留）；行数 1103 不变；`git diff --stat` = 292 insertions / 292 deletions（纯行内替换）；无代码与测试影响。
+
+### FIX-10 — moton16,2026-9-29,CodeBuddy,Deepseek-V4.1-Flash — docs: 过期行号订正 + 仓库地图/白名单修齐（5 个主文档口径，X3）
+
+> **涵盖提交**：`docs: 过期行号订正 + 仓库地图/白名单修齐（5 个主文档口径，X3）`（`96e205f`）
+> **来源**：v0.8.1 计划 Lane E（陈旧行号）；用户裁定 X3（延后项用仓库自己的 `docs/Execution-plan_developer.md` 口径，不新建根 `TODOS.md`）。
+>
+> **改动概况**：
+> - **过期行号**：`PROJECT_GUIDE.md` §4.8 `server.py` 约 1064 → 约 1312 行（计划点名的三处之一）；同清单内一并订正 §4.1 config 465→526、§4.2 registry 363→384、§4.5 indexer 1238→1253、§4.6 fts 149→152。`Quick-start_developer.md` 仓库地图 server.py 1126→1312、config 390→526、registry 304→384、indexer 1238→1253、fts 149→152、包体 `~5800`→`~10850` 行。实测依据：`server.py` **1312 行**（计划记 1313，以实测为准）；Lane C（C55–C57）改动后行数会再变，**由 C60/T8 复核**。
+> - **测试规模标注**：`PROJECT_GUIDE.md` §11「24 个文件 / 约 5250 行 / 264+ passed, 2 skipped」与 `Quick-start_developer.md`「340+ 测试用例」「22 个测试文件」→ 实测 **50 个文件 / 49 个测试文件 / 416 个用例 / 约 11570 行**；并把「全量 pytest 全绿」的表述改为「全量回归由 CI 承接，本地按靶向文件单跑」，与「本地不跑全量」的项目约定对齐。
+> - **仓库地图与白名单（X3）**：新建 `docs/Execution-plan_developer.md`（延后项落点：`_save_state` 剪枝、`list_files()` 全量构造、FTS 构造期写盘、多平台 watcher、云路径验收闸门、TTHW/进度反馈/DX 候选、两条口径残留）；`.gitignore` 白名单 3 → 5（+ `Execution-plan_developer.md`、+ `Docs_Folder-descriptions.md`）；`Docs_Folder-descriptions.md` 的「只需保留」清单 4 → 5；`Quick-start_developer.md` §2 地图补 `PROJECT_GUIDE.md` 与 `Docs_Folder-descriptions.md` 两行（原地图漏列 PROJECT_GUIDE）。
+> - **历史条目处置（本次裁定）**：本文件 C49 条目「`server.py` 由 1359 行降至 1126 行」**不改写**（该数字在其提交时点为真），仅追加「（v0.8.1 实测 1312 行）」注——记账流水是历史快照，不随版本回填。
+>
+> **验证**：纯文档/配置改动，无代码与测试影响；18 处替换均由脚本断言「原文唯一命中」后落盘；`.gitignore` 生效核验 = 两个新文件在 `git status` 中由「被忽略」变为「未跟踪可见」，提交后显示 `create mode 100644` 两行。
+
+### FIX-11 — moton16,2026-9-30,CodeBuddy,Deepseek-V4.1-Flash — docs: v0.8.1 版本目录随版本入库（docs/v0.8.1 白名单特例）
+
+> **涵盖提交**：`docs: v0.8.1 版本目录随版本入库（docs/v0.8.1 白名单特例）`
+> **来源**：用户裁定（2026-09-30）——`feat/v0.8.1` 推送到远端，同时把本轮 Worklog 放进 `docs/v0.8.1/`，并**取消该目录的 ignore**（目录级白名单特例）。
+>
+> **改动概况**：
+> - `.gitignore`：在 5 个主文档白名单之后新增「版本目录特例」`!docs/v0.8.1/`，并注明为什么只重纳目录本身就够——`docs/*` 只匹配 `docs` 的**直接子项**，不会命中子目录内部的文件；目录级排除（`docs/`）才会让后续 `!` 永远失效。
+> - **入库文件**：`docs/v0.8.1/PLAN.md`（施工图 + 三轮评审审计链，约 189KB）、`docs/v0.8.1/REPORT.md`（v0.8.1 开工报告）、`docs/v0.8.1/Worklog_2026-09-29.md`（本轮 Lane E/A/B/C 完成情况、验证证据与待办清单）。
+> - `docs/Docs_Folder-descriptions.md`：补一行「例外」说明，避免既有的「版本文件夹应显式 ignore」口径与新的入库现状互相矛盾（该文件本身也在白名单内、随仓库分发）。
+>
+> **验证**：`git check-ignore -v docs/v0.8.1/*.md` 退出码 **1**（未忽略，符合预期）；`git status` 中 `docs/v0.8.1/` 由「被忽略」变为「未跟踪可见」；`docs/` 根目录仍只有 5 个主文档 + 版本子目录。
+> **技术账追溯登记**：本轮 Lane E/A/B/C 的技术卡条目（`C53`、`C54`+P0、`C63`、`C55`、`C56`、`C57`+`C62`、`C64`）已于 C70 集中补写如下。
+
+### C53 — moton16,2026-09-29,moton16 — fix(ingest): MinerU 预签名 PUT 显式置空 Content-Type（issue #1）
+> **代码改动概况**：
+> - `mortis_rag_mcp/ingest/mineru.py`：
+>   - 根因分析：urllib 的 `AbstractHTTPHandler.do_request_` 在「有 data 且 `has_header('Content-type')` 为假」时会自动注入 `application/x-www-form-urlencoded`；阿里云 OSS V1 预签名把 `CONTENT-TYPE` 计入 `StringToSign`，服务端按实际收到的请求头校验签名导致 `403 SignatureDoesNotMatch`，造成开启摄取的文档全部上传失败；
+>   - 修复方案：`_put_upload` 显式传递 `headers={"Content-Type": ""}`（`Request.add_header` 会将其规整为 `Content-type`，命中 `do_request_` 的判据从而阻止自动注入），统一修复 v4 与 Agent 免登两通道共用上传路径；
+> - `tests/test_ingest_mineru.py`：
+>   - 新增本机回环 `http.server` 回归测试，断言服务端实际接收到的 `Content-Type` 为置空状态，且 `Request.has_header("Content-type")` 为 True。
+>
+> **验证**：
+> - 专项测试（19 passed）：`.\.venv\Scripts\python.exe -m pytest tests/test_ingest_mineru.py tests/test_version_sync.py -q`
+> - 实机验证状态：待实机验证（测试机无云端付费 Token，真机需用户授权执行，按 E1 降级形态如实记录）。
+
+### C54 — moton16,2026-09-29,moton16 — test(isolation): 测试宿主隔离三件套 + P0 flaky 消除 + 隔离守卫（C54 / P0）
+> **代码改动概况**：
+> - `tests/conftest.py`：
+>   - C54a 配置隔离：session 级 autouse fixture 在临时目录创建真实 `app.toml`，将 `MORTIS_RAG_CONFIG` 钉住，并清理宿主环境变量；
+>   - C54b 缓存根覆盖：function 级 autouse fixture 为每个单测生成独立缓存目录，杜绝污染宿主真实 `~/.mortis_rag_mcp_cache`；
+>   - conftest 的 `pytest_sessionfinish` 守卫：设置 `MORTIS_RAG_NO_STATUS_HOOK=1`，防止单测写入宿主 `STATUS.md`；
+> - `mortis_rag_mcp/config.py`：
+>   - `resolve_default_cache_dir()` 支持 `MORTIS_RAG_CACHE_DIR` 覆盖，并短路在改名逻辑之前，防止测试移动宿主旧缓存目录；
+> - `tests/test_adversarial_v070.py` & `tests/test_improvements.py`：
+>   - 为单测补充独立 per-test 注册表文件，消除跨用例泄漏与并发竞争（P0 flaky 修复）；
+> - `tests/test_isolation_guard.py`：
+>   - 新增隔离守卫测试，断言单测运行前后宿主真实缓存目录文件数零增长。
+>
+> **验证**：
+> - 专项测试（47 passed）：`.\.venv\Scripts\python.exe -m pytest tests/test_isolation_guard.py tests/test_path_migration.py tests/test_doctor.py -q`
+
+### C63 — moton16,2026-09-29,moton16 — fix(diaglog): 版本号去硬编码，收敛到包顶层单一真源（C63）
+> **代码改动概况**：
+> - `mortis_rag_mcp/__init__.py`：
+>   - 新增 `__version__ = "0.8.0"`（定义在包顶层，发版单一真源）；
+> - `mortis_rag_mcp/server.py` & `mortis_rag_mcp/diaglog.py`：
+>   - 消除硬编码版本号，`SERVER_INFO["version"]` 与 `diaglog` 默认兜底值统一引用 `mortis_rag_mcp.__version__`；
+> - `tests/test_version_sync.py`：
+>   - 新增版本真源同步校验测试。
+>
+> **验证**：
+> - 专项测试（16 passed）：`.\.venv\Scripts\python.exe -m pytest tests/test_diaglog.py tests/test_version_sync.py -q`
+
+### [C55, C56, C57+C62, C64] — moton16,2026-09-29,moton16 — feat(server,indexer): kb_read 跨库 chunk_id 寻址 + kb_list_files 分页/前缀 + 别名与行数订正
+> **代码改动概况**：
+> - **C55（参数别名）**：`kb_init` / `kb_init_solo` 支持 `vault_path` / `vault` / `vault_name` 别名，对齐既有 handler 口径，不改 schema 属性以守住体积门禁；
+> - **C56（跨库 chunk_id 寻址）**：
+>   - 未传库标识时遍历全部注册库进行只读探测；
+>   - 单命中自动展开并附加 `vault` 归属（solo 库仅输出库名与 `solo: true` 保护隐私）；多命中 fail-closed 报错并列出候选库；未完全探测时不谎报文件修改；
+> - **C57+C62（kb_list_files 分页与过滤）**：
+>   - 新增 `limit`, `offset`, `path_prefix` 参数；返回 `total`（过滤后、切片前条目数）、`next_offset` 与 `page_truncated`（与字节预算 truncated 区分）；
+>   - 抽象通用纯函数 `path_prefix_match`，统一 kb_search 与 kb_list_files 前缀口径；
+> - **C64（探测代价量测与上限防御）**：
+>   - 实测 10 库 60 文件开销（82ms / 619KiB）；设定先到先停双上限：`_PROBE_MAX_UNLOADED_VAULTS=32` 与 `_PROBE_BUDGET_SECONDS=2.0`。
+>
+> **验证**：
+> - 专项测试（82 passed）：`.\.venv\Scripts\python.exe -m pytest tests/test_kb_read_chunkid.py tests/test_mcp_stdio.py tests/test_scoped_search.py tests/test_solo_vault.py -q`
 
 
 
+### C65 — moton16,2026-10-05,Antigravity,Gemini 3.8 Flash — fix(read): fail closed on incomplete chunk probes
 
+> **涵盖改动**：`fix(read): fail closed on incomplete chunk probes`
+> **来源**：Issue #5 剩余工作、v0.8.1 计划 C65 卡。
+>
+> **改动概况**：
+> - `mortis_rag_mcp/server.py`：
+>   - 注册表为空且未显式指定 `vault_path` 时，显式拦截并报 `ValueError("没有已注册的知识库，请先使用 kb_init 注册知识库")`，MCP `handle` 返回 `isError=True` 具名错误，杜绝协议级 `-32000` / `IndexError`。
+>   - 新增 `_chunk_incomplete_message` 辅助函数：当存在跳过库（`skipped`）且已命中不足 2 个时判定为 `incomplete`，如实汇报已命中/跳过库名与原因，要求显式传 `vault_path`，杜绝未探全时误以为唯一而展开。
+>   - solo 库在探测报错/跳过原因中绝不泄露绝对物理路径，保持纯库名与 solo 标记。
+>   - 探测临时 indexer 收集到 `probes_to_close`，并在 `finally` 块中统一切断 FTS/vector 连接；不影响常驻 indexer。
+>   - 命中临时库提升为常驻 indexer 时，重新按 id 取 chunk，若取不到抛出 `ValueError` 引导重新 `kb_search`，不再静默使用陈旧 probe chunk 兜底。
+> - `mortis_rag_mcp/indexer.py`：
+>   - 初始化新增 `self._chunks_cache_loaded: bool = False`，在 `_load_chunks_cache` 确认有效且 meta 匹配后置 `True`；未加载且无有效文本缓存的库跳过并记「尚无可探测文本索引」。
+>   - `sqlite_vec` 回退至 `memory` 时，为 `_load_vectors_cache()` 补齐 `and load_vectors` 门禁，确保只读探测期零向量加载。
+> - `tests/test_kb_read_chunkid.py`：
+>   - 新增 8 项分支测试（`test_chunk_read_no_registered_vaults`、`test_chunk_probe_one_hit_with_unprobed_vault_is_incomplete`、`test_chunk_probe_missing_cache_is_unprobed`、`test_chunk_probe_valid_empty_cache_is_complete`、`test_chunk_probe_solo_diagnostics_do_not_leak_path`、`test_probe_load_vectors_false_survives_backend_fallback`、`test_chunk_probe_closes_resources_on_all_outcomes`、`test_probe_promoted_chunk_disappeared`）。
+>
+> **验证**：
+> - `tests/test_kb_read_chunkid.py`（20 passed）、`tests/test_facade_freeze.py`、`tests/test_vector_backend.py`（合计 29 passed, 4.56s）。
+
+### C66 — moton16,2026-10-05,Antigravity,Gemini 3.8 Flash — fix(search): serve existing indexes while refresh runs in background
+
+> **涵盖改动**：`fix(search): serve existing indexes while refresh runs in background`
+> **来源**：Issue #5、Issue #6 前置、v0.8.1 计划 C66 卡 + A4 回调修复。
+>
+> **改动概况**：
+> - `mortis_rag_mcp/_indexer/watch.py` & `indexer.py`：
+>   - 新增 `request_refresh(owner, *, immediate=False) -> bool` 与 `refresh_status(owner) -> dict[str, Any]`。
+>   - 调度线程 `_fs_scheduler_thread` 启动引入双检锁（`_fs_scheduler_start_lock`），避免多并发请求创建重复调度线程。
+>   - 连续读节拍限制：`_READ_REFRESH_MIN_INTERVAL_SECONDS = 1.0`，1 秒内重复只读请求合并；失败指数退避上限 5 秒。
+>   - `_fs_scheduler_loop` 进 sync 前清空 dirty 标记，sync 期间新请求重新置 dirty，单次最多合并一轮。
+>   - `_run_sync_quietly` 记录可观测 `_refresh_error` 与 `_last_refresh_completed_at`。
+>   - 停止状态下（`stop_watching`）拒绝新 refresh 请求，安全 join `_fs_scheduler_thread`。
+> - `mortis_rag_mcp/_server/search_dispatch.py` & `_server/fanout.py`：
+>   - 单库检索统一通过 `_search_single_vault` 处理，替换旧有的 `try_sync_with_guard`；
+>   - 冷库判定：未同步且无缓存且无 chunks 时立即返回 `status="indexing"`, `retry_after=3`, `chunks=[]`；
+>   - warm 检索不阻塞 `_sync_lock`，立即基于当前可用索引执行 search，并追加 `indexing_in_progress` 与 `indexing_progress`；
+>   - 目录不存在/被删除时防御性清空 chunks，返回空结果，避免死库缓存被持续召回。
+>   - 跨库 fan-out 支持汇总 `indexing_vaults` 状态，单库 cold 不阻断其他 warm 库，query 向量在外部模型下仅计算一次。
+> - `mortis_rag_mcp/server.py`：
+>   - A4 摄取完成回调修复：`_on_job_finished(source, out_md)` 接收二参数，仅对已存在 indexer 请求 `immediate=True` 后台刷新，不再反向启动阻塞 sync。
+>   - 只读 MCP 工具 `kb_read`、`kb_list_files`、`kb_stats` 前台不再同步等锁，改由 `request_refresh()` 后台驱动；
+>   - `kb_read` 显式 `chunk_id` 寻址增加物理文件 sha256 签名校验（stale chunk 快速 fail-visible，杜绝读错章节）。
+> - `mortis_rag_mcp/diaglog.py`：
+>   - 代理层适配 `request_refresh`，统计调度开销，四阶段顺序（sync -> retrieve -> rerank -> serialize）与 corr_id 严格保持。
+> - `tests/test_read_stale.py`：
+>   - 新建 C66 专用测试套件，覆盖 Event 阻塞下前台秒级返回、冷启动 indexing 状态机、防抖突发合并、chunk_id stale 签名过期拦截、A4 完成回调集成等。
+>
+> **验证**：
+> - C66 专项验收命令（86 passed in 48.94s）：
+>   `.\.venv\Scripts\python.exe -m pytest tests/test_read_stale.py tests/test_anti_contention.py tests/test_diaglog.py tests/test_multivault.py tests/test_scoped_search.py tests/test_ingest_server.py tests/test_p5_lifecycle.py tests/test_sync_engine.py tests/test_concurrency_hardening.py tests/test_search_oracle.py -q`
+> - 全库回归测试（454 passed, 2 skipped in 108.83s）。
+
+### C58a — moton16,2026-10-05,Antigravity — feat(config): add opt-in ingest auto watch and size policy
+> **代码改动概况**：
+> - `mortis_rag_mcp/config.py`：
+>   - `IngestConfig` dataclass 尾部新增 `auto_watch: bool = False` 与 `max_file_size_mb: int = 20`，新增 `max_file_size_bytes` 属性（`max_file_size_mb * 1024 * 1024`，0 表示不限），保持既有字段顺序与默认 `enabled=False`；
+>   - `IngestConfig.__post_init__` 与 `AppConfig.__post_init__`：严格校验 `auto_watch` 必须为真 `bool`，`max_file_size_mb` 必须为非布尔、非负、有限非浮点整数（`int >= 0`）；
+>   - `load_config`：从 `[ingest]` 节解析 `auto_watch`（严格 `isinstance(raw, bool)`，拒绝 `"false"` 等字符串，抛出具名 `ValueError`）；`max_file_size_mb` 经 `_numeric(..., int, 20, 0)` 解析与范围门禁；
+>   - 明确 `enabled=false + auto_watch=true` 为合法配置（有效但不激活运行时上传）。
+> - `mortis_rag_mcp/ingest/worker.py`：
+>   - 同步更新 fallback `IngestConfig` dataclass，保持相同的字段、默认值、类型校验与 `max_file_size_bytes` 属性。
+> - `config/app.toml.example`：
+>   - 在 `[ingest]` 节增补注释：明确默认关闭不上传、启用后扫描包含既有文档、支持全部 `INGEST_EXTS` 格式、默认 20MiB 上限（0 不限）、云端配额/费用与隐私影响声明、修改后需重启服务。
+> - `tests/test_ingest_auto.py`：
+>   - 新建测试套件，全面覆盖配置默认值、显式值解析、非 bool 严格拒绝、数值上下界与类型门禁、0 不限尺寸计算与边界判定、TOML fallback 解析兼容等。
+>
+> **验证**：
+> - 专项测试（67 passed in 2.93s）：
+>   `.\.venv\Scripts\python.exe -m pytest tests/test_ingest_auto.py tests/test_path_migration.py tests/test_doctor.py -q`
+> - 全局回归测试（479 passed, 2 skipped in 109.16s）。
+
+### C58b — moton16,2026-10-05,Antigravity — feat(ingest): enforce size policy and persist automatic submission dedupe
+> **代码改动概况**：
+> - `mortis_rag_mcp/ingest/worker.py`：
+>   - 统一尺寸上限策略门禁：新增 `_size_limit_bytes()` 与 `_check_file_size()`；显式 `submit(sources)` 在计算哈希和建任务前执行全量路径校验与尺寸判定，任一超限整批抛出 `ValueError`（all-or-nothing）；
+>   - 扫描尺寸过滤：`scan_pending()` 在计算 sha 之前执行尺寸检查，超限文件标记 `reason="too_large"` 且跳过哈希计算；`submit(None)` 过滤超限文件并返回 `skipped_too_large` 计数；
+>   - 运行时二次防御：`_run_job` 在沙箱检查后、创建产物和调用 client 解析前再次校验物理文件尺寸，防止入队后变大或恢复旧 queued 任务越过上限；
+>   - 自动候选与持久化免重试：
+>     - 新增 `_auto_pending()` 与 `auto_submit()`：仅在 `enabled=True && auto_watch=True` 时生效，默认关闭路径零扫描、零哈希、零线程；
+>     - 注入动态 `ignore_provider`，每轮扫描动态获取最新 `.vaultignore`/排除规则，排除临时目录与 `.assets`；
+>     - 引入 `state["auto_seen"]` 去重账本（`{source: {sha256, state, submitted_at, last_job_id}}`）：连续未变版本（含 done/failed/queued/parsing）自动跳过，源文件 sha 发生实际变化或 A->B->A 重新入队；
+>     - 任务状态迁移原子更新：`_worker_loop` 转换状态时仅当 `last_job_id` 匹配时更新 `auto_seen`，防止已完成的旧任务覆盖排队中的新版本；
+>     - 历史任务清理（>500）仅修剪 jobs，严格保留 `auto_seen` 账本去重凭证；完整无异常扫描支持清理已确认物理删除的源；
+>     - 兼容迁移：旧版缺失 `auto_seen` 的 state 自动基于 `jobs` 最新 `submitted_at` 构建。
+> - `mortis_rag_mcp/ingest/__init__.py`：
+>   - 更新设计约束文档注释，从“仅显式触发”更新为“默认手动，显式授权后可自动（auto_watch=True）”。
+> - `tests/test_ingest_auto.py`：
+>   - 扩展 18 个测试用例，覆盖显式提交阻断、精确边界允许、扫描过滤、auto_submit 诊断统计、force 无法绕过上限、queued 恢复与入队后变大二次拦截、混合源全批回滚、Agent 额度 PyMuPDF 兜底、动态 ignore、四种状态去重、sha 变化与 A->B->A 重新入队、500 历史修剪免重传、旧 state 迁移、删除源修剪与零副作用读状态等。
+>
+> **验证**：
+> - 专项测试（91 passed in 5.55s）：
+>   `.\.venv\Scripts\python.exe -m pytest tests/test_ingest_auto.py tests/test_ingest_worker.py tests/test_adversarial_v070.py tests/test_ingest_server.py tests/test_registry.py -q`
+> - 全局回归测试（497 passed, 2 skipped in 113.71s）。
+
+### C58c+C61 — moton16,2026-10-05,Antigravity — feat(watch): trigger coalesced automatic ingest across native and poll modes
+> **代码改动概况**：
+> - `mortis_rag_mcp/_indexer/watch.py`：
+>   - 架构解耦与控制流图：增加架构设计注释与 ASCII 控制流图，阐明文本同步（毫秒级本地哈希与分块）与文档摄取扫描（秒到分钟级二进制哈希与云端 MinerU 解析）解耦的核心逻辑；
+>   - 按需摄取扫描工作线程：新增 `request_ingest_scan(owner)` 与 `_ingest_scan_loop(owner)`，采用双检锁按需启动至多一条 `vault-ingest-scan` 守护线程，快速合并高频事件风暴（100 个事件只起一个 worker）；锁外调用 `_ingest_hook`，失败采用指数退避（0.5s -> 5.0s）；
+>   - 原生事件双通道分类：更新 `_on_fs_events`，逐条分类文件事件为文本事件与摄取事件（纯 PDF 事件仅唤醒 `vault-ingest-scan`，零文本 sync 开销；纯文本事件仅唤醒文本防抖；混合与目录变动/events=None 双向派发）；
+>   - 监听循环双模接线与 0 规则：`_native_watch_loop` 启动与每个 `fallback_interval > 0` 节拍触发摄取扫描；`_watch_loop` 启动与每 30s 节拍触发摄取扫描（若 `watch_fallback_interval == 0` 关闭原生兜底，轮询文档扫描仍保留 30s 默认节拍以防功能静默失效）；
+>   - 优雅生命周期停止：`stop_watching` 设置停止标记、清理 dirty、通知条件变量并以 2s 超时优雅 join `vault-ingest-scan` 线程，停止后拒绝新扫描请求。
+> - `mortis_rag_mcp/indexer.py`：
+>   - `MarkdownIndexer.__init__`：新增摄取协调状态字段（`_ingest_hook`, `_ingest_lock`, `_ingest_cv`, `_ingest_dirty`, `_ingest_worker_thread`, `_ingest_stopping`, `_last_ingest_scan_at`, `_ingest_scan_failures`, `_last_ingest_error`, `_ingest_scan_start_lock`）；
+>   - Facade 委托方法：暴露 `request_ingest_scan()` 与 `_ingest_scan_loop()`。
+> - `mortis_rag_mcp/ingest/worker.py`：
+>   - 复制判稳与写操作防抖（Req 9）：`IngestManager` 新增 `_stat_samples` 与 `_settling_files`（及 `mark_settling`）；`_auto_pending` 对 0 字节文件与采样仍在变化中的文件延后入队，且不阻断同批其他稳定文件；
+>   - 入队后源文件变更防御（Req 10）：`_run_job` 在解析前复核当前 sha256，若与任务 hash 不符直接标记 `state="failed"`, `error="source_changed: ..."`，杜绝错误上传并允许下一轮扫描按新版本哈希入队。
+> - `tests/test_watch_integration.py`：
+>   - 新增 7 个专项测试：纯 PDF 事件零文本 sync、纯文本事件零摄取 hook、混合与 indeterminate 事件双触发、100 事件合并单线程、阻塞摄取 hook 不卡死文本 sync、轮询模式 0 间隔默认兜底、停止生命周期无泄漏线程、非 Windows 环境 auto 退回 poll 仍保留摄取扫描。
+> - `tests/test_ingest_auto.py`：
+>   - 新增 2 个专项测试：0 字节与动态写文件判稳延后不阻塞稳定文件、入队后修改文件 worker 拦截 `source_changed` 且免上传并在后续扫描重新入队。
+>
+> **验证**：
+> - 专项测试（70 passed, 2 skipped in 6.14s）：
+>   `.\.venv\Scripts\python.exe -m pytest tests/test_watch_integration.py tests/test_fsnotify.py tests/test_ingest_auto.py tests/test_p5_lifecycle.py -q`
+> - 全局回归测试（107 passed in 55.25s）：
+>   覆盖 stale read、防争用、diaglog、多库、scoped search、ingest server、sync engine、并发加固、search oracle、chunkid read、facade freeze 等全部核心链路。
+
+### C58d — moton16,2026-10-05,Antigravity — feat(server): wire automatic ingest with explicit status and safe defaults
+> **代码改动概况**：
+> - `mortis_rag_mcp/server.py`：
+>   - 惰性挂载摄取 Hook（Req 1 & 2）：`_indexer_for` 在 `start_watching()` 之前仅在 `enabled && auto_watch` 为 True 时注入惰性 `_ingest_hook`（不在闭包定义时构造 manager，不提前创建 `.mortis-parsed` 目录）；
+>   - 锁序死锁规避（Req 2）：`_ingest_manager_for` 注入动态 `_ignore_provider`（实时拉取 `idx.config.exclude_patterns`），禁止反向申请 `_indexers_lock`，消除反向嵌套死锁风险；
+>   - 友好提示与矛盾检测（Req 3 & 5）：`_ingest_init_hint` 升级 `kb_init` / `kb_init_solo` 提示文案，明确容量上限（如 20MiB）、自动模式授权风险，并在 `auto_watch=true` 但 `enabled=false` 时给出矛盾警告；`kb_ingest(action="status")` 同样在矛盾配置下返回 `warning`；
+>   - 状态只读快照（Req 6）：`kb_stats` 追加 `ingest_auto` 状态快照（configured, effective, max_file_size_mb, watch_method, effective_interval, last_scan_at, last_error, skipped 计数等），仅只读现有 manager / state，manager 不存在则 `last_scan_at = None`，绝不因查 stats 隐式启动扫描或 worker；
+>   - 优雅停机（Req 9）：`shutdown` 与 `_kb_remove` 优先解除 `_ingest_hook` 引用，再触发 `stop_watching()`。
+> - `mortis_rag_mcp/doctor.py`：
+>   - 配置体检（Req 7）：`check_config` 诊断 `detail` 回显摄取有效状态（自动/手动/未启用）、容量上限及矛盾警告，保持 VALID 判定不因自动摄取关闭而失败；
+>   - 状态快照（Req 7 & 8）：新增 `check_ingest` 与 `STATUS.md` 表格中的 `文档摄取` 栏，仅做已有 `.ingest_state.json` 的轻量快照读取并明确标注 `（报告生成时快照）`，不构造 manager、不发起任何网络调用。
+> - `tests/test_ingest_server.py`：
+>   - 新增 4 个集成测试：`kb_stats` 的 `ingest_auto` 快照字段完整性与有效性校验、矛盾配置下 `kb_ingest` 告警、Mock 端到端全链路（enabled+auto true -> 放 PDF -> 触发 hook -> fake parse -> .mortis-parsed md 落盘 -> A4 刷新 -> kb_search 命中）、auto_watch=false 时负向路径（零 hook、零 worker 启动）。
+> - `tests/test_doctor.py`：
+>   - 新增 2 个诊断测试：`check_config` 三态回显与矛盾警告检测、`check_ingest` 状态快照读取与报告生成时快照标注。
+>
+> **验证**：
+> - 专项测试（106 passed in 10.68s）：
+>   `.\.venv\Scripts\python.exe -m pytest tests/test_ingest_server.py tests/test_ingest_auto.py tests/test_doctor.py tests/test_watch_integration.py -q`
+
+### C67 — moton16,2026-10-05,Antigravity — feat(search): add opt-in compact result projection
+> **代码改动概况**：
+> - `mortis_rag_mcp/_indexer/models.py`：
+>   - `Chunk.to_dict` 增加 keyword-only 参数 `compact=False`（Req 3 & 4）；
+>   - 当 `compact=True` 时，直接构造并返回极简四键结构（`source`, `heading`, `lines`, `snippet`），排除 `id`, `score`, `title`, `metadata`, `char_count`, `source_pdf`, `content`，保持 Chunk 实例与缓存对象不可变；
+> - `mortis_rag_mcp/_server/search_dispatch.py`：
+>   - `dispatch_search` 兼容解析布尔字符串格式的 `compact` 参数（Req 2）；
+>   - `compact=True` 强制激活 `preview=True` 并优先于 `mode="full"`；
+>   - `_search_single_vault` 支持 `compact` 参数（Req 5）：单库顶层注入已解析的绝对路径 `vault` 与注册名称 `vault_name`，chunks 内部不重复记录库标识；
+> - `mortis_rag_mcp/_server/fanout.py`：
+>   - `fanout_search` 增补 `compact: bool = False` 参数并支持全路由通道；
+>   - 组排序与最高分降序提前至 `pairs` / `Chunk` 层执行，杜绝投影后对无 `score` 键的 compact 字典排序（Req 7）；
+>   - 平铺跨库（`group_by_vault=False`）每条 chunk 追加 `vault` 绝对路径，不重复 `vault_name`；
+>   - 分组跨库（`group_by_vault=True`）在 group 顶层记录 `vault` 与 `vault_name`，group 内 chunks 不重复注入库属性；
+> - `mortis_rag_mcp/server.py`：
+>   - `_tool_definitions` 在 `kb_search` 的 inputSchema 中新增 `compact` 布尔参数（Req 1）；
+>   - `_fanout_search` 透传 `compact` 关键字参数；
+> - `tests/test_compact_search.py`：
+>   - 新增 7 个专项测试：Chunk.to_dict 四键投影与不变量检查、kb_search 工具 schema 与布尔字符串容错、单库顶层归属、平铺跨库每 chunk 带 vault 免重复 vault_name、分组跨库组级归属、compact/full 顺序与过滤等价性、单库/平铺/分组行号+库路径 `kb_read` 原文回读闭环、30 篇中文笔记在分组与平铺形态下的真实 payload 缩减量测（分组减幅达 33.3% >= 30%）。
+>
+> **验证**：
+> - 专项与相关测试（58 passed in 44.74s）：
+>   `.\.venv\Scripts\python.exe -m pytest tests/test_compact_search.py tests/test_preview_mode.py tests/test_budget_bytes.py tests/test_multivault.py tests/test_scoped_search.py tests/test_search_oracle.py tests/test_facade_freeze.py -q`
+
+### C68 — moton16,2026-10-05,Antigravity — fix(search): enforce whole-result budgeting and explicit grouped cursors
+> **代码改动概况**：
+> - `mortis_rag_mcp/_server/fanout.py`：
+>   - 废弃一切二分截断正文或 snippet 的破碎 chunk 逻辑，严格保持 chunk 全量原子性（Req 3 & 4）；
+>   - 引入正整数前缀 $1 \dots N-1$ 二分搜索（`_binary_search_prefix`），构建统一形状评估真实 UTF-8 封装大小（Req 9）；
+>   - 首条 chunk 超出预算时安全退化为正规空 envelope（`chunks=[]`, `returned=0`, `truncated=True`, 原游标保持），注入明确诊断提示 `budget_hint="use compact or increase budget_bytes"`（Req 6）；
+>   - 最小 envelope 超限处理（`_build_overflow_response`）：当元数据（searched, errors, status 等）本身超过预算时，不产生虚假错误或非法截断，而是显式标记 `budget_exceeded=True`，经过最多 3 轮迭代计算真实稳定的 `minimum_budget_bytes` 并给出提示 `narrow vaults or increase budget_bytes`（Req 7 & 8）；
+>   - 分组跨库分页与游标（Req 10–14）：废弃单值游标跨组伪进位，在 `group_by_vault=True` 且启用预算时，顶层 `next_offset` 设为 `None`，以字典形式显式返回 `group_next_offsets: dict[str, int]`（包含本页未分配到预算的候选组，未推进组保留原始偏移）；
+> - `mortis_rag_mcp/_server/search_dispatch.py`：
+>   - 严格参数校验 `_validate_group_offsets`（Req 12）：仅允许 `group_by_vault=True` 传入，校验字典值非负整数，校验 keys 必须属于本次已解析已授权库（拒绝未授权/未注册库，拒绝全局模式传入 solo 库，拒绝重复别名）；
+>   - 单库冷状态（`is_cold` / `indexing`）及空结果统一经由 `apply_budget` 包装（Req 15），消除控制字段绕过预算的口径差异；
+>   - 候选窗口稳定化（Req 16）：分组跨库固定 `per_vault_k = min(max_top_k, max(top_k, 20))`，确保多页分页过程中跨库候选集窗口稳定，消除深分页时候选池动态扩增导致 RRF 重排错位；
+> - `mortis_rag_mcp/server.py`：
+>   - `_tool_definitions` 在 `kb_search` 的 inputSchema 中新增 `group_offsets`（object，int 值）；
+>   - 完善 `budget_bytes` 说明，明确首条超限空 envelope 与包络溢出声明；
+>   - `_fanout_search` 转发 `group_offsets` 参数；
+> - `tests/test_budget_bytes.py`：
+>   - 更新旧用例 `test_budget_bytes_first_chunk_exceeds_budget`，断言整条 chunk 丢弃、`returned: 0`、`budget_hint` 出现、游标不跃迁，并对照测试 compact 模式下整条 chunk 正常装入；
+>   - 更新 `test_budget_bytes_fanout_grouped`，断言每组独立游标、顶层 `next_offset is None` 以及 `group_next_offsets` 回传 `group_offsets` 续页无漏读；
+>   - 新增 5 个深度对抗测试：最小 envelope 溢出迭代与 `minimum_budget_bytes` 精确声明、`group_offsets` 各种非法输入严格校验报错、`apply_budget` 输入对象不可变深比对、单库冷状态/空结果预算合规性、CJK/四字节 Emoji/反斜杠/转义字符 UTF-8 双层 json.loads 真实计量；
+> - `tests/test_read_stale.py` & `tests/test_isolation_guard.py`：
+>   - 消除 watcher sync 偶发竞争与子进程 Windows 编码警告。
+>
+> **验证**：
+> - 专项与相关测试（46 passed in 23.33s）：
+>   `.\.venv\Scripts\python.exe -m pytest tests/test_budget_bytes.py tests/test_compact_search.py tests/test_multivault.py tests/test_preview_mode.py tests/test_search_filters.py -q`
+
+### C69a — moton16,2026-10-05,Antigravity — fix(read): diagnose bounds and expose accurate continuation positions
+> **代码改动概况**：
+> - `mortis_rag_mcp/_indexer/reading.py`：
+>   - 新增私有模块与冻结数据类 `@dataclass(frozen=True, slots=True) ReadResult`（Req 2）；
+>   - 单次快照读取（`raw = path.read_bytes()`）并计算 sha256、物理总行数 `total_lines`、有效行范围与字符截断游标，杜绝检查陈旧度与读取内容二次读盘产生的不一致窗口（Req 4 & 14）；
+>   - 严格越界诊断（Req 1 & 7）：当 `start_line > total_lines` 时，抛出具名 `ValueError`，明确包含 `requested` 请求行号、`actual` 实际物理行号、相对 `source` 以及「核对分卷行号或用heading定位」的修复建议；空文件无范围返回空内容，带范围明确报错；
+>   - 字符上限与续读游标映射（Req 10, 12, 13）：正文规范化为 `\n.join(lines[start-1:end])`，字符截断时精准区分分隔符前 `(本行, len(line))` 与分隔符后 `(下一行, 0)`，输出 `content_end_line`、`next_start_line` 与 0-based `next_start_char`，支持单行长文本多页续读且无损严格拼接复原；
+>   - 异常安全隔离（Req 15）：引入双继承异常 `ReadFileNotFoundError(FileNotFoundError, ValueError)`，边界捕获 `OSError` 与 `UnicodeDecodeError`，消除物理绝对路径向 solo 客户端的泄漏；
+> - `mortis_rag_mcp/indexer.py`：
+>   - Facade `read(source, start_line, end_line)` 薄委托内部 `_read_result`，保持编程接口完整不截字符契约（Req 5 & 9）；
+>   - 新增私有薄委托 `_read_result(...)` 支持 `start_char`、`max_chars` 与 `expected_sha256` 单次校验；
+> - `mortis_rag_mcp/server.py`：
+>   - `_tool_definitions` 在 `kb_read` 的 inputSchema 中新增 `start_char`（integer, minimum 0, default 0）；
+>   - `_kb_read` 严格入参解析（Req 6 & 11）：显式布尔、浮点、负数、零及 `end < start` 严格校验报错，杜绝布尔隐式转为整数 1 绕过验证；`chunk_id` 与 `heading` 模式显式禁止携带 `start_char`；
+>   - 回显元数据扩充（Req 8）：成功返回结构增加 `total_lines`、`effective_start_line`、`effective_end_line`、`content_end_line`、`next_start_line` 与 `next_start_char`，兼容保留请求回显 `start_line` 与 `end_line`；
+> - `tests/test_read_ranges.py`：
+>   - 新增 13 个专项对抗测试：10行文件越界诊断提示定位要求、start1/EOF/EOF+1与钳制、空文件两分支、BOM/CRLF/Unicode无损解析、严格参数类型校验、未索引直连快速读取、沙箱与白名单后缀防御、单行长文本与多行跨页无损拼接复原、路径丢失与坏编码安全防护、协议级 isError 往返等。
+>
+> **验证**：
+> - 专项与相关测试（61 passed in 12.60s）：
+>   `.\.venv\Scripts\python.exe -m pytest tests/test_read_ranges.py tests/test_indexer.py tests/test_txt_indexing.py tests/test_wikilink_read.py tests/test_kb_read_chunkid.py tests/test_facade_freeze.py -q`
+
+### C69b — moton16,2026-10-07,Antigravity — feat(read): resolve heading sections from current source text
+> **代码改动概况**：
+> - `mortis_rag_mcp/_indexer/reading.py`：
+>   - 新增 `scan_headings(lines)` 标题扫描器（Req 3–5）：基于原文字符串切片进行轻量级扫描，复用 `frontmatter`、`iter_table_blocks` 与代码围栏精确维护，严格跳过 YAML 元数据、长同字符代码块与 HTML 表格内部假标题；支持 ATX 标题（`#`–`######` 对应 level 1–6）与 TXT/MD 小说章节标题（如 `第1章 ...`、`Chapter 1 ...` 归一为 level 1），不把文件 stem / title fallback 当物理 heading；
+>   - 在 `read_file_result` 中实现原文章节动态定位（Req 6–8）：
+>     - 精确文本匹配 `query_heading = heading.strip()`；
+>     - 零命中时抛出 `ValueError`，包含 `heading`、`source`、`total_lines`、前 5 个候选标题及起始行提示，列表过多提示总数，引导改用 `start_line`/`end_line`；
+>     - 多个同名标题时拒绝隐式合并或选首项，抛出 `ValueError` 列出前 5 个起始行与总命中数，明确指示歧义并引导行号定位；
+>     - 唯一定位时确定章节区间：`effective_start = matched_start`，`effective_end` 截至下一个同级或更高层级标题前一行（`level <= matched_level` - 1）或文件末尾，严格保留深层子标题与其正文内容；
+> - `mortis_rag_mcp/server.py`：
+>   - 废除原 `all_chunks()` 中跨切片并集计算 heading `min/max` 行号的陈旧逻辑，彻底解耦索引切片缓存，确保未索引直连文件与缓存陈旧文件均可准确命中最新物理章节（Req 2）；
+>   - 完善 `_tool_definitions` 中 `heading` 字段说明（Req 1）：阐明精确标题包含子标题、同名报错改行号、行号区间优先等契约；
+>   - 在无显式指定行号且传入 `heading` 时，将回显 `start_line` / `end_line` 与实际 `effective_start_line` / `effective_end_line` 对齐（Req 11）；
+>   - 调整冷文件探测逻辑，仅对无后缀短名未索引时走 indexing 提示，带后缀真实文件无论索引状态均直通物理读取；
+> - `tests/test_read_heading.py`：
+>   - 新增 10 个针对性测试用例：核心固定 fixture 层级章节测试（Target=[2,5], Child=[4,5], A=[1,7], End=[8,8]）、同名歧义 fail-closed、未找到标题有限候选诊断、代码块/表格/frontmatter 假标题过滤、小说章节标题门禁与读取、显式 range 优先覆盖 heading、chunk_id 互斥、长章节超 `read_max_chars` 截断与无缝续读、未索引与陈旧缓存物理读取、JSON-RPC `handle` 协议级 `isError=True` 验证。
+>
+> **验证**：
+> - 专项与相关测试（43 passed in 2.01s）：
+>   `.\.venv\Scripts\python.exe -m pytest tests/test_read_heading.py tests/test_read_ranges.py tests/test_wikilink_read.py tests/test_txt_indexing.py tests/test_chunking_seam.py tests/test_facade_freeze.py -q`
+
+### C59 — moton16,2026-10-07,Antigravity — docs: explain Windows MCP process locks during upgrades
+> **代码与文档改动概况**：
+> - `docs/Quick-start_developer.md`：
+>   - 在 §7（测试与已知平台坑）补充 Windows 升级时 console 入口 exe 被占用导致 `[WinError 5] 拒绝访问` 的机制说明与热更新限制；
+>   - 在 §9（常见任务食谱）新增「升级已有部署（Windows 进程占用排查）」小节，给出客户端停连接器、只读 PowerShell 过滤特定进程（`Get-CimInstance Win32_Process`）、安全定向结束 PID、当前 venv 安装及推荐使用 `python.exe -m mortis_rag_mcp --serve-mcp-stdio` 减少入口 exe 被锁冲突的标准操作步骤；
+> - `QUICKSTART_user.md`：
+>   - 新增第 8 节「升级已有部署（Windows 避坑指南）」，通俗说明进程被锁与代码热更新失效的根本原因，给出客户端关闭、PowerShell 排查残留、当前 venv 重装与参数推荐的 5 步无歧义升级流程；
+> - 规范核对：
+>   - 确认文档中引用的包入口 `mortis-rag-mcp`、`vault-mcp` 与 `pyproject.toml` 中的 `[project.scripts]` 完全一致；
+>   - 示例命令与路径全部使用占位符，不包含任何真实 vault 路径与敏感 API key。
+>
+> **验证**：
+> - 纯文档改动，相关版本与协议测试保持绿灯（3 passed in 0.25s）：
+>   `.\.venv\Scripts\python.exe -m pytest tests/test_version_sync.py -q`
+
+### C70/T8 — moton16,2026-10-07,Antigravity — docs: synchronize developer guides, update user docs, and enforce retrieval discipline
+> **代码与文档改动概况**：
+> - **Part 1：开发者主文档现状同步与历史欠账追溯（commit `bcd60af`）**：
+>   - `docs/PROJECT_GUIDE.md`：
+>     - 修正包名与入口描述（`mortis_rag_mcp`，`setuptools>=77`，MD/TXT 原生支持，PDF 转 MD 摄取）；
+>     - 更新检索与刷新时序（只读检索优先、后台增量 refresh、锁粒度不跨网络 sync）；
+>     - 更新 Facade/read/search 职责（compact 结构化投影、whole chunk 预算裁决、物理章节与区间读取、A4 双参回调）；
+>     - 新增 §4.11 Ingest 模块职责（单队列、20MiB 大小门禁、auto_seen 判据账本与安全沙箱）；
+>     - 更新 §6 工具 API 表与 §7 配置参考（对齐真实 schema、环境变量覆盖优先级与默认关说明）；
+>     - 在 §15 倒序追加 v0.8.1 开发详录（Intake、C65–C70、C58、C59 全卡实施与测试证据）；
+>   - `docs/Quick-start_developer.md` & `docs/Docs_Folder-descriptions.md` & `docs/Execution-plan_developer.md`：对齐测试用例基线、文件清单与版本目录规范，核验勾选完成状态；
+>   - `docs/Changelog_developer.md`：追溯补齐 Lane E/A/B/C 技术卡（C53、C54+P0、C63、C55、C56、C57+C62、C64）详细条目。
+> - **Part 2：用户文档、检索路由纪律与配置复核（commit `6c4361d`）**：
+>   - `skills/mortis-rag-mcp/SKILL.md`：
+>     - 递增 frontmatter 版本至 `5.3.0`，主标题同步为 0.8.1；
+>     - 全面清除无样本依据的“降低 70%+ Token”量化宣传；
+>     - 增补 C70.2 六条检索调用纪律（大候选初筛定向与预算、compact 无 chunk_id 的 source+行号回读契约、budget returned=0 恢复与 group 游标原样续页、read 实际总行数校正与同名 heading 消歧、indexing/stale 状态应对与禁擅自 rebuild、自动摄取默认关闭与用户显式授权边界）；
+>     - 给出大候选 compact 初筛、区间回读、物理章节直读与用户授权 ingest 配置四组标准调用样例；
+>   - `QUICKSTART_user.md`：
+>     - 修正 §0.2 中的 preview 描述，删除无依据 70%+ 说法；
+>     - 新增 §0.3 v0.8.1 检索与读取升级速查（compact 模式、heading 物理章节读取与重名消歧、只读优先、摄取 20MiB 门禁）；
+>     - 同步 §6 常用工具速查表，增加 compact、budget_bytes、group_offsets 与 heading 参数提示；
+>   - `README.md` & `README_EN.md`：
+>     - 删除无样本限定的“降低 70%+”承诺，准确描述为轻量返回切片与行号、降低上下文开销；
+>     - 去除固定“秒级”承诺，准确表述为后台增量同步与只读优先；
+>     - 补充 0.8.1 紧凑初筛与物理章节直读核心特性；
+>   - `config/app.toml.example`：
+>     - 复核 `[ingest]` 注释，明确阐述自动摄取的费用/隐私成本、扫描 cadence 绑定 index 轮询周期、初始存量文件自动入队、0 表示不限制单文件尺寸及重启生效要求。
+>
+> **验证**：
+> - 离线评测与不变量测试（29 passed in 1.02s）：
+>   `.\.venv\Scripts\python.exe -m pytest tests/test_version_sync.py tests/test_compact_search.py tests/test_read_heading.py tests/test_search_oracle.py -q`
+> - schema 字节量测：14,433 字节（+14.88%，依 PLAN.md 882 行已批准作为安全与新参数完整性授权例外登记）。
+
+### C60 — moton16,2026-10-07,Antigravity — chore: bump version to 0.8.1 and finalize release artifacts
+> **代码与文档改动概况**：
+> - `pyproject.toml` & `mortis_rag_mcp/__init__.py`：
+>   - 版本号由 `0.8.0` 正式升级为 `0.8.1`（包顶层 `__version__` 单一真源驱动）；
+> - `README.md` & `README_EN.md`：
+>   - 顶部 Version badge 同步更新为 `0.8.1`；
+> - `CHANGELOG_user.md`：
+>   - 顶部新增 `## [0.8.1] - 2026-10-07` 发布说明，面向终端用户大白话阐明：
+>     - 升级须知：100% 索引与缓存兼容、文档摄取 20MiB 默认上限与 0 不限配置、自动摄取默认关闭、整块预算与分组续页、先出结果后台静默刷新；
+>     - 新增功能：紧凑初筛模式（`compact`）、物理章节与小说分卷直读（`heading`）、行号越界实际行数诊断、跨库切片唯一识别展开；
+>     - 修复与改进：MinerU 预签名上传 403 签名修复（注明确切待实机验证状态）、Windows 升级进程占用说明、文件列表分页与前缀过滤；
+> - `tests/test_version_sync.py`：
+>   - 扩展版本同步守卫测试：断言 README.md 与 README_EN.md 的 Version badge、SKILL.md 标题包版本及 `diaglog.PACKAGE_VERSION` 与单一真源严格一致；
+> - `tests/test_mcp_stdio.py`：
+>   - 新增 `test_stdio_release_smoke_v081` 协议冒烟用例：验证 initialize 返回 0.8.1、15 个核心工具完整可见、新参数（`compact`, `start_char`, `group_offsets`, `heading`）暴露正确、`ping` 正常响应、越界行号与重名标题歧义均正确返回协议级 `isError=True`；
+> - `docs/v0.8.1/PLAN.md`：
+>   - 全量卡片状态核验收口：C60 打勾完成，7.2 发布清单 12 项全部核销。
+>
+> **验证**：
+> - 语法编译检查通过：`.\.venv\Scripts\python.exe -m compileall -q mortis_rag_mcp`
+> - 靶向发版测试集（38 passed in 3.60s）：
+>   `.\.venv\Scripts\python.exe -m pytest tests/test_version_sync.py tests/test_diaglog.py tests/test_mcp_stdio.py tests/test_facade_freeze.py tests/test_cache_codec_roundtrip.py -q`
+> - 差异与格式守卫通过：`git diff --check`（0 警告/0 错误）。
+
+### FIX-v081-docs — moton16,2026-10-07,CodeBuddy,GLM-5.3-Flash — docs: align read-priority wording and record v0.8.1 review follow-ups
+> **代码与文档改动概况**：
+> - 响应 feat/v0.8.1 二轮 review（`.runtime/review-v081/REVIEW.md`，PR #7）§3「旧残余与有意限制」的文档口径与续项登记：
+>   - `CHANGELOG_user.md` / `QUICKSTART_user.md` / `README.md` / `README_EN.md`：
+>     - 「不再发生前台同步等待」等绝对化表述改为「优先使用已就绪索引、后台静默刷新；并发更新时仍可能短暂等待」——共享 FTS 写锁未消除前如实陈述（对应 review §3.1）；
+>   - `docs/Execution-plan_developer.md`：
+>     - 按所有者裁定整份移除（此前登记在其上的 FTS 锁等待 / chunk 签名同代际两条审查续项不再单独维护，review 报告 §3 已有留痕）；
+>   - `.gitignore`：
+>     - 补齐本机代理配置目录（.codebuddy/.codex/.gstack/.cursor/.claude）、运行时产物（.runtime/、*.sqlite/*.log、.mortis_rag_mcp*、.env*）、测试与 IDE 噪声；docs/* 白名单行为不变。
+>
+> **验证**：
+> - 纯文档与忽略规则改动，不触碰产品代码；`tests/test_version_sync.py` 守卫保持绿灯（README badge 与版本真源未受影响）。
+
+### FIX-v081-code — moton16,2026-10-07,CodeBuddy,GLM-5.3-Flash — fix: address v0.8.1 pre-merge review findings R1–R6 and C54 isolation gaps
+> **代码与文档改动概况**：
+> - 依据 feat/v0.8.1 二轮 review（`.runtime/review-v081/REVIEW.md`，PR #7）落实 6 条确认发现与 C54 隔离缺口：
+>   - **R1（P1）自动摄取绕过豁免**：`server.py` `_ignore_provider` 改复用 `indexer._ignore_matcher()` 动态规则（覆盖 .vaultignore；此前只有静态 exclude_patterns）；`_indexer_for` 先发布进 `_indexers` 再 `start_watching()`（消除启动竞态窗口）；`worker.py` `_auto_pending` 在 provider 返回 None 时 fail-closed 拒绝本轮自动提交；
+>   - **R2（P1）首次同步误报唯一命中**：`server.py` 跨库 chunk_id 探测对已加载库的 incomplete 判定改为 `last_sync is None 且无完整缓存` 即跳过，不再因内存 `_chunks` 非空宣告探测完成；
+>   - **R3（P2）判稳**：`worker.py` 两次间隔采样规则扩展到所有新/变化源（首见只登记 (mtime,size) 采样，一致才 hash/提交，复制中途的部分字节不再被解析上传）；`watch.py` `_ingest_scan_loop` 支持主动重扫——hook 异常退避后重试（连续失败≤5 次），auto_submit 返回 `rescan_after_seconds`（仍有判稳文件或扫描不完整）时延时重扫，不再干等下一个文件事件；
+>   - **R4（P2）账本误清**：扫描遇忽略目录剪枝置 `pruned_by_ignore`，非完整枚举不清理 auto_seen 账本与判稳采样（临时排除目录后取消忽略不再同 SHA 重传）；
+>   - **R5（P2）heading 章节截短**：`reading.py` `scan_headings` 表格配对只在 frontmatter 之后的正文上做并偏移回物理行号（frontmatter title:"<table>" 不再污染正文表格配对）；
+>   - **R6（P2）skill 字段勘误**：`SKILL.md` compact 回读字段改为 `lines` 数组（start=`c.lines[0]`、end=`c.lines[1]`），预算恢复字段统一为 `minimum_budget_bytes`；
+>   - **C54 隔离补漏**：`tests/conftest.py` 会话隔离同时暂存/清除/恢复 legacy `VAULT_MCP_REGISTRY`；`pytest_sessionfinish` 在 `--collect-only` 时跳过状态写入（不再凭空产生 0/0/0 的 status.json/STATUS.md/status.lock）。
+> - 测试：`test_ingest_auto.py` 新增 R1 fail-closed / vaultignore 豁免 / 两次采样 / 账本保留 4 条回归，另 6 处既有断言适配两次采样语义（改为两扫模式）；`test_kb_read_chunkid.py` 新增首扫未完成库不可探测回归；`test_read_heading.py` 新增 frontmatter 表格字符串回归；`test_ingest_server.py` e2e 双触发 hook。
+>
+> **验证**：
+> - 靶向：触碰的 7 个测试文件收敛后全绿（70 passed 复核）；
+> - 全量（本批修复完成后单次）：551 passed, 4 skipped in 25.82s
+>   `bundled python -m pytest tests -q --basetemp=.runtime/fix-v081-20261007/pytest-full -p no:cacheprovider`
+
+### FIX-v081-final — moton16,2026-10-07,CodeBuddy,DeepSeek-V4.1-Flash — fix: close v0.8.1 final-round review regressions (N1–N4)
+
+> **代码与文档改动概况**：
+> - 依据 feat/v0.8.1 发版前最后一轮三路独立对抗审核（全新上下文子代理，明确指令为「证伪 R1–R6 修复声明」；报告存证 `.runtime/ship-v081-20261007/FINAL-ROUND.md`），全部关键证伪已由主代理回源码逐条复核后采信：
+>   - **N1（本轮新引入，P1）补扫自激**：`_indexer/watch.py` 给 `rescan_after_seconds` 加连续补扫上限 `_MAX_INGEST_RESCAN_STREAK = 30`（与 hook 异常分支「连续失败 >5 次」对称），无需补扫的轮次将计数归零。此前「判稳残留或持久 OSError」会让 `rescan_after_seconds` 恒为正且消费端无上限，扫描循环被钉成 1Hz 永久重扫——每轮对全库重算 sha256 并重写状态文件；
+>   - **N2（本轮新引入，P1）0 字节回归**：`ingest/worker.py` 恢复 0 字节在判稳比对**之前**短路（v0.8.0 语义：0 字节一律延后，不进上传链路）。R3 重写判稳逻辑时丢掉了该守卫，0 字节文件两次采样恒为 `(mtime, 0)` → 被判「已稳定」后直接 hash 上传空内容（`PROJECT_GUIDE.md` 与 `test_ingest_auto.py` 的「0 字节判稳延后」宣称因此失守）；
+>   - **N3（本轮新引入，P1）账本永不清**：`ingest/worker.py` 把「本轮出现过剪枝就整轮不清账本」改为**逐条豁免剪枝子树**（`pruned_by_ignore` 标记 → `pruned_dirs` 集合 + `_under_pruned()`），`_stat_samples` / `_settling_files` 同步改造。原实现下只要库内存在任一被忽略目录（如 `cache.placement="vault"` 的 `.mcp_cache/` 或用户自建目录规则），真实删除的条目永不回收：账本无界增长，且删除后重建的同 SHA 文件不再被解析；
+>   - **N4（既有未覆盖，P2）库根不可见清空账本**：`ingest/worker.py` 的 `vault_path.exists()` 为假的早退不再按「完整枚举 0 文件」处理（置 `clean_scan=False`、`scanned_sources=None`），避免未挂载 / 权限抖动 / 同步客户端整目录改名后整库重传（云端配额与费用）；
+>   - **文档漂移订正**：`skills/mortis-rag-mcp/SKILL.md` 与 `QUICKSTART_user.md` 的报错文本与响应字段对齐真实实现（`actual: N` / 响应字段 `total_lines` / `存在歧义 (起始行: 42, 108)`；此前引用代码中不存在的 `actual total lines`、`ambiguous heading`、`candidates at lines [...]`）；`docs/PROJECT_GUIDE.md` 订正回调参数语义为 `on_job_finished(source, out_md)`（第二参为解析产物 Markdown 路径，非 `changed`）；`_indexer/watch.py` docstring 订正重试阈值 off-by-one；
+>   - **幽灵引用清理**：`.gitignore` 白名单、`docs/Quick-start_developer.md`（4 处）、`docs/Docs_Folder-descriptions.md`（保留清单 5 → 4）、`mortis_rag_mcp/indexer.py` 注释中指向已按所有者裁定移除的 `docs/Execution-plan_developer.md` 的引用全部清理（`docs/Changelog_developer.md` 内的历史记账保留不改）。
+> - 测试：新增 4 条**复现级**回归——`test_ingest_auto.py` 的「0 字节永不上传」「剪枝子树豁免但真实删除仍回收」「库根不可见保账本」；`test_watch_integration.py` 的「补扫连续次数封顶」。四条均在「暂存源码修复（`git stash`）」状态下确认变红，复现力已实证。
+>
+> **验证**：
+> - 靶向：`test_ingest_auto.py` + `test_watch_integration.py` + `test_ingest_server.py` + `test_ingest_worker.py` = 86 passed in 6.21s；
+> - 全量（本批修复完成后单次）：555 passed, 4 skipped in 24.30s
+>   `bundled python -m pytest tests -q --basetemp=.runtime/ship-v081-20261007/pytest-full-2 -p no:cacheprovider`
+> - 未修项（本轮新发现的既有形态，已如实登记，不阻断本次发版）：R2 热缓存库在后台重同步窗口内仍可被当作可探测完整库；R5 未闭合 frontmatter / YAML 块标量含 `---` 时表格配对偏移归零、缩进代码块内标题被识别；`.vaultignore` 读取异常被 `except Exception: pass` 吞掉（含 UTF-8-BOM 首行失效）；`server.py` 先发布后 `start_watching()` 使启动异常留下永不复试的半成品 indexer；`tests/conftest.py` 的 `--collect-only` 早退分支在套件内不可达（NO_STATUS_HOOK 会话级封顶先短路）。
+
+### FIX-v081-ci — moton16,2026-10-07,CodeBuddy,DeepSeek-V4.1-Flash — test: make search assertions deterministic under read-first contract
+
+> **代码与文档改动概况**：
+> - 修复 v0.8.1 分支**从未在 CI 上转绿**的问题：`gh pr checks 7` 在 ubuntu 四个 job 上稳定 8 红（main `82989c8` 为绿，故确属本分支引入）。根因是 C66「读已就绪索引、后台刷新」把搜索路径的 `try_sync_with_guard(timeout=1.5)` 前台守护移除（对照 `origin/main:mortis_rag_mcp/_server/search_dispatch.py:96/131`），而 `kb_init` 只把首建丢进后台线程（`server.py:663`）——一批测试仍按「kb_init 后检索必然拿到完整索引」的旧契约写，成了时序依赖：Windows 上侥幸通过（本机 555 passed），Linux CI 上只拿到部分结果。
+> - 测试侧按分支自己已有的模式改为确定性等待（不触碰产品语义）：
+>   - `tests/test_budget_bytes.py`：新增 `_kb_init_ready()`（`kb_init` + 显式 `indexer.sync()`，`sync()` 走阻塞锁，后台首建会被等完再做一次无变更增量）与 `_is_search_settled()`；14 处 `kb_init` 调用点改走该助手；
+>   - `tests/test_compact_search.py` / `tests/test_exact_terms.py`：同样加 `_kb_init_ready()` 并替换全部 12 处 `kb_init` 调用点；
+>   - `tests/conftest.py`：新增交互式 stdio 轮询会话助手 `run_stdio_polling()`（+ `stdio_polling` fixture）——批式 stdio 一次性喂完 stdin，既表达不了真实客户端的「按 `retry_after` 稍候重试」，快速连发也等不到后台建库推进（实测 Linux CI 连发 50 条仍在首建中）；助手逐条发请求、逐条读应答、带真实间隔轮询到判据成立，并支持在同一条会话内续跑后续断言请求；
+>   - `tests/test_budget_bytes.py::test_budget_bytes_stdio_integration` 与 `tests/test_txt_indexing.py::test_txt_indexing_and_chapter_headings` 改为走该助手：先轮询到首建完成，再在同一会话内跑预算/章节断言（原先一次性批式发请求，Linux 上稳定拿到 `status:"indexing"` 或 0 命中）；后者顺带移除已被取代的本地批式助手与随之失效的 `os`/`subprocess`/`sys`/`Path` 导入；
+>   - `tests/test_read_stale.py::test_stale_chunk_id_signature_mismatch_fails_visible`：关掉 `_startup_index_all` 与 `start_watching`，锁定「索引持旧 chunk、磁盘已改」的窗口——后台刷新抢先跑完会让旧 `chunk_id` 变成 not found，断言落到另一条错误分支（Linux 必现）；
+>   - `tests/test_kb_read_chunkid.py::test_kb_read_chunk_id_first_sync_partial_not_probeable`：同样关掉启动预索引与后台监听，让「首扫未完成」成为确定状态（否则 A 库的 `last_sync` 被后台 sync 重新写实，R2 守卫不再触发）。
+> - 未改动任何产品代码：C66 的读优先语义是本版明确目标，本批只把测试从「时序依赖」改成「契约依赖」。
+> - 注记（既有测试隔离缺口，非本批引入）：`registry_path()` 默认落在真实用户目录 `~/.mortis_rag_mcp/vaults.toml`，未 monkeypatch 注册表的用例会写进开发机（本次排查时该文件已有 `v`×3、`TestV` 等历史残留）；本轮预热方案的中间版本也误写过 5 条 `name = "OS"`，已清理，最终方案不再触碰该文件。
+>
+> **验证**：
+> - 靶向：`test_budget_bytes.py` + `test_txt_indexing.py` = 18 passed in 2.36s；五文件组（`test_budget_bytes` + `test_compact_search` + `test_exact_terms` + `test_read_stale` + `test_kb_read_chunkid`）= 63 passed；
+> - 全量（本批完成后单次）：555 passed, 4 skipped in 32.63s
+>   `bundled python -m pytest tests -q --basetemp=.runtime/ship-v081-20261007/pytest-full-4 -p no:cacheprovider`
+> - 真实用户注册表残留复查：`name = "OS"` 0 条（清理后无新增）。

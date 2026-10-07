@@ -70,8 +70,18 @@ class VectorConfig:
 
 
 def resolve_default_cache_dir() -> str:
-    """新名 ~/.mortis_rag_mcp_cache 优先；旧名独占时原子搬迁。
-    延迟至运行时调用，严禁在模块顶层 import 时产生文件系统副作用。"""
+    """默认缓存根：env 覆盖 > 新名 ~/.mortis_rag_mcp_cache >（旧名独占时）原子搬迁。
+    延迟至运行时调用，严禁在模块顶层 import 时产生文件系统副作用。
+
+    env 覆盖（MORTIS_RAG_CACHE_DIR 新名优先 / VAULT_MCP_CACHE_DIR 旧名兼容）**必须短路在
+    改名逻辑之前**：下面的 os.rename 是真实副作用，用 env 显式指定缓存根的会话（测试隔离、
+    多实例并行）不该顺带搬动宿主的 ~/.vault_mcp_cache。只作用于「未显式配置 [cache] dir」
+    的场景——配置文件里写了 dir 时以配置为准（load_config 的口径）。
+    """
+    override = (os.getenv("MORTIS_RAG_CACHE_DIR", "").strip()
+                or os.getenv("VAULT_MCP_CACHE_DIR", "").strip())
+    if override:
+        return str(Path(override).expanduser())
     new = Path.home() / ".mortis_rag_mcp_cache"
     old = Path.home() / ".vault_mcp_cache"
     if not new.exists() and old.exists():
@@ -127,6 +137,23 @@ class IngestConfig:
     pymupdf_fallback: bool = True        # 云端通道全失败时本地兜底（需可选依赖 pymupdf）
     convert_small_tables: bool = True    # 小表格 HTML→markdown pipe；含跨行跨列的保留 HTML
     table_convert_max_cells: int = 60
+    auto_watch: bool = False             # 自动摄取（默认关闭：需显式授权）
+    max_file_size_mb: int = 20           # 单文件尺寸上限（MiB，默认20；0表示不限）
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.auto_watch, bool):
+            raise ValueError(f"ingest.auto_watch must be a boolean, got {self.auto_watch!r}")
+        if (
+            isinstance(self.max_file_size_mb, bool)
+            or not isinstance(self.max_file_size_mb, int)
+            or self.max_file_size_mb < 0
+        ):
+            raise ValueError(f"ingest.max_file_size_mb must be an integer >= 0, got {self.max_file_size_mb!r}")
+
+    @property
+    def max_file_size_bytes(self) -> int:
+        """Max file size in bytes (1024*1024 per MiB). 0 means unlimited."""
+        return self.max_file_size_mb * 1024 * 1024
 
 
 DEFAULT_EXCLUDE_PATTERNS = [
@@ -263,6 +290,14 @@ class AppConfig:
             self.ingest.output_dirname = ".mortis-parsed"
         else:
             self.ingest.output_dirname = out_dir
+        if not isinstance(self.ingest.auto_watch, bool):
+            raise ValueError(f"ingest.auto_watch must be a boolean, got {self.ingest.auto_watch!r}")
+        if (
+            isinstance(self.ingest.max_file_size_mb, bool)
+            or not isinstance(self.ingest.max_file_size_mb, int)
+            or self.ingest.max_file_size_mb < 0
+        ):
+            raise ValueError(f"ingest.max_file_size_mb must be an integer >= 0, got {self.ingest.max_file_size_mb!r}")
         if self.diag.max_bytes < 1:
             raise ValueError("diag.max_bytes must be positive")
         if self.diag.files < 1:
@@ -444,6 +479,9 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
         max_age_days=_numeric(cache, data, "max_age_days", int, 0, 0),
     )
     ingest = _section(data, "ingest")
+    raw_auto_watch = ingest.get("auto_watch", data.get("auto_watch", False))
+    if not isinstance(raw_auto_watch, bool):
+        raise ValueError(f"config key 'auto_watch' must be a boolean, got {raw_auto_watch!r}")
     ing = IngestConfig(
         enabled=bool(ingest.get("enabled", False)),
         api_key=str(_env(ingest.get("api_key", ""))),
@@ -458,6 +496,8 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
         pymupdf_fallback=bool(ingest.get("pymupdf_fallback", True)),
         convert_small_tables=bool(ingest.get("convert_small_tables", True)),
         table_convert_max_cells=_numeric(ingest, data, "table_convert_max_cells", int, 60, 1),
+        auto_watch=raw_auto_watch,
+        max_file_size_mb=_numeric(ingest, data, "max_file_size_mb", int, 20, 0),
     )
     raw_exclude_patterns = index.get("exclude_patterns", data.get("exclude_patterns", DEFAULT_EXCLUDE_PATTERNS))
     if isinstance(raw_exclude_patterns, str):

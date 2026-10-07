@@ -439,8 +439,11 @@ def test_doctor_render_md_declares_detail_column_is_not_an_instruction():
 def _stub_home(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    # 摘掉 conftest 的会话 pin 与缓存根覆盖（C54），否则测不到「按 home 解析」的行为
     monkeypatch.delenv("MORTIS_RAG_CONFIG", raising=False)
     monkeypatch.delenv("VAULT_MCP_CONFIG", raising=False)
+    monkeypatch.delenv("MORTIS_RAG_CACHE_DIR", raising=False)
+    monkeypatch.delenv("VAULT_MCP_CACHE_DIR", raising=False)
 
 
 def test_doctor_check_config_reports_full_path_and_flags_shadowed_old_config(tmp_path, monkeypatch):
@@ -525,4 +528,72 @@ def test_doctor_record_test_run_refreshes_path_warning(tmp_path, monkeypatch):
     doctor.record_test_run(passed=5, failed=0, skipped=0, total_collected=5)
     content = (tmp_path / "STATUS.md").read_text(encoding="utf-8")
     assert "写入路径告警" in content
+
+
+def test_doctor_check_config_ingest_statuses():
+    mock_cfg = MagicMock()
+    mock_cfg.embedding.mode = "static"
+    mock_cfg.embedding.model = ""
+    mock_cfg.embedding.endpoint = ""
+    mock_cfg.embedding.api_key = ""
+    mock_cfg.reranker.enabled = False
+
+    # 1. auto_watch=True but enabled=False (contradiction)
+    mock_cfg.ingest.enabled = False
+    mock_cfg.ingest.auto_watch = True
+    mock_cfg.ingest.max_file_size_mb = 25
+    with patch("mortis_rag_mcp.config.load_config", return_value=mock_cfg):
+        res, _ = doctor.check_config(None)
+        assert res["ok"] is True
+        assert "auto_watch=true但未启用(enabled=false，不生效，上限25MiB)" in res["detail"]
+
+    # 2. enabled=True and auto_watch=True
+    mock_cfg.ingest.enabled = True
+    mock_cfg.ingest.auto_watch = True
+    mock_cfg.ingest.max_file_size_mb = 10
+    mock_cfg.watch_method = "poll"
+    mock_cfg.watch_fallback_interval = 45.0
+    with patch("mortis_rag_mcp.config.load_config", return_value=mock_cfg):
+        res, _ = doctor.check_config(None)
+        assert res["ok"] is True
+        assert "ingest: 自动(上限10MiB，监听=poll/45.0s)" in res["detail"]
+
+    # 3. enabled=True and auto_watch=False (manual)
+    mock_cfg.ingest.enabled = True
+    mock_cfg.ingest.auto_watch = False
+    with patch("mortis_rag_mcp.config.load_config", return_value=mock_cfg):
+        res, _ = doctor.check_config(None)
+        assert res["ok"] is True
+        assert "ingest: 手动(上限10MiB)" in res["detail"]
+
+
+def test_doctor_check_ingest_snapshot_reads_existing_state(tmp_path, monkeypatch):
+    vault = tmp_path / "snap_vault"
+    vault.mkdir()
+    parsed_dir = vault / ".mortis-parsed"
+    parsed_dir.mkdir()
+    state_file = parsed_dir / ".ingest_state.json"
+    state_file.write_text(json.dumps({
+        "version": 1,
+        "auto_watch": {
+            "last_scan_at": "2026-10-05T12:00:00Z"
+        }
+    }), encoding="utf-8")
+
+    mock_reg = MagicMock()
+    mock_entry = MagicMock(path=str(vault), name="snap_vault")
+    mock_reg.load.return_value = [mock_entry]
+
+    mock_cfg = MagicMock()
+    mock_cfg.ingest.enabled = True
+    mock_cfg.ingest.auto_watch = True
+    mock_cfg.ingest.max_file_size_mb = 20
+    mock_cfg.ingest.output_dirname = ".mortis-parsed"
+
+    with patch("mortis_rag_mcp.registry.VaultRegistry", return_value=mock_reg):
+        res = doctor.check_ingest(mock_cfg)
+        assert res["ok"] is True
+        assert "2026-10-05T12:00:00Z" in res["detail"]
+        assert "报告生成时快照" in res["detail"]
+
 

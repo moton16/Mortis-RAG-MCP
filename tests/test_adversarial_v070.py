@@ -162,7 +162,21 @@ def test_gate_9_retryable_mineru_error(tmp_path: Path):
     mgr = IngestManager(tmp_path, IngestConfig(enabled=True))
     pdf = tmp_path / "sample.pdf"
     pdf.write_bytes(b"%PDF-1.4 dummy content")
-    with patch("mortis_rag_mcp.ingest.mineru.MineruClient.parse", side_effect=MineruError("Rate limited", retryable=True)):
+
+    # P0 flaky 修复（v0.8.1）：原实现在 force 重试后立即读 status() 快照，而 mock 的 parse
+    # 是瞬时失败——重试后的 failed 常常先于断言落地，CI 上表现为偶发
+    # `{'failed': 2}`（run 36440434091）。改为注入可控节拍：第 2 次解析停在 gate 上，
+    # 状态窗口由测试自己持有，不再与 worker 赛跑。
+    gate = threading.Event()
+    calls = {"n": 0}
+
+    def _parse(src, **kwargs):
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            gate.wait(timeout=10.0)  # 第二次解析卡住，直到断言完成
+        raise MineruError("Rate limited", retryable=True)
+
+    with patch("mortis_rag_mcp.ingest.mineru.MineruClient.parse", side_effect=_parse):
         mgr.submit(["sample.pdf"])
         if mgr._worker:
             mgr._worker.join(timeout=5.0)
@@ -171,10 +185,16 @@ def test_gate_9_retryable_mineru_error(tmp_path: Path):
         job = status["jobs"][0]
         assert job["state"] == "failed"
         assert job.get("retryable") is True
-        # force 重试
+        # force 重试：此时 worker 已 join 退出，submit 必然拉新线程 → 状态必为 queued/parsing
         mgr.submit(["sample.pdf"], force=True)
-        status2 = mgr.status()
-        assert status2["summary"].get("queued", 0) + status2["summary"].get("parsing", 0) >= 1
+        try:
+            status2 = mgr.status()
+            assert status2["summary"].get("queued", 0) + status2["summary"].get("parsing", 0) >= 1, status2
+        finally:
+            gate.set()
+        if mgr._worker:
+            mgr._worker.join(timeout=10.0)
+    assert calls["n"] >= 2
 
 
 # ----------------------------------------------------------------------
@@ -254,8 +274,11 @@ def test_gate_13_path_prefix_matches_parsed_products(tmp_path: Path):
 # ----------------------------------------------------------------------
 # Gate 14 (D6b): server 级 IngestManager 并发获取幂等
 # ----------------------------------------------------------------------
-def test_gate_14_server_concurrent_ingest_manager_lock(tmp_path: Path):
+def test_gate_14_server_concurrent_ingest_manager_lock(tmp_path: Path, monkeypatch):
     from mortis_rag_mcp.server import VaultMcpServer
+
+    # C54c：VaultMcpServer() 构造会读注册表并后台预索引其中的库；不隔离会读宿主真实注册表
+    monkeypatch.setenv("MORTIS_RAG_REGISTRY", str(tmp_path / "vaults.toml"))
 
     server = VaultMcpServer()
     vault_str = str(tmp_path)

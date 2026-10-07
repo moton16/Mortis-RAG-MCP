@@ -8,8 +8,10 @@
 """
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
+from ..registry import normalize_vault_key, VaultEntry
 from .fanout import fanout_search, apply_budget
 
 if TYPE_CHECKING:
@@ -60,6 +62,149 @@ def _parse_exact_terms(value: Any) -> list[str] | None:
     return terms or None
 
 
+def _search_single_vault(
+    server: VaultMcpServer,
+    indexer: Any,
+    query: str,
+    top_k: int,
+    use_rerank: bool,
+    search_filters: Any,
+    dedupe: bool,
+    exact_terms: list[str] | None,
+    preview: bool,
+    query_tokens: list[str] | None,
+    budget_bytes: int | None,
+    compact: bool = False,
+) -> dict[str, Any]:
+    v_path = str(Path(indexer.vault_path).expanduser().resolve())
+    entry = server.registry.get(indexer.vault_path)
+    v_name = entry.name if entry else Path(indexer.vault_path).name
+
+    if not Path(indexer.vault_path).is_dir():
+        with indexer._cache_lock:
+            indexer._chunks = {}
+            indexer._signatures = {}
+        res_empty: dict[str, Any] = {"chunks": []}
+        if compact:
+            res_empty["vault"] = v_path
+            res_empty["vault_name"] = v_name
+        if budget_bytes is not None:
+            return apply_budget(
+                res_empty,
+                budget_bytes,
+                orig_offset=search_filters.offset if search_filters else 0,
+                preview=preview,
+            )
+        return res_empty
+    indexer.request_refresh()
+    r_status = indexer.refresh_status()
+    is_cold = (
+        indexer.last_sync is None
+        and not getattr(indexer, "_chunks_cache_loaded", False)
+        and len(indexer._chunks) == 0
+    )
+    if is_cold:
+        res_cold = {
+            "status": "indexing",
+            "message": "知识库正在后台进行首次初始化构建与嵌入计算，请稍候...",
+            "progress": r_status["indexing_progress"],
+            "retry_after": 3,
+            "chunks": [],
+        }
+        if compact:
+            res_cold["vault"] = v_path
+            res_cold["vault_name"] = v_name
+        if budget_bytes is not None:
+            res_cold = apply_budget(
+                res_cold,
+                budget_bytes,
+                orig_offset=search_filters.offset if search_filters else 0,
+                preview=preview,
+            )
+        return res_cold
+
+    results = indexer.search(
+        query,
+        top_k,
+        bool(use_rerank),
+        filters=search_filters,
+        dedupe=bool(dedupe),
+        exact_terms=exact_terms,
+    )
+    if compact:
+        res_dict: dict[str, Any] = {
+            "vault": v_path,
+            "vault_name": v_name,
+            "chunks": [chunk.to_dict(preview=True, query_tokens=query_tokens, compact=True) for chunk in results],
+        }
+    else:
+        res_dict = {"chunks": [chunk.to_dict(preview=preview, query_tokens=query_tokens) for chunk in results]}
+    if r_status["indexing_in_progress"]:
+        res_dict["indexing_in_progress"] = True
+        res_dict["indexing_progress"] = r_status["indexing_progress"]
+    if r_status.get("refresh_error"):
+        res_dict["indexing_error"] = r_status["refresh_error"]
+    if budget_bytes is not None:
+        res_dict = apply_budget(res_dict, budget_bytes, orig_offset=search_filters.offset, preview=preview)
+    return res_dict
+
+
+def _validate_group_offsets(
+    server: VaultMcpServer,
+    raw_group_offsets: Any,
+    group_by_vault: bool,
+    target_vaults: list[str] | None,
+) -> dict[str, int] | None:
+    """严格校验并解析 group_offsets（仅在 group_by_vault=True 时允许）。"""
+    if raw_group_offsets is None:
+        return None
+    if not group_by_vault:
+        raise ValueError("group_offsets is only allowed when group_by_vault=true")
+    if not isinstance(raw_group_offsets, dict):
+        raise ValueError("group_offsets must be a dictionary/object")
+
+    all_entries = server.registry.load()
+    if target_vaults is not None and len(target_vaults) > 0:
+        target_keys = {normalize_vault_key(server._resolve_vault_path(t)) for t in target_vaults}
+        authorized_entries = [e for e in all_entries if normalize_vault_key(e.path) in target_keys and Path(e.path).is_dir()]
+    else:
+        authorized_entries = [e for e in all_entries if not e.solo and Path(e.path).is_dir()]
+
+    authorized_by_key: dict[str, VaultEntry] = {}
+    for entry in authorized_entries:
+        authorized_by_key[normalize_vault_key(entry.path)] = entry
+        authorized_by_key[normalize_vault_key(entry.name)] = entry
+
+    resolved_group_offsets: dict[str, int] = {}
+    for raw_k, v in raw_group_offsets.items():
+        if isinstance(v, bool) or not isinstance(v, int):
+            raise ValueError(f"group_offsets values must be non-negative integers, got {v!r} for key '{raw_k}'")
+        if v < 0:
+            raise ValueError(f"group_offsets values must be >= 0, got {v} for key '{raw_k}'")
+
+        k_str = str(raw_k)
+        try:
+            resolved_path = server._resolve_vault_path(k_str)
+            norm_path_key = normalize_vault_key(resolved_path)
+        except Exception:
+            raise ValueError(f"unknown or unresolvable vault in group_offsets: '{raw_k}'")
+
+        if norm_path_key not in authorized_by_key:
+            entry_match = next((e for e in all_entries if normalize_vault_key(e.path) == norm_path_key), None)
+            if entry_match and entry_match.solo and (target_vaults is None or len(target_vaults) == 0):
+                raise ValueError(f"vault '{raw_k}' is solo and not authorized in global search")
+            if target_vaults is not None and len(target_vaults) > 0:
+                raise ValueError(f"vault '{raw_k}' is not among authorized target vaults")
+            raise ValueError(f"vault '{raw_k}' is not authorized or readable for this search")
+
+        canonical_path = authorized_by_key[norm_path_key].path
+        if canonical_path in resolved_group_offsets:
+            raise ValueError(f"duplicate vault in group_offsets: '{raw_k}' resolves to '{canonical_path}' which was already specified")
+        resolved_group_offsets[canonical_path] = v
+
+    return resolved_group_offsets
+
+
 def dispatch_search(server: VaultMcpServer, arguments: dict[str, Any]) -> dict[str, Any]:
     """处理 kb_search 请求分发。"""
     from ..server import _parse_top_k, _search_filter, _tokenize_query
@@ -76,47 +221,55 @@ def dispatch_search(server: VaultMcpServer, arguments: dict[str, Any]) -> dict[s
     dedupe = arguments.get("dedupe", True)
     if isinstance(dedupe, str):
         dedupe = dedupe.strip().lower() not in {"0", "false", "no", "off"}
-    preview_val = arguments.get("preview", False)
-    if isinstance(preview_val, str):
-        preview = preview_val.strip().lower() in {"1", "true", "yes", "on"}
+
+    compact_val = arguments.get("compact", False)
+    if isinstance(compact_val, str):
+        compact = compact_val.strip().lower() in {"1", "true", "yes", "on"}
     else:
-        preview = bool(preview_val)
-    if arguments.get("mode") == "preview":
+        compact = bool(compact_val)
+
+    if compact:
         preview = True
+    else:
+        preview_val = arguments.get("preview", False)
+        if isinstance(preview_val, str):
+            preview = preview_val.strip().lower() in {"1", "true", "yes", "on"}
+        else:
+            preview = bool(preview_val)
+        if arguments.get("mode") == "preview":
+            preview = True
 
     search_filters = _search_filter(arguments, server.config.max_top_k)
     query_tokens = _tokenize_query(query)
     budget_bytes = _parse_budget_bytes(arguments.get("budget_bytes"))
     exact_terms = _parse_exact_terms(arguments.get("exact_terms"))
 
-    # 单库检索通道（传入单个目标）
-    if len(targets) == 1:
+    raw_group_offsets = arguments.get("group_offsets")
+    group_offsets = _validate_group_offsets(
+        server,
+        raw_group_offsets,
+        group_by_vault=group_by_vault,
+        target_vaults=targets if targets else None,
+    )
+
+    # 单库检索通道（传入单个目标且非 group_by_vault）
+    if len(targets) == 1 and not group_by_vault:
         resolved_single = server._resolve_vault_path(targets[0])
         indexer = server._indexer_for({"vault_path": resolved_single})
-        sync_ok = indexer.try_sync_with_guard(timeout=1.5)
-        if not sync_ok and len(indexer._chunks) == 0:
-            return {
-                "status": "indexing",
-                "message": "知识库正在后台进行首次初始化构建与嵌入计算，请稍候...",
-                "progress": indexer._sync_progress,
-                "retry_after": 3,
-                "chunks": [],
-            }
-        results = indexer.search(
-            query,
-            top_k,
-            bool(use_rerank),
-            filters=search_filters,
-            dedupe=bool(dedupe),
+        return _search_single_vault(
+            server,
+            indexer,
+            query=query,
+            top_k=top_k,
+            use_rerank=use_rerank,
+            search_filters=search_filters,
+            dedupe=dedupe,
             exact_terms=exact_terms,
+            preview=preview,
+            query_tokens=query_tokens,
+            budget_bytes=budget_bytes,
+            compact=compact,
         )
-        res_dict: dict[str, Any] = {"chunks": [chunk.to_dict(preview=preview, query_tokens=query_tokens) for chunk in results]}
-        if not sync_ok:
-            res_dict["indexing_in_progress"] = True
-            res_dict["indexing_progress"] = indexer._sync_progress
-        if budget_bytes is not None:
-            res_dict = apply_budget(res_dict, budget_bytes, orig_offset=search_filters.offset, preview=preview)
-        return res_dict
 
     # 未指定目标时的默认单库处理
     if not targets:
@@ -126,34 +279,24 @@ def dispatch_search(server: VaultMcpServer, arguments: dict[str, Any]) -> dict[s
                 f"vault '{entries[0].name}' is solo (excluded from global search); "
                 "pass an explicit vault_path to search it"
             )
-        if len(entries) == 1:
+        if len(entries) == 1 and not group_by_vault:
             indexer = server._indexer_for({"vault_path": entries[0].path})
-            sync_ok = indexer.try_sync_with_guard(timeout=1.5)
-            if not sync_ok and len(indexer._chunks) == 0:
-                return {
-                    "status": "indexing",
-                    "message": "知识库正在后台进行首次初始化构建与嵌入计算，请稍候...",
-                    "progress": indexer._sync_progress,
-                    "retry_after": 3,
-                    "chunks": [],
-                }
-            results = indexer.search(
-                query,
-                top_k,
-                bool(use_rerank),
-                filters=search_filters,
-                dedupe=bool(dedupe),
+            return _search_single_vault(
+                server,
+                indexer,
+                query=query,
+                top_k=top_k,
+                use_rerank=use_rerank,
+                search_filters=search_filters,
+                dedupe=dedupe,
                 exact_terms=exact_terms,
+                preview=preview,
+                query_tokens=query_tokens,
+                budget_bytes=budget_bytes,
+                compact=compact,
             )
-            res_dict = {"chunks": [chunk.to_dict(preview=preview, query_tokens=query_tokens) for chunk in results]}
-            if not sync_ok:
-                res_dict["indexing_in_progress"] = True
-                res_dict["indexing_progress"] = indexer._sync_progress
-            if budget_bytes is not None:
-                res_dict = apply_budget(res_dict, budget_bytes, orig_offset=search_filters.offset, preview=preview)
-            return res_dict
 
-    # 跨库检索（Scoped 定向多库 或 全局盲搜）
+    # 跨库检索（Scoped 定向多库 或 全局盲搜，或显式 group_by_vault）
     return fanout_search(
         server,
         query,
@@ -167,4 +310,6 @@ def dispatch_search(server: VaultMcpServer, arguments: dict[str, Any]) -> dict[s
         query_tokens=query_tokens,
         budget_bytes=budget_bytes,
         exact_terms=exact_terms,
+        compact=compact,
+        group_offsets=group_offsets,
     )

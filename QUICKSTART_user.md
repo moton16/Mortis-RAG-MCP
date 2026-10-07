@@ -24,9 +24,26 @@ v0.7.2 带来了更自然便捷的检索与交互体验：
 1. **库名直呼**：`kb_search` 的 `vault_path` 支持直接传知识库显示名称（如 `vault_path="我的笔记"`），不用再费力拼装 Windows 漫长路径。
 2. **多库定向圈选**：支持通过 `vault_paths=["知识库A", "知识库B"]` 一次性圈选多个目标库联合检索；即使是被设为私密独立库（solo）的知识库，只要在此显式点名即可参与联合召回。
 3. **二段式精准精读（省 Token 模式）**：
-   - 第一步（找锚点）：调用 `kb_search(..., preview=true)`，检索仅返回高光摘要窗口、行号与字符数，单块 Token 消耗降低 70%+；
+   - 第一步（找锚点）：调用 `kb_search(..., preview=true)`，检索仅返回高光摘要窗口、行号与字符数，大幅精简上下文占用；
    - 第二步（按需精读）：根据命中结果的 `source`、`start_line` 与 `end_line`，按需调用 `kb_read` 读取切题正文，告别全篇冗余注入。
 4. **构建防假死与进度感知**：首次建库或后台构建期间若返回 `status: "indexing"`，会携带构建进度信息，稍候片刻等待后台构建即可，不再发生前台卡死。
+
+### 0.3 0.8.1 新用法速查
+
+v0.8.1 进一步强化了检索初筛、章节直读与后台刷新体验：
+
+1. **紧凑初筛模式（`compact=true`）**：
+   - 适合大候选召回（如 `top_k >= 5`）：调用 `kb_search(query, compact=true, budget_bytes=3500)`，仅返回文档路径、行号区间与标题信息，去除大段正文和 chunk_id，极大减轻宿主上下文与缓冲区压力。
+   - 回读正文：直接根据返回的 `vault`、`source` 与行号调用 `kb_read(source, start_line, end_line, vault_path)` 精准精读。
+2. **物理章节直读与重名消歧**：
+   - `kb_read(source="...", heading="## 章节名", vault_path="...")`：直接读取该章节物理范围（含子章节，直到下一个同级或更高级标题）。
+   - 若文件中存在多个同名标题，系统会返回所有候选章节的起始物理行号（如报错 `heading '章节名' … 中存在 2 处同名标题 (起始行: 42, 108)；存在歧义…`），此时带上 `start_line` 即可直接消歧读取。
+   - 越界安全：若请求行号超出文件末尾，系统会明确报错并附带文件实际总行数（如 `start_line 超出文件行数范围 (requested: 500, actual: 320, …)`，响应字段 `total_lines`），方便调整。
+3. **后台刷新与只读优先**：
+   - 当知识库后台正在增量同步或嵌入计算时，搜索优先使用当前已就绪的文本索引，不在前台执行全量同步或等待嵌入请求；并发更新时仍可能短暂等待，并非所有请求都能立即返回。
+4. **文档自动摄取安全保障**：
+   - `[ingest] auto_watch` 默认关闭（`false`），绝不未经用户显式配置擅自向云端上传解析文件。
+   - 默认单文件上限 `max_file_size_mb = 20`，超过 20MiB 的文件自动跳过，防误传超大文档。
 
 ## 1. 安装
 
@@ -147,12 +164,12 @@ Copy-Item .\skills\mortis-rag-mcp\SKILL.md "$env:USERPROFILE\.workbuddy\skills\m
 | 注册独立库（不参与全局检索） | `kb_init_solo {path, name?}`（0.6.0） |
 | 看有哪些库 | `kb_list` |
 | 设置库描述（引导定向选库） | `kb_describe {vault_path, description}`（0.7.0） |
-| 搜索（跨库） | `kb_search {query, preview?}` |
-| 搜索（指定库/多库定向） | `kb_search {query, vault_path? vault_paths? preview?}`（0.7.2） |
+| 搜索（跨库） | `kb_search {query, preview?, compact?, budget_bytes?}` |
+| 搜索（指定库/多库定向） | `kb_search {query, vault_path? vault_paths? preview?, compact?}`（0.7.2/0.8.1） |
 | 只搜某目录 / 某标签 / 某时间段 | `kb_search {query, path_prefix? tags? mtime_after? mtime_before?}`（0.5.0） |
-| 翻页 | `kb_search {query, offset, limit}`（0.5.0） |
+| 翻页 / 预算分批 | `kb_search {query, offset, limit, group_offsets?}`（0.5.0/0.8.1） |
 | 「这个库更重要」 | `kb_set_weight {vault_path, weight}` + 可选 `kb_search {group_by_vault: true}`（0.5.0） |
-| 读原文 | `kb_read {source, vault_path}` |
+| 读原文 / 读章节 | `kb_read {source, vault_path, start_line?, end_line?, heading?}`（0.8.1 支持 heading） |
 | 摄取 PDF / Office 文档 | `kb_ingest {action: "pending" / "submit" / "status", vault_path?}`（0.7.0，需配置开启） |
 | 排除私密笔记 | `kb_exempt {action: "add_pattern" / "exempt_file"}` |
 | 索引出错了 | 看 `kb_stats` 的 `failed_files`（0.5.0 起重启也不丢）；反复调 `kb_stats` 触发增量补齐 |
@@ -165,3 +182,36 @@ Copy-Item .\skills\mortis-rag-mcp\SKILL.md "$env:USERPROFILE\.workbuddy\skills\m
 - **failed_files 有值**：多为 embedding API 限流/网络错误。0.5.0 起请求自动重试（指数退避、429 遵循 Retry-After）并按批切分，单次限流不再打垮整个索引；仍失败就隔几分钟反复 `kb_stats` 让增量 sync 自动补。
 - **换设备**：简单场景 clone → 装包 → 配 key → 对笔记文件夹 `kb_init`（首次全量建索引，花一次 embedding 钱）；想省这笔钱就先在旧机器 `kb_export` 导出索引快照，新机器 `kb_init` 后 `kb_import` 导入——导入后 0 次重嵌。
 - **Windows 中文乱码**：服务端已强制 stdio UTF-8；确保客户端也以 UTF-8 收发。
+
+## 8. 升级已有部署（Windows 避坑指南）
+
+当仓库更新代码并重新安装时（例如通过 `git pull` 拉取更新后），Windows 系统常因进程占用导致升级报错，请参考以下指引：
+
+### 8.1 现象与原因
+- **安装报错**：若 MCP 客户端（如 Claude Desktop、Codex、WorkBuddy 等）处于开启或连接状态，Windows 操作系统会锁定正在运行的控制台入口文件（`mortis-rag-mcp.exe`），导致重新安装时报 `PermissionError: [WinError 5] 拒绝访问`。
+- **更新不生效**：仅执行 `git pull` 只更新了磁盘上的源文件，若后台正在运行的 Python 进程未退出，已加载到内存的模块并不会自动热加载，必须完全重启服务进程。
+
+### 8.2 安全升级步骤
+1. **先在客户端关闭或禁用连接器**：
+   - 在客户端设置中临时关闭/停用 mortis-rag-mcp 连接；
+   - 确认进程已退出（单纯“重启终端”不一定能释放客户端后台托管的子进程）。
+2. **（可选）只读定位占用进程**：
+   - 打开 PowerShell，运行只读命令查看是否仍有残留实例：
+     ```powershell
+     Get-CimInstance Win32_Process |
+         Where-Object { $_.Name -in @('mortis-rag-mcp.exe', 'vault-mcp.exe') -or $_.CommandLine -like '*mortis_rag_mcp*' } |
+         Select-Object ProcessId, Name, ExecutablePath, CommandLine
+     ```
+   - 若客户端已关闭但仍有残留进程，确认 PID 归属本项目后可执行 `Stop-Process -Id <确认过的PID>` 释放。若客户端有自动重启守护，必须先在客户端停用连接器，避免循环 kill。
+3. **使用虚拟环境的 Python 执行安装**：
+   ```powershell
+   .\.venv\Scripts\python.exe -m pip install -e .
+   ```
+   *注意：切勿使用 `pip uninstall` 尝试规避锁，锁未释放时卸载同样会失败；系统重启仅作为最后排障手段。*
+4. **推荐更稳妥的客户端连接器配置**：
+   在客户端中直接使用虚拟环境中的 `python.exe` 配合模块启动参数，可避免 console exe 入口文件被锁：
+   - `command`: `C:\path\to\Mortis-RAG-MCP\.venv\Scripts\python.exe`
+   - `args`: `["-m", "mortis_rag_mcp", "--serve-mcp-stdio", "--app-config", "C:\path\to\Mortis-RAG-MCP\config\app.toml"]`
+5. **验证新版本**：
+   重新启用客户端连接器，发起 MCP 连接，确认 initialize 返回的版本号或调用 `kb_list` 正常返回。
+

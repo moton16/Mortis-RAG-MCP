@@ -27,6 +27,7 @@ from ._indexer.models import (
     _candidate_terms,
     _extract_snippet,
     dedupe_by_content_hash,
+    path_prefix_match,
 )
 from ._indexer import scanning as _scanning
 from ._indexer.scanning import (
@@ -82,6 +83,7 @@ from ._indexer.snapshot import (
     _SNAPSHOT_MEMBER_LIMITS,
 )
 from ._indexer import exemptions as _exemptions
+from ._indexer import reading as _reading
 from ._indexer import watch as _watch
 from ._indexer.watch import _FS_MAX_DEBOUNCE_WAIT
 
@@ -115,7 +117,12 @@ class MarkdownIndexer:
         config: AppConfig | None = None,
         embedding_provider: EmbeddingProvider | None = None,
         reranker_provider: RerankerProvider | None = None,
+        *,
+        load_vectors: bool = True,
     ) -> None:
+        # load_vectors=False：只读探测用（如 kb_read 的跨库 chunk_id 寻址）——跳过向量层
+        # 全量加载，省掉每个未加载库一次的向量反序列化；文本层与 FTS 仍会加载
+        # （残余代价：构造期 FTS 仍可能写盘，见 docs/PROJECT_GUIDE.md 的索引层说明）。
         self.vault_path = Path(vault_path).expanduser()
         self.config = config or AppConfig(vault_path=str(self.vault_path))
         self.embedding_provider = embedding_provider or create_embedding_provider(self.config.embedding)
@@ -167,10 +174,27 @@ class MarkdownIndexer:
         self._fs_debounce_cv = threading.Condition(self._fs_debounce_lock)
         self._fs_scheduler_thread: threading.Thread | None = None
         self._fs_requested = False
+        self._fs_refresh_immediate: bool = False
         self._fs_pending_since: float | None = None
         self._fs_debounce_seconds: float = 0.5
         # 连续同步的最小间隔：避免高频事件把 sync 压成紧密循环。
         self._fs_last_sync_at: float = 0.0
+        self._fs_scheduler_start_lock = threading.Lock()
+        self._refresh_error: str | None = None
+        self._refresh_requested_at: float | None = None
+        self._last_refresh_completed_at: float = 0.0
+        self._READ_REFRESH_MIN_INTERVAL_SECONDS: float = 1.0
+        # Ingest auto-scan coordination (Card C58c / C61)
+        self._ingest_hook: Callable[[], Any] | None = None
+        self._ingest_lock = threading.Lock()
+        self._ingest_cv = threading.Condition(self._ingest_lock)
+        self._ingest_dirty: bool = False
+        self._ingest_worker_thread: threading.Thread | None = None
+        self._ingest_stopping: bool = False
+        self._last_ingest_scan_at: float = 0.0
+        self._ingest_scan_failures: int = 0
+        self._last_ingest_error: str | None = None
+        self._ingest_scan_start_lock = threading.Lock()
         self._sync_lock = threading.Lock()
         self._cache_lock = threading.Lock()
         # 是否正在 sync（供 kb_stats 报进度）；连续失败次数用于监听线程的退避。
@@ -186,6 +210,7 @@ class MarkdownIndexer:
             "chunks_total": 0,
         }
         self._chunks_cache_path: Path | None = None
+        self._chunks_cache_loaded: bool = False
         self._vectors_cache_path: Path | None = None
         self._fts_cache_path: Path | None = None
         self._vectors_db_path: Path | None = None
@@ -194,7 +219,7 @@ class MarkdownIndexer:
         self._vector_backend: Any = None
         if self.config.cache.enabled and self.config.cache.dir:
             try:
-                self._init_cache_paths()
+                self._init_cache_paths(load_vectors=load_vectors)
             except OSError:
                 self._chunks_cache_path = None
                 self._vectors_cache_path = None
@@ -224,7 +249,7 @@ class MarkdownIndexer:
         # ids are already persisted so sync never re-embeds them.
         self._vectors_on_disk = bool(getattr(self._vector_backend, "on_disk", False))
         self._disk_vectors: set[str] = set()
-        if not self._vectors_on_disk and self.config.vector.backend == "sqlite_vec":
+        if not self._vectors_on_disk and self.config.vector.backend == "sqlite_vec" and load_vectors:
             # Configured sqlite_vec but import/load failed -> fell back to memory;
             # the vectors cache was skipped during init, so load it now.
             try:
@@ -246,7 +271,7 @@ class MarkdownIndexer:
         normalized = os.path.normcase(os.path.realpath(raw))
         return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
 
-    def _init_cache_paths(self) -> None:
+    def _init_cache_paths(self, *, load_vectors: bool = True) -> None:
         root = self._cache_root()
         namespace = self.config.cache.namespace or "default"
         base = root / namespace
@@ -277,7 +302,7 @@ class MarkdownIndexer:
         # With the disk-backed sqlite_vec backend, vectors are not loaded into
         # RAM (that's the memory win); the disk store is migrated/flushed by
         # _ensure_disk_vectors_migrated() on first sync.
-        if self.config.vector.backend != "sqlite_vec":
+        if load_vectors and self.config.vector.backend != "sqlite_vec":
             self._load_vectors_cache()
         self._sweep_stale_cache()
 
@@ -353,6 +378,7 @@ class MarkdownIndexer:
         meta, files = loaded
         if meta != self._chunks_meta():
             return
+        self._chunks_cache_loaded = True
         self._chunks = {source: chunks for source, (_, chunks) in files.items()}
         self._signatures = {source: signature for source, (signature, _) in files.items()}
 
@@ -950,13 +976,33 @@ class MarkdownIndexer:
         return _cosine_fn(left, right)
 
     def read(self, source: str, start_line: int | None = None, end_line: int | None = None) -> str:
+        res = self._read_result(source, start_line=start_line, end_line=end_line, max_chars=None)
+        return res.content
+
+    def _read_result(
+        self,
+        source: str,
+        start_line: int | None = None,
+        end_line: int | None = None,
+        *,
+        heading: str | None = None,
+        start_char: int = 0,
+        max_chars: int | None = None,
+        expected_sha256: str | None = None,
+        chunk_id_hint: str | None = None,
+    ) -> _reading.ReadResult:
         path = self._safe_path(source)
-        lines = path.read_text(encoding="utf-8").splitlines()
-        start = 1 if start_line is None else max(1, start_line)
-        end = len(lines) if end_line is None else min(len(lines), end_line)
-        if start > end:
-            return ""
-        return "\n".join(lines[start - 1:end])
+        return _reading.read_file_result(
+            path,
+            source,
+            start_line=start_line,
+            end_line=end_line,
+            heading=heading,
+            start_char=start_char,
+            max_chars=max_chars,
+            expected_sha256=expected_sha256,
+            chunk_id_hint=chunk_id_hint,
+        )
 
     def list_files(self) -> list[dict[str, Any]]:
         return [{"source": source, "title": chunks[0].title if chunks else Path(source).stem, "chunks": len(chunks)} for source, chunks in sorted(self._chunks.items())]
@@ -1251,3 +1297,16 @@ class MarkdownIndexer:
 
     def stop_watching(self) -> None:
         return _watch.stop_watching(self)
+
+    def request_refresh(self, *, immediate: bool = False) -> bool:
+        return _watch.request_refresh(self, immediate=immediate)
+
+    def refresh_status(self) -> dict[str, Any]:
+        return _watch.refresh_status(self)
+
+    def request_ingest_scan(self) -> bool:
+        return _watch.request_ingest_scan(self)
+
+    def _ingest_scan_loop(self) -> None:
+        return _watch._ingest_scan_loop(self)
+
