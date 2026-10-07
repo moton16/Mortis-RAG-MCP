@@ -175,3 +175,57 @@ def test_stdio_survives_lone_surrogate_in_notes(tmp_path):
     # 关键：服务没有中途死掉，第 3 个请求（tools/list）仍然有响应。
     assert len(responses) == 3, f"服务在写出代理项时被杀，只回了 {len(responses)} 条"
     assert responses[-1]["result"]["tools"]
+
+
+def test_stdio_release_smoke_v081(tmp_path):
+    """C60/Req 9: stdio smoke:
+    - initialize 版本 0.8.1
+    - 15 工具列表与新参数可见（compact, start_char, group_offsets, heading）
+    - ping 正常
+    - invalid range 与 heading 歧义返回 isError
+    """
+    sample = tmp_path / "notes.md"
+    sample.write_text("# Chapter\nContent line 2\n# Chapter\nContent line 4\n", encoding="utf-8")
+    config = tmp_path / "app.toml"
+    config.write_text(f'vault_path = "{tmp_path.as_posix()}"\nmode = "static"\n', encoding="utf-8")
+
+    responses = _run_stdio(config, [
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+        {"jsonrpc": "2.0", "id": 2, "method": "ping", "params": {}},
+        {"jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {}},
+        {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {
+            "name": "kb_read",
+            "arguments": {"source": "notes.md", "start_line": 999, "end_line": 1000}
+        }},
+        {"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {
+            "name": "kb_read",
+            "arguments": {"source": "notes.md", "heading": "Chapter"}
+        }},
+    ])
+
+    # 1. initialize 检查
+    assert responses[0]["result"]["serverInfo"]["version"] == "0.8.1"
+    assert responses[0]["result"]["serverInfo"]["name"] == "mortis-rag-mcp"
+
+    # 2. ping 检查
+    assert responses[1]["result"] == {}
+
+    # 3. 15 工具列表与新参数检查
+    tools = {t["name"]: t for t in responses[2]["result"]["tools"]}
+    assert len(tools) == 15
+    search_props = tools["kb_search"]["inputSchema"]["properties"]
+    assert "compact" in search_props
+    assert "group_offsets" in search_props
+    read_props = tools["kb_read"]["inputSchema"]["properties"]
+    assert "start_char" in read_props
+    assert "heading" in read_props
+
+    # 4. invalid range 返回 isError
+    assert responses[3]["result"]["isError"] is True
+    err_text_range = responses[3]["result"]["content"][0]["text"]
+    assert "actual" in err_text_range or "lines" in err_text_range
+
+    # 5. ambiguous heading 返回 isError
+    assert responses[4]["result"]["isError"] is True
+    err_text_heading = responses[4]["result"]["content"][0]["text"]
+    assert "存在歧义" in err_text_heading or "同名标题" in err_text_heading
