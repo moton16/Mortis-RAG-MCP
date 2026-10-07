@@ -122,7 +122,7 @@ class MarkdownIndexer:
     ) -> None:
         # load_vectors=False：只读探测用（如 kb_read 的跨库 chunk_id 寻址）——跳过向量层
         # 全量加载，省掉每个未加载库一次的向量反序列化；文本层与 FTS 仍会加载
-        # （残余代价见 docs/Execution-plan_developer.md 第 3 条）。
+        # （残余代价：构造期 FTS 仍可能写盘，见 docs/PROJECT_GUIDE.md 的索引层说明）。
         self.vault_path = Path(vault_path).expanduser()
         self.config = config or AppConfig(vault_path=str(self.vault_path))
         self.embedding_provider = embedding_provider or create_embedding_provider(self.config.embedding)

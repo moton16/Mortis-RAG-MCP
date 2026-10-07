@@ -479,7 +479,7 @@ query 为空 → 直接返回（过滤+分页后）的 chunk 列表
   - `auto_seen` 持久化账本：在 `.mortis-parsed/.ingest_state.json` 记录已处理文件 sha256 签名、状态与最新 job_id，跨重启防重复上传；历史任务剪枝（>500 条）仅修剪 jobs 列表，永久保留 `auto_seen` 账本凭证；
   - 统一尺寸上限策略：默认 `max_file_size_mb = 20`（0 为不限），对 manual submit、scan pending、auto watch、recovery 全入口统一双闸门拦截；
   - 源文件防抖与变更校验：0 字节或正在写入的文件采样判稳延后；任务执行前比对源文件当前 sha256，不符时阻断上传并报错 `source_changed`；
-  - 完成回调解耦：`on_job_finished(source, changed)` 支持双参回调，通知后台线程唤醒即时索引刷新。
+  - 完成回调解耦：`on_job_finished(source, out_md)` 支持双参回调（第二参为解析产物 Markdown 路径），通知后台线程唤醒即时索引刷新。
 * **`ingest/mineru.py`（MinerU 客户端）**：
   - 标准库 `urllib` 实现 v4 高精端点与 Agent 免登端点；
   - 预签名 PUT 上传显式传递 `headers={"Content-Type": ""}`，阻止 urllib 自动注入 `application/x-www-form-urlencoded` 导致阿里云 OSS 403 签名错误；

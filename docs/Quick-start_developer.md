@@ -3,7 +3,7 @@
 > 面向第一次接触本仓库的开发者（人类或 agent）。**只读这一篇就够上手**：
 > 项目概况 → 架构 → 代码逻辑 → 各模块职责 → 开发约定 → 常见任务食谱。
 > 需要溯源某次具体改动时才去翻 `Changelog_developer.md`；要写新功能先看
-> `Execution-plan_developer.md`（如有对应方案）。
+> 是否已有排期（`PROJECT_GUIDE.md` §15 与 issue / PR 记录）。
 
 ---
 
@@ -58,7 +58,6 @@ Mortis-RAG-MCP/
 │   ├── Quick-start_developer.md       # 本文件
 │   ├── Changelog_developer.md         # 每次 commit 的技术变更流水
 │   ├── PROJECT_GUIDE.md               # 全系统架构指南（代码级现状全貌）
-│   ├── Execution-plan_developer.md    # 待执行功能的代码级方案（做完一个划掉一个）
 │   └── Docs_Folder-descriptions.md    # docs/ 目录保留口径说明（本目录的元文档）
 ├── QUICKSTART_user.md       # 用户向：初次部署指南
 ├── CHANGELOG_user.md        # 用户向：release 版本变更（无技术细节）
@@ -216,7 +215,6 @@ $env:PYTHONUTF8='1'; $env:PYTHONIOENCODING='utf-8'
    - `docs/Changelog_developer.md`：commit 级技术流水，必须记录操作者与技术细节。
    - `docs/PROJECT_GUIDE.md`：全系统架构指南，代码级架构变动写在第十五节。
    - `docs/Quick-start_developer.md`：本文件，架构/约定变了就同步。
-   - `docs/Execution-plan_developer.md`：待执行功能方案，做完一个划掉一个。
 3. **Breaking 变更**：工具更名/删工具 = 大版本，README + CHANGELOG_user 顶部必须写
    升级须知，skill 同步改（skill 教 AI 用工具，名字对不上 AI 就会调幽灵工具）。
 4. **skill 同步**：`skills/mortis-rag-mcp/SKILL.md` 是发给 AI 看的"使用纪律"，改工具
@@ -269,4 +267,4 @@ $env:PYTHONUTF8='1'; $env:PYTHONIOENCODING='utf-8'
 - [ ] 读完本文件 §3-§5，能不看代码讲清索引/检索两条管线
 - [ ] 跑过一次 eval（哪怕只有占位查询）
 - [ ] 知道四条文档分工和 commit 记账规则
-- [ ] 动手前确认：`docs/Execution-plan_developer.md` 里是否已有对应方案——有就照着做，别另起炉灶
+- [ ] 动手前确认：`docs/PROJECT_GUIDE.md` §15 或 issue / PR 记录里是否已有排期方案——有就照着做，别另起炉灶

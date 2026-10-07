@@ -857,3 +857,21 @@
 > - 靶向：触碰的 7 个测试文件收敛后全绿（70 passed 复核）；
 > - 全量（本批修复完成后单次）：551 passed, 4 skipped in 25.82s
 >   `bundled python -m pytest tests -q --basetemp=.runtime/fix-v081-20261007/pytest-full -p no:cacheprovider`
+
+### FIX-v081-final — moton16,2026-10-07,CodeBuddy,DeepSeek-V4.1-Flash — fix: close v0.8.1 final-round review regressions (N1–N4)
+
+> **代码与文档改动概况**：
+> - 依据 feat/v0.8.1 发版前最后一轮三路独立对抗审核（全新上下文子代理，明确指令为「证伪 R1–R6 修复声明」；报告存证 `.runtime/ship-v081-20261007/FINAL-ROUND.md`），全部关键证伪已由主代理回源码逐条复核后采信：
+>   - **N1（本轮新引入，P1）补扫自激**：`_indexer/watch.py` 给 `rescan_after_seconds` 加连续补扫上限 `_MAX_INGEST_RESCAN_STREAK = 30`（与 hook 异常分支「连续失败 >5 次」对称），无需补扫的轮次将计数归零。此前「判稳残留或持久 OSError」会让 `rescan_after_seconds` 恒为正且消费端无上限，扫描循环被钉成 1Hz 永久重扫——每轮对全库重算 sha256 并重写状态文件；
+>   - **N2（本轮新引入，P1）0 字节回归**：`ingest/worker.py` 恢复 0 字节在判稳比对**之前**短路（v0.8.0 语义：0 字节一律延后，不进上传链路）。R3 重写判稳逻辑时丢掉了该守卫，0 字节文件两次采样恒为 `(mtime, 0)` → 被判「已稳定」后直接 hash 上传空内容（`PROJECT_GUIDE.md` 与 `test_ingest_auto.py` 的「0 字节判稳延后」宣称因此失守）；
+>   - **N3（本轮新引入，P1）账本永不清**：`ingest/worker.py` 把「本轮出现过剪枝就整轮不清账本」改为**逐条豁免剪枝子树**（`pruned_by_ignore` 标记 → `pruned_dirs` 集合 + `_under_pruned()`），`_stat_samples` / `_settling_files` 同步改造。原实现下只要库内存在任一被忽略目录（如 `cache.placement="vault"` 的 `.mcp_cache/` 或用户自建目录规则），真实删除的条目永不回收：账本无界增长，且删除后重建的同 SHA 文件不再被解析；
+>   - **N4（既有未覆盖，P2）库根不可见清空账本**：`ingest/worker.py` 的 `vault_path.exists()` 为假的早退不再按「完整枚举 0 文件」处理（置 `clean_scan=False`、`scanned_sources=None`），避免未挂载 / 权限抖动 / 同步客户端整目录改名后整库重传（云端配额与费用）；
+>   - **文档漂移订正**：`skills/mortis-rag-mcp/SKILL.md` 与 `QUICKSTART_user.md` 的报错文本与响应字段对齐真实实现（`actual: N` / 响应字段 `total_lines` / `存在歧义 (起始行: 42, 108)`；此前引用代码中不存在的 `actual total lines`、`ambiguous heading`、`candidates at lines [...]`）；`docs/PROJECT_GUIDE.md` 订正回调参数语义为 `on_job_finished(source, out_md)`（第二参为解析产物 Markdown 路径，非 `changed`）；`_indexer/watch.py` docstring 订正重试阈值 off-by-one；
+>   - **幽灵引用清理**：`.gitignore` 白名单、`docs/Quick-start_developer.md`（4 处）、`docs/Docs_Folder-descriptions.md`（保留清单 5 → 4）、`mortis_rag_mcp/indexer.py` 注释中指向已按所有者裁定移除的 `docs/Execution-plan_developer.md` 的引用全部清理（`docs/Changelog_developer.md` 内的历史记账保留不改）。
+> - 测试：新增 4 条**复现级**回归——`test_ingest_auto.py` 的「0 字节永不上传」「剪枝子树豁免但真实删除仍回收」「库根不可见保账本」；`test_watch_integration.py` 的「补扫连续次数封顶」。四条均在「暂存源码修复（`git stash`）」状态下确认变红，复现力已实证。
+>
+> **验证**：
+> - 靶向：`test_ingest_auto.py` + `test_watch_integration.py` + `test_ingest_server.py` + `test_ingest_worker.py` = 86 passed in 6.21s；
+> - 全量（本批修复完成后单次）：555 passed, 4 skipped in 24.30s
+>   `bundled python -m pytest tests -q --basetemp=.runtime/ship-v081-20261007/pytest-full-2 -p no:cacheprovider`
+> - 未修项（本轮新发现的既有形态，已如实登记，不阻断本次发版）：R2 热缓存库在后台重同步窗口内仍可被当作可探测完整库；R5 未闭合 frontmatter / YAML 块标量含 `---` 时表格配对偏移归零、缩进代码块内标题被识别；`.vaultignore` 读取异常被 `except Exception: pass` 吞掉（含 UTF-8-BOM 首行失效）；`server.py` 先发布后 `start_watching()` 使启动异常留下永不复试的半成品 indexer；`tests/conftest.py` 的 `--collect-only` 早退分支在套件内不可达（NO_STATUS_HOOK 会话级封顶先短路）。

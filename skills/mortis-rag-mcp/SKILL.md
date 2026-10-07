@@ -36,7 +36,7 @@ version: 5.3.0
 1. **大候选初筛定向与预算**：已知目标库必须显式定向 `vault_path`；`top_k >= 5` 时优先开启 `compact=true, budget_bytes=3500, use_rerank=false` 进行轻量初筛，削减无效 payload；不作无依据的特定百分比节省假设。
 2. **compact 结果回读规范**：`compact=true` 投影中**不包含 chunk_id**。后续必须使用结果中的顶层或 group 内 `vault` + `source` + 行区间字段调用 `kb_read` 进行回读——compact 投影的行区间在 `lines` 数组中（`start_line=c.lines[0]`、`end_line=c.lines[1]`），严禁对 compact 结果臆造或传递不存在的 chunk_id。对于普通 `preview=true` 或完整结果，仍保留 `chunk_id`，唯一命中时可直接读取。
 3. **预算截断与续页纪律**：若 `budget_bytes` 导致返回 `returned=0` 且 `truncated=true`，不得使用完全相同的参数在原库无限重试；应改为启用 `compact=true`、增大 `budget_bytes` 或缩小目标库/目录范围。当遇到 `budget_exceeded` 时按提示的 `minimum_budget_bytes` 调整或缩减范围；多库分组检索触发截断时，必须将返回的 `group_next_offsets` 原样作为下一轮的 `group_offsets` 沿原路由续页，严禁中途切换为单库并沿用旧排序游标。
-4. **原文读取越界与标题消歧**：`kb_read` 若发生行号越界，根据报错中返回的 `actual total lines` 核对校正分卷行号；已知小节标题优先传 `heading` 读取完整章节；若提示 `ambiguous heading` 重名，使用返回的候选物理行号（如 `candidates at lines [...]`）带上 `start_line` 明确消歧；若读取因长度截断（`truncated=true`），后续读取必须使用 `next_start_line` 与 `next_start_char` 续读，不得简单沿用 `end_line + 1`。
+4. **原文读取越界与标题消歧**：`kb_read` 若发生行号越界，根据报错中返回的 `actual: N`（响应字段 `total_lines`）核对校正分卷行号；已知小节标题优先传 `heading` 读取完整章节；若提示 `存在歧义`（`N 处同名标题 (起始行: 42, 108)`），使用返回的候选物理行号带上 `start_line` 明确消歧；若读取因长度截断（`truncated=true`），后续读取必须使用 `next_start_line` 与 `next_start_char` 续读，不得简单沿用 `end_line + 1`。
 5. **后台构建与陈旧状态应对**：`kb_search` 返回 `status: "indexing"` 或 `stale_chunks` 时，查看 `stats` 与 `retry_after` 建议；未经用户明确指令，**严禁自行调用 `kb_rebuild`**；若源文档已发生更新但后台未完成重新嵌入，可直接使用 `source` + `heading` 进行原文直读，无需等待或依赖陈旧 chunk 行号。
 6. **文档自动摄取授权边界**：`[ingest] auto_watch` 与 `enabled` 默认关闭。未获用户明确许可前，严禁擅自修改配置文件启用自动监听或手动提交摄取任务；`kb_ingest` 的 `pending`/`status` 探查仅为状态查看，不构成云端上传授权；遇到相同哈希的失败任务，须由用户确认后主动重试。
 
