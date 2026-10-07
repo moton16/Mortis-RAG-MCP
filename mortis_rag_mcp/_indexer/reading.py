@@ -27,6 +27,66 @@ class ReadFileNotFoundError(FileNotFoundError, ValueError):
     pass
 
 
+from .chunking import _HEADING_RE, _FENCE_START_RE, clean_heading, _is_chapter_heading, frontmatter
+from ..ingest.tables import iter_table_blocks
+
+
+def scan_headings(lines: list[str]) -> list[tuple[str, int, int]]:
+    """扫描文本行列表中的物理标题，返回 (title, level, 1-based start_line) 列表。
+
+    跳过 frontmatter、代码围栏 (``` 或 ~~~) 以及 HTML 表格块 (<table>...</table>) 内部的假标题。
+    不注入图片，不修改原始行号。
+    支持 ATX 标题 (#..######) 以及中文/Chapter 章节标题（视为 level 1）。
+    """
+    headings: list[tuple[str, int, int]] = []
+    fm_end, _, _ = frontmatter(lines)
+    tbl_blocks = iter_table_blocks(lines)
+    tbl_lines = {idx for s, e in tbl_blocks for idx in range(s, e + 1)}
+
+    fence_char: str | None = None
+    fence_len: int = 0
+
+    for i, line in enumerate(lines):
+        if i <= fm_end:
+            continue
+
+        # 代码围栏状态维护（需使用相同字符且长度>=起始围栏方可闭合）
+        m = _FENCE_START_RE.match(line)
+        if m:
+            token = m.group(1)
+            char, length = token[0], len(token)
+            if fence_char is None:
+                fence_char = char
+                fence_len = length
+                continue
+            elif char == fence_char and length >= fence_len:
+                fence_char = None
+                fence_len = 0
+                continue
+
+        if fence_char is not None:
+            continue
+
+        if i in tbl_lines:
+            continue
+
+        # 优先 ATX 标题
+        hm = _HEADING_RE.match(line)
+        if hm:
+            hashes = hm.group(1)
+            raw_title = hm.group(2)
+            title = clean_heading(raw_title)
+            headings.append((title, len(hashes), i + 1))
+            continue
+
+        # 章节标题（如 第1章 标题、Chapter 1 Title）
+        is_ch, ch_title = _is_chapter_heading(line)
+        if is_ch:
+            headings.append((ch_title, 1, i + 1))
+
+    return headings
+
+
 def read_file_result(
     path: Path,
     source: str,
@@ -79,6 +139,10 @@ def read_file_result(
                 f"start_line/end_line 超出空文件范围 (requested: start={start_line}, end={end_line}, "
                 f"actual: 0, source: {source})；文件为空"
             )
+        if heading is not None:
+            raise ValueError(
+                f"heading 未找到: '{heading.strip()}' (source: {source}, total_lines: 0)；文件为空"
+            )
         return ReadResult(
             source_sha256=source_sha256,
             content="",
@@ -91,24 +155,57 @@ def read_file_result(
             next_start_char=None,
         )
 
-    if start_line is not None:
-        if start_line > total_lines:
-            raise ValueError(
-                f"start_line 超出文件行数范围 (requested: {start_line}, actual: {total_lines}, "
-                f"source: {source})；请核对分卷行号或用heading定位"
-            )
-        effective_start = start_line
-    else:
-        effective_start = 1
+    if heading is not None and start_line is None and end_line is None:
+        query_heading = heading.strip()
+        all_headings = scan_headings(lines)
+        matches = [h for h in all_headings if h[0] == query_heading]
 
-    if end_line is not None:
-        if end_line < effective_start:
+        if not matches:
+            cand_preview = ", ".join(f"'{h[0]}' (line {h[2]})" for h in all_headings[:5])
+            if len(all_headings) > 5:
+                cand_preview += f" 等共 {len(all_headings)} 个标题"
+            elif not all_headings:
+                cand_preview = "（文件中未检测到任何标题）"
             raise ValueError(
-                f"end_line must be >= start_line: end_line={end_line}, start_line={effective_start}"
+                f"heading 未找到: '{query_heading}' (source: {source}, total_lines: {total_lines})；"
+                f"候选标题: {cand_preview}；请核对标题文字或改用 start_line/end_line 行号读取"
             )
-        effective_end = min(end_line, total_lines)
+
+        if len(matches) > 1:
+            lines_str = ", ".join(str(h[2]) for h in matches[:5])
+            raise ValueError(
+                f"heading '{query_heading}' 在文件 '{source}' 中存在 {len(matches)} 处同名标题 "
+                f"(起始行: {lines_str})；存在歧义，请改用 start_line/end_line 明确指定行号读取"
+            )
+
+        matched_title, matched_level, matched_start = matches[0]
+        next_heading = next((h for h in all_headings if h[2] > matched_start and h[1] <= matched_level), None)
+        if next_heading is not None:
+            matched_end = next_heading[2] - 1
+        else:
+            matched_end = total_lines
+
+        effective_start = matched_start
+        effective_end = matched_end
     else:
-        effective_end = total_lines
+        if start_line is not None:
+            if start_line > total_lines:
+                raise ValueError(
+                    f"start_line 超出文件行数范围 (requested: {start_line}, actual: {total_lines}, "
+                    f"source: {source})；请核对分卷行号或用heading定位"
+                )
+            effective_start = start_line
+        else:
+            effective_start = 1
+
+        if end_line is not None:
+            if end_line < effective_start:
+                raise ValueError(
+                    f"end_line must be >= start_line: end_line={end_line}, start_line={effective_start}"
+                )
+            effective_end = min(end_line, total_lines)
+        else:
+            effective_end = total_lines
 
     first_line = lines[effective_start - 1]
     if start_char < 0 or start_char > len(first_line):

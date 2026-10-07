@@ -219,7 +219,7 @@ CURRENT                         THIS RELEASE                     12-MONTH IDEAL
 | 7 | [x] | C67 | compact全路由投影 | C66 | 2–4h / 30–60m |
 | 8 | [x] | C68 | 完整chunk预算与续页 | C67 | 4–6h / 45–90m |
 | 9 | [x] | C69a | 原文读范围/越界/总行数 | C66 | 2–4h / 30–60m |
-| 10 | [ ] | C69b | 物理heading章节读取 | C69a | 4–6h / 45–90m |
+| 10 | [x] | C69b | 物理heading章节读取 | C69a | 4–6h / 45–90m |
 | 11 | [ ] | C59 | Windows升级占用说明 | 任意；代码不变 | 0.5–1h / 10–20m |
 | 12 | [ ] | C70/T8 | 使用纪律、现状文档、欠账、离线评测 | 所有代码卡 | 2–4h / 30–60m |
 | 13 | [ ] | C60 | 版本/最终验收/CI/发布交接 | C70 | 2–4h+CI / 30–60m+CI |
@@ -608,7 +608,7 @@ poll/start/fallback cadence -+                                  |
 
 **验收**：物理行数准确、越界不再静默成功、长单行可续读、不扩包导出/缓存代际。提交 `fix(read): diagnose bounds and expose accurate continuation positions`。
 
-### [ ] C69b：heading按原文章节定位
+### [x] C69b：heading按原文章节定位
 
 **前置**：C69a。文件：`_indexer/reading.py`、server::_kb_read/schema、`tests/test_read_heading.py/test_wikilink_read.py/test_txt_indexing.py`。
 

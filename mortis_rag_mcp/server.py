@@ -277,7 +277,7 @@ def _tool_definitions() -> list[dict[str, Any]]:
                 "source": {"type": "string"},
                 "chunk_id": {"type": "string", "description": "可选，命中切片 ID（由 kb_search 返回），自动展开上下文；与 start_line/end_line/heading 互斥"},
                 "expand_lines": {"type": "integer", "default": 30, "minimum": 0, "maximum": 500, "description": "可选，配合 chunk_id 使用：切片前后各展开行数（默认 30，范围 0-500）"},
-                "heading": {"type": "string"},
+                "heading": {"type": "string", "description": "可选，按原文章节标题精确定位段落（包含子标题）；多处同名标题报错引导改用行号；若同时传入 start_line/end_line 则行区间优先"},
                 "start_line": {"type": "integer", "minimum": 1},
                 "end_line": {"type": "integer", "minimum": 1},
                 "start_char": {"type": "integer", "minimum": 0, "default": 0, "description": "可选，start_line 内 0-based Unicode 字符起始偏移量（默认 0），仅在显式指定 start_line 时有效，用于单行超过 read_max_chars 时的续读"},
@@ -1489,7 +1489,8 @@ class VaultMcpServer:
                     )
                 else:
                     is_cold = (
-                        indexer.last_sync is None
+                        not Path(norm_clean).suffix
+                        and indexer.last_sync is None
                         and not getattr(indexer, "_chunks_cache_loaded", False)
                         and len(indexer._chunks) == 0
                     )
@@ -1500,15 +1501,6 @@ class VaultMcpServer:
                     source = clean_source
             else:
                 source = clean_source
-
-            if heading and start_line is None and end_line is None:
-                matches = [chunk for chunk in indexer.all_chunks() if chunk.source == source and chunk.metadata.get("heading") == heading]
-                if not matches:
-                    raise ValueError(f"heading not found: {heading}")
-                start_line = min(chunk.metadata["start_line"] for chunk in matches)
-                end_line = max(chunk.metadata["end_line"] for chunk in matches)
-                echo_start_line = start_line
-                echo_end_line = end_line
 
         read_max_chars = indexer.config.index.read_max_chars
         read_res = indexer._read_result(
@@ -1521,6 +1513,10 @@ class VaultMcpServer:
             expected_sha256=expected_sha256,
             chunk_id_hint=chunk_id_hint,
         )
+
+        if heading and req_start_line is None and req_end_line is None:
+            echo_start_line = read_res.effective_start_line
+            echo_end_line = read_res.effective_end_line
 
         result = {
             "source": source,

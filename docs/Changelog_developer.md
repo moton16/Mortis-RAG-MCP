@@ -677,6 +677,28 @@
 > - 专项与相关测试（61 passed in 12.60s）：
 >   `.\.venv\Scripts\python.exe -m pytest tests/test_read_ranges.py tests/test_indexer.py tests/test_txt_indexing.py tests/test_wikilink_read.py tests/test_kb_read_chunkid.py tests/test_facade_freeze.py -q`
 
+### C69b — moton16,2026-10-07,Antigravity — feat(read): resolve heading sections from current source text
+> **代码改动概况**：
+> - `mortis_rag_mcp/_indexer/reading.py`：
+>   - 新增 `scan_headings(lines)` 标题扫描器（Req 3–5）：基于原文字符串切片进行轻量级扫描，复用 `frontmatter`、`iter_table_blocks` 与代码围栏精确维护，严格跳过 YAML 元数据、长同字符代码块与 HTML 表格内部假标题；支持 ATX 标题（`#`–`######` 对应 level 1–6）与 TXT/MD 小说章节标题（如 `第1章 ...`、`Chapter 1 ...` 归一为 level 1），不把文件 stem / title fallback 当物理 heading；
+>   - 在 `read_file_result` 中实现原文章节动态定位（Req 6–8）：
+>     - 精确文本匹配 `query_heading = heading.strip()`；
+>     - 零命中时抛出 `ValueError`，包含 `heading`、`source`、`total_lines`、前 5 个候选标题及起始行提示，列表过多提示总数，引导改用 `start_line`/`end_line`；
+>     - 多个同名标题时拒绝隐式合并或选首项，抛出 `ValueError` 列出前 5 个起始行与总命中数，明确指示歧义并引导行号定位；
+>     - 唯一定位时确定章节区间：`effective_start = matched_start`，`effective_end` 截至下一个同级或更高层级标题前一行（`level <= matched_level` - 1）或文件末尾，严格保留深层子标题与其正文内容；
+> - `mortis_rag_mcp/server.py`：
+>   - 废除原 `all_chunks()` 中跨切片并集计算 heading `min/max` 行号的陈旧逻辑，彻底解耦索引切片缓存，确保未索引直连文件与缓存陈旧文件均可准确命中最新物理章节（Req 2）；
+>   - 完善 `_tool_definitions` 中 `heading` 字段说明（Req 1）：阐明精确标题包含子标题、同名报错改行号、行号区间优先等契约；
+>   - 在无显式指定行号且传入 `heading` 时，将回显 `start_line` / `end_line` 与实际 `effective_start_line` / `effective_end_line` 对齐（Req 11）；
+>   - 调整冷文件探测逻辑，仅对无后缀短名未索引时走 indexing 提示，带后缀真实文件无论索引状态均直通物理读取；
+> - `tests/test_read_heading.py`：
+>   - 新增 10 个针对性测试用例：核心固定 fixture 层级章节测试（Target=[2,5], Child=[4,5], A=[1,7], End=[8,8]）、同名歧义 fail-closed、未找到标题有限候选诊断、代码块/表格/frontmatter 假标题过滤、小说章节标题门禁与读取、显式 range 优先覆盖 heading、chunk_id 互斥、长章节超 `read_max_chars` 截断与无缝续读、未索引与陈旧缓存物理读取、JSON-RPC `handle` 协议级 `isError=True` 验证。
+>
+> **验证**：
+> - 专项与相关测试（43 passed in 2.01s）：
+>   `.\.venv\Scripts\python.exe -m pytest tests/test_read_heading.py tests/test_read_ranges.py tests/test_wikilink_read.py tests/test_txt_indexing.py tests/test_chunking_seam.py tests/test_facade_freeze.py -q`
+
+
 
 
 
