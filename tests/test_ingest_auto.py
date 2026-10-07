@@ -801,3 +801,106 @@ def test_auto_submit_keeps_ledger_when_dirs_policy_pruned(tmp_path: Path) -> Non
         assert r_back["skipped_seen"] == 1
         assert mock_parse.call_count == 0
 
+
+def test_zero_byte_file_is_never_submitted(tmp_path: Path) -> None:
+    """R3 回归（0 字节）：空文件两次采样恒为 (mtime, 0)，会被判成「已稳定」。
+
+    若 0 字节判定放在判稳比对**之后**，空内容会被 hash 后直接入队上传。
+    必须始终延后：内容写入并稳定后才进入上传链路。
+    """
+    mgr = IngestManager(tmp_path, IngestConfig(enabled=True, auto_watch=True))
+    empty = tmp_path / "empty.pdf"
+    empty.write_bytes(b"")
+    good = tmp_path / "good.pdf"
+    good.write_bytes(b"%PDF-1.4 real body")
+
+    with patch.object(mgr, "_worker_loop"):
+        assert mgr.auto_submit()["submitted"] == 0  # 首扫仅登记采样
+        r2 = mgr.auto_submit()
+        assert r2["submitted"] == 1
+        assert r2["jobs"][0]["source"] == "good.pdf"
+
+        # 连续多轮：空文件始终不得被提交
+        for _ in range(3):
+            assert mgr.auto_submit()["submitted"] == 0
+        assert "empty.pdf" not in mgr._load_state()["auto_seen"]
+
+        # 内容写入后才走判稳 → 上传
+        empty.write_bytes(b"%PDF-1.4 content finally written")
+        assert mgr.auto_submit()["submitted"] == 0  # 采样变化 → 重新判稳
+        assert mgr.auto_submit()["submitted"] == 1
+
+
+def test_clean_scan_prunes_real_deletion_despite_pruned_subtree(tmp_path: Path) -> None:
+    """R4 补正：目录剪枝只豁免被剪枝子树，不能让真实删除的条目永远留在账本里。
+
+    「本轮出现过剪枝就整轮不清账本」会让已删除文件永久占位：删除后重建同 SHA
+    文件不再被解析，同时账本无界增长。
+    """
+    ignored = {"on": False}
+
+    def provider():
+        from mortis_rag_mcp._indexer.scanning import IgnoreMatcher
+        return IgnoreMatcher(["sub"] if ignored["on"] else [])
+
+    mgr = IngestManager(tmp_path, IngestConfig(enabled=True, auto_watch=True), ignore_provider=provider)
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    (sub / "paper.pdf").write_bytes(b"%PDF-1.4 paper body")
+    top = tmp_path / "top.pdf"
+    top.write_bytes(b"%PDF-1.4 top body")
+
+    mock_parse = MagicMock()
+    with patch.object(mgr, "_worker_loop"), patch("mortis_rag_mcp.ingest.mineru.MineruClient.parse", mock_parse):
+        assert mgr.auto_submit()["submitted"] == 0  # 首扫仅登记采样
+        assert mgr.auto_submit()["submitted"] == 2
+
+        st = mgr._load_state()
+        for j in st["jobs"].values():
+            j["state"] = "done"
+        for entry in st["auto_seen"].values():
+            entry["state"] = "done"
+        mgr._save_state(st)
+
+        # 目录被临时忽略 + 同轮 top.pdf 被真实删除
+        ignored["on"] = True
+        top.unlink()
+        assert mgr.auto_submit()["submitted"] == 0
+
+        st2 = mgr._load_state()
+        assert "sub/paper.pdf" in st2["auto_seen"]  # 剪枝子树豁免，取消忽略后不重传
+        assert "top.pdf" not in st2["auto_seen"]  # 真实删除照常回收
+
+
+def test_missing_vault_root_keeps_ledger(tmp_path: Path) -> None:
+    """库根暂时不可见（未挂载 / 权限抖动 / 同步客户端整目录改名）≠ 文件被删光。
+
+    `Path.exists()` 对瞬时 OSError 返回 False，若此时按「完整枚举 0 文件」清理，
+    账本会被整体清空 → 路径恢复后整库重传。
+    """
+    mgr = IngestManager(tmp_path, IngestConfig(enabled=True, auto_watch=True))
+    doc = tmp_path / "paper.pdf"
+    doc.write_bytes(b"%PDF-1.4 paper body")
+
+    real_exists = Path.exists
+
+    def fake_exists(self: Path) -> bool:
+        if self == mgr.vault_path:
+            return False
+        return real_exists(self)
+
+    with patch.object(mgr, "_worker_loop"):
+        assert mgr.auto_submit()["submitted"] == 0
+        assert mgr.auto_submit()["submitted"] == 1
+
+        st = mgr._load_state()
+        for j in st["jobs"].values():
+            j["state"] = "done"
+        st["auto_seen"]["paper.pdf"]["state"] = "done"
+        mgr._save_state(st)
+
+        with patch.object(Path, "exists", fake_exists):
+            assert mgr.auto_submit()["submitted"] == 0
+
+        assert "paper.pdf" in mgr._load_state()["auto_seen"]
+

@@ -116,6 +116,11 @@ def _is_excluded_dir_name(name: str, out_dirname: str) -> bool:
     return False
 
 
+def _under_pruned(rel_posix: str, pruned_dirs: set[str]) -> bool:
+    """rel 是否位于本轮被策略剪枝的目录子树内（review R4 的逐条豁免判据）。"""
+    return any(rel_posix.startswith(prefix + "/") for prefix in pruned_dirs)
+
+
 def _is_path_ignored(matcher: Any, rel_posix: str, is_dir: bool = False) -> bool:
     if matcher is None:
         return False
@@ -447,7 +452,10 @@ class IngestManager:
             return [], scan_stats
 
         if not self.vault_path.exists():
-            scan_stats["clean_scan"] = True
+            # 库根不可见（未挂载 / 权限被临时改 / 同步客户端整目录改名）不是「文件被删光」：
+            # 绝不能让账本按「完整枚举 0 文件」清空，否则路径恢复后整库重传。
+            scan_stats["clean_scan"] = False
+            scan_stats["scanned_sources"] = None
             return [], scan_stats
 
         state = self._load_state()
@@ -468,6 +476,7 @@ class IngestManager:
 
         targets: list[dict] = []
         scanned_sources: set[str] = set()
+        pruned_dirs: set[str] = set()
         entries_to_visit = [self.vault_path]
         clean_scan = True
 
@@ -484,7 +493,9 @@ class IngestManager:
                                 if _is_path_ignored(matcher, rel_dir, is_dir=True):
                                     # review R4：目录被策略剪枝 ⇒ 本轮不是完整枚举，
                                     # 其下文件的账本条目不得按「确认删除」清理。
-                                    scan_stats["pruned_by_ignore"] = True
+                                    # 记录剪枝子树而非置「整轮不清」标记：清理时逐条
+                                    # 豁免，既保住剪枝子树，又让真实删除的条目照常回收。
+                                    pruned_dirs.add(rel_dir)
                                     continue
                                 entries_to_visit.append(Path(entry.path))
                             elif entry.is_file(follow_symlinks=False):
@@ -507,6 +518,16 @@ class IngestManager:
                                             "size": st.st_size,
                                             "limit_bytes": limit,
                                         })
+                                    continue
+
+                                # 0 字节必须在判稳比对**之前**短路：复制刚创建的 0 字节
+                                # 文件两次采样恒为 (mtime, 0)，会被判成「已稳定」后直接
+                                # hash 上传空内容；内容确实为空的文件同样没有可解析内容。
+                                # 与 v0.8.0 语义一致：0 字节一律延后，不进上传链路。
+                                if st.st_size == 0:
+                                    scan_stats["skipped_settling"] = scan_stats.get("skipped_settling", 0) + 1
+                                    self._stat_samples[rel] = (st.st_mtime, 0)
+                                    self._settling_files.add(rel)
                                     continue
 
                                 # 判稳（Card C58c / C61 Req 9；review R3）：所有新/变化源
@@ -545,11 +566,16 @@ class IngestManager:
 
         scan_stats["clean_scan"] = clean_scan
         scan_stats["scanned_sources"] = scanned_sources
-        # 判稳采样只对完整枚举的扫描做清理：被策略剪枝的轮次保留原状（review R4）。
-        if clean_scan and not scan_stats.get("pruned_by_ignore", False):
+        scan_stats["pruned_dirs"] = pruned_dirs
+        # 判稳采样清理只对完整枚举的轮次做，并逐条豁免被策略剪枝的子树（review R4）：
+        # 「本轮出现过剪枝就整轮不清」会让残留采样项永不回收，`_settling_files`
+        # 恒非空 ⇒ rescan_after_seconds 恒为正，扫描循环被钉成 1Hz 全库重扫。
+        if clean_scan:
             for gone in [s for s in self._stat_samples if s not in scanned_sources]:
+                if _under_pruned(gone, pruned_dirs):
+                    continue
                 self._stat_samples.pop(gone, None)
-            self._settling_files.intersection_update(scanned_sources)
+                self._settling_files.discard(gone)
         return targets, scan_stats
 
     def auto_submit(self) -> dict:
@@ -586,17 +612,18 @@ class IngestManager:
             aw["skipped_ignored"] = scan_stats.get("skipped_ignored", 0)
             aw["too_large_samples"] = scan_stats.get("too_large_samples", [])
 
-            # review R4：只有完整枚举（无忽略目录剪枝）的干净扫描才允许清理账本，
-            # 否则被临时排除目录的条目会被误当「已删除」清掉，取消排除后同 SHA 重传。
-            if (
-                scan_stats.get("clean_scan")
-                and not scan_stats.get("pruned_by_ignore", False)
-                and scan_stats.get("scanned_sources") is not None
-            ):
+            # review R4：只有完整枚举的干净扫描才允许清理账本，并逐条豁免被策略剪枝
+            # 子树内的条目——临时排除目录 ≠ 文件被删除，取消排除后同 SHA 不得重传。
+            # 逐条判定（而非「本轮有剪枝就整轮不清」）才能让真实删除的条目照常回收。
+            if scan_stats.get("clean_scan") and scan_stats.get("scanned_sources") is not None:
                 scanned_set = scan_stats["scanned_sources"]
+                pruned_dirs = scan_stats.get("pruned_dirs") or set()
                 for s in list(auto_seen.keys()):
-                    if s not in scanned_set and s not in active_sources:
-                        auto_seen.pop(s, None)
+                    if s in scanned_set or s in active_sources:
+                        continue
+                    if _under_pruned(s, pruned_dirs):
+                        continue
+                    auto_seen.pop(s, None)
 
             jobs = []
             new_job_count = 0
