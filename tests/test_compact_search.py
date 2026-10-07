@@ -9,6 +9,17 @@ from mortis_rag_mcp._server.fanout import _measure_payload_bytes
 from mortis_rag_mcp.server import VaultMcpServer, _tool_definitions
 
 
+def _kb_init_ready(server: VaultMcpServer, path, name: str) -> None:
+    """kb_init 之后显式同步一次，让索引状态确定。
+
+    C66 起 kb_search 走「优先使用已就绪索引、后台刷新」，不再在前台阻塞等待首建；
+    kb_init 只把首建丢进后台线程，紧跟其后的检索会与后台首建竞态（Windows 侥幸通过、
+    Linux CI 只拿到部分结果）。要断言完整索引的测试必须显式同步。
+    """
+    server.call_tool("kb_init", {"path": str(path), "name": name})
+    server._indexer_for({"vault_path": name}).sync()
+
+
 def test_chunk_to_dict_compact():
     chunk = Chunk(
         id="chunk_id_123",
@@ -77,7 +88,7 @@ def test_compact_schema_and_dispatch_tolerance(tmp_path, monkeypatch):
     (vault / "note.md").write_text("# Test Heading\nHere is some searchable text.", encoding="utf-8")
 
     server = VaultMcpServer()
-    server.call_tool("kb_init", {"path": str(vault), "name": "test_vault"})
+    _kb_init_ready(server, vault, "test_vault")
 
     # Test boolean string tolerance for compact (true/1/yes/on)
     for truthy_val in (True, "true", "1", "yes", "on", "TRUE", "On"):
@@ -113,7 +124,7 @@ def test_single_vault_compact_attribution(tmp_path, monkeypatch):
     (vault / "chapter1.md").write_text("# Chapter One\nOnce upon a time in ancient empire.", encoding="utf-8")
 
     server = VaultMcpServer()
-    server.call_tool("kb_init", {"path": str(vault), "name": "NovelVault"})
+    _kb_init_ready(server, vault, "NovelVault")
 
     # 1. Compact search: top level must have vault and vault_name
     res_compact = server.call_tool("kb_search", {
@@ -154,8 +165,8 @@ def test_multivault_flat_compact_search(tmp_path, monkeypatch):
     (v2 / "doc2.md").write_text("# Doc 2\nQuantum entanglement teleportation protocol.", encoding="utf-8")
 
     server = VaultMcpServer()
-    server.call_tool("kb_init", {"path": str(v1), "name": "V1"})
-    server.call_tool("kb_init", {"path": str(v2), "name": "V2"})
+    _kb_init_ready(server, v1, "V1")
+    _kb_init_ready(server, v2, "V2")
 
     # Flat cross-vault (group_by_vault=False) with compact=True
     res = server.call_tool("kb_search", {
@@ -188,8 +199,8 @@ def test_multivault_grouped_compact_search(tmp_path, monkeypatch):
     (v2 / "beta.md").write_text("# Beta Strategy\nMarket microstructure and trading latency.", encoding="utf-8")
 
     server = VaultMcpServer()
-    server.call_tool("kb_init", {"path": str(v1), "name": "Alpha"})
-    server.call_tool("kb_init", {"path": str(v2), "name": "Beta"})
+    _kb_init_ready(server, v1, "Alpha")
+    _kb_init_ready(server, v2, "Beta")
 
     # Grouped cross-vault (group_by_vault=True) with compact=True
     res = server.call_tool("kb_search", {
@@ -232,7 +243,7 @@ def test_compact_parity_and_readback_roundtrip(tmp_path, monkeypatch):
     (vault / "dist_sys.md").write_text(content, encoding="utf-8")
 
     server = VaultMcpServer()
-    server.call_tool("kb_init", {"path": str(vault), "name": "SysVault"})
+    _kb_init_ready(server, vault, "SysVault")
 
     # 1. Compare parity of full vs compact
     res_full = server.call_tool("kb_search", {
@@ -302,8 +313,8 @@ def test_compact_payload_reduction_measurement(tmp_path, monkeypatch):
         )
 
     server = VaultMcpServer()
-    server.call_tool("kb_init", {"path": str(v1), "name": "CorpusA"})
-    server.call_tool("kb_init", {"path": str(v2), "name": "CorpusB"})
+    _kb_init_ready(server, v1, "CorpusA")
+    _kb_init_ready(server, v2, "CorpusB")
 
     # 1. Grouped multi-vault shape (group_by_vault=True)
     res_preview_grp = server.call_tool("kb_search", {

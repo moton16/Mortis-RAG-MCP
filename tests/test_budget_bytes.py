@@ -40,6 +40,23 @@ def _run_stdio(config: Path, requests: list[dict]) -> list[dict]:
     return [json.loads(line) for line in proc.stdout.splitlines() if line]
 
 
+def _kb_init_ready(server: VaultMcpServer, path, name: str) -> None:
+    """kb_init 之后显式同步一次，让索引状态确定。
+
+    C66 起 kb_search 走「优先使用已就绪索引、后台刷新」，不再在前台阻塞等待首建完成；
+    kb_init 只把首建丢进后台线程，因此紧跟其后的检索会与后台首建竞态——Windows 上
+    侥幸拿到完整索引，Linux CI 上只拿到部分结果（本条曾导致 ubuntu 5 连红）。
+    要断言完整索引的测试必须显式同步。
+    """
+    server.call_tool("kb_init", {"path": str(path), "name": name})
+    server._indexer_for({"vault_path": name}).sync()
+
+
+def _is_search_settled(data: dict) -> bool:
+    """首建完成判据：非冷启动(status!=indexing)且后台无在飞构建。"""
+    return data.get("status") != "indexing" and not data.get("indexing_in_progress")
+
+
 def test_parse_budget_bytes():
     """验证 budget_bytes 防御式解析与夹取。"""
     assert _parse_budget_bytes(None) is None
@@ -145,7 +162,7 @@ def test_budget_bytes_default_behavior_unchanged(budget_vault, tmp_path, monkeyp
     monkeypatch.setenv("VAULT_MCP_REGISTRY", str(reg_path))
 
     server = VaultMcpServer(config_path)
-    server.call_tool("kb_init", {"path": str(budget_vault), "name": "OSVault"})
+    _kb_init_ready(server, budget_vault, "OSVault")
 
     res = server.call_tool("kb_search", {"vault_path": "OSVault", "query": "操作系统", "top_k": 5})
     data = json.loads(res["content"][0]["text"])
@@ -166,7 +183,7 @@ def test_budget_bytes_all_fit(budget_vault, tmp_path, monkeypatch):
     monkeypatch.setenv("VAULT_MCP_REGISTRY", str(reg_path))
 
     server = VaultMcpServer(config_path)
-    server.call_tool("kb_init", {"path": str(budget_vault), "name": "OSVault"})
+    _kb_init_ready(server, budget_vault, "OSVault")
 
     # 预算充足 (50000 字节)，5 条必定能全量返回
     res = server.call_tool(
@@ -191,7 +208,7 @@ def test_budget_bytes_truncation_and_offset_continuity(budget_vault, tmp_path, m
     monkeypatch.setenv("VAULT_MCP_REGISTRY", str(reg_path))
 
     server = VaultMcpServer(config_path)
-    server.call_tool("kb_init", {"path": str(budget_vault), "name": "OSVault"})
+    _kb_init_ready(server, budget_vault, "OSVault")
 
     # 每条 chunk 序列化后约 800-900 字节，设置预算 2200 字节，应该只能返回 2 条左右
     budget = 2200
@@ -308,8 +325,8 @@ def test_budget_bytes_fanout_grouped(tmp_path, monkeypatch):
     monkeypatch.setenv("VAULT_MCP_REGISTRY", str(reg_path))
 
     server = VaultMcpServer(config_path)
-    server.call_tool("kb_init", {"path": str(vault1), "name": "VaultOne"})
-    server.call_tool("kb_init", {"path": str(vault2), "name": "VaultTwo"})
+    _kb_init_ready(server, vault1, "VaultOne")
+    _kb_init_ready(server, vault2, "VaultTwo")
 
     # 预算 3500 字节，不足以放下两库共 6 条结果（每条 ~800 字节 + 元数据）
     budget = 3500
@@ -360,20 +377,52 @@ def test_budget_bytes_stdio_integration(budget_vault, tmp_path):
     config_path = tmp_path / "app.toml"
     config_path.write_text('mode = "static"\n', encoding="utf-8")
 
+    # C66：kb_search 不再阻塞等待首建（读优先）。stdio 子进程里没有可用参数让
+    # 首建同步完成，因此先用同一份配置在进程内建好缓存——子进程启动时直接加载
+    # 完整文本索引（_chunks_cache_loaded=True），检索结果与首建时序无关。
+    # 预热期间把注册表钉到本次 tmp_path：注册表默认落在真实用户目录
+    # （~/.mortis_rag_mcp/vaults.toml），直接 registry.add 会污染开发机。
+    saved_reg = {k: os.environ.get(k) for k in ("MORTIS_RAG_REGISTRY", "VAULT_MCP_REGISTRY")}
+    os.environ["MORTIS_RAG_REGISTRY"] = str(tmp_path / "warm_vaults.toml")
+    os.environ.pop("VAULT_MCP_REGISTRY", None)
+    try:
+        warm = VaultMcpServer(config_path)
+        try:
+            warm.registry.add(str(budget_vault), name="OS")
+            assert warm._indexer_for({"vault_path": "OS"}).sync(), "预热索引失败"
+        finally:
+            warm.shutdown()
+    finally:
+        for env_key, old_val in saved_reg.items():
+            if old_val is None:
+                os.environ.pop(env_key, None)
+            else:
+                os.environ[env_key] = old_val
+
+    # 首建完成判据仍按真实客户端契约轮询：刷新在飞时响应带 indexing_in_progress。
+    search_args = {"vault_path": "OS", "query": "操作系统", "top_k": 8, "budget_bytes": 1800}
+    search_ids = list(range(3, 3 + 50))
     requests = [
         {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
         {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "kb_init", "arguments": {"path": str(budget_vault), "name": "OS"}}},
-        {
-            "jsonrpc": "2.0",
-            "id": 3,
-            "method": "tools/call",
-            "params": {"name": "kb_search", "arguments": {"vault_path": "OS", "query": "操作系统", "top_k": 8, "budget_bytes": 1800}},
-        },
+    ]
+    requests += [
+        {"jsonrpc": "2.0", "id": rid, "method": "tools/call", "params": {"name": "kb_search", "arguments": search_args}}
+        for rid in search_ids
     ]
 
     responses = _run_stdio(config_path, requests)
-    assert len(responses) == 3
-    search_resp = json.loads(responses[2]["result"]["content"][0]["text"])
+    assert len(responses) == 2 + len(search_ids)
+    settled: list[dict] = []
+    for resp in responses:
+        if resp.get("id") not in search_ids:
+            continue
+        data = json.loads(resp["result"]["content"][0]["text"])
+        if _is_search_settled(data):
+            settled.append(data)
+    assert settled, "首建未在 stdio 重试窗口内完成"
+
+    search_resp = settled[-1]
     assert search_resp["truncated"] is True
     assert search_resp["returned"] >= 1
     assert _measure_payload_bytes(search_resp) <= 1800
@@ -398,8 +447,8 @@ def test_budget_bytes_fanout_flat(tmp_path, monkeypatch):
     monkeypatch.setenv("VAULT_MCP_REGISTRY", str(reg_path))
 
     server = VaultMcpServer(config_path)
-    server.call_tool("kb_init", {"path": str(v1), "name": "VFlat1"})
-    server.call_tool("kb_init", {"path": str(v2), "name": "VFlat2"})
+    _kb_init_ready(server, v1, "VFlat1")
+    _kb_init_ready(server, v2, "VFlat2")
 
     # 预算 2500 字节仅够容纳 1 条（每条 ~1600 字节 + 元数据），第 2 条被截断
     budget = 2500
@@ -421,7 +470,7 @@ def test_budget_bytes_offset_beyond_end(budget_vault, tmp_path, monkeypatch):
     monkeypatch.setenv("VAULT_MCP_REGISTRY", str(reg_path))
 
     server = VaultMcpServer(config_path)
-    server.call_tool("kb_init", {"path": str(budget_vault), "name": "OSVault"})
+    _kb_init_ready(server, budget_vault, "OSVault")
 
     res = server.call_tool(
         "kb_search",
@@ -449,7 +498,7 @@ def test_budget_bytes_minimum_envelope_overflow(tmp_path, monkeypatch):
         v = tmp_path / f"long_named_vault_corpus_data_{i}"
         v.mkdir()
         (v / "note.md").write_text(f"# 笔记{i}\n内容数据段落测试", encoding="utf-8")
-        server.call_tool("kb_init", {"path": str(v), "name": f"CorpusVaultBranch{i}"})
+        _kb_init_ready(server, v, f"CorpusVaultBranch{i}")
 
     # 设置极小预算 500 字节（最小包络含 searched/errors/hint/group_next_offsets 已大于 600 字节）
     res = server.call_tool(
@@ -489,8 +538,8 @@ def test_budget_bytes_group_offsets_validation(tmp_path, monkeypatch):
     (v_solo / "s.md").write_text("# S\n内容", encoding="utf-8")
 
     server = VaultMcpServer(config_path)
-    server.call_tool("kb_init", {"path": str(v1), "name": "V1"})
-    server.call_tool("kb_init", {"path": str(v2), "name": "V2"})
+    _kb_init_ready(server, v1, "V1")
+    _kb_init_ready(server, v2, "V2")
     server.call_tool("kb_init_solo", {"path": str(v_solo), "name": "VSolo"})
 
     # 1. group_by_vault=False 时传入 group_offsets -> ValueError

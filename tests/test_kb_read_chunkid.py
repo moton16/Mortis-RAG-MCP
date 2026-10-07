@@ -697,10 +697,14 @@ def test_probe_promoted_chunk_disappeared(tmp_path: Path, monkeypatch: pytest.Mo
     assert "索引已变化" in msg or "重新 kb_search" in msg
 
 
-def test_kb_read_chunk_id_first_sync_partial_not_probeable(tmp_path: Path):
+def test_kb_read_chunk_id_first_sync_partial_not_probeable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """review R2：首次同步未完成的库不得参与跨库 chunk_id 探测——
     last_sync=None 且无完整缓存时，内存 _chunks 非空只是部分扫描结果，
     不能据此宣告「已探测完整库」而误报唯一命中。"""
+    # 「首扫未完成」必须是确定状态：启动预索引或后台监听补跑一次 sync 就会把
+    # last_sync 重新写实，A 不再是 incomplete，断言退化成「两库撞 id」（Linux 上必现）。
+    monkeypatch.setattr(VaultMcpServer, "_startup_index_all", lambda self: None)
+    monkeypatch.setattr(MarkdownIndexer, "start_watching", lambda self: None)
     same_text = "# Shared\nshared body that identifies the same chunk\n"
     vault_a = tmp_path / "vault_sync_a"
     vault_b = tmp_path / "vault_sync_b"

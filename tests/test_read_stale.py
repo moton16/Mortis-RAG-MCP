@@ -142,8 +142,13 @@ def test_request_refresh_coalesces_bursts(tmp_path: Path):
     indexer.stop_watching()
 
 
-def test_stale_chunk_id_signature_mismatch_fails_visible(tmp_path: Path):
+def test_stale_chunk_id_signature_mismatch_fails_visible(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """C66: 物理文件修改后若 chunk_id 的 sha256 签名与磁盘不符，fail-visible 提示重新 kb_search。"""
+    # 关掉后台监听与启动预索引：本用例要的是「索引仍持旧 chunk、磁盘已改」这个窗口，
+    # 后台刷新一旦抢先跑完，旧 chunk_id 会直接变成 not found（Linux 上必现），
+    # 断言就落到另一条错误分支上。
+    monkeypatch.setattr(VaultMcpServer, "_startup_index_all", lambda self: None)
+    monkeypatch.setattr(MarkdownIndexer, "start_watching", lambda self: None)
     vault = tmp_path / "vault_stale_chunk"
     vault.mkdir()
     note = vault / "stale.md"

@@ -875,3 +875,20 @@
 > - 全量（本批修复完成后单次）：555 passed, 4 skipped in 24.30s
 >   `bundled python -m pytest tests -q --basetemp=.runtime/ship-v081-20261007/pytest-full-2 -p no:cacheprovider`
 > - 未修项（本轮新发现的既有形态，已如实登记，不阻断本次发版）：R2 热缓存库在后台重同步窗口内仍可被当作可探测完整库；R5 未闭合 frontmatter / YAML 块标量含 `---` 时表格配对偏移归零、缩进代码块内标题被识别；`.vaultignore` 读取异常被 `except Exception: pass` 吞掉（含 UTF-8-BOM 首行失效）；`server.py` 先发布后 `start_watching()` 使启动异常留下永不复试的半成品 indexer；`tests/conftest.py` 的 `--collect-only` 早退分支在套件内不可达（NO_STATUS_HOOK 会话级封顶先短路）。
+
+### FIX-v081-ci — moton16,2026-10-07,CodeBuddy,DeepSeek-V4.1-Flash — test: make search assertions deterministic under read-first contract
+
+> **代码与文档改动概况**：
+> - 修复 v0.8.1 分支**从未在 CI 上转绿**的问题：`gh pr checks 7` 在 ubuntu 四个 job 上稳定 8 红（main `82989c8` 为绿，故确属本分支引入）。根因是 C66「读已就绪索引、后台刷新」把搜索路径的 `try_sync_with_guard(timeout=1.5)` 前台守护移除（对照 `origin/main:mortis_rag_mcp/_server/search_dispatch.py:96/131`），而 `kb_init` 只把首建丢进后台线程（`server.py:663`）——一批测试仍按「kb_init 后检索必然拿到完整索引」的旧契约写，成了时序依赖：Windows 上侥幸通过（本机 555 passed），Linux CI 上只拿到部分结果。
+> - 测试侧按分支自己已有的模式改为确定性等待（不触碰产品语义）：
+>   - `tests/test_budget_bytes.py`：新增 `_kb_init_ready()`（`kb_init` + 显式 `indexer.sync()`，`sync()` 走阻塞锁，后台首建会被等完再做一次无变更增量）与 `_is_search_settled()`；14 处 `kb_init` 调用点改走该助手；`test_budget_bytes_stdio_integration` 因 stdio 子进程无法调 `sync()`，改为「先用同一份配置在进程内预热缓存（子进程启动即加载完整文本索引）+ 按真实客户端契约轮询到非冷启动且无 `indexing_in_progress`」，并**在预热期间把注册表钉到 tmp_path**——注册表默认落在真实用户目录 `~/.mortis_rag_mcp/vaults.toml`，直接 `registry.add` 会污染开发机（本次已清理误写入的 5 条记录）；
+>   - `tests/test_compact_search.py` / `tests/test_exact_terms.py`：同样加 `_kb_init_ready()` 并替换全部 12 处 `kb_init` 调用点；
+>   - `tests/test_read_stale.py::test_stale_chunk_id_signature_mismatch_fails_visible`：关掉 `_startup_index_all` 与 `start_watching`，锁定「索引持旧 chunk、磁盘已改」的窗口——后台刷新抢先跑完会让旧 `chunk_id` 变成 not found，断言落到另一条错误分支（Linux 必现）；
+>   - `tests/test_kb_read_chunkid.py::test_kb_read_chunk_id_first_sync_partial_not_probeable`：同样关掉启动预索引与后台监听，让「首扫未完成」成为确定状态（否则 A 库的 `last_sync` 被后台 sync 重新写实，R2 守卫不再触发）。
+> - 未改动任何产品代码：C66 的读优先语义是本版明确目标，本批只把测试从「时序依赖」改成「契约依赖」。
+>
+> **验证**：
+> - 靶向：`test_budget_bytes.py` + `test_compact_search.py` + `test_exact_terms.py` + `test_read_stale.py` + `test_kb_read_chunkid.py` = 63 passed in 2.20s；
+> - 全量（本批完成后单次）：555 passed, 4 skipped in 27.42s
+>   `bundled python -m pytest tests -q --basetemp=.runtime/ship-v081-20261007/pytest-full-3 -p no:cacheprovider`
+> - 真实用户注册表残留复查：`name = "OS"` 0 条（清理后无新增）。
