@@ -803,3 +803,27 @@
 > - 离线评测与不变量测试（29 passed in 1.02s）：
 >   `.\.venv\Scripts\python.exe -m pytest tests/test_version_sync.py tests/test_compact_search.py tests/test_read_heading.py tests/test_search_oracle.py -q`
 > - schema 字节量测：14,433 字节（+14.88%，依 PLAN.md 882 行已批准作为安全与新参数完整性授权例外登记）。
+
+### C60 — moton16,2026-10-07,Antigravity — chore: bump version to 0.8.1 and finalize release artifacts
+> **代码与文档改动概况**：
+> - `pyproject.toml` & `mortis_rag_mcp/__init__.py`：
+>   - 版本号由 `0.8.0` 正式升级为 `0.8.1`（包顶层 `__version__` 单一真源驱动）；
+> - `README.md` & `README_EN.md`：
+>   - 顶部 Version badge 同步更新为 `0.8.1`；
+> - `CHANGELOG_user.md`：
+>   - 顶部新增 `## [0.8.1] - 2026-10-07` 发布说明，面向终端用户大白话阐明：
+>     - 升级须知：100% 索引与缓存兼容、文档摄取 20MiB 默认上限与 0 不限配置、自动摄取默认关闭、整块预算与分组续页、先出结果后台静默刷新；
+>     - 新增功能：紧凑初筛模式（`compact`）、物理章节与小说分卷直读（`heading`）、行号越界实际行数诊断、跨库切片唯一识别展开；
+>     - 修复与改进：MinerU 预签名上传 403 签名修复（注明确切待实机验证状态）、Windows 升级进程占用说明、文件列表分页与前缀过滤；
+> - `tests/test_version_sync.py`：
+>   - 扩展版本同步守卫测试：断言 README.md 与 README_EN.md 的 Version badge、SKILL.md 标题包版本及 `diaglog.PACKAGE_VERSION` 与单一真源严格一致；
+> - `tests/test_mcp_stdio.py`：
+>   - 新增 `test_stdio_release_smoke_v081` 协议冒烟用例：验证 initialize 返回 0.8.1、15 个核心工具完整可见、新参数（`compact`, `start_char`, `group_offsets`, `heading`）暴露正确、`ping` 正常响应、越界行号与重名标题歧义均正确返回协议级 `isError=True`；
+> - `docs/v0.8.1/PLAN.md`：
+>   - 全量卡片状态核验收口：C60 打勾完成，7.2 发布清单 12 项全部核销。
+>
+> **验证**：
+> - 语法编译检查通过：`.\.venv\Scripts\python.exe -m compileall -q mortis_rag_mcp`
+> - 靶向发版测试集（38 passed in 3.60s）：
+>   `.\.venv\Scripts\python.exe -m pytest tests/test_version_sync.py tests/test_diaglog.py tests/test_mcp_stdio.py tests/test_facade_freeze.py tests/test_cache_codec_roundtrip.py -q`
+> - 差异与格式守卫通过：`git diff --check`（0 警告/0 错误）。
