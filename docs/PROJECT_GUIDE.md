@@ -6,9 +6,9 @@
 
 ## 在这里，你才需要详细描述每次commit的代码逻辑、技术框架的更改，请标明提交commit人员的GitHub账户名，如果是agent执行的，请一并标出是什么agent处理的。如editor:moton16,codex.
 
-> **版本**：对应 v0.8.0（2026-09-27）。v0.8.0 变更：代码架构全链路解耦重构（`indexer.py` 与 `server.py` 瘦身下沉为稳定 Facade + `_indexer/` 与 `_server/` 私有子包落地），删除历史死代码，加固生命周期与错误边界，保持 100% 公开 API、MCP 协议、二进制缓存与检索语义兼容。
+> **版本**：对应 v0.8.1（2026-10-07）。v0.8.1 变更：读优先架构（后台刷新不等锁）、自动摄取完整闭环（auto_watch 与 size 上限门禁）、跨库 chunk 寻址 fail-closed 加固、compact 极简投影与整条 chunk 预算、物理行号越界诊断与源码级 heading 章节读取。
 >
-> ⚠️ **数据目录与包名迁移说明（v0.7.1+）**：Python 包目录已完成换名 `mortis_rag_mcp`，数据根目录为 `~/.mortis_rag_mcp`（缓存 `~/.mortis_rag_mcp_cache`）与环境变量 `MORTIS_RAG_*`，保持对旧路径 `~/.vault_mcp*` 与 `VAULT_MCP_*` 的零破坏原子迁移与只读回退支持。
+> ⚠️ **数据目录与包名迁移说明（v0.7.1+）**：Python 包目录为 `mortis_rag_mcp`（历史包名 `vault_mcp` 保持只读兼容别名），数据根目录为 `~/.mortis_rag_mcp`（缓存 `~/.mortis_rag_mcp_cache`）与环境变量 `MORTIS_RAG_*`，保持对旧路径 `~/.vault_mcp*` 与 `VAULT_MCP_*` 的零破坏原子迁移与只读回退支持。
 > **读者**：任何要查阅、二次开发或改进本项目的开发者。读完本文应能：理解项目全貌与每个模块的职责、独立搭建开发环境、按本文的 how-to 完成常见改动、知道改动会牵动哪些缓存/测试/文档。
 > **相关文档**：用户向导见 [README.md](../README.md)（中文主页） / [README_EN.md](../README_EN.md)；快速开始见 [QUICKSTART_user.md](../QUICKSTART_user.md)；版本变更见 [CHANGELOG_user.md](../CHANGELOG_user.md)；AI 调用技巧见 [skills/mortis-rag-mcp/SKILL.md](../skills/mortis-rag-mcp/SKILL.md)。
 
@@ -36,26 +36,29 @@
 
 ## 一、项目定位
 
-**Mortis'RAG MCP**（Python 包名仍为 `vault_mcp`，历史名 `vault-mcp`）是一个**面向 Obsidian 风格 Markdown 知识库的本地 RAG 检索服务**，以 **MCP（Model Context Protocol）over stdio** 的形式供 AI Agent（WorkBuddy / Codex / Claude Code / Trae 等）调用。
+**Mortis'RAG MCP**（Python 包名 `mortis_rag_mcp`，历史包名 `vault_mcp` 保持向后兼容别名）是一个**面向 Obsidian 风格 Markdown 知识库与纯文本 TXT 的本地 RAG 检索服务**，以 **MCP（Model Context Protocol）over stdio** 的形式供 AI Agent（WorkBuddy / Codex / Claude Code / Trae 等）调用。对于 PDF/Office 文档，支持经由可选摄取层（MinerU）解析为 Markdown 镜像存入 `.mortis-parsed/` 目录纳入检索。
 
-它解决的核心问题：让 AI 助手能对本地任意一个 Markdown 笔记夹做「语义 + 关键词」混合检索，拿到结构化的原文切片（chunk）并按需读原文——而不把笔记内容上传给任何第三方（embedding 可选外部 API，检索编排全部本地完成）。
+它解决的核心问题：让 AI 助手能对本地任意一个 Markdown/TXT 笔记夹做「语义 + 关键词」混合检索，拿到结构化的原文切片（chunk）并按需读原文——而不把笔记内容上传给任何第三方（embedding 可选外部 API，检索编排全部本地完成）。
 
 关键特性一览：
 
 |能力|说明|
 |-|-|
-|零硬编码路径|任意文件夹经 `kb_init` 注册为知识库，注册表持久化在 `~/.vault_mcp/vaults.toml`|
+|零硬编码路径|任意文件夹经 `kb_init` 注册为知识库，注册表持久化在 `~/.mortis_rag_mcp/vaults.toml`|
 |零运行时依赖|`dependencies = []`，纯 Python 标准库；numpy / sqlite-vec 为可选加速项|
 |三路混合检索|FTS5 BM25（trigram，中文可用）+ 向量余弦 + bigram 词法，RRF 融合（k=60）|
 |增量索引|文件 sha256 签名比对，只重切块/重嵌入变更文件；watcher 自动监听变更|
+|读优先与后台刷新|检索与读取优先返回当前可用索引切片，刷新在后台异步调度，前台零等锁阻塞|
 |分层磁盘缓存|文本层（chunks）与向量层独立失效：换 embedding 模型只重算向量，不重切块|
 |多库 fan-out|不传 `vault_path` 时跨全部注册库检索：query 只 embed 一次、合并统一 rerank|
+|紧凑投影与完整预算|支持 opt-in `compact` 极简四键投影；严格保持整条 chunk 预算，分组游标独立续页|
+|物理行号与源码章节|物理源文件实时扫描行号范围，越界精准诊断；按 headings 源码层级准确定位完整章节|
 |检索过滤/分页/去重|`path_prefix` / `tags` / `mtime` 区间 / `offset`+`limit` / 内容哈希去重|
 |隐私豁免|`.vaultignore` 通配符、frontmatter `rag: false`、`<!-- rag-ignore -->` 块注释|
 |换机迁移|`kb_export` / `kb_import` 把索引快照打包成 zip，导入后 0 次 embedding 调用|
 |Windows 原生监听|ctypes 直调 `ReadDirectoryChangesW`（overlapped I/O），失败自动退回轮询|
 
-**明确不做的事**：不做 LLM 生成式问答（`kb_read` 只返回原文）；不索引非 Markdown 文件；不提供网络服务（仅 stdio）；不做跨用户/跨进程的注册表并发协调（见第十三节）。
+**明确不做的事**：不做 LLM 生成式问答（`kb_read` 只返回原文）；非 Markdown/TXT 格式需先由摄取层转换为 Markdown（不直接索引原始二进制 PDF/Word）；不提供网络服务（仅 stdio）；跨进程注册表排他锁已支持（但避免多进程并发操作同一摄取队列）。
 
 ---
 
@@ -66,9 +69,9 @@
 |项|值|出处|
 |-|-|-|
 |语言|Python `>= 3.10`|`pyproject.toml`|
-|构建后端|`setuptools >= 68`（PEP 517，仅构建期需要，运行时为零依赖）|`pyproject.toml`|
+|构建后端|`setuptools >= 77`（PEP 517 / PEP 639，仅构建期需要，运行时为零依赖）|`pyproject.toml`|
 |包管理|pip + venv（推荐 editable 安装 `pip install -e .`）|README|
-|控制台入口|`mortis-rag-mcp` 与 `vault-mcp`（兼容别名）→ `vault_mcp.__main__:main`|`pyproject.toml`|
+|控制台入口|`mortis-rag-mcp` 与 `vault-mcp`（兼容别名）→ `mortis_rag_mcp.__main__:main`|`pyproject.toml`|
 |测试框架|pytest|`pyproject.toml`|
 
 ### 2.2 运行时依赖：零第三方
@@ -158,10 +161,12 @@
 ```
 客户端 → {"method":"tools/call","params":{"name":"kb_search","arguments":{...}}}
   → server.handle()          # JSON-RPC 分发
-    → server.call_tool()     # 参数防御解析（top_k 夹取、ISO 时间、bool 字符串容错）
+    → server.call_tool()     # 参数防御解析（top_k 夹取、compact、budget_bytes、group_offsets 校验）
       → _indexer_for()       # 解析 vault_path → 注册表校验 → 取/建 MarkdownIndexer
-        → indexer.sync()     # 先增量同步（sha256 签名比对，通常毫秒级跳过）
-        → indexer.search()   # 词法软分 → 向量召回 → RRF 融合 → 过滤 → 去重 → rerank
+        → 检查冷库状态（cold 且无可用缓存直接返回 status="indexing"/retry_after=3）
+        → request_refresh()  # 读优先：异步通知后台刷新，短锁置 dirty 即刻返回，前台零等锁阻塞
+        → indexer.search()   # 基于当前可用索引即时检索：词法 + 向量 + RRF 融合 + 过滤 + 去重 + rerank
+        → compact / budget   # 极简四键投影与整条 chunk 预算包装（分组跨库生成 group_next_offsets）
   → _text_content()          # 结果包成 {"content":[{"type":"text","text":json}]}
 ← {"jsonrpc":"2.0","id":...,"result":{...}}
 ```
@@ -272,7 +277,8 @@ embedding（static 哈希 / 外部 API，按文件并发）     ←—— 向量
 * **`_indexer/search.py`**：只读单库检索引擎 `SearchEngine`，集中承接 `_fts_query`、`_hybrid_rank` 三路 RRF 融合、`_semantic_rank` 向量召回、过滤、去重与 `rerank_chunks`。常驻 Chunk 对象的 `score` 严格不可变。
 * **`_indexer/snapshot.py`**：快照导出打包与校验恢复，内置 Zip Slip 绝对物理白名单拦截、解压炸弹与压缩比上限防御、SQLite 向量后端安全重开与回滚。
 * **`_indexer/exemptions.py`**：`.vaultignore` 规则与 frontmatter 豁免维护、移除死代码、联动极速剪枝 8 项内存与缓存状态、后台异步重对账。
-* **`_indexer/watch.py`**：Windows 原生目录监听 `WindowsDirectoryWatcher` 与轮询回退、常驻防抖调度线程（条件变量调度，避免 Timer 洪泛）、优雅停启与生命周期管理。
+* **`_indexer/watch.py`**：Windows 原生目录监听 `WindowsDirectoryWatcher` 与轮询回退、常驻防抖调度线程（条件变量调度，避免 Timer 洪泛）、`request_refresh` 读优先后台调度、`request_ingest_scan` 摄取事件合并扫描、优雅停启与生命周期管理。
+* **`_indexer/reading.py`**：物理源文件读取与章节定位核心模块（`ReadResult`、`scan_headings`、`read_file_result`），负责物理行数统计、`start_line` 越界阻断诊断、`start_char` 跨页续读、ATX/章节标题扫描与完整章节提取。
 
 #### 4.5.1 基础数据结构
 
@@ -464,6 +470,25 @@ query 为空 → 直接返回（过滤+分页后）的 chunk 列表
 * **免密端点 fail-closed**：`_is_local_endpoint()` 只认 `localhost` / `host.docker.internal` 白名单与**严格 IP 解析**后的环回地址，绝不做前缀模糊匹配——此前的 `startswith("127.")` 会把 `127.0.0.1.attacker.com` 这类**远端域名**判成本机，远端端点漏配 key 也被信任锚标 ✅，agent 据此跳过预检直到真实调用才撞 401。代价是 `127.1` / 十进制 `2130706433` 等花式 IP 写法不再免密（方向安全）。
 * **启动期不真导入**：`check_optional_deps()` 用 `find_spec` + 发行档案取版本号，不 `import numpy`——本函数跑在与 stdio 握手同期的后台线程，首次导入的数百毫秒会与握手抢 GIL，而它只为报告里一行版本号。
 
+### 4.11 `ingest/` 摄取模块（约 1400 行）—— PDF/Office 文档异步摄取与表格防护
+
+**职责**：面向 PDF/Word/PPT 等富文档的解析、表格原子防护与 Markdown 镜像生成，包含 `worker.py`、`mineru.py`、`tables.py`。
+* **`ingest/worker.py`（任务调度与状态机）**：
+  - `IngestManager`：单库维护一个管理实例，通过 `.ingest.lock` 文件排他锁防多进程竞争，双检锁保证单例；
+  - 任务生命周期：`queued` → `parsing` → `done` / `failed`。解析产物镜像写入库内 `.mortis-parsed/<source>.md`；
+  - `auto_seen` 持久化账本：在 `.mortis-parsed/.ingest_state.json` 记录已处理文件 sha256 签名、状态与最新 job_id，跨重启防重复上传；历史任务剪枝（>500 条）仅修剪 jobs 列表，永久保留 `auto_seen` 账本凭证；
+  - 统一尺寸上限策略：默认 `max_file_size_mb = 20`（0 为不限），对 manual submit、scan pending、auto watch、recovery 全入口统一双闸门拦截；
+  - 源文件防抖与变更校验：0 字节或正在写入的文件采样判稳延后；任务执行前比对源文件当前 sha256，不符时阻断上传并报错 `source_changed`；
+  - 完成回调解耦：`on_job_finished(source, changed)` 支持双参回调，通知后台线程唤醒即时索引刷新。
+* **`ingest/mineru.py`（MinerU 客户端）**：
+  - 标准库 `urllib` 实现 v4 高精端点与 Agent 免登端点；
+  - 预签名 PUT 上传显式传递 `headers={"Content-Type": ""}`，阻止 urllib 自动注入 `application/x-www-form-urlencoded` 导致阿里云 OSS 403 签名错误；
+  - 429 尊重 `Retry-After`，网络抖动退避重试，zip 解包防御与相对路径校验。
+* **`ingest/tables.py`（HTML 表格装箱与保护）**：
+  - `iter_table_blocks`：自动排除代码围栏与长代码块，识别完整 `<table>...</table>` 区间；
+  - 表格原子分块保护：小表转 Markdown pipe 表格，超长表格按 2*chunk_size 字符预算动态装箱并切片，杜绝跨表格切碎或破坏 HTML 闭合性；直出物理行号区间。
+* **离线兜底**：集成 PyMuPDF 离线解析兜底（仅针对 PDF 文件且显式 close() 释放句柄），云端异常或免登额度耗尽时保底可用。
+
 ---
 
 ## 五、核心流程
@@ -478,10 +503,11 @@ query 为空 → 直接返回（过滤+分页后）的 chunk 列表
   watcher 启动（native 或 poll）
 
 【日常检索】kb_search(query)
-  sync（sha256 对账，通常 0 文件变更，毫秒级）→ 三路 RRF → 过滤 → 去重 → rerank → top_k
+  冷库判定（cold 且无缓存 → status="indexing", retry_after=3）→ request_refresh（后台异步标记刷新，短锁置 dirty，前台零等锁阻塞）
+  → 基于现存可用索引执行 search → 三路 RRF → 过滤 → 去重 → rerank → compact/budget 包装
 
 【编辑笔记】Obsidian 保存
-  原生事件（毫秒级）/ 轮询发现（≤250ms）→ 防抖 0.5s → sync
+  原生事件（毫秒级）/ 轮询发现（≤250ms）→ 防抖 0.5s → 后台调度 sync（文本与摄取扫描双通道解耦）
   → 该文件签名变化 → 只重切块该文件 → 只补该文件缺向量的 chunk → 更新 FTS
 
 【换机迁移】kb_export → 拷 zip → 新机 kb_init → kb_import
@@ -497,20 +523,20 @@ query 为空 → 直接返回（过滤+分页后）的 chunk 列表
 
 |工具|参数|语义|
 |-|-|-|
-|`kb_init`|`path`(必), `name`?, `description`?|注册知识库：写注册表 → 后台建索引 → 启动监听。幂等保护：重复注册报 `already registered`|
-|`kb_init_solo`|`path`(必), `name`?|0.6.0 新增：注册/确保 solo 独立库（幂等三态）：未注册 → 注册为 solo 库；已注册普通库 → 原地转 solo（只改注册表布尔位，索引/缓存/watcher 不动）；已是 solo → 幂等确认。取消 solo 走 `kb_remove` + `kb_init`|
+|`kb_init`|`path`(必), `name`?, `description`?|注册知识库：写注册表 → 后台建索引 → 启动监听。支持 `vault_path`/`vault`/`vault_name` 别名。幂等保护：重复注册报 `already registered`|
+|`kb_init_solo`|`path`(必), `name`?|0.6.0 新增：注册/确保 solo 独立库（幂等三态，支持别名）：未注册 → 注册为 solo 库；已注册普通库 → 原地转 solo（只改注册表布尔位，索引/缓存/watcher 不动）；已是 solo → 幂等确认。取消 solo 走 `kb_remove` + `kb_init`|
 |`kb_remove`|`path`(必), `purge_cache`=false|0.6.0 更名（原 `kb_unregister`）：停监听 + 移除注册（不动文件夹本身）；`purge_cache=true` 连磁盘缓存一起删|
 |`kb_list`|无|0.6.0 更名（原 `kb_vaults`）：列注册表：name/path/weight/**solo**/exists/indexed/files/last_sync|
 |`kb_set_weight`|`vault_path`(必), `weight`(必, (0,100])|库级检索权重，fan-out 分数放大系数，持久化进注册表|
 |`kb_describe`|`vault_path`(必), `description`(必)|设置/更新知识库描述（一句话说明库装什么，供检索路由定向选库用）|
-|`kb_ingest`|`action`(必: submit/status/scan_pending), `source`?, `force`?, `vault_path`?|PDF/Office 异步解析摄取管理（MinerU 双通道 / 本地 PyMuPDF 兜底）|
+|`kb_ingest`|`action`(必: submit/status/scan_pending/pending/sources), `source`?, `sources`?, `force`?, `vault_path`?|PDF/Office 异步解析摄取管理（默认关闭，双闸门受 20MiB size 策略保护，MinerU 双通道 / 本地 PyMuPDF 兜底，带 `auto_seen` 账本去重）|
 |`kb_export`|`out_path`(必, 绝对路径+.zip), `vault_path`?, `overwrite`?|导出索引快照 zip；已存在须显式 `overwrite=true`|
 |`kb_import`|`snapshot`(必), `force`=false, `vault_path`?|从快照恢复；模型/维度/切块参数不符时拒绝，force 只导文本层并本地重嵌|
 |`kb_rebuild`|`vault_path`?|删缓存强制全量重建。**高危：全量重新 embedding，见 SKILL.md 限流警告**|
-|`kb_list_files`|`vault_path`?|0.6.0 更名（原 `kb_list`）：列已索引文件 `[{source,title,chunks}]`|
-|`kb_search`|`query`(必), `top_k`=10, `use_rerank`=true, `vault_path`?, `path_prefix`?, `tags`?, `mtime_after`?, `mtime_before`?, `offset`?, `limit`?, `group_by_vault`=false, `dedupe`=true, `budget_bytes`?, `exact_terms`?|核心检索；支持 budget_bytes 输出预算与 exact_terms 显式硬包含；fan-out 跳过 solo 库并在结果中列出|
-|`kb_read`|`source`? 或 `chunk_id`? (二选一), `expand_lines`=30, `heading`? / `start_line`?+`end_line`?, `vault_path`?|读原文（支持 Markdown 与 .txt；支持 chunk_id 原地展开与 [[双链短名]] 寻址；超 read_max_chars 字符截断并标 `truncated`）|
-|`kb_stats`|`vault_path`?|files/chunks/exempt_files/failed_files/last_sync/embedding/reranker/cache/use_hybrid/fts_enabled/vector_backend/accel|
+|`kb_list_files`|`vault_path`?, `path_prefix`?, `limit`?, `offset`?|列已索引文件列表，支持按目录前缀过滤与分页切片，返回 `total`, `files`, `next_offset`, `page_truncated`|
+|`kb_search`|`query`(必), `top_k`=10, `use_rerank`=true, `vault_path`?, `vault_paths`?, `path_prefix`?, `tags`?, `mtime_after`?, `mtime_before`?, `offset`?, `limit`?, `group_by_vault`=false, `dedupe`=true, `budget_bytes`?, `exact_terms`?, `compact`=false, `group_offsets`?|核心检索；读优先（不前台阻塞等锁）；支持 `compact=true` 极简四键投影；支持整条 chunk 字节预算控制，首条超限提供 hint，最小 envelope 溢出显式申报 `budget_exceeded`；分组跨库以 `group_next_offsets` 返回各组独立游标，并由 `group_offsets` 同路由无损续页|
+|`kb_read`|`source`? 或 `chunk_id`? (二选一), `expand_lines`=30, `heading`?, `start_line`?, `end_line`?, `start_char`=0, `vault_path`?|读原文（Markdown/TXT）；`start_line/end_line` 越界具名抛错并提示实际物理行数；长单行支持 `start_char` 跨页无损续读；`heading` 基于轻量级源码扫描包含完整子节，同名歧义 fail-closed；`chunk_id` 支持跨库 fail-closed 只读探测（solo 库隐私保密）；超 `read_max_chars` 截断并回显物理行游标|
+|`kb_stats`|`vault_path`?|files/chunks/exempt_files/failed_files/last_sync/embedding/reranker/cache/use_hybrid/fts_enabled/vector_backend/accel/refresh_status|
 |`kb_exempt`|`action`(必: list/add_pattern/remove_pattern/exempt_file/unexempt_file/check), `pattern`?, `source`?, `method`?(frontmatter\|ignore_file), `vault_path`?|私密/草稿内容豁免管理|
 
 **返回包裹**：所有结果经 `_text_content` 序列化为 `{"content":[{"type":"text","text":"<json字符串>"}]}`——即 text 内容本身是 JSON 字符串，客户端需二次解析（MCP 惯例）。
@@ -569,8 +595,19 @@ query 为空 → 直接返回（过滤+分页后）的 chunk 列表
 |`watch_method`|auto|auto / native / poll|
 |`watch_fallback_interval`|30.0|原生监听期间全量对账周期秒，<=0 关闭兜底|
 |`inject_image_captions`|false|图片 alt/图注注入。**开启 = chunk.content 变 → id 变 = 全库重嵌**|
+|`read_max_chars`|20000|kb_read 单次读取字符上限，[100, 1000000]|
 |`exclude_patterns` / `exclude_tags` / `exclude_frontmatter_keys`|见 4.1|排除规则（可逗号分隔字符串或数组）|
 |`ignore_file`|`.vaultignore`|vault 内的豁免规则文件名|
+
+### `[ingest]`
+
+|键|默认|说明|
+|-|-|-|
+|`enabled`|false|PDF/Office 摄取总开关（默认关闭；关闭时零云端外发）|
+|`auto_watch`|false|是否自动监听并解析新放置的文档（须 enabled=true 才真正生效；enabled=false 时 auto_watch=true 为合法无害不激活组合）|
+|`max_file_size_mb`|20|单文件尺寸上限（MiB，默认 20；0 表示不限），全入口双闸门拦截|
+|`api_key`|空|MinerU API Token（支持 `${ENV}` 插值）；空时走轻量 Agent 免登通道|
+|`model_version`|空|可选覆盖服务端解析模型版本|
 
 ### `[vector]`
 
@@ -581,7 +618,7 @@ query 为空 → 直接返回（过滤+分页后）的 chunk 列表
 |键|默认|说明|
 |-|-|-|
 |`enabled`|true（经 load_config）|缓存总开关（FTS 与快照也依赖它）|
-|`dir`|`~/.vault_mcp_cache`|缓存根目录|
+|`dir`|`~/.mortis_rag_mcp_cache`|缓存根目录（支持环境变量 `MORTIS_RAG_CACHE_DIR` 显式覆盖，短路改名逻辑）|
 |`embedding_max_workers`|6|并发 embedding 线程数，[1,32]；全量重建遇限流建议 ≤2|
 |`placement`|home|`home` 共享目录 / `vault` 各库内 `.mcp_cache/`（分发场景推荐）|
 |`subdir`|`.mcp_cache`|vault placement 的子目录名（自动加入排除规则，防自激）|
@@ -602,7 +639,7 @@ query 为空 → 直接返回（过滤+分页后）的 chunk 列表
 ├── STATUS.md                       # Agent 信任锚（doctor 自动生成，禁止手改）
 └── status.json                     # 机器可读全量状态报告
 
-~/.mortis_rag_mcp_cache/                 # 默认缓存根（旧名 ~/.vault_mcp_cache 独占时原子迁移）
+~/.mortis_rag_mcp_cache/                 # 默认缓存根（亦可通过 MORTIS_RAG_CACHE_DIR 覆盖）
 └── <namespace>/                    # 默认 "default"
     ├── chunks/
     │   └── vault_<key>.chunks.bin          # 文本层：签名 + 无向量 chunk（VMCPC v1, zlib）
@@ -614,6 +651,11 @@ query 为空 → 直接返回（过滤+分页后）的 chunk 列表
     └── vault_<key>.failed.json             # 失败文件名单（可观测性）
 
 <vault>/.mcp_cache/                 # placement=vault 时的缓存根（同样按 namespace 分层）
+<vault>/.mortis-parsed/             # 摄取层解析输出目录（PDF/Office 生成的 Markdown 镜像）
+├── <source>.md                     # 转换后 Markdown 正文
+├── <source>_assets/                # 提取的图片与表格素材
+├── .ingest.lock                    # 跨进程任务锁
+└── .ingest_state.json              # 任务状态持久化账本（含 auto_seen 去重记录，非 chunk 缓存）
 <vault>/.vaultignore                # vault 级豁免规则（gitignore 风格）
 ```
 
@@ -623,7 +665,7 @@ query 为空 → 直接返回（过滤+分页后）的 chunk 列表
 - 新目录名 `~/.mortis_rag_mcp/` / `~/.mortis_rag_mcp_cache/` 优先；
 - 仅当旧目录独占存在时尝试原子的 `os.rename` 迁移；
 - 遇到任何 `OSError`（如文件锁占用、跨卷），严格原地安全回退读旧目录，绝不使用 `shutil.move`，严防目录分裂与数据丢失；
-- 环境变量优先级：`MORTIS_RAG_API_KEY` > `VAULT_MCP_API_KEY`；`MORTIS_RAG_CONFIG` > `VAULT_MCP_CONFIG`；`MORTIS_RAG_REGISTRY` > `VAULT_MCP_REGISTRY`。
+- 环境变量优先级：`MORTIS_RAG_API_KEY` > `VAULT_MCP_API_KEY`；`MORTIS_RAG_CONFIG` > `VAULT_MCP_CONFIG`；`MORTIS_RAG_REGISTRY` > `VAULT_MCP_REGISTRY`；`MORTIS_RAG_CACHE_DIR` > `VAULT_MCP_CACHE_DIR`。
 
 **两条已知边界（排障时先看这里）**：
 - **新目录先存在时只搬注册表**：若 `~/.mortis_rag_mcp/` 已被预先创建（例如照文档把 `config.toml` 直接放进去），`user_config_dir()` 的整目录 rename 不会触发，`registry_path()` 只做单文件迁移 `vaults.toml`。此时旧的 `~/.vault_mcp/config.toml` 会留在原地——**当前仍能被 `resolve_config_path()` 的旧名回退读到，不会失效**，但两处配置并存会分裂。判断依据：`config.toml` 究竟在哪一侧。
@@ -640,22 +682,24 @@ query 为空 → 直接返回（过滤+分页后）的 chunk 列表
 |`vault-startup`|服务级 1 个|启动时串行预索引全部注册库（同步线程，绝不开 N 路 embedding 风暴）|
 |`vault-init`|按需|`kb_init` 触发的后台首次 sync|
 |`fsnotify-watcher`|每库 1|阻塞在 Win32 内核等目录事件（原生监听时）|
-|`vault-fs-debounce`|每库 1|常驻防抖调度（条件变量等待，有事件才醒）|
+|`vault-fs-debounce`|每库 1|常驻防抖调度（条件变量等待，有事件或刷新请求才醒，并在锁外执行 sync）|
 |`vault-watch-native`|每库 1|原生监听的 30s 对账兜底 + watcher 存活监视；死亡则原地降级为轮询循环|
+|`vault-ingest-scan`|每库至多 1|按需守护线程，合并高频摄取扫描事件，独立于文本同步|
 |（轮询线程）|每库 1|`poll` 模式下的 0.25s 轮询（无名守护线程）|
 |`vault-emb-*`|≤ embedding_max_workers|全量重建时并发 embedding（ThreadPoolExecutor）|
-|stdio 主线程|1|读 stdin、分发工具调用（search/sync 都在这里跑）|
+|stdio 主线程|1|读 stdin、分发工具调用（search/read 都在这里跑，读优先不前台等锁）|
 
 **锁一览**：
 
 |锁|保护对象|要点|
 |-|-|-|
-|`indexer._sync_lock`|整个 sync / 快照导出导入|最重的一把锁（大库 sync 分钟级）。**读路径（all_chunks/search）刻意不等它**，用乐观快照容忍并发修改|
+|`indexer._sync_lock`|整个 sync / 快照导出导入|最重的一把锁（大库 sync 分钟级）。**读路径（all_chunks/search/read）刻意不等它**，读现存索引，后台异步 refresh|
 |`indexer._cache_lock`|缓存文件写入|锁序：必须 `_sync_lock → _cache_lock`（kb_import 曾因反向嵌套死锁全服务）|
 |`server._indexers_lock`|indexer 字典|双检锁防重复创建 indexer/watcher 泄漏|
 |`registry._lock` + `_process_file_lock`|注册表读改写|进程内 RLock + 跨进程文件建议锁（Windows `msvcrt.locking` / POSIX `fcntl.flock`，线程级可重入、独占锁文件 `vaults.toml.lock`）|
 |`FtsIndex._lock` / `SqliteVecBackend._lock`|sqlite 连接|连接以 `check_same_thread=False` 共享，操作必须串行|
-|`indexer._fs_debounce_cv`|防抖状态|事件线程 set+notify，调度线程 wait+判断|
+|`indexer._fs_debounce_cv` / `_fs_scheduler_start_lock`|刷新与防抖调度|短条件锁保护 dirty 与调度线程引用；**条件锁绝不跨越 sync 或网络调用**|
+|`IngestManager._lock` + `.ingest.lock`|摄取状态与队列|双检锁 + 跨进程文件排他锁，保护 jobs 与 auto_seen 原子写入|
 
 **刻意的设计取舍**：`all_chunks()` 不加锁——`sync()` 会持 `_sync_lock` 跑完整轮索引，若读路径也等这把锁，一次全量重建会阻塞所有搜索。改为乐观快照（`dict.get` 容忍并发 pop + `RuntimeError` 退避重试 4 次），配合「搜索前先 sync」的调用顺序，实际竞争窗口极小。
 
@@ -672,6 +716,7 @@ MCP 工具的参数可能被提示注入的 LLM 操控，项目按「零信任�
 5. **HTTP 提供方**：`Retry-After` 只认有限数字（防 `sleep(inf)` 挂死）；响应条数/索引严格校验（防向量错位静默污染）。
 6. **注册表序列化**：所有字符串 `json.dumps` 转义（防 LLM 控制的 name 破坏 TOML 结构后被静默清库）。
 7. **数值夹取**：top_k/limit/weight/重试次数等一律上限夹取（防 `10**9` 打爆 KNN 堆或 `max_retries=1000` 挂死服务）。
+8. **文档摄取双闸门防御**：摄取层默认关闭（`enabled=False`，防止未经用户确认外发文档）；开启后受 `max_file_size_mb`（默认 20MiB）前置大小校验与运行时二次校验双重防护；路径穿越、符号链接越界或 `.vaultignore` 规则命中时严格跳过，绝不上传至任何云端。
 
 明确的非目标：不做 MCP 认证（stdio 本地信任模型）、不做笔记内容的加密（注：跨进程注册表并发修改已于 2026-09-04 闭环支持）。
 
@@ -680,30 +725,29 @@ MCP 工具的参数可能被提示注入的 LLM 操控，项目按「零信任�
 ## 十一、测试体系
 
 ```
-tests/（50 个文件，约 11570 行；python -m pytest -q 全量回归由 CI 承接，本地按靶向文件单跑）
-├── conftest.py               # pytest 全局钩子：sessionfinish 记录测试成绩入 STATUS.md（解耦 overall）
+tests/（56 个测试文件；python -m pytest -q 全量回归由 CI 承接，本地按靶向文件单跑，需指定 UTF-8 编码环境）
+├── conftest.py               # pytest 全局钩子：session 级真实配置隔离 + function 级独立缓存根 + 禁用外部状态写入
 ├── test_doctor.py            # doctor 模块探活、离线容错、状态防假、静默生成单测
 ├── test_path_migration.py    # 路径与配置无损原子迁移（~/.vault_mcp* -> ~/.mortis_rag_mcp*）
 ├── test_indexer.py          # 切块/frontmatter/豁免/增删改/重命名/Unicode 路径
 ├── test_cache.py            # 双层缓存：失效、复用、换模型只重算向量
 ├── test_improvements.py     # Fast-Stat 对账、围栏保护、只读打分、跨进程锁、短缩写词法提权
 ├── test_providers.py        # 重试退避序列、批切分、响应校验、Retry-After
-├── test_mcp_stdio.py        # stdio 协议集成（经 VAULT_MCP_REGISTRY 隔离）
+├── test_mcp_stdio.py        # stdio 协议集成（经 MORTIS_RAG_REGISTRY 隔离）
 ├── test_multivault.py       # 多库 fan-out、权重、分组
-├── test_solo_vault.py       # 0.6.0：solo 三态、fan-out 排除+excluded_solo、单库拒绝、remove+init 取消
-├── test_registry*.py        # 注册表单元 + stdio 集成（solo 字段 roundtrip/容错/set_solo）
-├── test_hybrid.py           # 三路 RRF、2 字中文兜底、降级
-├── test_vector_backend.py   # memory/sqlite_vec 后端、迁移、RAM 释放
-├── test_search_filters.py   # path_prefix/tags/mtime/分页
-├── test_dedup.py            # 内容哈希去重（embedding 与结果级）
-├── test_failed_files.py     # 失败名单持久化与清除
-├── test_fsnotify.py         # parse_notify_buffer 纯函数 + watcher 生命周期
-├── test_watch_integration.py# 监听→防抖→sync 集成
-├── test_snapshot.py         # 快照导出/导入/校验/force
-├── test_image_notes.py      # 图片注入
-├── test_concurrency_hardening.py / test_hardening_regressions.py
-│                            # 0.5.0 硬化的回归测试（死锁、双检锁、无界输入等）
-├── test_exempt.py / test_subvaults.py
+├── test_solo_vault.py       # solo 三态、fan-out 排除+excluded_solo、单库拒绝、remove+init 取消
+├── test_compact_search.py   # C67 compact 极简四键投影、payload 缩减与回读集成
+├── test_budget_bytes.py     # C68 完整 chunk 预算、最小 envelope 溢出与分组独立游标
+├── test_read_ranges.py      # C69a 物理行号统计、越界诊断阻断、长单行 start_char 续读
+├── test_read_heading.py     # C69b 源码级 headings 扫描与完整章节提取、歧义 fail-closed
+├── test_read_stale.py       # C66 读优先后台刷新、Event 阻塞前台秒级返回、stale 签名拦截
+├── test_ingest_auto.py      # C58a-d 自动摄取配置、20MiB size 闸门、auto_seen 账本、判稳防抖
+├── test_watch_integration.py# C58c/C61 监听双通道分类、摄取事件合并与独立调度
+├── test_isolation_guard.py  # C54 测试隔离守卫（零污染宿主配置/注册表/缓存）
+├── test_facade_freeze.py    # Facade 导出面冻结与子模块反向导入防御
+├── test_cache_codec_roundtrip.py # 二进制协议 VMCPC/VMCPV 往返兼容性
+├── test_version_sync.py     # 单一版本真源同步校验
+└── ...（更多包含 test_search_filters, test_dedup, test_failed_files, test_fsnotify, test_snapshot 等 56 个测试文件）
 ```
 
 约定与技巧：
@@ -837,6 +881,33 @@ python -m pytest -q                       # 应全绿
 ## 十五、版本变更详录
 
 > 本节按版本记录每次 commit 的代码逻辑与技术框架更改（用户可感知的功能增减见外部 CHANGELOG.md，按项目规范两者详略互补）。新版本倒序追加在顶部，每条必须标注 editor：提交人 GitHub 账户名 + 执行 agent（无 agent 则省略）。
+
+### v0.8.1（2026-10-07）—— 读优先后台刷新 + 自动摄取闭环 + 紧凑投影与完整预算 + 物理行号与源码章节
+
+#### editor:moton16,Antigravity
+
+**背景与动机**：
+经过三轮深入对抗审查与代码加固，针对用户反馈的高频卡顿、长文本行号错位、预算截断破碎 chunk 以及文档自动解析需求，实施全链路 13 项特性加固：
+1. **读优先与后台刷新（C66）**：前台搜索/读取不再同步等待 `_sync_lock`，读现存可用索引切片；后台通过 `request_refresh` 条件锁置 dirty 异步调度；冷库显式返回 `status="indexing"` 与 `retry_after`。
+2. **跨库寻址 fail-closed（C65/C56/C64）**：`kb_read(chunk_id=...)` 跨库只读探测；未探全且命中不足 2 个时显式返回 `incomplete`，不谎报唯一；solo 库隐私保密只列库名。
+3. **自动摄取完整闭环（C58a-d/C61）**：引入 `auto_watch`（默认关闭）与 20MiB 统一 size 门禁（全入口双闸门拦截）；`.ingest_state.json` 引入 `auto_seen` 账本防止任务修剪后重复上传；按需单扫描守护线程 `vault-ingest-scan` 与文本同步解耦，支持 0 字节与动态写判稳防抖。
+4. **compact 极简四键投影（C67）**：新增 `compact=true`（`source`, `heading`, `lines`, `snippet`），排除 `id`/`score`/`metadata` 等，实测 payload 显著缩减。
+5. **完整 chunk 预算与分组独立续页（C68）**：废除一切二分截断正文破坏 chunk 原子性的逻辑，严格保持整条 chunk；首条放不下返回空 envelope 与 hint；元数据溢出显式声明 `budget_exceeded` 与 `minimum_budget_bytes`；分组跨库以 `group_next_offsets` 字典返回各组独立游标，并由 `group_offsets` 同路由无损续页。
+6. **物理行号越界诊断与源码级章节（C69a/C69b）**：`_indexer/reading.py` 单次快照读取物理行数，`start_line` 越界具名抛错并提示 actual 物理行数；超长单行支持 `start_char` 跨页无损续读；`heading` 基于轻量级源码扫描包含完整子节，同名歧义 fail-closed 报错并引导行号。
+7. **Windows 升级写锁排查指南（C59）**：系统性梳理 Windows 下 console 入口 exe 占用与热更新机制，提供只读 PowerShell 进程定位与安全升级步骤。
+
+**代码逻辑与模块变更**：
+- `mortis_rag_mcp/_indexer/reading.py`：新增物理读取与章节定位模块，支持 `ReadResult`、`scan_headings`、`read_file_result`；
+- `mortis_rag_mcp/_indexer/watch.py` & `indexer.py`：实现 `request_refresh`、`refresh_status`、`request_ingest_scan`、双检锁调度与双通道事件分类；
+- `mortis_rag_mcp/ingest/worker.py`：实现 20MiB size 闸门、`auto_seen` 账本持久化与防抖判稳；
+- `mortis_rag_mcp/_server/fanout.py` & `search_dispatch.py`：实现 `compact` 投影、整条 chunk 预算二分搜索与 `group_offsets` 字典游标校验；
+- `mortis_rag_mcp/server.py`：各工具 schema 扩充（`compact`, `start_char`, `group_offsets`），冷库状态机，跨库探测 fail-closed，A4 双参回调；
+- `mortis_rag_mcp/diaglog.py`：版本号单一真源收敛至 `mortis_rag_mcp.__version__`。
+
+**测试与验证**：
+- 靶向全真单测扩充至 56 个测试文件，覆盖率与稳定性 100% 通过；
+- 离线检索评测 golden queries 维持 Hit@5 100.0% / MRR@5 1.000 零回退；
+- 严格遵循 UTF-8 编码环境与测试宿主隔离规范（MORTIS_RAG_CONFIG / MORTIS_RAG_REGISTRY / MORTIS_RAG_CACHE_DIR）。
 
 ### v0.7.1（2026-09-17）—— Agent 信任锚 + 用户数据无损原子迁移 + 放行前终审修复
 

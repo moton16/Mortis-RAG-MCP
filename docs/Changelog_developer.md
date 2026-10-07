@@ -461,7 +461,64 @@
 > - `docs/Docs_Folder-descriptions.md`：补一行「例外」说明，避免既有的「版本文件夹应显式 ignore」口径与新的入库现状互相矛盾（该文件本身也在白名单内、随仓库分发）。
 >
 > **验证**：`git check-ignore -v docs/v0.8.1/*.md` 退出码 **1**（未忽略，符合预期）；`git status` 中 `docs/v0.8.1/` 由「被忽略」变为「未跟踪可见」；`docs/` 根目录仍只有 5 个主文档 + 版本子目录。
-> **记账欠账（如实登记）**：本轮 Lane E/A/B/C 的技术卡条目（`C53`、`C54`+P0、`C63`、`C55`、`C56`、`C57`+`C62`、`C64`）**尚未补写**，将另行一次性批量追加；Lane D（A4/C58/C61/C59）的条目随其提交一并写。
+> **技术账追溯登记**：本轮 Lane E/A/B/C 的技术卡条目（`C53`、`C54`+P0、`C63`、`C55`、`C56`、`C57`+`C62`、`C64`）已于 C70 集中补写如下。
+
+### C53 — moton16,2026-09-29,moton16 — fix(ingest): MinerU 预签名 PUT 显式置空 Content-Type（issue #1）
+> **代码改动概况**：
+> - `mortis_rag_mcp/ingest/mineru.py`：
+>   - 根因分析：urllib 的 `AbstractHTTPHandler.do_request_` 在「有 data 且 `has_header('Content-type')` 为假」时会自动注入 `application/x-www-form-urlencoded`；阿里云 OSS V1 预签名把 `CONTENT-TYPE` 计入 `StringToSign`，服务端按实际收到的请求头校验签名导致 `403 SignatureDoesNotMatch`，造成开启摄取的文档全部上传失败；
+>   - 修复方案：`_put_upload` 显式传递 `headers={"Content-Type": ""}`（`Request.add_header` 会将其规整为 `Content-type`，命中 `do_request_` 的判据从而阻止自动注入），统一修复 v4 与 Agent 免登两通道共用上传路径；
+> - `tests/test_ingest_mineru.py`：
+>   - 新增本机回环 `http.server` 回归测试，断言服务端实际接收到的 `Content-Type` 为置空状态，且 `Request.has_header("Content-type")` 为 True。
+>
+> **验证**：
+> - 专项测试（19 passed）：`.\.venv\Scripts\python.exe -m pytest tests/test_ingest_mineru.py tests/test_version_sync.py -q`
+> - 实机验证状态：待实机验证（测试机无云端付费 Token，真机需用户授权执行，按 E1 降级形态如实记录）。
+
+### C54 — moton16,2026-09-29,moton16 — test(isolation): 测试宿主隔离三件套 + P0 flaky 消除 + 隔离守卫（C54 / P0）
+> **代码改动概况**：
+> - `tests/conftest.py`：
+>   - C54a 配置隔离：session 级 autouse fixture 在临时目录创建真实 `app.toml`，将 `MORTIS_RAG_CONFIG` 钉住，并清理宿主环境变量；
+>   - C54b 缓存根覆盖：function 级 autouse fixture 为每个单测生成独立缓存目录，杜绝污染宿主真实 `~/.mortis_rag_mcp_cache`；
+>   - conftest 的 `pytest_sessionfinish` 守卫：设置 `MORTIS_RAG_NO_STATUS_HOOK=1`，防止单测写入宿主 `STATUS.md`；
+> - `mortis_rag_mcp/config.py`：
+>   - `resolve_default_cache_dir()` 支持 `MORTIS_RAG_CACHE_DIR` 覆盖，并短路在改名逻辑之前，防止测试移动宿主旧缓存目录；
+> - `tests/test_adversarial_v070.py` & `tests/test_improvements.py`：
+>   - 为单测补充独立 per-test 注册表文件，消除跨用例泄漏与并发竞争（P0 flaky 修复）；
+> - `tests/test_isolation_guard.py`：
+>   - 新增隔离守卫测试，断言单测运行前后宿主真实缓存目录文件数零增长。
+>
+> **验证**：
+> - 专项测试（47 passed）：`.\.venv\Scripts\python.exe -m pytest tests/test_isolation_guard.py tests/test_path_migration.py tests/test_doctor.py -q`
+
+### C63 — moton16,2026-09-29,moton16 — fix(diaglog): 版本号去硬编码，收敛到包顶层单一真源（C63）
+> **代码改动概况**：
+> - `mortis_rag_mcp/__init__.py`：
+>   - 新增 `__version__ = "0.8.0"`（定义在包顶层，发版单一真源）；
+> - `mortis_rag_mcp/server.py` & `mortis_rag_mcp/diaglog.py`：
+>   - 消除硬编码版本号，`SERVER_INFO["version"]` 与 `diaglog` 默认兜底值统一引用 `mortis_rag_mcp.__version__`；
+> - `tests/test_version_sync.py`：
+>   - 新增版本真源同步校验测试。
+>
+> **验证**：
+> - 专项测试（16 passed）：`.\.venv\Scripts\python.exe -m pytest tests/test_diaglog.py tests/test_version_sync.py -q`
+
+### [C55, C56, C57+C62, C64] — moton16,2026-09-29,moton16 — feat(server,indexer): kb_read 跨库 chunk_id 寻址 + kb_list_files 分页/前缀 + 别名与行数订正
+> **代码改动概况**：
+> - **C55（参数别名）**：`kb_init` / `kb_init_solo` 支持 `vault_path` / `vault` / `vault_name` 别名，对齐既有 handler 口径，不改 schema 属性以守住体积门禁；
+> - **C56（跨库 chunk_id 寻址）**：
+>   - 未传库标识时遍历全部注册库进行只读探测；
+>   - 单命中自动展开并附加 `vault` 归属（solo 库仅输出库名与 `solo: true` 保护隐私）；多命中 fail-closed 报错并列出候选库；未完全探测时不谎报文件修改；
+> - **C57+C62（kb_list_files 分页与过滤）**：
+>   - 新增 `limit`, `offset`, `path_prefix` 参数；返回 `total`（过滤后、切片前条目数）、`next_offset` 与 `page_truncated`（与字节预算 truncated 区分）；
+>   - 抽象通用纯函数 `path_prefix_match`，统一 kb_search 与 kb_list_files 前缀口径；
+> - **C64（探测代价量测与上限防御）**：
+>   - 实测 10 库 60 文件开销（82ms / 619KiB）；设定先到先停双上限：`_PROBE_MAX_UNLOADED_VAULTS=32` 与 `_PROBE_BUDGET_SECONDS=2.0`。
+>
+> **验证**：
+> - 专项测试（82 passed）：`.\.venv\Scripts\python.exe -m pytest tests/test_kb_read_chunkid.py tests/test_mcp_stdio.py tests/test_scoped_search.py tests/test_solo_vault.py -q`
+
+
 
 ### C65 — moton16,2026-10-05,Antigravity,Gemini 3.8 Flash — fix(read): fail closed on incomplete chunk probes
 

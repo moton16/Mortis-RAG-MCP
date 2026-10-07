@@ -14,26 +14,27 @@
 
 ## 一、未排期缺陷与加固（截至 v0.8.1 开工）
 
-- [ ] **1. `_save_state` 剪枝会丢旧失败记录**
+- [x] **1. `_save_state` 剪枝会丢旧失败记录**
   - 问题：单库累计 job 超过 500 条时按时间剪枝，较早的 `failed` 记录被删除，「按 `submitted_at` 取最新状态」的判据在极端情况下失真。
   - 证据：`mortis_rag_mcp/ingest/worker.py::_save_state`。
-  - 现状：v0.8.1 的自动摄取判据走独立函数按 `submitted_at` 绕开该缺陷，本体未修。
-  - 验收：构造 >500 条历史 job 的单测，断言「最新状态」仍可解析。
+  - 落地：落地于 v0.8.1 (commit 0150bac C58b)——引入独立 `auto_seen` 账本持久化在 `.mortis-parsed/.ingest_state.json`，修剪 jobs 列表时不修剪 `auto_seen` 凭证，彻底解决已失败任务因历史修剪被重复上传的问题。
+  - 验收：构造 >500 条历史 job 的单测通过（`tests/test_ingest_auto.py::test_auto_submit_dedupe_survives_500_job_pruning`）。
 
 - [ ] **2. `list_files()` 先构造全量列表再切片**
   - 问题：`kb_list_files` 的分页发生在全量构造之后，超大库（数万文件）单次调用仍要付全量内存与延迟。
   - 证据：`mortis_rag_mcp/indexer.py::list_files`（返回 `{source,title,chunks}` 摘要列表）。
+  - 现状：v0.8.1（C57/C62）已为 `kb_list_files` 增加了 `limit/offset/path_prefix` 参数与 `page_truncated` 游标；但底层仍是先构造全量列表再切片，无限深页流式早停延后至后续专项。
   - 验收：为「只取前 N 条」加早停路径，并用大库夹具量测前后耗时。
 
 - [ ] **3. FTS 在「只读探测」路径上可能写盘**
   - 问题：以只读探测为目的构造 `MarkdownIndexer(...)` 时，FTS sqlite 文件仍会被打开/回填。
   - 证据：`mortis_rag_mcp/indexer.py::_init_cache_paths` → `_fts_ensure_populated`。
-  - 现状：v0.8.1 的跨库 `chunk_id` 探测加 `load_vectors=False` 只省掉向量层；文本层与 FTS 仍在。
+  - 现状：v0.8.1（C65）为跨库探测增加了 `load_vectors=False` 规避向量层开销，并在探测结束后统一切断连接；但文本层与 FTS 构造可能写派生数据仍为已知残余，未在此次重构为完全严格只读。
   - 验收：只读探测不产生新的 sqlite 写入（断言文件尺寸/mtime 不变）。
 
 - [ ] **4. 多平台 watcher**
   - 问题：`mortis_rag_mcp/fsnotify.py` 只有 win32（`ReadDirectoryChangesW`）实现，非 Windows 恒不可用并回落 `poll`。
-  - 待办：Linux inotify / macOS FSEvents 后端；或至少在 `doctor` 里把「本机只能用 poll」显式说清。
+  - 现状：v0.8.1（C58c/C61）锁定了 poll 模式下的 effective cadence（30s 兜底节拍）与摄取事件合并；非 Windows 原生后端（Linux inotify / macOS FSEvents）延后。
   - 验收：平台条件跳过也要有实现与文档口径，且 poll 下的自动摄取节拍有测试锁定。
 
 ## 二、DX / 工程化候选（无承诺，按需认领）
@@ -45,7 +46,7 @@
 
 ## 三、已上报但未顺手修的口径残留
 
-- [ ] **9. `PROJECT_GUIDE.md` §2.3 关于 numpy 的注记已过期**：`accel` extra 已在 v0.8.0 落地，注记仍称「numpy 连 optional-dependencies 都没声明」。
+- [x] **9. `PROJECT_GUIDE.md` §2.3 关于 numpy 的注记已过期**：`accel` extra 已在 v0.8.0 落地，已于 v0.8.1 C70.1 彻底清理注记口径。
 - [ ] **10. `Quick-start_developer.md` §7 的 `SAFE_DELETE_FAIL_CLOSED` 描述与代码不符**：全库 `*.py` grep 零命中该字符串，`purge_cache` / `rebuild` 走 `Path.unlink()`；`tests/test_subvaults.py` 的 rebuild「已知环境红」真实成因待独立排查。
 
 ---

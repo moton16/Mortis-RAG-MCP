@@ -194,12 +194,13 @@ stdin 一行 JSON → handle() → method=="tools/call"
 ## 7. 测试
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest tests/ -q     # 全量（约 80s）
+# 设置 UTF-8 编码环境后运行靶向测试
+$env:PYTHONUTF8='1'; $env:PYTHONIOENCODING='utf-8'
+.\.venv\Scripts\python.exe -m pytest tests/test_compact_search.py tests/test_read_heading.py -q
 ```
 
-- 49 个测试文件：切块/缓存/多库/子库/豁免/去重/快照/solo/混合检索/过滤器/并发硬化/监听……
-- **约定**：不碰真实网络（embedding 用 `static` 模式或 monkeypatch）；临时库一律 `tmp_path`；
-  Windows 与 Unicode 路径已有专项用例，新功能涉及路径必须补。
+- 56 个测试文件（单机推荐按模块靶向运行；CI 全量矩阵覆盖 Ubuntu 3.10–3.13 与 Windows 3.12）：切块/缓存/多库/紧凑投影/预算/物理读取/章节定位/自动摄取/防抖监听/宿主隔离/快照等。
+- **约定**：不碰真实网络（embedding 用 `static` 模式或注入 FakeProvider）；临时库一律 `tmp_path`；测试注册表与配置经 `MORTIS_RAG_CONFIG` / `MORTIS_RAG_REGISTRY` 严格隔离，绝不污染宿主真实环境。
 - 已知 Windows 平台坑：`kb_rebuild` 删 FTS 缓存走系统回收站，trash 失败会
   `SAFE_DELETE_FAIL_CLOSED`（`test_subvaults.py::test_stdio_kb_rebuild_returns_stats`
   在部分 Windows 环境因此红）——修它是件独立任务，别顺手带在别的 commit 里。
