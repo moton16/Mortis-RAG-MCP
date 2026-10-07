@@ -12,32 +12,13 @@
 from __future__ import annotations
 
 import json
-import os
-from pathlib import Path
-import subprocess
-import sys
+
 import pytest
 
 from mortis_rag_mcp.indexer import Chunk, MarkdownIndexer
 from mortis_rag_mcp.server import VaultMcpServer
 from mortis_rag_mcp._server.fanout import _measure_payload_bytes
 from mortis_rag_mcp._server.search_dispatch import _parse_budget_bytes
-
-
-def _run_stdio(config: Path, requests: list[dict]) -> list[dict]:
-    payload = "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in requests)
-    proc = subprocess.run(
-        [sys.executable, "-m", "mortis_rag_mcp", "--serve-mcp-stdio", "--app-config", str(config)],
-        input=payload,
-        text=True,
-        capture_output=True,
-        check=False,
-        encoding="utf-8",
-        env={**os.environ, "VAULT_MCP_REGISTRY": str(config.parent / "vaults.toml")},
-    )
-    assert proc.returncode == 0, proc.stderr
-    assert not proc.stderr, proc.stderr
-    return [json.loads(line) for line in proc.stdout.splitlines() if line]
 
 
 def _kb_init_ready(server: VaultMcpServer, path, name: str) -> None:
@@ -372,57 +353,41 @@ def test_budget_bytes_fanout_grouped(tmp_path, monkeypatch):
     assert not (ids1 & ids2)
 
 
-def test_budget_bytes_stdio_integration(budget_vault, tmp_path):
+def test_budget_bytes_stdio_integration(budget_vault, tmp_path, stdio_polling):
     """断言经 stdio 真实命令行调用时，budget_bytes 严格生效且 stderr 为空。"""
     config_path = tmp_path / "app.toml"
     config_path.write_text('mode = "static"\n', encoding="utf-8")
 
-    # C66：kb_search 不再阻塞等待首建（读优先）。stdio 子进程里没有可用参数让
-    # 首建同步完成，因此先用同一份配置在进程内建好缓存——子进程启动时直接加载
-    # 完整文本索引（_chunks_cache_loaded=True），检索结果与首建时序无关。
-    # 预热期间把注册表钉到本次 tmp_path：注册表默认落在真实用户目录
-    # （~/.mortis_rag_mcp/vaults.toml），直接 registry.add 会污染开发机。
-    saved_reg = {k: os.environ.get(k) for k in ("MORTIS_RAG_REGISTRY", "VAULT_MCP_REGISTRY")}
-    os.environ["MORTIS_RAG_REGISTRY"] = str(tmp_path / "warm_vaults.toml")
-    os.environ.pop("VAULT_MCP_REGISTRY", None)
-    try:
-        warm = VaultMcpServer(config_path)
-        try:
-            warm.registry.add(str(budget_vault), name="OS")
-            assert warm._indexer_for({"vault_path": "OS"}).sync(), "预热索引失败"
-        finally:
-            warm.shutdown()
-    finally:
-        for env_key, old_val in saved_reg.items():
-            if old_val is None:
-                os.environ.pop(env_key, None)
-            else:
-                os.environ[env_key] = old_val
+    # C66：kb_search 不再阻塞等待首建（读优先）。首建进行中时响应为
+    # status:"indexing"（冷启动）或带 indexing_in_progress（部分索引）；
+    # stdio 子进程没有可用参数让首建同步完成，故按真实客户端契约在一条交互式
+    # 会话里带真实间隔轮询到索引就绪，再断言预算行为。
+    registry = str(config_path.parent / "vaults.toml")
+    session = stdio_polling(
+        config_path,
+        prefix_requests=[
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {"name": "kb_init", "arguments": {"path": str(budget_vault), "name": "OS"}},
+            },
+        ],
+        poll_request={
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "params": {
+                "name": "kb_search",
+                "arguments": {"vault_path": "OS", "query": "操作系统", "top_k": 8, "budget_bytes": 1800},
+            },
+        },
+        is_settled=_is_search_settled,
+        env_overrides={"VAULT_MCP_REGISTRY": registry, "MORTIS_RAG_REGISTRY": registry},
+    )
 
-    # 首建完成判据仍按真实客户端契约轮询：刷新在飞时响应带 indexing_in_progress。
-    search_args = {"vault_path": "OS", "query": "操作系统", "top_k": 8, "budget_bytes": 1800}
-    search_ids = list(range(3, 3 + 50))
-    requests = [
-        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
-        {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "kb_init", "arguments": {"path": str(budget_vault), "name": "OS"}}},
-    ]
-    requests += [
-        {"jsonrpc": "2.0", "id": rid, "method": "tools/call", "params": {"name": "kb_search", "arguments": search_args}}
-        for rid in search_ids
-    ]
-
-    responses = _run_stdio(config_path, requests)
-    assert len(responses) == 2 + len(search_ids)
-    settled: list[dict] = []
-    for resp in responses:
-        if resp.get("id") not in search_ids:
-            continue
-        data = json.loads(resp["result"]["content"][0]["text"])
-        if _is_search_settled(data):
-            settled.append(data)
-    assert settled, "首建未在 stdio 重试窗口内完成"
-
-    search_resp = settled[-1]
+    search_resp = session["observed"][-1]
+    assert _is_search_settled(search_resp), f"首建未在轮询窗口内完成：{search_resp}"
     assert search_resp["truncated"] is True
     assert search_resp["returned"] >= 1
     assert _measure_payload_bytes(search_resp) <= 1800

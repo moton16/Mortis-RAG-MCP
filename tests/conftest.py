@@ -118,3 +118,122 @@ def pytest_sessionfinish(session, exitstatus):
         doctor.record_test_run(passed=passed, failed=failed, skipped=skipped, total_collected=total_collected)
     except Exception:
         pass
+
+
+# --------------------------------------------------------------------- stdio 助手
+# C66「优先使用已就绪索引、后台刷新」之后，kb_search 不再在前台阻塞等待首建：
+# 冷启动返回 status="indexing"，首建/刷新在飞时带 indexing_in_progress 并返回
+# 当前可见的部分结果，真实客户端按 retry_after 稍候重试。
+# 批式 stdio 会话（一次性喂完 stdin）表达不了「稍候重试」，且快速连发 N 条请求
+# 也等不到后台线程推进（实测 50 条连发仍在首建中）。这里提供交互式轮询会话：
+# 逐条发请求、逐条读应答、带真实间隔，直到判据成立或超时。
+
+_STDIO_POLL_INTERVAL = 0.15
+_STDIO_POLL_TIMEOUT = 60.0
+
+
+def run_stdio_polling(
+    config_path,
+    prefix_requests: list[dict],
+    poll_request: dict,
+    is_settled,
+    *,
+    followup_requests: list[dict] | None = None,
+    interval: float = _STDIO_POLL_INTERVAL,
+    timeout: float = _STDIO_POLL_TIMEOUT,
+    env_overrides: dict | None = None,
+) -> dict:
+    """在一条 stdio 会话里轮询 poll_request，直到 is_settled(data) 或超时。
+
+    返回 {"prefix": [原始响应...], "observed": [轮询响应体...], "followups": [原始响应...]}
+    —— prefix / followup 保留完整 JSON-RPC 包络（调用方常需检查 result.isError），
+    轮询部分只给已解析的响应体，最后一个即判据成立的那次。
+    followup_requests 在判据成立后于**同一条会话**内按序发出（索引此时已就绪，
+    结果确定），用于承载后续断言。退出时等待子进程收尾并断言 stderr 为空。
+    """
+    import json as _json
+    import queue as _queue
+    import subprocess as _sp
+    import sys as _sys
+    import threading as _threading
+    import time as _time
+
+    proc = _sp.Popen(
+        [_sys.executable, "-m", "mortis_rag_mcp", "--serve-mcp-stdio", "--app-config", str(config_path)],
+        stdin=_sp.PIPE,
+        stdout=_sp.PIPE,
+        stderr=_sp.PIPE,
+        text=True,
+        encoding="utf-8",
+        env={**os.environ, **(env_overrides or {})},
+    )
+    lines: "_queue.Queue[str | None]" = _queue.Queue()
+
+    def _reader() -> None:
+        assert proc.stdout is not None
+        try:
+            for line in proc.stdout:
+                lines.put(line)
+        finally:
+            lines.put(None)
+
+    _threading.Thread(target=_reader, daemon=True, name="stdio-reader").start()
+
+    def _next_raw(wait: float) -> str:
+        try:
+            item = lines.get(timeout=wait)
+        except _queue.Empty:
+            raise AssertionError(f"stdio 会话在 {wait:.1f}s 内无应答")
+        if item is None:
+            raise AssertionError("stdio 会话提前结束")
+        return item
+
+    def _send(payload: dict) -> None:
+        assert proc.stdin is not None
+        proc.stdin.write(_json.dumps(payload, ensure_ascii=False) + "\n")
+        proc.stdin.flush()
+
+    observed: list[dict] = []
+    prefix_responses: list[dict] = []
+    followup_responses: list[dict] = []
+    try:
+        for req in prefix_requests:
+            _send(req)
+        for _ in prefix_requests:
+            prefix_responses.append(_json.loads(_next_raw(timeout)))
+        next_id = max(int(r.get("id", 0)) for r in prefix_requests) + 1
+        deadline = _time.monotonic() + timeout
+        settled = False
+        while _time.monotonic() < deadline:
+            _send({**poll_request, "id": next_id})
+            resp = _json.loads(_next_raw(interval + 5.0))
+            data = _json.loads(resp["result"]["content"][0]["text"])
+            # 保底：即便判据一直不成立，也把已观测结果带给调用方自行裁量
+            observed.append(data)
+            next_id += 1
+            if is_settled(data):
+                settled = True
+                break
+            _time.sleep(interval)
+        if settled and followup_requests:
+            for req in followup_requests:
+                _send({**req, "id": next_id})
+                followup_responses.append(_json.loads(_next_raw(interval + 10.0)))
+                next_id += 1
+        if proc.stdin is not None:
+            proc.stdin.close()
+    finally:
+        try:
+            proc.wait(timeout=15)
+        except _sp.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=15)
+    stderr = proc.stderr.read() if proc.stderr is not None else ""
+    assert not stderr, stderr
+    return {"prefix": prefix_responses, "observed": observed, "followups": followup_responses}
+
+
+@pytest.fixture
+def stdio_polling():
+    """交互式 stdio 轮询会话助手（见 run_stdio_polling）。"""
+    return run_stdio_polling

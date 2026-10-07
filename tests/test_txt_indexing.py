@@ -28,7 +28,12 @@ def _run_stdio(config: Path, requests: list[dict]) -> list[dict]:
     return [json.loads(line) for line in proc.stdout.splitlines() if line]
 
 
-def test_txt_indexing_and_chapter_headings(tmp_path):
+def _is_search_settled(data: dict) -> bool:
+    """C66：首建完成判据——非冷启动（status != "indexing"）且后台无在飞构建。"""
+    return data.get("status") != "indexing" and not data.get("indexing_in_progress")
+
+
+def test_txt_indexing_and_chapter_headings(tmp_path, stdio_polling):
     vault = tmp_path / "book_vault"
     vault.mkdir(parents=True)
 
@@ -55,30 +60,48 @@ def test_txt_indexing_and_chapter_headings(tmp_path):
     config = tmp_path / "app.toml"
     config.write_text('mode = "static"\n', encoding="utf-8")
 
-    requests = [
-        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
-        {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "kb_init", "arguments": {"path": str(vault), "name": "BookVault"}}},
-        # 1. 检索第一章内容
-        {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "kb_search", "arguments": {"query": "异界苏醒 古木参天", "vault_path": "BookVault"}}},
-        # 2. 检索第二章内容
-        {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "kb_search", "arguments": {"query": "神秘传承 古老符文", "vault_path": "BookVault"}}},
-        # 3. F-01: 测试 kb_read 原生读取 .txt 原文，确保不被沙箱拦截
-        {"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": "kb_read", "arguments": {"source": "novel.txt", "start_line": 1, "end_line": 3, "vault_path": "BookVault"}}},
-        # 4. F-08: 验证 kb_stats 包含 skipped_unsupported 统计
-        {"jsonrpc": "2.0", "id": 6, "method": "tools/call", "params": {"name": "kb_stats", "arguments": {"vault_path": "BookVault"}}},
-        # 5. 验证 F-09: guard.txt 的 heading 不能是包含句号的长段落
-        {"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {"name": "kb_search", "arguments": {"query": "逻辑代数 核心概念", "vault_path": "BookVault"}}},
-    ]
-    responses = _run_stdio(config, requests)
+    # C66：kb_search 不再阻塞等待首建（读优先）。批式 stdio 一次性喂完 stdin，
+    # 表达不了真实客户端的「按 retry_after 稍候重试」，快速连发也等不到后台建库
+    # 推进（Linux CI 上实测 0 命中）。这里在一条交互式会话里先轮询到首建完成，
+    # 再于同一会话内跑后续断言——索引此时已就绪，结果与时序无关。
+    registry = str(config.parent / "vaults.toml")
+    env_overrides = {"VAULT_MCP_REGISTRY": registry, "MORTIS_RAG_REGISTRY": registry}
+    session = stdio_polling(
+        config,
+        prefix_requests=[
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "kb_init", "arguments": {"path": str(vault), "name": "BookVault"}}},
+        ],
+        poll_request={"jsonrpc": "2.0", "method": "tools/call", "params": {"name": "kb_search", "arguments": {"query": "异界苏醒 古木参天", "vault_path": "BookVault"}}},
+        is_settled=_is_search_settled,
+        env_overrides=env_overrides,
+        followup_requests=[
+            # 1. 检索第一章内容
+            {"jsonrpc": "2.0", "method": "tools/call", "params": {"name": "kb_search", "arguments": {"query": "异界苏醒 古木参天", "vault_path": "BookVault"}}},
+            # 2. 检索第二章内容
+            {"jsonrpc": "2.0", "method": "tools/call", "params": {"name": "kb_search", "arguments": {"query": "神秘传承 古老符文", "vault_path": "BookVault"}}},
+            # 3. F-01: 测试 kb_read 原生读取 .txt 原文，确保不被沙箱拦截
+            {"jsonrpc": "2.0", "method": "tools/call", "params": {"name": "kb_read", "arguments": {"source": "novel.txt", "start_line": 1, "end_line": 3, "vault_path": "BookVault"}}},
+            # 4. F-08: 验证 kb_stats 包含 skipped_unsupported 统计
+            {"jsonrpc": "2.0", "method": "tools/call", "params": {"name": "kb_stats", "arguments": {"vault_path": "BookVault"}}},
+            # 5. 验证 F-09: guard.txt 的 heading 不能是包含句号的长段落
+            {"jsonrpc": "2.0", "method": "tools/call", "params": {"name": "kb_search", "arguments": {"query": "逻辑代数 核心概念", "vault_path": "BookVault"}}},
+        ],
+    )
+    responses = [session["prefix"][1], *session["followups"]]
+    probe = session["observed"][-1]
+    assert _is_search_settled(probe), f"首建未在轮询窗口内完成：{probe}"
+    assert len(probe["chunks"]) > 0
+    assert len(session["followups"]) == 5
 
     # 验证 2: kb_init 报告中包含 skipped_unsupported
-    init_res = json.loads(responses[1]["result"]["content"][0]["text"])
+    init_res = json.loads(responses[0]["result"]["content"][0]["text"])
     assert "skipped_unsupported" in init_res
     assert init_res["skipped_unsupported"].get("epub") == 1
     assert init_res["skipped_unsupported"].get("zip") == 1
 
     # 验证 3: 第一章检索并验证 heading
-    r3 = json.loads(responses[2]["result"]["content"][0]["text"])
+    r3 = json.loads(responses[1]["result"]["content"][0]["text"])
     assert len(r3["chunks"]) > 0
     c3 = r3["chunks"][0]
     assert c3["source"] == "novel.txt"
@@ -86,7 +109,7 @@ def test_txt_indexing_and_chapter_headings(tmp_path):
     assert "第一章 异界苏醒" in heading3
 
     # 验证 4: 第二章检索并验证 heading
-    r4 = json.loads(responses[3]["result"]["content"][0]["text"])
+    r4 = json.loads(responses[2]["result"]["content"][0]["text"])
     assert len(r4["chunks"]) > 0
     c4 = r4["chunks"][0]
     assert c4["source"] == "novel.txt"
@@ -94,19 +117,19 @@ def test_txt_indexing_and_chapter_headings(tmp_path):
     assert "第二章 神秘传承" in heading4
 
     # 验证 5 (F-01): kb_read 读取 .txt 文件成功，无沙箱错误
-    r5 = responses[4]["result"]
+    r5 = responses[3]["result"]
     assert r5.get("isError") is not True
     read_data = json.loads(r5["content"][0]["text"])
     assert "异界苏醒" in read_data["content"]
 
     # 验证 6 (F-08): kb_stats 正确返回 skipped_unsupported
-    r6 = json.loads(responses[5]["result"]["content"][0]["text"])
+    r6 = json.loads(responses[4]["result"]["content"][0]["text"])
     assert "skipped_unsupported" in r6
     assert r6["skipped_unsupported"].get("epub") == 1
     assert r6["skipped_unsupported"].get("zip") == 1
 
     # 验证 7 (F-09): 门禁生效，长句带句号未被作为 heading
-    r7 = json.loads(responses[6]["result"]["content"][0]["text"])
+    r7 = json.loads(responses[5]["result"]["content"][0]["text"])
     if r7["chunks"]:
         guard_chunk = next((c for c in r7["chunks"] if c["source"] == "guard.txt"), None)
         if guard_chunk:
