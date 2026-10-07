@@ -698,6 +698,22 @@
 > - 专项与相关测试（43 passed in 2.01s）：
 >   `.\.venv\Scripts\python.exe -m pytest tests/test_read_heading.py tests/test_read_ranges.py tests/test_wikilink_read.py tests/test_txt_indexing.py tests/test_chunking_seam.py tests/test_facade_freeze.py -q`
 
+### C59 — moton16,2026-10-07,Antigravity — docs: explain Windows MCP process locks during upgrades
+> **代码与文档改动概况**：
+> - `docs/Quick-start_developer.md`：
+>   - 在 §7（测试与已知平台坑）补充 Windows 升级时 console 入口 exe 被占用导致 `[WinError 5] 拒绝访问` 的机制说明与热更新限制；
+>   - 在 §9（常见任务食谱）新增「升级已有部署（Windows 进程占用排查）」小节，给出客户端停连接器、只读 PowerShell 过滤特定进程（`Get-CimInstance Win32_Process`）、安全定向结束 PID、当前 venv 安装及推荐使用 `python.exe -m mortis_rag_mcp --serve-mcp-stdio` 减少入口 exe 被锁冲突的标准操作步骤；
+> - `QUICKSTART_user.md`：
+>   - 新增第 8 节「升级已有部署（Windows 避坑指南）」，通俗说明进程被锁与代码热更新失效的根本原因，给出客户端关闭、PowerShell 排查残留、当前 venv 重装与参数推荐的 5 步无歧义升级流程；
+> - 规范核对：
+>   - 确认文档中引用的包入口 `mortis-rag-mcp`、`vault-mcp` 与 `pyproject.toml` 中的 `[project.scripts]` 完全一致；
+>   - 示例命令与路径全部使用占位符，不包含任何真实 vault 路径与敏感 API key。
+>
+> **验证**：
+> - 纯文档改动，相关版本与协议测试保持绿灯（3 passed in 0.25s）：
+>   `.\.venv\Scripts\python.exe -m pytest tests/test_version_sync.py -q`
+
+
 
 
 

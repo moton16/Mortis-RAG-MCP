@@ -203,6 +203,7 @@ stdin 一行 JSON → handle() → method=="tools/call"
 - 已知 Windows 平台坑：`kb_rebuild` 删 FTS 缓存走系统回收站，trash 失败会
   `SAFE_DELETE_FAIL_CLOSED`（`test_subvaults.py::test_stdio_kb_rebuild_returns_stats`
   在部分 Windows 环境因此红）——修它是件独立任务，别顺手带在别的 commit 里。
+- **Windows 升级文件写锁**：Windows 环境下 MCP 客户端拉起的 console 入口 exe（`mortis-rag-mcp.exe` 或 `vault-mcp.exe`）运行期间会被系统锁定。此时若执行 editable 重装（`pip install -e .`）会报 `[WinError 5] 拒绝访问`。仅 `git pull` 更新了磁盘源码，运行中未重启的 Python 进程不会自动重新加载模块。排查与安全升级步骤见 §9 食谱。
 
 ## 8. 开发约定
 
@@ -243,6 +244,23 @@ stdin 一行 JSON → handle() → method=="tools/call"
 2. `load_config()` 解析（字符串走 `_env()` 插值，数字走 `_numeric()`）
 3. `config/app.toml.example` 加带注释的样例
 4. 若影响切块/embedding → `_cache_meta()` 代际键
+
+### 升级已有部署（Windows 进程占用排查）
+1. **停止客户端连接**：先在对应 MCP 客户端（如 Claude Desktop / Codex / WorkBuddy）中停用或关闭连接器。注意：仅关闭终端或 IDE 窗口不保证后台托管的 Python 子进程完全退出。
+2. **只读排查残留进程**：运行以下只读 PowerShell 命令，精确定位占用进程的 PID、名称与命令行，避免按进程名全杀其他 Python 任务：
+   ```powershell
+   Get-CimInstance Win32_Process |
+       Where-Object { $_.Name -in @('mortis-rag-mcp.exe', 'vault-mcp.exe') -or $_.CommandLine -like '*mortis_rag_mcp*' } |
+       Select-Object ProcessId, Name, ExecutablePath, CommandLine
+   ```
+3. **安全终止进程（仅在客户端无法正常关闭时）**：确认 PID 确实归属本项目后，才针对性执行 `Stop-Process -Id <确认过的PID>`；若客户端配置了自动拉起，必须先关连接器，不要循环 kill。
+4. **使用本虚拟环境 Python 执行重装**：
+   ```powershell
+   .\.venv\Scripts\python.exe -m pip install -e .
+   ```
+   （切勿尝试“先 pip uninstall”，文件被锁时卸载同样会失败；系统重启仅作为句柄死锁无法解除时的最后排障手段）。
+5. **推荐连接器配置方式**：客户端推荐直接使用该 venv `python.exe` 配合参数 `-m mortis_rag_mcp --serve-mcp-stdio`，减少 console exe 被锁冲突。运行中模块不会热更新，每次更新后仍须重启服务生效。
+6. **验证升级**：重新启用连接器，检查 initialize 回显版本号与 `kb_list` 响应。
 
 ## 10. 上手 checklist
 

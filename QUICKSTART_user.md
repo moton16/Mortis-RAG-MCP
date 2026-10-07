@@ -165,3 +165,36 @@ Copy-Item .\skills\mortis-rag-mcp\SKILL.md "$env:USERPROFILE\.workbuddy\skills\m
 - **failed_files 有值**：多为 embedding API 限流/网络错误。0.5.0 起请求自动重试（指数退避、429 遵循 Retry-After）并按批切分，单次限流不再打垮整个索引；仍失败就隔几分钟反复 `kb_stats` 让增量 sync 自动补。
 - **换设备**：简单场景 clone → 装包 → 配 key → 对笔记文件夹 `kb_init`（首次全量建索引，花一次 embedding 钱）；想省这笔钱就先在旧机器 `kb_export` 导出索引快照，新机器 `kb_init` 后 `kb_import` 导入——导入后 0 次重嵌。
 - **Windows 中文乱码**：服务端已强制 stdio UTF-8；确保客户端也以 UTF-8 收发。
+
+## 8. 升级已有部署（Windows 避坑指南）
+
+当仓库更新代码并重新安装时（例如通过 `git pull` 拉取更新后），Windows 系统常因进程占用导致升级报错，请参考以下指引：
+
+### 8.1 现象与原因
+- **安装报错**：若 MCP 客户端（如 Claude Desktop、Codex、WorkBuddy 等）处于开启或连接状态，Windows 操作系统会锁定正在运行的控制台入口文件（`mortis-rag-mcp.exe`），导致重新安装时报 `PermissionError: [WinError 5] 拒绝访问`。
+- **更新不生效**：仅执行 `git pull` 只更新了磁盘上的源文件，若后台正在运行的 Python 进程未退出，已加载到内存的模块并不会自动热加载，必须完全重启服务进程。
+
+### 8.2 安全升级步骤
+1. **先在客户端关闭或禁用连接器**：
+   - 在客户端设置中临时关闭/停用 mortis-rag-mcp 连接；
+   - 确认进程已退出（单纯“重启终端”不一定能释放客户端后台托管的子进程）。
+2. **（可选）只读定位占用进程**：
+   - 打开 PowerShell，运行只读命令查看是否仍有残留实例：
+     ```powershell
+     Get-CimInstance Win32_Process |
+         Where-Object { $_.Name -in @('mortis-rag-mcp.exe', 'vault-mcp.exe') -or $_.CommandLine -like '*mortis_rag_mcp*' } |
+         Select-Object ProcessId, Name, ExecutablePath, CommandLine
+     ```
+   - 若客户端已关闭但仍有残留进程，确认 PID 归属本项目后可执行 `Stop-Process -Id <确认过的PID>` 释放。若客户端有自动重启守护，必须先在客户端停用连接器，避免循环 kill。
+3. **使用虚拟环境的 Python 执行安装**：
+   ```powershell
+   .\.venv\Scripts\python.exe -m pip install -e .
+   ```
+   *注意：切勿使用 `pip uninstall` 尝试规避锁，锁未释放时卸载同样会失败；系统重启仅作为最后排障手段。*
+4. **推荐更稳妥的客户端连接器配置**：
+   在客户端中直接使用虚拟环境中的 `python.exe` 配合模块启动参数，可避免 console exe 入口文件被锁：
+   - `command`: `C:\path\to\Mortis-RAG-MCP\.venv\Scripts\python.exe`
+   - `args`: `["-m", "mortis_rag_mcp", "--serve-mcp-stdio", "--app-config", "C:\path\to\Mortis-RAG-MCP\config\app.toml"]`
+5. **验证新版本**：
+   重新启用客户端连接器，发起 MCP 连接，确认 initialize 返回的版本号或调用 `kb_list` 正常返回。
+
