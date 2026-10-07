@@ -385,3 +385,38 @@ def test_auto_method_degrades_to_poll_off_windows_with_ingest_scan(tmp_path: Pat
         finally:
             indexer.stop_watching()
 
+
+def test_ingest_rescan_streak_is_capped(tmp_path: Path, monkeypatch):
+    """review R3 补丁：hook 持续要求补扫时必须有上限。
+
+    `rescan_after_seconds` 在「有判稳残留」或「扫描不完整」时恒为正；没有上限时
+    扫描循环会 1Hz 永久重扫全库（每轮全量 sha256 + 状态落盘）。超过上限后退回
+    事件驱动，与 hook 异常分支的「连续失败 ≤5 次」对称。
+    """
+    from mortis_rag_mcp._indexer import watch as watch_mod
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    indexer = MarkdownIndexer(vault, _config(tmp_path), embedding_provider=StaticEmbeddingProvider(dimension=8))
+
+    monkeypatch.setattr(watch_mod, "_MAX_INGEST_RESCAN_STREAK", 3)
+    calls: list[float] = []
+    hook_cv = threading.Condition()
+
+    def hook():
+        with hook_cv:
+            calls.append(time.monotonic())
+            hook_cv.notify_all()
+        return {"rescan_after_seconds": 0.02}
+
+    indexer._ingest_hook = hook
+    try:
+        indexer.request_ingest_scan()
+        with hook_cv:
+            assert hook_cv.wait_for(lambda: len(calls) >= 4, timeout=5.0), f"calls={len(calls)}"
+        # 第 4 次后封顶：再等远超单次补扫间隔的时间，不得再有新调用
+        time.sleep(0.5)
+        assert len(calls) == 4, f"rescan 未封顶，calls={len(calls)}"
+    finally:
+        indexer.stop_watching()
+
