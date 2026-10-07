@@ -413,6 +413,8 @@ def test_ignore_rules_and_dynamic_provider(tmp_path: Path) -> None:
     (tmp_path / "keep.pdf").write_bytes(b"%PDF-1.4 keep")
 
     with patch.object(mgr, "_worker_loop"):
+        # review R3 两次采样：首扫只登记判稳采样，次扫一致才提交
+        assert mgr.auto_submit()["submitted"] == 0
         res = mgr.auto_submit()
         assert res["submitted"] == 1
         assert res["skipped_ignored"] == 1
@@ -447,7 +449,10 @@ def test_auto_seen_dedup_all_four_states(tmp_path: Path) -> None:
 
         targets, scan_stats = mgr._auto_pending()
         assert len(targets) == 0, f"Expected 0 targets for state {st_val}"
-        assert scan_stats["skipped_seen"] == 1
+        # review R3 两次采样：首扫只登记采样，次扫采样一致才走到 sha 比对计入 skip_seen
+        targets2, scan_stats2 = mgr._auto_pending()
+        assert len(targets2) == 0, f"Expected 0 targets for state {st_val}"
+        assert scan_stats2["skipped_seen"] == 1
 
 
 def test_auto_seen_changed_hash_enqueues_new_job(tmp_path: Path) -> None:
@@ -457,6 +462,8 @@ def test_auto_seen_changed_hash_enqueues_new_job(tmp_path: Path) -> None:
     doc.write_bytes(b"%PDF-1.4 v1")
 
     with patch.object(mgr, "_worker_loop"):
+        # review R3 两次采样：首扫登记采样，次扫一致才提交
+        assert mgr.auto_submit()["submitted"] == 0
         r1 = mgr.auto_submit()
         assert r1["submitted"] == 1
 
@@ -464,8 +471,9 @@ def test_auto_seen_changed_hash_enqueues_new_job(tmp_path: Path) -> None:
         r2 = mgr.auto_submit()
         assert r2["submitted"] == 0
 
-        # Modify content
+        # Modify content：变化源同样需两次采样（先登记新采样，再提交）
         doc.write_bytes(b"%PDF-1.4 v2 modified")
+        assert mgr.auto_submit()["submitted"] == 0
         r3 = mgr.auto_submit()
         assert r3["submitted"] == 1
         assert r3["jobs"][0]["source"] == "update.pdf"
@@ -477,18 +485,21 @@ def test_a_b_a_version_changes_eligible_again(tmp_path: Path) -> None:
     doc = tmp_path / "toggle.pdf"
 
     with patch.object(mgr, "_worker_loop"):
-        # Version A
+        # Version A（review R3 两次采样：每次内容变化后首扫登记、次扫提交）
         doc.write_bytes(b"%PDF-1.4 Content A")
+        assert mgr.auto_submit()["submitted"] == 0
         r1 = mgr.auto_submit()
         assert r1["submitted"] == 1
 
         # Version B
         doc.write_bytes(b"%PDF-1.4 Content B")
+        assert mgr.auto_submit()["submitted"] == 0
         r2 = mgr.auto_submit()
         assert r2["submitted"] == 1
 
         # Version A again
         doc.write_bytes(b"%PDF-1.4 Content A")
+        assert mgr.auto_submit()["submitted"] == 0
         r3 = mgr.auto_submit()
         assert r3["submitted"] == 1
 
@@ -574,6 +585,8 @@ def test_clean_scan_prunes_deleted_sources_from_auto_seen(tmp_path: Path) -> Non
     pdf.write_bytes(b"%PDF-1.4 test")
 
     with patch.object(mgr, "_worker_loop"):
+        # review R3 两次采样：首扫登记采样，次扫一致才入账本
+        mgr.auto_submit()
         mgr.auto_submit()
         st = mgr._load_state()
         assert "temp.pdf" in st["auto_seen"]
@@ -617,25 +630,25 @@ def test_copy_settling_defers_zero_byte_and_changing_files(tmp_path: Path) -> No
     mgr.mark_settling("changing.pdf")
 
     with patch.object(mgr, "_worker_loop"):
-        # First scan
+        # First scan: review R3 两次采样——所有首见文件（含 stable.pdf）只登记采样
         r1 = mgr.auto_submit()
-        # stable.pdf must be submitted (not blocked by zero or changing)
-        assert r1["submitted"] == 1
-        assert r1["jobs"][0]["source"] == "stable.pdf"
+        assert r1["submitted"] == 0
+        assert r1["rescan_after_seconds"] > 0
 
         # Now zero_doc gets some bytes, but enters settling check
         zero_doc.write_bytes(b"%PDF-1.4 Zero content now present")
         # changing_doc changes size (still changing)
         changing_doc.write_bytes(b"%PDF-1.4 Part 1 and Part 2 (more content)")
 
-        # Second scan: changing_doc size changed -> deferred again
+        # Second scan: stable.pdf 采样一致 → 提交；zero/changing 采样变化 → 继续判稳
         r2 = mgr.auto_submit()
-        # zero_doc was deferred because previous sample was 0 bytes, now sampled non-zero
-        assert r2["submitted"] == 0
+        assert r2["submitted"] == 1
+        assert r2["jobs"][0]["source"] == "stable.pdf"
 
         # Third scan: zero_doc and changing_doc now remain unchanged (settled)
         r3 = mgr.auto_submit()
         assert r3["submitted"] == 2
+        assert r3["rescan_after_seconds"] == 0.0
         sources = {j["source"] for j in r3["jobs"]}
         assert sources == {"zero.pdf", "changing.pdf"}
 
@@ -650,6 +663,8 @@ def test_source_changed_fails_job_without_upload_and_next_scan_reenqueues(tmp_pa
     with patch("mortis_rag_mcp.ingest.mineru.MineruClient.parse", mock_parse):
         # Don't let worker loop run automatically yet
         with patch.object(mgr, "_worker_loop"):
+            # review R3 两次采样：首扫登记采样，次扫提交
+            assert mgr.auto_submit()["submitted"] == 0
             res = mgr.auto_submit()
             assert res["submitted"] == 1
             job_id = res["jobs"][0]["job_id"]
@@ -669,10 +684,120 @@ def test_source_changed_fails_job_without_upload_and_next_scan_reenqueues(tmp_pa
 
         # Run auto_submit() again: it must discover the new hash and enqueue a new job!
         with patch.object(mgr, "_worker_loop"):
+            assert mgr.auto_submit()["submitted"] == 0  # 变化源首次采样
             res2 = mgr.auto_submit()
             assert res2["submitted"] == 1
             new_job = res2["jobs"][0]
             assert new_job["source"] == "evolving.pdf"
             assert new_job["job_id"] != job_id
             assert new_job["state"] == "queued"
+
+
+# ---------------------------------------------------------------
+# review v0.8.1 修复回归（R1/R3/R4，报告 .runtime/review-v081/REVIEW.md）
+# ---------------------------------------------------------------
+
+def test_auto_submit_fails_closed_when_matcher_unavailable(tmp_path: Path) -> None:
+    """R1/F2：provider 已配置但拿不到 matcher（如启动窗口期 indexer 未发布）时，
+    自动提交必须 fail-closed 拒绝本轮，绝不冒然提交可能被豁免的文档。"""
+    mgr = IngestManager(
+        tmp_path, IngestConfig(enabled=True, auto_watch=True), ignore_provider=lambda: None
+    )
+    (tmp_path / "secret.pdf").write_bytes(b"%PDF-1.4 secret")
+
+    with patch.object(mgr, "_worker_loop"):
+        res = mgr.auto_submit()
+    assert res["submitted"] == 0
+    assert res["jobs"] == []
+    # 本轮未确认扫描完整 → 要求扫描循环延时重试，等 matcher 就绪后补扫
+    assert res["rescan_after_seconds"] > 0
+    st = mgr._load_state()
+    assert "secret.pdf" not in st["auto_seen"]
+    assert not st["jobs"]
+
+
+def test_auto_submit_honors_vaultignore_patterns(tmp_path: Path) -> None:
+    """R1/F1：ignore_provider 必须覆盖 .vaultignore 级别的动态豁免规则，
+    被排除的 PDF 不得进入自动解析队列（此前只拿静态 exclude_patterns）。"""
+    def provider():
+        from mortis_rag_mcp._indexer.scanning import IgnoreMatcher
+        return IgnoreMatcher(["secret.pdf", "private/secret.pdf"])
+
+    mgr = IngestManager(tmp_path, IngestConfig(enabled=True, auto_watch=True), ignore_provider=provider)
+    private_dir = tmp_path / "private"
+    private_dir.mkdir()
+    (private_dir / "secret.pdf").write_bytes(b"%PDF-1.4 nested secret")
+    (tmp_path / "secret.pdf").write_bytes(b"%PDF-1.4 top secret")
+    (tmp_path / "normal.pdf").write_bytes(b"%PDF-1.4 normal")
+
+    with patch.object(mgr, "_worker_loop"):
+        assert mgr.auto_submit()["submitted"] == 0  # 首扫仅登记采样
+        res = mgr.auto_submit()
+    assert res["submitted"] == 1
+    assert res["jobs"][0]["source"] == "normal.pdf"
+    assert res["skipped_ignored"] == 2
+    st = mgr._load_state()
+    assert "secret.pdf" not in st["auto_seen"]
+    assert "private/secret.pdf" not in st["auto_seen"]
+
+
+def test_auto_submit_two_sample_settling_for_new_files(tmp_path: Path) -> None:
+    """R3/F6：新文件首次扫描只登记采样，两次采样一致才 hash/提交；
+    复制中途的部分字节不会被当成完整文档解析上传。"""
+    mgr = IngestManager(tmp_path, IngestConfig(enabled=True, auto_watch=True))
+    doc = tmp_path / "copy.pdf"
+    doc.write_bytes(b"%PDF-1.4 PARTIAL_PAGE_ONLY")
+
+    with patch.object(mgr, "_worker_loop"):
+        r1 = mgr.auto_submit()
+        assert r1["submitted"] == 0
+        assert r1["rescan_after_seconds"] > 0
+
+        # 复制继续：字节增长 → 采样变化 → 继续判稳（旧逻辑此处已把部分字节入队）
+        doc.write_bytes(b"%PDF-1.4 PARTIAL_PAGE_ONLY\nREST_OF_DOCUMENT")
+        r2 = mgr.auto_submit()
+        assert r2["submitted"] == 0
+
+        # 复制完成、采样一致 → 恰好提交一次，且登记的是完整字节的 SHA
+        r3 = mgr.auto_submit()
+        assert r3["submitted"] == 1
+        assert r3["rescan_after_seconds"] == 0.0
+        st = mgr._load_state()
+        seen = st["auto_seen"]["copy.pdf"]
+        assert st["jobs"][seen["last_job_id"]]["sha256"] == _sha256(doc)
+
+
+def test_auto_submit_keeps_ledger_when_dirs_policy_pruned(tmp_path: Path) -> None:
+    """R4/F7：目录被临时忽略（策略剪枝）≠ 文件被删除；账本必须保留，
+    取消忽略后同 SHA 不得重传（此前 clean_scan 误清 auto_seen 导致重复解析）。"""
+    ignored = {"on": False}
+
+    def provider():
+        from mortis_rag_mcp._indexer.scanning import IgnoreMatcher
+        return IgnoreMatcher(["sub"] if ignored["on"] else [])
+
+    mgr = IngestManager(tmp_path, IngestConfig(enabled=True, auto_watch=True), ignore_provider=provider)
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    doc = sub / "paper.pdf"
+    doc.write_bytes(b"%PDF-1.4 paper body")
+
+    mock_parse = MagicMock()
+    with patch.object(mgr, "_worker_loop"), patch("mortis_rag_mcp.ingest.mineru.MineruClient.parse", mock_parse):
+        assert mgr.auto_submit()["submitted"] == 0  # 首扫仅登记采样
+        assert mgr.auto_submit()["submitted"] == 1
+
+        # 临时忽略目录：非完整枚举，账本不得按「已删除」清理
+        ignored["on"] = True
+        r_ign = mgr.auto_submit()
+        assert r_ign["submitted"] == 0
+        st = mgr._load_state()
+        assert "sub/paper.pdf" in st["auto_seen"]
+
+        # 取消忽略：同 SHA 命中账本 → 跳过，不重传
+        ignored["on"] = False
+        r_back = mgr.auto_submit()
+        assert r_back["submitted"] == 0
+        assert r_back["skipped_seen"] == 1
+        assert mock_parse.call_count == 0
 

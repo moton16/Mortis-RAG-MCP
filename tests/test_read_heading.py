@@ -74,6 +74,40 @@ def test_fixed_fixture_hierarchical_sections(tmp_path: Path):
     assert res_end["content"] == "# End"
 
 
+def test_heading_section_not_truncated_by_frontmatter_table_string(tmp_path: Path):
+    """review R5：frontmatter 里的表格字符串不得污染正文表格配对——
+    title:"<table>" 与正文 HTML 表格组合时，表格内的 '# Fake' 不能被当成
+    新章节把 Target 章节静默截短（应读满 4-11 行且 truncated=False）。"""
+    content = (
+        "---\n"
+        'title: "<table>"\n'
+        "---\n"
+        "# Target\n"
+        "target intro\n"
+        "<table>\n"
+        "<tr><td>\n"
+        "# Fake\n"
+        "</td></tr>\n"
+        "</table>\n"
+        "target tail that must remain in this section\n"
+        "# End\n"
+    )
+    p = tmp_path / "doc.md"
+    p.write_text(content, encoding="utf-8")
+
+    # 标题扫描不得把表格内的 '# Fake' 当章节（否则 Target 止步于第 7 行）
+    titles = [h[0] for h in scan_headings(p.read_text(encoding="utf-8").splitlines())]
+    assert "Fake" not in titles
+    assert titles == ["Target", "End"]
+
+    res = read_file_result(p, "doc.md", heading="Target")
+    assert res.effective_start_line == 4
+    assert res.effective_end_line == 11
+    assert "# Fake" in res.content
+    assert "target tail" in res.content
+    assert res.truncated is False
+
+
 def test_ambiguous_headings_fail_closed(tmp_path: Path):
     """C69b Req 7: 同名隔远章节或不同 level 同名均计为歧义，禁止隐式合并或选第一个。"""
     content = (

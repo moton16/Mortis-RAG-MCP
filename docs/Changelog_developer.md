@@ -840,3 +840,20 @@
 >
 > **验证**：
 > - 纯文档与忽略规则改动，不触碰产品代码；`tests/test_version_sync.py` 守卫保持绿灯（README badge 与版本真源未受影响）。
+
+### FIX-v081-code — moton16,2026-10-07,CodeBuddy,GLM-5.3-Flash — fix: address v0.8.1 pre-merge review findings R1–R6 and C54 isolation gaps
+> **代码与文档改动概况**：
+> - 依据 feat/v0.8.1 二轮 review（`.runtime/review-v081/REVIEW.md`，PR #7）落实 6 条确认发现与 C54 隔离缺口：
+>   - **R1（P1）自动摄取绕过豁免**：`server.py` `_ignore_provider` 改复用 `indexer._ignore_matcher()` 动态规则（覆盖 .vaultignore；此前只有静态 exclude_patterns）；`_indexer_for` 先发布进 `_indexers` 再 `start_watching()`（消除启动竞态窗口）；`worker.py` `_auto_pending` 在 provider 返回 None 时 fail-closed 拒绝本轮自动提交；
+>   - **R2（P1）首次同步误报唯一命中**：`server.py` 跨库 chunk_id 探测对已加载库的 incomplete 判定改为 `last_sync is None 且无完整缓存` 即跳过，不再因内存 `_chunks` 非空宣告探测完成；
+>   - **R3（P2）判稳**：`worker.py` 两次间隔采样规则扩展到所有新/变化源（首见只登记 (mtime,size) 采样，一致才 hash/提交，复制中途的部分字节不再被解析上传）；`watch.py` `_ingest_scan_loop` 支持主动重扫——hook 异常退避后重试（连续失败≤5 次），auto_submit 返回 `rescan_after_seconds`（仍有判稳文件或扫描不完整）时延时重扫，不再干等下一个文件事件；
+>   - **R4（P2）账本误清**：扫描遇忽略目录剪枝置 `pruned_by_ignore`，非完整枚举不清理 auto_seen 账本与判稳采样（临时排除目录后取消忽略不再同 SHA 重传）；
+>   - **R5（P2）heading 章节截短**：`reading.py` `scan_headings` 表格配对只在 frontmatter 之后的正文上做并偏移回物理行号（frontmatter title:"<table>" 不再污染正文表格配对）；
+>   - **R6（P2）skill 字段勘误**：`SKILL.md` compact 回读字段改为 `lines` 数组（start=`c.lines[0]`、end=`c.lines[1]`），预算恢复字段统一为 `minimum_budget_bytes`；
+>   - **C54 隔离补漏**：`tests/conftest.py` 会话隔离同时暂存/清除/恢复 legacy `VAULT_MCP_REGISTRY`；`pytest_sessionfinish` 在 `--collect-only` 时跳过状态写入（不再凭空产生 0/0/0 的 status.json/STATUS.md/status.lock）。
+> - 测试：`test_ingest_auto.py` 新增 R1 fail-closed / vaultignore 豁免 / 两次采样 / 账本保留 4 条回归，另 6 处既有断言适配两次采样语义（改为两扫模式）；`test_kb_read_chunkid.py` 新增首扫未完成库不可探测回归；`test_read_heading.py` 新增 frontmatter 表格字符串回归；`test_ingest_server.py` e2e 双触发 hook。
+>
+> **验证**：
+> - 靶向：触碰的 7 个测试文件收敛后全绿（70 passed 复核）；
+> - 全量（本批修复完成后单次）：551 passed, 4 skipped in 25.82s
+>   `bundled python -m pytest tests -q --basetemp=.runtime/fix-v081-20261007/pytest-full -p no:cacheprovider`

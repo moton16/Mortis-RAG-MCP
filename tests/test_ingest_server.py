@@ -308,6 +308,8 @@ def test_mock_e2e_auto_ingest_flow(tmp_path, monkeypatch):
         assert callable(indexer._ingest_hook)
 
         # Trigger hook directly (simulates scan thread trigger)
+        # review R3 两次采样：首扫只登记判稳采样，次扫才真正入队
+        indexer._ingest_hook()
         indexer._ingest_hook()
 
         # Manager should have auto_submitted and started worker thread.

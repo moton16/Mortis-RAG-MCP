@@ -56,6 +56,10 @@ def isolated_host(tmp_path_factory):
     # 宿主导出的新名注册表会压过用例自设的旧名（registry 新名优先），历史上造成过
     # KeyError: 'description' 假失败 → 会话内移除，让各用例自己的隔离口径生效。
     _set("MORTIS_RAG_REGISTRY", None)
+    # review §3.6/C54 补漏：legacy 宿主可能还在导出旧名变量，registry_path() 对旧名
+    # 同样生效——只清新名会让迁移测试在模拟 legacy 宿主下走 dummy 注册表路径。
+    # 两变量一并暂存/清除/恢复。
+    _set("VAULT_MCP_REGISTRY", None)
     # 会话级封顶：测试不得把成绩写进宿主 ~/.mortis_rag_mcp/STATUS.md。**刻意不还原**——
     # pytest_sessionfinish 在 fixture teardown 之后才跑，还原会让守卫重新依赖「宿主恰好
     # 有 status.json」这条错误的封顶。
@@ -88,6 +92,10 @@ def isolated_cache_dir(request, monkeypatch, isolated_host):
 def pytest_sessionfinish(session, exitstatus):
     try:
         if os.getenv("MORTIS_RAG_NO_STATUS_HOOK") == "1":
+            return
+        if getattr(session.config.option, "collectonly", False):
+            # review §3.7/C54：--collect-only 不执行用例，0/0/0 的成绩没有观测价值，
+            # 还会在模拟宿主里凭空写 status.json/STATUS.md/status.lock。
             return
         if os.getenv("CI") or os.getenv("GITHUB_ACTIONS"):
             return

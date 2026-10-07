@@ -40,8 +40,12 @@ def scan_headings(lines: list[str]) -> list[tuple[str, int, int]]:
     """
     headings: list[tuple[str, int, int]] = []
     fm_end, _, _ = frontmatter(lines)
-    tbl_blocks = iter_table_blocks(lines)
-    tbl_lines = {idx for s, e in tbl_blocks for idx in range(s, e + 1)}
+    # review R5：表格配对只在 frontmatter 之后的正文上做——frontmatter 里的
+    # title:"<table>" 之类表格字样会污染配对深度，导致正文 HTML 表格内部的
+    # # 假标题没被屏蔽（章节被静默截短）。表格行号整体偏移回物理源文件。
+    tbl_offset = fm_end + 1  # frontmatter() 无前置元数据时返回 -1 → 偏移 0
+    tbl_blocks = iter_table_blocks(lines[tbl_offset:])
+    tbl_lines = {tbl_offset + idx for s, e in tbl_blocks for idx in range(s, e + 1)}
 
     fence_char: str | None = None
     fence_len: int = 0

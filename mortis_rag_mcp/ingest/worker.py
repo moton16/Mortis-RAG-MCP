@@ -62,6 +62,8 @@ from ..registry import _process_file_lock
 
 INGEST_EXTS = {".pdf", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx"}
 _STATE_NAME = ".ingest_state.json"
+# review R3：扫描后仍有判稳中的文件或扫描不完整时，扫描循环延时重扫的间隔。
+_SETTLE_RESCAN_SECONDS = 1.0
 _EXCLUDED_DIR_NAMES = {".git", "node_modules", ".venv", ".trash", ".obsidian", ".stversions", ".stfolder", ".DS_Store"}
 
 
@@ -451,7 +453,16 @@ class IngestManager:
         state = self._load_state()
         auto_seen = state.get("auto_seen", {})
 
-        matcher = self.ignore_provider() if self.ignore_provider is not None else None
+        matcher = None
+        if self.ignore_provider is not None:
+            matcher = self.ignore_provider()
+            if matcher is None:
+                # review R1 fail-closed：宿主配置了 ignore_provider 却拿不到匹配器
+                # （indexer 尚未发布），无法判定 .vaultignore/exclude 豁免规则；
+                # 宁可本轮不摄取，也绝不冒然提交可能被排除的文档。
+                scan_stats["clean_scan"] = False
+                scan_stats["last_error"] = "ignore matcher unavailable; auto submit skipped"
+                return [], scan_stats
         out_dirname = self.out_root.name
         limit = self._size_limit_bytes()
 
@@ -471,6 +482,9 @@ class IngestManager:
                                     continue
                                 rel_dir = Path(entry.path).relative_to(self.vault_path).as_posix()
                                 if _is_path_ignored(matcher, rel_dir, is_dir=True):
+                                    # review R4：目录被策略剪枝 ⇒ 本轮不是完整枚举，
+                                    # 其下文件的账本条目不得按「确认删除」清理。
+                                    scan_stats["pruned_by_ignore"] = True
                                     continue
                                 entries_to_visit.append(Path(entry.path))
                             elif entry.is_file(follow_symlinks=False):
@@ -495,22 +509,17 @@ class IngestManager:
                                         })
                                     continue
 
-                                # 复制尚在进行的文档判稳（Card C58c / C61 Req 9）
-                                if st.st_size == 0:
-                                    scan_stats["skipped_settling"] = scan_stats.get("skipped_settling", 0) + 1
-                                    self._stat_samples[rel] = (st.st_mtime, 0)
-                                    self._settling_files.add(rel)
-                                    continue
-
-                                if rel in self._settling_files:
-                                    prev_mtime, prev_size = self._stat_samples.get(rel, (0.0, -1))
-                                    if st.st_size != prev_size or st.st_mtime != prev_mtime:
-                                        self._stat_samples[rel] = (st.st_mtime, st.st_size)
-                                        scan_stats["skipped_settling"] = scan_stats.get("skipped_settling", 0) + 1
-                                        continue
+                                # 判稳（Card C58c / C61 Req 9；review R3）：所有新/变化源
+                                # 至少两次间隔采样一致才 hash/提交——首次事件到达时文件
+                                # 可能正处于复制中途，非零的部分字节同样会被解析上传。
+                                sample = self._stat_samples.get(rel)
+                                if sample is not None and (st.st_mtime, st.st_size) == sample:
                                     self._settling_files.discard(rel)
-
-                                self._stat_samples[rel] = (st.st_mtime, st.st_size)
+                                else:
+                                    self._stat_samples[rel] = (st.st_mtime, st.st_size)
+                                    self._settling_files.add(rel)
+                                    scan_stats["skipped_settling"] = scan_stats.get("skipped_settling", 0) + 1
+                                    continue
 
                                 digest = _sha256(path)
                                 seen = auto_seen.get(rel)
@@ -536,6 +545,11 @@ class IngestManager:
 
         scan_stats["clean_scan"] = clean_scan
         scan_stats["scanned_sources"] = scanned_sources
+        # 判稳采样只对完整枚举的扫描做清理：被策略剪枝的轮次保留原状（review R4）。
+        if clean_scan and not scan_stats.get("pruned_by_ignore", False):
+            for gone in [s for s in self._stat_samples if s not in scanned_sources]:
+                self._stat_samples.pop(gone, None)
+            self._settling_files.intersection_update(scanned_sources)
         return targets, scan_stats
 
     def auto_submit(self) -> dict:
@@ -551,6 +565,7 @@ class IngestManager:
                 "skipped_too_large": 0,
                 "skipped_seen": 0,
                 "skipped_ignored": 0,
+                "rescan_after_seconds": 0.0,
             }
 
         targets, scan_stats = self._auto_pending()
@@ -571,7 +586,13 @@ class IngestManager:
             aw["skipped_ignored"] = scan_stats.get("skipped_ignored", 0)
             aw["too_large_samples"] = scan_stats.get("too_large_samples", [])
 
-            if scan_stats.get("clean_scan") and scan_stats.get("scanned_sources") is not None:
+            # review R4：只有完整枚举（无忽略目录剪枝）的干净扫描才允许清理账本，
+            # 否则被临时排除目录的条目会被误当「已删除」清掉，取消排除后同 SHA 重传。
+            if (
+                scan_stats.get("clean_scan")
+                and not scan_stats.get("pruned_by_ignore", False)
+                and scan_stats.get("scanned_sources") is not None
+            ):
                 scanned_set = scan_stats["scanned_sources"]
                 for s in list(auto_seen.keys()):
                     if s not in scanned_set and s not in active_sources:
@@ -629,6 +650,13 @@ class IngestManager:
             "skipped_too_large": scan_stats.get("skipped_too_large", 0),
             "skipped_seen": scan_stats.get("skipped_seen", 0),
             "skipped_ignored": scan_stats.get("skipped_ignored", 0),
+            # review R3：仍有判稳中的文件或本轮扫描不完整时，请扫描循环延时重扫，
+            # 不依赖下一个文件事件（事件被防抖吞并/丢失会让复制中的文件永远滞留）。
+            "rescan_after_seconds": (
+                _SETTLE_RESCAN_SECONDS
+                if (self._settling_files or not scan_stats.get("clean_scan", True))
+                else 0.0
+            ),
         }
 
     # ------------------------------------------------------------ worker

@@ -695,3 +695,50 @@ def test_probe_promoted_chunk_disappeared(tmp_path: Path, monkeypatch: pytest.Mo
         server._kb_read({"chunk_id": cid})
     msg = str(exc_info.value)
     assert "索引已变化" in msg or "重新 kb_search" in msg
+
+
+def test_kb_read_chunk_id_first_sync_partial_not_probeable(tmp_path: Path):
+    """review R2：首次同步未完成的库不得参与跨库 chunk_id 探测——
+    last_sync=None 且无完整缓存时，内存 _chunks 非空只是部分扫描结果，
+    不能据此宣告「已探测完整库」而误报唯一命中。"""
+    same_text = "# Shared\nshared body that identifies the same chunk\n"
+    vault_a = tmp_path / "vault_sync_a"
+    vault_b = tmp_path / "vault_sync_b"
+    vault_a.mkdir()
+    vault_b.mkdir()
+    (vault_a / "shared.md").write_text(same_text, encoding="utf-8")
+    (vault_b / "shared.md").write_text(same_text, encoding="utf-8")
+
+    config_path = tmp_path / "app.toml"
+    config_path.write_text('mode = "static"\n', encoding="utf-8")
+
+    server = VaultMcpServer(config_path)
+    server.registry.add(str(vault_a), name="SyncVaultA")
+    server.registry.add(str(vault_b), name="SyncVaultB")
+
+    idx_a = server._indexer_for({"vault_path": "SyncVaultA"})
+    idx_a.sync()
+    cid = idx_a.all_chunks()[0].id
+
+    # 模拟首扫进行中：chunks 已产出但 last_sync 未落定、缓存未加载（review R2 状态）
+    idx_a.last_sync = None
+    idx_a._chunks_cache_loaded = False
+
+    # 1. A 首扫未完成、B 尚未 sync → 不得拿 A 的部分结果误报唯一命中
+    with pytest.raises(ValueError, match="chunk_id not found"):
+        server._kb_read({"chunk_id": cid})
+
+    # 2. B 完成首扫 → B 命中但 A 未完成探测：按 C65 契约 fail-closed 报 incomplete，
+    #    显式传 vault_path 才能读取（A 仍被视为未完成，不参与唯一性裁决）
+    idx_b = server._indexer_for({"vault_path": "SyncVaultB"})
+    idx_b.sync()
+    with pytest.raises(ValueError, match="incomplete"):
+        server._kb_read({"chunk_id": cid})
+    res = server._kb_read({"chunk_id": cid, "vault_path": "SyncVaultB"})
+    assert res["chunk_id"] == cid
+    assert res["vault"] == "SyncVaultB"
+
+    # 3. A 也完成首扫 → 两库撞 id，恢复歧义报错
+    idx_a.sync()
+    with pytest.raises(ValueError, match="同时命中"):
+        server._kb_read({"chunk_id": cid})

@@ -186,6 +186,10 @@ def _start_ingest_scan_worker(owner: MarkdownIndexer) -> None:
 def _ingest_scan_loop(owner: MarkdownIndexer) -> None:
     """按需 ingest 扫描循环：合并 PDF/Office 变动事件，锁外调用 _ingest_hook。
     失败执行指数退避 (0.5s -> 5.0s)，避免紧密自旋。
+    review R3 追加两条主动重扫（此前完全依赖下一个文件事件驱动）：
+    1) hook 异常：退避后置回 dirty 重试，连续失败达 5 次停止自动重试、退回事件驱动；
+    2) hook 返回 rescan_after_seconds>0（仍有判稳中的文件或扫描不完整）：
+       延时后置回 dirty 重扫——事件被防抖吞并/丢失时，复制中的文件不会永远滞留。
     """
     while not (owner._watch_stop.is_set() or getattr(owner, "_stopping", False) or owner._ingest_stopping):
         with owner._ingest_lock:
@@ -198,11 +202,17 @@ def _ingest_scan_loop(owner: MarkdownIndexer) -> None:
         hook = owner._ingest_hook
         if hook is None:
             return
+        rescan_after = 0.0
         try:
-            hook()
+            result = hook()
             owner._last_ingest_scan_at = time.time()
             owner._ingest_scan_failures = 0
             owner._last_ingest_error = None
+            if isinstance(result, dict):
+                try:
+                    rescan_after = max(0.0, float(result.get("rescan_after_seconds") or 0.0))
+                except (TypeError, ValueError):
+                    rescan_after = 0.0
         except Exception as exc:
             owner._ingest_scan_failures = getattr(owner, "_ingest_scan_failures", 0) + 1
             err_msg = str(exc)
@@ -211,6 +221,22 @@ def _ingest_scan_loop(owner: MarkdownIndexer) -> None:
             owner._last_ingest_error = err_msg or exc.__class__.__name__
             backoff = min(0.5 * (2 ** min(owner._ingest_scan_failures - 1, 4)), 5.0)
             owner._watch_stop.wait(backoff)
+            if owner._watch_stop.is_set() or getattr(owner, "_stopping", False) or owner._ingest_stopping:
+                return
+            if owner._ingest_scan_failures <= 5:
+                # review R3/F5：临时扫描异常主动退避重扫，不再干等下一个事件。
+                with owner._ingest_lock:
+                    owner._ingest_dirty = True
+                    owner._ingest_cv.notify_all()
+            continue
+
+        if rescan_after > 0:
+            owner._watch_stop.wait(rescan_after)
+            if owner._watch_stop.is_set() or getattr(owner, "_stopping", False) or owner._ingest_stopping:
+                return
+            with owner._ingest_lock:
+                owner._ingest_dirty = True
+                owner._ingest_cv.notify_all()
 
 
 def _start_fs_scheduler(owner: MarkdownIndexer) -> None:

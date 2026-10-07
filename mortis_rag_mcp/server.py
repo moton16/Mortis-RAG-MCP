@@ -602,12 +602,18 @@ class VaultMcpServer:
                 # C58d: start_watching 之前挂 hook，仅 effective=enabled && auto_watch 时挂
                 # 惰性获取 manager，不在定义闭包时构造 manager，不默认创建 .mortis-parsed
                 if self.config.ingest.enabled and self.config.ingest.auto_watch:
-                    def _ingest_hook() -> None:
+                    def _ingest_hook() -> Any:
                         mgr = self._ingest_manager_for(key)
-                        mgr.auto_submit()
+                        # 返回 auto_submit 结果供 _ingest_scan_loop 判断是否需要
+                        # 主动重扫（review R3：判稳滞留/扫描不完整时不依赖下一个事件）。
+                        return mgr.auto_submit()
                     indexer._ingest_hook = _ingest_hook
-                indexer.start_watching()
+                # review R1/F2：先发布进 _indexers 再启动监听。watcher 启动后文件
+                # 事件即可触发 _ingest_hook → _ignore_provider；若此刻本库尚未发布，
+                # provider 拿不到 indexer，auto_submit 会在无法判定豁免规则的窗口里
+                # 提交本应被 .vaultignore/exclude 排除的文档。
                 self._indexers[key] = indexer
+                indexer.start_watching()
         return indexer
 
     def _list_vaults(self) -> dict[str, Any]:
@@ -828,9 +834,11 @@ class VaultMcpServer:
                     def _ignore_provider() -> Any:
                         idx = self._indexers.get(key)
                         if idx is None:
+                            # fail-closed 信号：auto_submit 本轮拒绝提交（review R1）。
                             return None
-                        from ._indexer.scanning import IgnoreMatcher
-                        return IgnoreMatcher(idx.config.exclude_patterns)
+                        # 动态 matcher：同时覆盖 exclude_patterns 与 .vaultignore
+                        # （此前只拿静态 exclude_patterns，vaultignore 豁免被绕过）。
+                        return idx._ignore_matcher()
 
                     manager = IngestManager(
                         vault_path,
@@ -1244,7 +1252,10 @@ class VaultMcpServer:
                         continue
                     indexer = probe
                 else:
-                    if indexer.last_sync is None and not getattr(indexer, "_chunks_cache_loaded", False) and not indexer._chunks:
+                    # review R2：首次同步未完成的库一律视为 incomplete——内存里
+                    # 非空的 _chunks 只是部分扫描结果，不能据此宣告「已探测完整库」，
+                    # 否则跨库 chunk_id 定位会在首次同步期间误报唯一命中。
+                    if indexer.last_sync is None and not getattr(indexer, "_chunks_cache_loaded", False):
                         skipped.append((label, "尚无可探测文本索引"))
                         continue
 
