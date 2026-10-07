@@ -1,8 +1,22 @@
+# Personal agents config
+.codebuddy/
+.codex/
+.gstack/
+.cursor/
+.claude/
+
 # Personal / machine-specific config — NEVER distribute.
 # app.toml may contain personal vault paths and env-var references.
 config/app.toml
 .vault_mcp/
+.mortis_rag_mcp/
+.mortis_rag_mcp_cache/
+.mortis-parsed/
 vaults.toml
+.smoke_vaults.toml
+.env
+.env.*
+*.env
 
 # Python
 __pycache__/
@@ -13,6 +27,32 @@ build/
 dist/
 .venv/
 venv/
+.runtime/
+.ruff_cache/
+.mypy_cache/
+
+# Testing & Coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# Databases & Logs (Local runs)
+*.sqlite
+*.sqlite3
+*.sqlite-shm
+*.sqlite-wal
+*.db
+*.log
+
+# IDE & Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
 # Docs — 默认忽略 docs/ 下的临时/本地草稿，仅白名单放行要随仓库分发的开发者文档。
 # 注意：必须用 docs/*（而非 docs/）——目录级排除会让 Git 不再进入该目录，
 # 后续的 ! 白名单将永远无法生效（gitignore 只对"未被排除目录内的文件"生效）。
@@ -25,10 +65,8 @@ docs/*
 # 版本目录特例（用户裁定）：docs/v0.8.1/ 的计划、实机报告与 Worklog 随版本入库。
 # docs/* 只匹配 docs 的直接子项，所以把目录本身重新纳入即可让其中文件可见。
 !docs/v0.8.1/
-# Tooling / test artifacts
-.pytest_cache/
-.smoke_vaults.toml
 
 # OS noise
 Thumbs.db
+desktop.ini
 .DS_Store

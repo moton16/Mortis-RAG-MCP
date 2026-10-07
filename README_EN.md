@@ -13,7 +13,7 @@ English | [简体中文](README.md)
 
 ## 🌟 Key Features
 
-- ⚡ **Compact Search & Section Read (0.8.1)**: Adds lightweight `compact=true` structured projection and whole-chunk budgeting cursors; `kb_read` resolves heading sections directly with accurate out-of-bounds line hints; read-priority background refresh.
+- ⚡ **Compact Search & Section Read (0.8.1)**: Adds lightweight `compact=true` structured projection and whole-chunk budgeting cursors; `kb_read` resolves heading sections directly with accurate out-of-bounds line hints; searches use ready indexes while refresh runs in the background, though concurrent updates may still cause brief waits.
 - 📂 **Zero Hardcoded Paths**: Attach any local folder as a knowledge base using `kb_init`. Persistent user-level registry without modifying configs or locking to fixed directories.
 - 📖 **In-place Chunk Expansion & Wikilink Read (0.8.0)**: Read context directly via `kb_read(chunk_id=...)` without calculating line ranges; navigate `[[wikilinks]]` by short stem names automatically.
 - 🏷️ **Aliases Retrieval & Exact Terms Hard Inclusion (0.8.0)**: Native frontmatter `aliases` search; guaranteed recall for proper nouns via `exact_terms` with multi-route fallback.

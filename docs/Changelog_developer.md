@@ -827,3 +827,16 @@
 > - 靶向发版测试集（38 passed in 3.60s）：
 >   `.\.venv\Scripts\python.exe -m pytest tests/test_version_sync.py tests/test_diaglog.py tests/test_mcp_stdio.py tests/test_facade_freeze.py tests/test_cache_codec_roundtrip.py -q`
 > - 差异与格式守卫通过：`git diff --check`（0 警告/0 错误）。
+
+### FIX-v081-docs — moton16,2026-10-07,CodeBuddy,GLM-5.3-Flash — docs: align read-priority wording and record v0.8.1 review follow-ups
+> **代码与文档改动概况**：
+> - 响应 feat/v0.8.1 二轮 review（`.runtime/review-v081/REVIEW.md`，PR #7）§3「旧残余与有意限制」的文档口径与续项登记：
+>   - `CHANGELOG_user.md` / `QUICKSTART_user.md` / `README.md` / `README_EN.md`：
+>     - 「不再发生前台同步等待」等绝对化表述改为「优先使用已就绪索引、后台静默刷新；并发更新时仍可能短暂等待」——共享 FTS 写锁未消除前如实陈述（对应 review §3.1）；
+>   - `docs/Execution-plan_developer.md`：
+>     - 按所有者裁定整份移除（此前登记在其上的 FTS 锁等待 / chunk 签名同代际两条审查续项不再单独维护，review 报告 §3 已有留痕）；
+>   - `.gitignore`：
+>     - 补齐本机代理配置目录（.codebuddy/.codex/.gstack/.cursor/.claude）、运行时产物（.runtime/、*.sqlite/*.log、.mortis_rag_mcp*、.env*）、测试与 IDE 噪声；docs/* 白名单行为不变。
+>
+> **验证**：
+> - 纯文档与忽略规则改动，不触碰产品代码；`tests/test_version_sync.py` 守卫保持绿灯（README badge 与版本真源未受影响）。
