@@ -770,10 +770,36 @@
 > - 纯文档改动，相关版本与协议测试保持绿灯（3 passed in 0.25s）：
 >   `.\.venv\Scripts\python.exe -m pytest tests/test_version_sync.py -q`
 
-
-
-
-
-
-
-
+### C70/T8 — moton16,2026-10-07,Antigravity — docs: synchronize developer guides, update user docs, and enforce retrieval discipline
+> **代码与文档改动概况**：
+> - **Part 1：开发者主文档现状同步与历史欠账追溯（commit `bcd60af`）**：
+>   - `docs/PROJECT_GUIDE.md`：
+>     - 修正包名与入口描述（`mortis_rag_mcp`，`setuptools>=77`，MD/TXT 原生支持，PDF 转 MD 摄取）；
+>     - 更新检索与刷新时序（只读检索优先、后台增量 refresh、锁粒度不跨网络 sync）；
+>     - 更新 Facade/read/search 职责（compact 结构化投影、whole chunk 预算裁决、物理章节与区间读取、A4 双参回调）；
+>     - 新增 §4.11 Ingest 模块职责（单队列、20MiB 大小门禁、auto_seen 判据账本与安全沙箱）；
+>     - 更新 §6 工具 API 表与 §7 配置参考（对齐真实 schema、环境变量覆盖优先级与默认关说明）；
+>     - 在 §15 倒序追加 v0.8.1 开发详录（Intake、C65–C70、C58、C59 全卡实施与测试证据）；
+>   - `docs/Quick-start_developer.md` & `docs/Docs_Folder-descriptions.md` & `docs/Execution-plan_developer.md`：对齐测试用例基线、文件清单与版本目录规范，核验勾选完成状态；
+>   - `docs/Changelog_developer.md`：追溯补齐 Lane E/A/B/C 技术卡（C53、C54+P0、C63、C55、C56、C57+C62、C64）详细条目。
+> - **Part 2：用户文档、检索路由纪律与配置复核（commit `6c4361d`）**：
+>   - `skills/mortis-rag-mcp/SKILL.md`：
+>     - 递增 frontmatter 版本至 `5.3.0`，主标题同步为 0.8.1；
+>     - 全面清除无样本依据的“降低 70%+ Token”量化宣传；
+>     - 增补 C70.2 六条检索调用纪律（大候选初筛定向与预算、compact 无 chunk_id 的 source+行号回读契约、budget returned=0 恢复与 group 游标原样续页、read 实际总行数校正与同名 heading 消歧、indexing/stale 状态应对与禁擅自 rebuild、自动摄取默认关闭与用户显式授权边界）；
+>     - 给出大候选 compact 初筛、区间回读、物理章节直读与用户授权 ingest 配置四组标准调用样例；
+>   - `QUICKSTART_user.md`：
+>     - 修正 §0.2 中的 preview 描述，删除无依据 70%+ 说法；
+>     - 新增 §0.3 v0.8.1 检索与读取升级速查（compact 模式、heading 物理章节读取与重名消歧、只读优先、摄取 20MiB 门禁）；
+>     - 同步 §6 常用工具速查表，增加 compact、budget_bytes、group_offsets 与 heading 参数提示；
+>   - `README.md` & `README_EN.md`：
+>     - 删除无样本限定的“降低 70%+”承诺，准确描述为轻量返回切片与行号、降低上下文开销；
+>     - 去除固定“秒级”承诺，准确表述为后台增量同步与只读优先；
+>     - 补充 0.8.1 紧凑初筛与物理章节直读核心特性；
+>   - `config/app.toml.example`：
+>     - 复核 `[ingest]` 注释，明确阐述自动摄取的费用/隐私成本、扫描 cadence 绑定 index 轮询周期、初始存量文件自动入队、0 表示不限制单文件尺寸及重启生效要求。
+>
+> **验证**：
+> - 离线评测与不变量测试（29 passed in 1.02s）：
+>   `.\.venv\Scripts\python.exe -m pytest tests/test_version_sync.py tests/test_compact_search.py tests/test_read_heading.py tests/test_search_oracle.py -q`
+> - schema 字节量测：14,433 字节（+14.88%，依 PLAN.md 882 行已批准作为安全与新参数完整性授权例外登记）。
