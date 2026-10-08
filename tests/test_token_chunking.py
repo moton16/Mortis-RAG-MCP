@@ -110,12 +110,16 @@ def test_injected_caption_not_claimed_as_source_line():
             assert text.splitlines()[span["line"] - 1][span["start_char"]:span["end_char"]] in c.content
 
 
-def test_pipe_table_repeats_header_and_retains_spans():
-    text = "| name | value |\n| --- | --- |\n" + "| hello | world |\n" * 25
+@pytest.mark.parametrize("header,separator,row", [
+    ("| name | value |", "| --- | --- |", "| hello | world |"),
+    ("| name |", "| --- |", "| hello |"),
+])
+def test_pipe_table_repeats_header_and_retains_spans(header, separator, row):
+    text = header + "\n" + separator + "\n" + (row + "\n") * 25
     output = chunks(text)
     assert_coverage(text, output)
     assert len(output) > 1
-    assert all("| name | value |" in c.content for c in output)
+    assert all(header in c.content for c in output)
     assert any(s["kind"] == "table_header" for c in output for s in c.metadata["synthetic_segments"])
 
 

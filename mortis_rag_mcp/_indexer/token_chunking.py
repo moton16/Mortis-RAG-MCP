@@ -178,8 +178,8 @@ def _pipe_tables(lines):
                 fence_token = None
             i += 1
             continue
-        if (fence_token is None and i + 1 < len(lines) and "|" in lines[i]
-                and re.fullmatch(r"\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*", lines[i + 1])):
+        if (fence_token is None and i + 1 < len(lines) and "|" in lines[i] and "|" in lines[i + 1]
+                and re.fullmatch(r"\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)*\|?\s*", lines[i + 1])):
             end = i + 1
             while end + 1 < len(lines) and "|" in lines[end + 1] and lines[end + 1].strip():
                 end += 1

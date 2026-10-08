@@ -1,6 +1,8 @@
 """R2 defaults, historical codec compatibility and physical/virtual text routing."""
 from dataclasses import replace
 import hashlib
+import os
+from pathlib import Path
 
 import pytest
 
@@ -140,5 +142,44 @@ def test_explicit_rechunk_normal_rebuild_no_approval(tmp_path, transport):
         assert calls
         assert owner.reembedding_approval_summary() is None
         assert owner._paid_control_store().list_payment_authorizations() == []
+    finally:
+        owner.close_document_store()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="actual Windows filesystem case alias")
+def test_case_alias_virtual_wins_even_with_incomplete_scan(tmp_path, monkeypatch):
+    from mortis_rag_mcp._indexer import scanning
+    cfg = AppConfig()
+    cfg.cache.dir = str(tmp_path / "cache")
+    cfg.cache.enabled = True
+    cfg.cache.placement = "home"
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    physical = vault / "Note.MARKDOWN"
+    physical.write_text("physical unique", encoding="utf-8")
+    owner = MarkdownIndexer(vault, cfg)
+    try:
+        owner.sync()
+        assert "Note.MARKDOWN" in owner._chunks
+        body = "virtual unique"
+        sha = hashlib.sha256(physical.read_bytes()).hexdigest()
+        store = owner.document_store(write=True)
+        staged = store.stage_revision(source="note.markdown", source_sha256=sha,
+            render_sha256=hashlib.sha256(body.encode()).hexdigest(),
+            parser_fingerprint="fixture", markdown=body)
+        store.commit_revision(staged.revision_id, source_sha256=sha)
+        denied = vault / "denied"
+        denied.mkdir()
+        original = scanning.os.scandir
+        def partial(path):
+            if Path(path) == denied:
+                raise PermissionError("fixture inaccessible subtree")
+            return original(path)
+        monkeypatch.setattr(scanning.os, "scandir", partial)
+        owner.sync()
+        assert set(owner._chunks) == {"note.markdown"}
+        assert all("virtual unique" in c.content for c in owner.all_chunks())
+        assert owner.read("Note.MARKDOWN") == "virtual unique"
+        assert owner.read("note.markdown") == "virtual unique"
     finally:
         owner.close_document_store()

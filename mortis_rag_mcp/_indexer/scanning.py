@@ -157,6 +157,11 @@ def ignored_name(name: str) -> bool:
     )
 
 
+def source_compare_key(source: str) -> str:
+    """Platform filesystem comparison only; never rewrite stored source or IDs."""
+    return os.path.normcase(source.replace("\\", "/"))
+
+
 def source_rel(vault_path: Path, path: Path) -> str:
     """库内相对 posix 路径（原 MarkdownIndexer._source 逐字迁移）。"""
     return path.relative_to(vault_path).as_posix()

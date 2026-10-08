@@ -1308,7 +1308,18 @@ class MarkdownIndexer:
         virtual = bool(expected_revision_id) or Path(source).suffix.lower() not in self._READABLE_SUFFIXES
         if not virtual:
             store = self._existing_document_store()
-            virtual = store is not None and store.get_active(source, include_hidden=True) is not None
+            active = store.get_active(source, include_hidden=True) if store is not None else None
+            if store is not None and active is None:
+                key = _scanning.source_compare_key(source)
+                matches = [doc.source for doc in store.list_documents() if doc.active_revision
+                           and _scanning.source_compare_key(doc.source) == key]
+                if len(matches) > 1:
+                    raise ValueError("multiple virtual sources refer to the same filesystem path")
+                if matches:
+                    active = store.get_active(matches[0], include_hidden=True)
+                    if active is not None:
+                        source = matches[0]
+            virtual = active is not None
         if virtual:
             return _reading.read_virtual_result(
                 self, source, start_line, end_line, heading=heading,
