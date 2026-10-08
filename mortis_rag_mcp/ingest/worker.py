@@ -59,8 +59,21 @@ except ImportError:
 from .mineru import AGENT_EXTS, MineruClient, MineruError
 from .tables import convert_small_tables
 from ..registry import _process_file_lock
+from .router import DEFAULT_PARSE_BUDGET, ParseBudget, decide_route
+from .local import LocalUnsupported, parse_local
+from .audio import AudioUnsupported, parse_audio
 
 INGEST_EXTS = {".pdf", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx"}
+AUDIO_EXTS = {".wav", ".mp3", ".m4a", ".flac"}
+
+#: legacy/既有路径不得把音频误送 MinerU（C99/C104 接缝）：稳定错误码 + 明确拒绝，
+#: 既不云解析，也不静默跳过当作已解析。只有完成本地格式解析并接入 virtual worker
+#: 音频路由的分支（`VirtualIngestWorker` + `parse_audio`）才允许音频进入 audio adapter。
+AUDIO_ROUTE_UNSUPPORTED = "AUDIO_ROUTE_UNSUPPORTED"
+
+
+def _ingest_exts(config: Any) -> set[str]:
+    return INGEST_EXTS | AUDIO_EXTS if getattr(config, "audio_enabled", False) else INGEST_EXTS
 _STATE_NAME = ".ingest_state.json"
 # review R3：扫描后仍有判稳中的文件或扫描不完整时，扫描循环延时重扫的间隔。
 _SETTLE_RESCAN_SECONDS = 1.0
@@ -103,7 +116,7 @@ def _validate_safe_source(vault_path: Path, rel_path_str: str) -> Path:
         raise ValueError(f"source path resolves outside vault: {rel_path_str}")
     if not resolved.is_file():
         raise ValueError(f"not an ingestible document: {rel_path_str}")
-    if resolved.suffix.lower() not in INGEST_EXTS:
+    if resolved.suffix.lower() not in INGEST_EXTS | AUDIO_EXTS:
         raise ValueError(f"not an ingestible document ({resolved.suffix}): {rel_path_str}")
     return resolved
 
@@ -286,7 +299,7 @@ class IngestManager:
                                 entries_to_visit.append(Path(entry.path))
                             elif entry.is_file(follow_symlinks=False):
                                 path = Path(entry.path)
-                                if path.suffix.lower() not in INGEST_EXTS:
+                                if path.suffix.lower() not in _ingest_exts(self.config):
                                     continue
                                 rel = path.relative_to(self.vault_path).as_posix()
                                 st = entry.stat()
@@ -352,6 +365,12 @@ class IngestManager:
             validated = []
             for rel in sources:
                 path = _validate_safe_source(self.vault_path, rel)
+                if path.suffix.lower() in AUDIO_EXTS:
+                    # legacy 路径没有本地格式解析接线：明确拒绝，绝不把音频送 MinerU。
+                    raise ValueError(
+                        f"{AUDIO_ROUTE_UNSUPPORTED}: legacy 摄取路径不得把音频送 MinerU（{rel}）；"
+                        "请在完成本地格式解析并接入 virtual worker 音频路由后再启用。"
+                    )
                 st = path.stat()
                 if not self._check_file_size(st.st_size):
                     raise ValueError(f"file size {st.st_size} bytes exceeds limit {limit} bytes: {rel}")
@@ -506,7 +525,7 @@ class IngestManager:
                                 entries_to_visit.append(Path(entry.path))
                             elif entry.is_file(follow_symlinks=False):
                                 path = Path(entry.path)
-                                if path.suffix.lower() not in INGEST_EXTS:
+                                if path.suffix.lower() not in _ingest_exts(self.config):
                                     continue
                                 rel = path.relative_to(self.vault_path).as_posix()
                                 scanned_sources.add(rel)
@@ -737,6 +756,17 @@ class IngestManager:
     def _run_job(self, job: dict) -> None:
         # D1: run_job 入口再次校验沙箱与尺寸上限
         src = _validate_safe_source(self.vault_path, job["source"])
+        if src.suffix.lower() in AUDIO_EXTS:
+            # 兜底防线：扫描/恢复可能因 audio_enabled=true 把音频带回 legacy 队列；
+            # 明确失败并给出稳定错误码，绝不落到 `_client_or_make().parse()`（MinerU）。
+            job["state"] = "failed"
+            job["error_code"] = AUDIO_ROUTE_UNSUPPORTED
+            job["error"] = (
+                f"{AUDIO_ROUTE_UNSUPPORTED}: legacy 摄取路径不得把音频送 MinerU"
+                f"（{job['source']}）；请在 virtual worker 音频路由接通后再启用。"
+            )
+            job["finished_at"] = time.time()
+            return
         st = src.stat()
         if not self._check_file_size(st.st_size):
             limit = self._size_limit_bytes()
@@ -871,18 +901,22 @@ class StoreMediaSink:
     worker 调 `attach_occurrences` 挂出现。未被挂上的 blob 由 `gc_unreferenced()` 回收。
     """
 
-    def __init__(self, store: Any) -> None:
+    def __init__(self, store: Any, *, job_id: str = "", owner_token: str = "") -> None:
         self.store = store
+        self.job_id = job_id
+        self.owner_token = owner_token
         self.items: list[Any] = []
 
     def add(self, *, name: str, data: bytes, kind: str, ordinal: int, mime_type: str,
             page: int | None = None, bbox: Any = None, caption: str = "",
             ocr: str = "", width: int | None = None, height: int | None = None,
+            t_start_ms: int | None = None, t_end_ms: int | None = None,
             metadata: dict[str, Any] | None = None) -> str:
         from ..doc_store import MediaOccurrenceSpec
 
         blob_id = self.store.put_media_blob(
-            data=data, mime_type=mime_type, width=width, height=height
+            data=data, mime_type=mime_type, width=width, height=height,
+            job_id=self.job_id, owner_token=self.owner_token,
         )
         occurrence_id = f"occ-{ordinal:05d}"
         meta = {"archive_member": name}
@@ -899,6 +933,8 @@ class StoreMediaSink:
             ocr=ocr,
             width=width,
             height=height,
+            t_start_ms=t_start_ms,
+            t_end_ms=t_end_ms,
             metadata=meta,
         ))
         return occurrence_id
@@ -918,9 +954,21 @@ class VirtualIngestWorker:
         store_provider: Callable[[], Any],
         on_job_finished: Callable[[str, str], None] | None = None,
         ignore_provider: Callable[[], Any] | None = None,
+        parse_budget: ParseBudget | None = None,
+        audio_adapter: Any = None,
+        chunker_fingerprint_provider: Callable[[], str] | None = None,
     ) -> None:
         self.vault_path = Path(vault_path).expanduser().resolve()
         self.config = config
+        # §20.7C：进程级**共享**解析预算池。默认注入模块级 `DEFAULT_PARSE_BUDGET`，
+        # 绝不每库/每 job 新建一个冒充全局。它是逻辑预算准入（控制同时在解析的受控缓冲），
+        # 不是 native 库 RSS 硬保证，也不是跨进程统一限额。
+        self.parse_budget = parse_budget or DEFAULT_PARSE_BUDGET
+        self.audio_adapter = audio_adapter
+        # C99 接缝：队列 fingerprint 需纳入真实 chunker/profile 指纹。`IngestConfig`
+        # 本身不含 chunking 段，故由上层（server/indexer）注入 provider；未注入时退回
+        # 常量占位并在报告中记为待接线。
+        self._chunker_fingerprint_provider = chunker_fingerprint_provider
         self._store_provider = store_provider
         self.on_job_finished = on_job_finished
         self.ignore_provider = ignore_provider
@@ -929,6 +977,8 @@ class VirtualIngestWorker:
         self._worker: threading.Thread | None = None
         self._client: MineruClient | None = None
         self._settling_files: set[str] = set()
+        #: 每个音频 job 的已完成片段进度（ordinal → 事实），未持久化时的内存兜底。
+        self._audio_progress: dict[str, dict[int, dict[str, Any]]] = {}
         self._lease_seconds = max(300.0, float(getattr(config, "poll_timeout", 600.0)) + 120.0)
 
     # ---------------------------------------------------------------- helpers
@@ -976,12 +1026,13 @@ class VirtualIngestWorker:
         self._settling_files.add(Path(rel).as_posix())
 
     def _assert_network_policy(self, source: str) -> None:
-        policy = str(getattr(self.config, "network_policy", "configured") or "configured")
-        if policy == "local_only":
-            raise ValueError(
-                f"ingest.network_policy=local_only 拒绝云端解析：{source}"
-                "（云路径必须在**入队前**拒绝，绝不会先上传再报错）"
-            )
+        path = _validate_safe_source(self.vault_path, source)
+        if path.suffix.lower() in AUDIO_EXTS:
+            from .audio import inspect_wav
+            inspect_wav(path, self.config)
+            return
+        with self.parse_budget.reserve(min(self._limits().memory_budget_bytes, path.stat().st_size * 4), self._stop.is_set):
+            decide_route(path, self.config, limits=self._limits())
 
     def _job_view(self, job: Any, *, channel: str = "", error: str = "",
                   parse_quality: str = "") -> dict[str, Any]:
@@ -1027,7 +1078,7 @@ class VirtualIngestWorker:
                                 stack.append(Path(entry.path))
                             elif entry.is_file(follow_symlinks=False):
                                 path = Path(entry.path)
-                                if path.suffix.lower() not in INGEST_EXTS:
+                                if path.suffix.lower() not in _ingest_exts(self.config):
                                     continue
                                 rel = path.relative_to(self.vault_path).as_posix()
                                 if _is_path_ignored(matcher, rel):
@@ -1076,6 +1127,11 @@ class VirtualIngestWorker:
             targets = [t for t in scanned if t.get("reason") != "too_large"]
             skipped_too_large = len([t for t in scanned if t.get("reason") == "too_large"])
             skipped_ignored = 0
+            # §13.3：local_only / 未授权云路径必须在**入队前**拒绝（显式分支已在
+            # 上面的循环里逐条校验）。这里做全批量校验：任一目标越云即整体拒绝，
+            # 绝不「先入队、等领取再拦」。
+            for target in targets:
+                self._assert_network_policy(target["source"])
         else:
             targets = []
             skipped_too_large = 0
@@ -1207,25 +1263,109 @@ class VirtualIngestWorker:
 
     # ---------------------------------------------------------------- worker
 
-    def _parser_fingerprint(self) -> str:
-        """入队时的 parser 指纹（用于「同源同 SHA 同 parser 合并」）。
+    def _chunker_fingerprint(self) -> str:
+        provider = self._chunker_fingerprint_provider
+        value = ""
+        if provider is not None:
+            try:
+                value = str(provider() or "")
+            except Exception:
+                value = ""
+        # 未注入时用显式占位，而不是空串：接入真实 chunker 指纹后自然区分代际。
+        return value or "chunker-fingerprint-unwired"
 
-        通道在领取时才解析，故这里用 `channel="auto"`；真正的解析事实指纹由
-        `parse_structured()` 产出并写进 `document_revisions.parser_fingerprint`。
+    def _parser_fingerprint(self) -> str:
+        """入队时的 job 指纹（用于「同源同 SHA 同 parser/profile 合并」，§12.2）。
+
+        通道在领取时才判定，故 `channel="auto"`。**必须**纳入 routing/network_policy
+        与 chunker/profile 指纹：否则同内容不同 profile 会被 `enqueue_job` 误合并成
+        同一 job。真正的解析事实指纹仍由 `parse_structured()`/`parse_local()` 产出并
+        写进 `document_revisions.parser_fingerprint`（本函数不是它）。
         """
         from .mineru import ADAPTER_VERSION
-        from .models import parser_fingerprint
 
         cfg = self.config
-        return parser_fingerprint(
-            adapter=ADAPTER_VERSION,
-            channel="auto",
-            model=str(getattr(cfg, "model_version", "vlm")),
-            language=str(getattr(cfg, "language", "ch")),
-            is_ocr=bool(getattr(cfg, "is_ocr", False)),
-            enable_table=bool(getattr(cfg, "enable_table", True)),
-            enable_formula=bool(getattr(cfg, "enable_formula", True)),
-        )
+        parts = [
+            "job-v1",
+            "adapter=" + str(ADAPTER_VERSION),
+            "channel=auto",
+            "model=" + str(getattr(cfg, "model_version", "vlm")),
+            "language=" + str(getattr(cfg, "language", "ch")),
+            "ocr=" + ("1" if getattr(cfg, "is_ocr", False) else "0"),
+            "table=" + ("1" if getattr(cfg, "enable_table", True) else "0"),
+            "formula=" + ("1" if getattr(cfg, "enable_formula", True) else "0"),
+            "routing=" + str(getattr(cfg, "routing", "auto")),
+            "network=" + str(getattr(cfg, "network_policy", "configured")),
+            "chunker=" + self._chunker_fingerprint(),
+        ]
+        return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:32]
+
+    # ------------------------------------------------------------- audio (C104)
+
+    def _audio_resume(self, store: Any, job: Any) -> dict[int, dict[str, Any]]:
+        """读回已完成片段的 checkpoint（resume **只补缺失片段**）。
+
+        `ingest_subjobs` 目前只有 `report_phase`（ordinal 0）这一个写入面，**没有**读回
+        API；因此仅当 store 暴露 `list_subjobs(job_id)` 时才真正跨进程恢复，否则返回 {}。
+        需要的读回 API（见最终报告）：
+            DocumentStore.list_subjobs(job_id) -> list[SubjobRecord]  # .checkpoint 为 JSON
+        """
+        reader = getattr(store, "list_subjobs", None)
+        if reader is None:
+            return {}
+        try:
+            rows = reader(job.job_id)
+        except Exception:
+            return {}
+        resumed: dict[int, dict[str, Any]] = {}
+        for row in rows or []:
+            try:
+                payload = json.loads(getattr(row, "checkpoint", "") or "")
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            for item in payload.get("completed", []):
+                try:
+                    ordinal = int(item["ordinal"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                resumed[ordinal] = dict(item)
+        return resumed
+
+    def _audio_checkpoint(self, store: Any, job: Any, owner: str, segment: Any,
+                          transcript: str) -> None:
+        """逐片段记录进度（partial coverage 的事实来源），供重试/恢复只补缺失片段。"""
+        progress = self._audio_progress.setdefault(job.job_id, {})
+        progress[int(segment.ordinal)] = {
+            "ordinal": int(segment.ordinal),
+            "t_start_ms": int(segment.t_start_ms),
+            "t_end_ms": int(segment.t_end_ms),
+            "sha256": segment.input_sha256,
+            "text": transcript,
+        }
+        self._persist_audio_checkpoint(store, job, owner, progress)
+
+    @staticmethod
+    def _persist_audio_checkpoint(store: Any, job: Any, owner: str,
+                                  progress: dict[int, dict[str, Any]]) -> None:
+        """用现成的 `report_phase`（ordinal 0 + checkpoint 列）持久化片段进度。
+
+        这是「用现成 ingest_subjobs API」的最小落地；真正的 per-ordinal 分卷/音频
+        subjob 状态机需要 `record_subjob`（见最终报告）。持久化失败绝不阻断解析。
+        """
+        reporter = getattr(store, "report_phase", None)
+        if reporter is None:
+            return
+        try:
+            payload = json.dumps(
+                {"completed": sorted(progress.values(), key=lambda item: item["ordinal"])},
+                ensure_ascii=False, separators=(",", ":"),
+            )[:8192]
+            phase = str(getattr(job, "phase", "") or "prepared")
+            reporter(job.job_id, owner, phase=phase, checkpoint=payload)
+        except Exception:
+            pass
 
     def _client_or_make(self) -> MineruClient:
         if self._client is None:
@@ -1256,11 +1396,15 @@ class VirtualIngestWorker:
                 self._run_job(store, job, owner)
             except Exception as exc:  # 单 job 失败不拖垮队列
                 try:
-                    store.fail_job(job.job_id, owner, error_code=type(exc).__name__,
+                    store.fail_job(job.job_id, owner,
+                                   error_code=str(getattr(exc, "code_str", "") or type(exc).__name__),
                                    error_summary=str(exc)[:500],
                                    retryable=bool(getattr(exc, "retryable", False)))
                 except Exception:
                     pass
+            finally:
+                # 逐 job 清理音频进度缓存（已通过 checkpoint 持久化的事实不丢）。
+                self._audio_progress.pop(job.job_id, None)
 
     def _run_job(self, store: Any, job: Any, owner: str) -> None:
         src = _validate_safe_source(self.vault_path, job.source)
@@ -1275,25 +1419,43 @@ class VirtualIngestWorker:
                            error_summary="source_changed before parse", retryable=False)
             return
 
-        sink = StoreMediaSink(store)
-        client = self._client_or_make()
+        self._assert_network_policy(job.source)
+        matcher = self._matcher()
+        if matcher is not None and matcher.is_ignored(job.source)[0]:
+            raise ValueError("source exempt before parse")
+        store.renew_lease(job.job_id, owner, lease_seconds=self._lease_seconds)
+        sink = StoreMediaSink(store, job_id=job.job_id, owner_token=owner)
 
         def _record(kind: str, payload: dict[str, Any]) -> None:
-            try:
-                store.report_phase(job.job_id, owner, phase=kind,
-                                   remote_task_id=str(payload.get("remote_task_id") or ""),
-                                   checkpoint=str(payload.get("payload_hash") or ""))
-            except Exception:
-                pass
+            store.report_phase(job.job_id, owner, phase=kind,
+                               remote_task_id=str(payload.get("remote_task_id") or ""),
+                               checkpoint=str(payload.get("payload_hash") or ""))
 
-        result = client.parse_structured(
-            src,
-            poll_interval=float(getattr(self.config, "poll_interval", 3.0)),
-            poll_timeout=float(getattr(self.config, "poll_timeout", 600.0)),
-            sink=sink,
-            intent_recorder=_record,
-            request_id=job.job_id,
-        )
+        with self.parse_budget.reserve(self._limits().memory_budget_bytes, self._stop.is_set):
+            if src.suffix.lower() in AUDIO_EXTS:
+                # C104：resume 只补缺失片段；checkpoint 逐片段持久化（partial coverage 事实）。
+                resume_state = self._audio_resume(store, job)
+                result = parse_audio(
+                    src, self.config, sink=sink, adapter=self.audio_adapter,
+                    cancelled=self._stop.is_set, resume=resume_state,
+                    checkpoint=lambda segment, transcript: self._audio_checkpoint(
+                        store, job, owner, segment, transcript))
+            else:
+                decision = decide_route(src, self.config, limits=self._limits())
+                if decision.route == "local":
+                    result = parse_local(src, limits=self._limits(),
+                                         max_pages=getattr(self.config, "local_max_pages", 300),
+                                         cancelled=self._stop.is_set)
+                else:
+                    result = self._client_or_make().parse_structured(
+                        src, poll_interval=float(getattr(self.config, "poll_interval", 3.0)),
+                        poll_timeout=float(getattr(self.config, "poll_timeout", 600.0)),
+                        sink=sink, intent_recorder=_record, request_id=job.job_id)
+                result.capabilities["route_decision"] = decision.as_dict()
+        self._assert_network_policy(job.source)
+        matcher = self._matcher()
+        if matcher is not None and matcher.is_ignored(job.source)[0]:
+            raise ValueError("source exempt before publication")
         # 第二次源核验（发布前）：stat 或 hash 变了 → 废弃候选并重新扫描
         stat_after = src.stat()
         if (stat_after.st_size, stat_after.st_mtime_ns) != (stat_before.st_size, stat_before.st_mtime_ns):
@@ -1358,6 +1520,9 @@ def make_ingest_manager(
     store_provider: Callable[[], Any] | None = None,
     on_job_finished: Callable[..., None] | None = None,
     ignore_provider: Callable[[], Any] | None = None,
+    parse_budget: ParseBudget | None = None,
+    audio_adapter: Any = None,
+    chunker_fingerprint_provider: Callable[[], str] | None = None,
 ) -> Any:
     """按 `ingest.storage` 选择摄取实现（唯一的路径分派点）。
 
@@ -1370,6 +1535,8 @@ def make_ingest_manager(
         return VirtualIngestWorker(
             vault_path, config, store_provider,
             on_job_finished=on_job_finished, ignore_provider=ignore_provider,
+            parse_budget=parse_budget, audio_adapter=audio_adapter,
+            chunker_fingerprint_provider=chunker_fingerprint_provider,
         )
     return IngestManager(
         vault_path, config, on_job_finished=on_job_finished, ignore_provider=ignore_provider

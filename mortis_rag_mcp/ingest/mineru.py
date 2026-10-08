@@ -157,8 +157,15 @@ def _io_profile(
     enforce_remote_policy: bool = False,
     allow_loopback: bool = False,
 ) -> Iterator[None]:
-    """在 with 块内设置 IO 预算（可嵌套：内层覆盖外层）。"""
-    previous = getattr(_IO_CTX, "ctx", None)
+    """嵌套 IO 继承外层总 deadline，内层预算只能收紧。"""
+    previous = _current_io()
+    if previous is not None:
+        if previous.deadline is not None:
+            deadline = previous.deadline if deadline is None else min(deadline, previous.deadline)
+        if previous.limit_bytes is not None:
+            limit_bytes = previous.limit_bytes if limit_bytes is None else min(limit_bytes, previous.limit_bytes)
+        enforce_remote_policy = enforce_remote_policy or previous.enforce_remote_policy
+        allow_loopback = previous.allow_loopback
     _IO_CTX.ctx = _IOContext(
         deadline=deadline,
         limit_bytes=limit_bytes,
@@ -219,7 +226,7 @@ def _read_bounded(resp: Any, limit: int | None) -> bytes:
 def _error_body(exc: urllib.error.HTTPError) -> str:
     """读取错误响应体（有界）用作诊断；不记完整 URL。"""
     try:
-        raw = exc.read()
+        raw = exc.read(64 * 1024)
     except Exception:  # pragma: no cover - 极端情况下 body 不可读
         return ""
     limit = 500
@@ -250,7 +257,11 @@ def _http_json(req: urllib.request.Request, timeout: float) -> dict:
     except MineruError:
         raise
     try:
+        _admit_structure_json(payload)
         return json.loads(payload.decode("utf-8"))
+    except (MemoryError, RecursionError) as exc:
+        raise MineruError("HTTP JSON allocation budget exceeded",
+                          retryable=False, code_str=RESOURCE_LIMIT) from exc
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise MineruError(
             f"invalid JSON response: {exc}",
@@ -602,16 +613,48 @@ def _derive_page_map(markdown: str, blocks: list[dict[str, Any]]) -> tuple[list[
     return spans, ""
 
 
+def _admit_structure_json(payload: bytes) -> None:
+    depth = 0
+    nodes = 1
+    in_string = False
+    escaped = False
+    for byte in payload:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif byte == 92:
+                escaped = True
+            elif byte == 34:
+                in_string = False
+            continue
+        if byte == 34:
+            in_string = True
+        elif byte in (91, 123):
+            depth += 1
+            nodes += 1
+        elif byte in (93, 125):
+            depth -= 1
+        elif byte in (44, 58):
+            nodes += 1
+        if depth > 64 or nodes > 100_000:
+            raise MineruError("structure JSON depth/node budget exceeded",
+                              retryable=False, code_str=RESOURCE_LIMIT)
+
+
 def _parse_structure_json(members: list[tuple[str, bytes]]) -> tuple[dict[str, Any], list[dict[str, Any]], list[str], bool]:
     """结构 JSON 白名单解析。未知 schema → 不猜字段，标 partial（PARSE_PARTIAL）。"""
     capabilities: dict[str, Any] = {}
     blocks: list[dict[str, Any]] = []
     warnings: list[str] = []
     partial = False
-    recognized = False
     for name, payload in members:
+        recognized = False
+        _admit_structure_json(payload)
         try:
             document = json.loads(payload.decode("utf-8"))
+        except (RecursionError, MemoryError) as exc:
+            raise MineruError("structure JSON allocation budget exceeded",
+                              retryable=False, code_str=RESOURCE_LIMIT) from exc
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             warnings.append(f"structure json unreadable: {name} ({type(exc).__name__})")
             partial = True
@@ -640,6 +683,9 @@ def _safe_extract_zip(
     sink: MediaSink | None,
 ) -> ArchiveOutcome:
     """安全消费 MinerU 结果归档：先准入中央目录，再逐成员受限读取。**不 extractall**。"""
+    if len(zip_bytes) * 2 > limits.memory_budget_bytes:
+        raise MineruError("archive buffer exceeds controlled memory budget",
+                          retryable=False, code_str=RESOURCE_LIMIT)
     declared = _inspect_central_directory(zip_bytes, limits)
     try:
         zf = zipfile.ZipFile(io.BytesIO(zip_bytes))
@@ -710,10 +756,20 @@ def _safe_extract_zip(
                               code_str=CONTRACT_UNVERIFIED)
 
         remaining = limits.extracted_max_bytes
+        retained_budget = len(zip_bytes) * 2
+
+        def buffer_limit(maximum: int, multiplier: int) -> int:
+            available = (limits.memory_budget_bytes - retained_budget) // multiplier
+            if available <= 0:
+                raise MineruError("archive working buffers exceed controlled memory budget",
+                                  retryable=False, code_str=RESOURCE_LIMIT)
+            return min(maximum, available)
+
         md_info = markdown_infos[0]
         markdown_bytes = _read_member_bounded(
-            zf, md_info, limit=limits.markdown_max_bytes, remaining=remaining
+            zf, md_info, limit=buffer_limit(limits.markdown_max_bytes, 12), remaining=remaining
         )
+        retained_budget += len(markdown_bytes) * 12
         remaining -= len(markdown_bytes)
         markdown = markdown_bytes.decode("utf-8", errors="replace")
 
@@ -731,9 +787,10 @@ def _safe_extract_zip(
                     warnings.append("too many structure json members; extras ignored")
                     continue
                 payload = _read_member_bounded(
-                    zf, info, limit=limits.json_max_bytes, remaining=remaining
+                    zf, info, limit=buffer_limit(limits.json_max_bytes, 64), remaining=remaining
                 )
                 remaining -= len(payload)
+                retained_budget += len(payload) * 64
                 json_members.append((key, payload))
                 continue
             if suffix not in _IMAGE_EXTS or "/" not in key:
@@ -747,9 +804,11 @@ def _safe_extract_zip(
                     code_str=RESOURCE_LIMIT,
                 )
             payload = _read_member_bounded(
-                zf, info, limit=limits.media_max_bytes, remaining=remaining
+                zf, info, limit=buffer_limit(limits.media_max_bytes, 2), remaining=remaining
             )
             remaining -= len(payload)
+            if isinstance(sink, DictMediaSink):
+                retained_budget += len(payload) * 2
             if suffix != ".svg" and image_pixel_budget_exceeded(payload, limits.max_image_pixels):
                 raise MineruError(
                     f"image member {info.filename!r} declares more than "
@@ -790,7 +849,7 @@ def _safe_extract_zip(
 
     structure_caps, blocks, json_warnings, partial = _parse_structure_json(json_members)
     warnings.extend(json_warnings)
-    page_map, reason = _derive_page_map(markdown, blocks)
+    page_map, reason = _derive_page_map(normalize_markdown(markdown), blocks)
     if reason:
         warnings.append(f"page_map unavailable: {reason}")
     capabilities: dict[str, Any] = {
@@ -1012,6 +1071,7 @@ class MineruClient:
         with _io_profile(limit_bytes=None, enforce_remote_policy=True):
             payload, warnings = self._upload_payload(path)
             _put_upload(upload_url, payload, max(self.timeout, 300.0))
+            del payload
         # 3) 轮询批量结果
         while time.monotonic() < deadline:
             poll_url = f"{V4_BASE}/extract-results/batch/{batch_id}"
@@ -1079,6 +1139,7 @@ class MineruClient:
         with _io_profile(limit_bytes=None, enforce_remote_policy=True):
             payload, warnings = self._upload_payload(path)
             _put_upload(upload_url, payload, max(self.timeout, 300.0))
+            del payload
         while time.monotonic() < deadline:
             poll_url = f"{AGENT_BASE}/parse/{task_id}"
             with _io_profile(limit_bytes=self.limits.json_max_bytes, enforce_remote_policy=True):
@@ -1129,10 +1190,7 @@ class MineruClient:
         data.update(payload)
         if data.get("endpoint"):
             data["endpoint"] = redact_endpoint(str(data["endpoint"]))
-        try:
-            recorder(kind, data)
-        except Exception:  # pragma: no cover - 持久化失败不能拖垮解析
-            pass
+        recorder(kind, data)
 
     def _paid_post(self, url: str, body: dict[str, Any], *, intent_recorder: Any,
                    request_id: str, label: str) -> dict:
@@ -1148,10 +1206,12 @@ class MineruClient:
         headers = self._v4_headers() if url.startswith(V4_BASE) else {"Content-Type": "application/json"}
         req = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"),
                                      headers=headers, method="POST")
+        self._note(intent_recorder, "send_intent", request_id=request_id, endpoint=url,
+                   payload_hash=payload_hash)
         try:
             return _http_json(req, self.timeout)
         except MineruError as exc:
-            if exc.http_status is None:
+            if exc.http_status is None or exc.http_status == 429 or exc.http_status >= 500:
                 self._note(intent_recorder, "submission_unknown", request_id=request_id, endpoint=url)
                 raise MineruError(
                     f"submission_unknown: {label} outcome unknown after network error ({exc})",
@@ -1168,7 +1228,8 @@ class MineruClient:
             req = urllib.request.Request(url, headers=self._v4_headers())
         else:
             req = urllib.request.Request(url)
-        data = _http_json(req, self.timeout)
+        with _io_profile(limit_bytes=self.limits.json_max_bytes, enforce_remote_policy=True):
+            data = _http_json(req, self.timeout)
         self._note(intent_recorder, "polling", request_id=request_id, endpoint=url,
                    remote_task_id=remote_task_id)
         return data
@@ -1184,14 +1245,23 @@ class MineruClient:
                 code_str=RESOURCE_LIMIT,
                 fix="流式上传未实现前退回有界缓冲；超出预算必须拒绝而不是无界读入。",
             )
-        return path.read_bytes(), []
+        with path.open("rb") as stream:
+            return _read_bounded(stream, self.limits.memory_budget_bytes), []
 
     def _download_archive(self, url: str, recorder: Any, request_id: str) -> bytes:
-        with _io_profile(limit_bytes=self.limits.archive_max_bytes, enforce_remote_policy=True):
+        limit = min(self.limits.archive_max_bytes, self.limits.memory_budget_bytes // 2)
+        if limit < 1:
+            raise MineruError("archive download buffer budget exhausted",
+                              retryable=False, code_str=RESOURCE_LIMIT)
+        with _io_profile(limit_bytes=limit, enforce_remote_policy=True):
             return _http_bytes(url, max(self.timeout, 300.0))
 
     def _download_bytes(self, url: str, recorder: Any, request_id: str) -> bytes:
-        with _io_profile(limit_bytes=self.limits.markdown_max_bytes, enforce_remote_policy=True):
+        limit = min(self.limits.markdown_max_bytes, self.limits.memory_budget_bytes // 12)
+        if limit < 1:
+            raise MineruError("markdown download buffer budget exhausted",
+                              retryable=False, code_str=RESOURCE_LIMIT)
+        with _io_profile(limit_bytes=limit, enforce_remote_policy=True):
             return _http_bytes(url, max(self.timeout, 120.0))
 
     def _sleep_until(self, interval: float, deadline: float) -> None:

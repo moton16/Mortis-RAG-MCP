@@ -175,8 +175,19 @@ class MediaOccurrence:
     width: int | None = None
     height: int | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    ocr: str = ""
+    anchor_start: int | None = None
+    anchor_end: int | None = None
+    blob_sha256: str = ""
 
     def __post_init__(self) -> None:
+        if self.anchor_start is not None:
+            if (isinstance(self.anchor_start, bool) or not isinstance(self.anchor_start, int)
+                    or self.anchor_start < 0 or isinstance(self.anchor_end, bool)
+                    or not isinstance(self.anchor_end, int) or self.anchor_end < self.anchor_start):
+                raise ValueError("MediaOccurrence anchor must be a nonnegative half-open span")
+        elif self.anchor_end is not None:
+            raise ValueError("MediaOccurrence anchor_end requires anchor_start")
         if not isinstance(self.occurrence_id, str) or not self.occurrence_id:
             raise ValueError("MediaOccurrence.occurrence_id 必须是非空字符串")
         if not isinstance(self.kind, str) or not self.kind:
@@ -295,6 +306,7 @@ class DictMediaSink:
                 width=width,
                 height=height,
                 metadata=dict(metadata or {}),
+                ocr=ocr,
             )
         )
         return occurrence_id

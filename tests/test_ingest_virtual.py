@@ -165,3 +165,36 @@ def test_ignore_matcher_unavailable_fails_closed(env):
         worker.submit(["doc.pdf"])
     assert "ignore matcher" in str(exc_info.value)
     assert store.queue_depth() == 0
+
+
+@pytest.mark.parametrize('policy_change', ['ignore', 'local_only'])
+@pytest.mark.parametrize('when', ['before_parse', 'before_publication'])
+def test_worker_rechecks_current_policy(env, monkeypatch, policy_change, when):
+    from mortis_rag_mcp._indexer.scanning import IgnoreMatcher
+    vault, cfg, store, worker = env
+    _pdf(vault)
+    patterns = []
+    worker.ignore_provider = lambda: IgnoreMatcher(patterns)
+    monkeypatch.setattr(worker, '_ensure_worker', lambda store: None)
+    worker.submit(['doc.pdf'])
+    job = store.claim_job('A')
+    assert job is not None
+    calls = []
+    def change_policy():
+        if policy_change == 'ignore':
+            patterns.append('*.pdf')
+        else:
+            cfg.ingest.network_policy = 'local_only'
+    class Client:
+        def parse_structured(self, *args, **kwargs):
+            calls.append(True)
+            change_policy()
+            return ingest_models.ParseResult(markdown='body', parser_fingerprint='fake',
+                channel='v4', model='fake', quality='full')
+    worker._client = Client()
+    if when == 'before_parse':
+        change_policy()
+    with pytest.raises(ValueError):
+        worker._run_job(store, job, 'A')
+    assert len(calls) == (0 if when == 'before_parse' else 1)
+    assert store.get_active('doc.pdf') is None

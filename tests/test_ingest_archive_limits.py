@@ -234,3 +234,55 @@ def test_no_files_are_written_to_disk(tmp_path: Path):
     before = set(tmp_path.iterdir())
     _safe_extract_zip(zip_bytes, limits=_limits(), sink=DictMediaSink())
     assert set(tmp_path.iterdir()) == before
+
+
+def test_structure_json_limit_rejected_before_member_open(monkeypatch):
+    zip_bytes = _make_zip({'full.md': b'# t', 'content_list.json': b'[]' * 100})
+    original = zipfile.ZipFile.open
+    def guarded_open(zf, name, *args, **kwargs):
+        filename = name.filename if isinstance(name, zipfile.ZipInfo) else name
+        if filename.endswith('.json'):
+            raise AssertionError('oversized JSON must be refused before decompression')
+        return original(zf, name, *args, **kwargs)
+    monkeypatch.setattr(zipfile.ZipFile, 'open', guarded_open)
+    with pytest.raises(MineruError) as error:
+        _safe_extract_zip(zip_bytes, limits=_limits(json_max_bytes=199), sink=None)
+    assert error.value.code_str == 'RESOURCE_LIMIT'
+
+
+@pytest.mark.parametrize('budget', [1, 1024])
+def test_memory_budget_rejects_markdown_before_member_open(monkeypatch, budget):
+    archive = _make_zip({'full.md': b'X' * 1024})
+    def forbidden(*args, **kwargs):
+        raise AssertionError('budget must be checked before member decompression')
+    monkeypatch.setattr(zipfile.ZipFile, 'open', forbidden)
+    with pytest.raises(MineruError) as error:
+        _safe_extract_zip(archive, limits=_limits(memory_budget_bytes=budget), sink=None)
+    assert error.value.code_str == 'RESOURCE_LIMIT'
+
+
+@pytest.mark.parametrize('payload', [b'[' * 65 + b'0' + b']' * 65,
+                                     b'[' + b'0,' * 100_001 + b'0]'], ids=['depth', 'nodes'])
+def test_json_depth_and_nodes_rejected_before_loads(monkeypatch, payload):
+    from mortis_rag_mcp.ingest import mineru
+    def forbidden(*args, **kwargs):
+        raise AssertionError('JSON structure admission must precede loads')
+    monkeypatch.setattr(mineru.json, 'loads', forbidden)
+    with pytest.raises(MineruError) as error:
+        mineru._parse_structure_json([('content.json', payload)])
+    assert error.value.code_str == 'RESOURCE_LIMIT'
+
+
+def test_cumulative_json_budget_refused_before_second_read(monkeypatch):
+    archive = _make_zip({'full.md': b'A', 'a.json': b' ' * 1000 + b'{"page_count":1}',
+                         'z.json': b' ' * 1000 + b'{"page_count":1}'})
+    original = zipfile.ZipFile.open
+    def guarded(zf, name, *args, **kwargs):
+        filename = name.filename if isinstance(name, zipfile.ZipInfo) else name
+        if filename == 'z.json':
+            raise AssertionError('second JSON must be refused before decompression')
+        return original(zf, name, *args, **kwargs)
+    monkeypatch.setattr(zipfile.ZipFile, 'open', guarded)
+    with pytest.raises(MineruError) as error:
+        _safe_extract_zip(archive, limits=_limits(memory_budget_bytes=100_000), sink=None)
+    assert error.value.code_str == 'RESOURCE_LIMIT'

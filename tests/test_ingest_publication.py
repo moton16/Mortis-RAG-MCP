@@ -258,8 +258,8 @@ def test_retryable_failure_stays_failed_until_explicit_retry(vault, tmp_path):
     store = open_store(tmp_path, vault, cfg)
     job, _ = store.enqueue_job(source="a.pdf", source_sha256="s1", parser_fingerprint="fp")
     store.claim_job("owner-A")
-    failed = store.fail_job(job.job_id, "owner-A", error_code="SUBMISSION_UNKNOWN",
-                            error_summary="outcome unknown", retryable=True, retry_after=30.0)
+    failed = store.fail_job(job.job_id, "owner-A", error_code="RESOURCE_LIMIT",
+                            error_summary="local budget exceeded before send", retryable=True, retry_after=30.0)
     assert failed.state == "failed" and failed.retry_after == 30.0
     assert store.claim_job("owner-B") is None       # 绝不自动重传
     retried = store.retry_job(job.job_id)
