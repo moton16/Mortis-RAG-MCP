@@ -4,7 +4,9 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Mapping
 
 from ..doc_store import (
     DocStoreError,
@@ -13,6 +15,8 @@ from ..doc_store import (
     is_within,
     normalize_source_path,
 )
+
+DEFAULT_MIRROR_DIRNAME = ".mortis-parsed"
 
 
 def _file_sha256(path: Path) -> str:
@@ -104,6 +108,104 @@ def _header(text: str) -> tuple[dict, str]:
     if not isinstance(values.get("parsed_by"), str) or not values["parsed_by"]:
         raise ValueError("parser provenance is missing")
     return values, body
+
+
+@dataclass(frozen=True)
+class MirrorOwnershipProof:
+    """**单项**镜像归属证明（只读抽取；供 sync 的逐项镜像排除消费）。
+
+    `legacy_mirror` 标记、路径吻合、或「文档库里恰好有同名 source」都**不是**
+    证明。证明必须同时具备：镜像 frontmatter 声明的 source/SHA、库内物理源
+    SHA 复核、唯一 ledger `done` 归属，以及（正文含媒体引用时）资产校验。
+    """
+
+    mirror: str
+    source: str
+    source_sha256: str
+    parser: str
+    media_assets: int
+
+
+def load_legacy_ledger(mirrors_root: Path) -> dict[str, Any] | None:
+    """读取旧 `.ingest_state.json`；缺失/损坏返回 None（不猜、不自动修复）。"""
+    ledger_path = Path(mirrors_root) / ".ingest_state.json"
+    if not ledger_path.is_file():
+        return None
+    try:
+        ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError):
+        return None
+    return ledger if isinstance(ledger, dict) else None
+
+
+def prove_mirror_ownership(root: Path, mirror: str, *, quota_bytes: int,
+                           mirrors_root: Path | None = None,
+                           ledger: Mapping[str, Any] | None = None) -> MirrorOwnershipProof:
+    """逐项只读归属证明；任何一环无法证明即抛 `ValueError(reason)`。
+
+    不做目录级判断、不写库、不改源文件/用户配置。调用方（sync）只按本函数
+    返回的成功证明排除该**具体**镜像路径。
+    """
+    mirrors = Path(mirrors_root) if mirrors_root is not None else root / DEFAULT_MIRROR_DIRNAME
+    path = root / mirror
+    if path.is_symlink() or not is_within(path, mirrors):
+        raise ValueError("unsafe mirror path")
+    if not path.is_file():
+        raise ValueError("mirror file is missing")
+    if path.stat().st_size > quota_bytes:
+        raise ValueError("mirror exceeds quota")
+    fields, body = _header(path.read_text(encoding="utf-8"))
+    if "\x00" in body:
+        raise ValueError("mirror body contains NUL")
+    source = normalize_source_path(fields["source_pdf"], root)
+    physical = root / source
+    if not physical.is_file() or _file_sha256(physical) != fields["source_sha256"]:
+        raise ValueError("missing source or source SHA mismatch")
+    assets: list[dict] = []
+    if re.search(r"!\[[^\]]*\]\(|<img\b", body, re.I):
+        assets = _verify_media_assets(body, path, mirrors, quota_bytes)
+    if ledger is None:
+        ledger = load_legacy_ledger(mirrors)
+    if ledger is None:
+        raise ValueError("legacy ledger provenance is missing")
+    jobs = ledger.get("jobs", {})
+    values = jobs.values() if isinstance(jobs, dict) else jobs
+    matching = [j for j in values if isinstance(j, dict) and j.get("source") == source
+                and j.get("state") == "done" and j.get("sha256") == fields["source_sha256"]]
+    if len(matching) != 1:
+        raise ValueError("mirror ownership cannot be proven by ledger")
+    return MirrorOwnershipProof(mirror=str(mirror), source=source,
+                                source_sha256=str(fields["source_sha256"]),
+                                parser=MIGRATION_VERSION + ":" + str(fields["parsed_by"]),
+                                media_assets=len(assets))
+
+
+def resolve_excluded_mirrors(root: Path, candidates: Mapping[str, str], *, quota_bytes: int,
+                             mirrors_root: Path | None = None) -> tuple[set[str], dict[str, str]]:
+    """把 `source -> 候选镜像路径` 映射收敛为**已证明**镜像集合。
+
+    返回 `(excluded, reasons)`；`reasons` 只用于诊断（未证明→保留为普通文件）。
+    候选文件不存在时静默跳过；证明成立且 header 声明的 source 与候选 source
+    一致才排除。整库 migration/apply 不由本函数触发。
+    """
+    mirrors = Path(mirrors_root) if mirrors_root is not None else root / DEFAULT_MIRROR_DIRNAME
+    ledger = load_legacy_ledger(mirrors)
+    excluded: set[str] = set()
+    reasons: dict[str, str] = {}
+    for source, mirror in candidates.items():
+        if not (root / mirror).is_file():
+            continue
+        try:
+            proof = prove_mirror_ownership(root, mirror, quota_bytes=quota_bytes,
+                                           mirrors_root=mirrors, ledger=ledger)
+        except (ValueError, OSError, UnicodeError, TypeError, DocStoreError) as exc:
+            reasons[str(mirror)] = str(exc)
+            continue
+        if proof.source != source:
+            reasons[str(mirror)] = "mirror header source does not match the indexed source"
+            continue
+        excluded.add(str(mirror))
+    return excluded, reasons
 
 
 def migrate_legacy_mirrors(store: DocumentStore, *, apply: bool = False) -> dict:

@@ -431,16 +431,34 @@ def run_sync(owner: MarkdownIndexer) -> list[Chunk]:
     # §20.1「来源精确排除」：解析事实已进文档库的 source，其**同名旧镜像**不再作为
     # 物理文本重复进索引（否则一次检索同时命中虚拟文档与镜像，双份结果）。逐条按
     # source 推导镜像路径，不做目录级忽略；未入库的镜像与用户内容照旧可见。
+    #
+    # E03-a：路径吻合（或仅有库内同名 source）**不是**归属证明。同路径上的普通用户
+    # 文件此前会被一并排除（F04 误排除）。现在只排除经 `prove_mirror_ownership`
+    # 逐项证明的镜像：frontmatter 声明 source/SHA + 物理源 SHA 复核 + 唯一 ledger
+    # done 归属 + 媒体资产校验。证明失败→保留为普通文件，绝不永久隐藏。
     mirror_prefix = owner._ingest_mirror_prefix()
     excluded_mirrors: set[str] = set()
+    mirror_candidates: dict[str, str] = {}
     for document in documents:
-        if document.visibility != "active":
+        # 仅当存在可见、有效的 virtual 副本（active 且有 active_revision）时才考虑
+        # 排除其镜像；副本失效后下一轮重新评估。
+        if document.visibility != "active" or not document.active_revision:
             continue
         source = document.source
-        if source.lower().endswith((".md", ".markdown", ".txt")):
-            excluded_mirrors.add(mirror_prefix + source)
-        else:
-            excluded_mirrors.add(mirror_prefix + source.rsplit(".", 1)[0] + ".md")
+        name = source if source.lower().endswith((".md", ".markdown", ".txt")) \
+            else source.rsplit(".", 1)[0] + ".md"
+        mirror_candidates[source] = mirror_prefix + name
+    if mirror_candidates and store is not None:
+        from ..ingest.migration import resolve_excluded_mirrors
+
+        try:
+            quota = int(store._quota_limit_bytes())
+        except Exception:
+            quota = 0
+        excluded_mirrors, _mirror_rejections = resolve_excluded_mirrors(
+            owner.vault_path, mirror_candidates, quota_bytes=quota,
+            mirrors_root=owner.vault_path / mirror_prefix.rstrip("/"),
+        )
     for source in set(owner._chunks) | set(owner.failed_files):
         canonical = virtual_sources.get(source_compare_key(source))
         if (source_compare_key(source) in hidden_keys or source in excluded_mirrors or matcher.is_ignored(source)[0]
