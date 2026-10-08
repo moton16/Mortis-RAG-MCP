@@ -99,28 +99,31 @@ def start_watching(
     owner._start_fs_scheduler()
 
 
-def request_refresh(owner: MarkdownIndexer, *, immediate: bool = False) -> bool:
+def request_refresh(owner: MarkdownIndexer, *, immediate: bool = False,
+                    start_scheduler: bool = True) -> bool:
+    """登记一次刷新请求；返回 True 即**确实**保留了 pending（E04-a）。
+
+    `start_scheduler=False` 只登记标志、不拉起调度线程：导入等已持有 mutation
+    锁的调用方在**释放锁之后**用它登记下一轮，避免为"登记"而启动后台 sync。
+    """
     if owner._watch_stop.is_set() or getattr(owner, "_stopping", False):
         return False
     if not Path(owner.vault_path).is_dir():
         return False
-    _start_fs_scheduler(owner)
+    if start_scheduler:
+        _start_fs_scheduler(owner)
     with owner._fs_debounce_lock:
         now = time.monotonic()
         owner._refresh_requested_at = now
         if immediate:
             owner._fs_refresh_immediate = True
-            owner._fs_requested = True
-            owner._fs_pending_since = now
-            owner._fs_debounce_cv.notify_all()
-            return True
-        min_interval = getattr(owner, "_READ_REFRESH_MIN_INTERVAL_SECONDS", 1.0)
-        last_completed = getattr(owner, "_last_refresh_completed_at", 0.0)
-        if (now - last_completed) < min_interval:
-            return True
-        owner._fs_requested = True
+        # E04-a：返回 True 就是"已安排下一轮"的承诺。此前在「最近完成 < min_interval」
+        # 的合并窗口里直接 return True 却**不置 `_fs_requested`**，调用方以为已登记、
+        # 调度器却永远等不到事件——刷新请求被静默丢弃。合并窗口只影响防抖起点，
+        # 不能吞掉请求；真正的合并由调度器的 debounce 完成。
         if owner._fs_pending_since is None:
             owner._fs_pending_since = now
+        owner._fs_requested = True
         owner._fs_debounce_cv.notify_all()
         return True
 

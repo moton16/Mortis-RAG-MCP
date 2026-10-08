@@ -246,9 +246,28 @@ def import_snapshot(owner: MarkdownIndexer, snapshot: str | Path, force: bool = 
         # kb_search / kb_list_files 排队在 _sync_lock 上，整个 MCP 服务冻结。
         # 导入体本身会在锁内从磁盘重载全部状态，无需外层再持 _cache_lock。
         with owner._sync_lock:
-            return _import_snapshot_locked(
+            result = _import_snapshot_locked(
                 owner, src, zf, vectors_member, skip_vectors, warnings
             )
+        # 释放 mutation 之后才登记刷新（E04-a）。
+        _register_post_import_refresh(owner, result)
+        return result
+
+
+def _register_post_import_refresh(owner: MarkdownIndexer, result: dict[str, Any]) -> None:
+    """导入**释放 mutation 锁之后**登记一次刷新（E04-a）。
+
+    导入不发布包内正文（§20.7F），文本层为空；此前导入路径从不登记刷新，索引
+    会停在「空且无待办」的状态，只有下次外部触发才重建。这里只登记 pending、
+    不拉起后台调度线程（避免为"登记"而启动一次后台 sync）。
+    """
+    from .watch import request_refresh
+
+    try:
+        accepted = bool(request_refresh(owner, immediate=True, start_scheduler=False))
+    except Exception:
+        accepted = False
+    result["refresh_requested"] = accepted
 
 
 def _sha_file(path: Path) -> str:
@@ -657,13 +676,16 @@ def _import_v2(owner: MarkdownIndexer, src: Path, archive: zipfile.ZipFile,
                         except Exception:
                             pass
                 raise
-        return {"imported": True, "path": str(src), "format_version": 2,
-                "files": 0, "chunks": 0,
-                "packaged_files": packaged_files, "packaged_chunks": packaged_chunks,
-                "text_published": False,
-                "vectors": len(vectors) if compatible else 0, "vectors_imported": compatible,
-                "parsed_documents_trusted": trusted, "replaced": bool(published and replace),
-                "warnings": ["local source reconciliation required"]}
+        result = {"imported": True, "path": str(src), "format_version": 2,
+                  "files": 0, "chunks": 0,
+                  "packaged_files": packaged_files, "packaged_chunks": packaged_chunks,
+                  "text_published": False,
+                  "vectors": len(vectors) if compatible else 0, "vectors_imported": compatible,
+                  "parsed_documents_trusted": trusted, "replaced": bool(published and replace),
+                  "warnings": ["local source reconciliation required"]}
+        # 释放 mutation 之后才登记刷新（E04-a）。
+        _register_post_import_refresh(owner, result)
+        return result
 
 
 def _import_snapshot_locked(
