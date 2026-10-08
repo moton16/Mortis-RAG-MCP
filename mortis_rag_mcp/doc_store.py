@@ -165,7 +165,7 @@ JOB_ACTIVE_STATES = ("queued", "parsing", "staged")
 JOB_TERMINAL_STATES = ("done", "failed", "cancelled", "superseded")
 #: §12.5 提交阶段（远端恢复）：prepared/submitted/polling/downloaded/staged/committed/submission_unknown。
 JOB_PHASES = (
-    "prepared", "submitted", "polling", "downloaded", "staged", "committed", "submission_unknown",
+    "prepared", "send_intent", "submitted", "polling", "downloaded", "staged", "committed", "submission_unknown",
 )
 #: 租约时长常量（§23.1：租约/锁值必须有常量与配置边界，不散落 magic number）。
 DEFAULT_LEASE_SECONDS = 120.0
@@ -1073,6 +1073,66 @@ class ControlStore:
             )
             conn.commit()
 
+    def _ensure_lifecycle_schema(self, conn: sqlite3.Connection) -> None:
+        conn.execute("CREATE TABLE IF NOT EXISTS generation_pins (pin_id TEXT PRIMARY KEY, "
+                     "generation_id TEXT NOT NULL, owner TEXT NOT NULL, lease_until REAL NOT NULL)")
+        conn.execute("CREATE TABLE IF NOT EXISTS import_confirmations (snapshot_sha256 TEXT PRIMARY KEY, "
+                     "trusted INTEGER NOT NULL, generation_id TEXT NOT NULL, confirmed_at REAL NOT NULL)")
+        conn.commit()
+
+    @contextlib.contextmanager
+    def pin_generation(self, *, lease_seconds: float = 300):
+        if not math.isfinite(lease_seconds) or lease_seconds <= 0:
+            raise StoreContractError("Invalid generation pin lease")
+        token = uuid.uuid4().hex
+        with self.mutation() as conn:
+            self._ensure_lifecycle_schema(conn)
+            generation = str(self._read_meta(conn)[5])
+            if not generation:
+                raise StoreConflict("No active generation to pin")
+            conn.execute("INSERT INTO generation_pins VALUES (?, ?, ?, ?)",
+                         (token, generation, str(os.getpid()), time.time() + lease_seconds))
+            conn.commit()
+        try:
+            yield generation
+        finally:
+            with self.mutation() as conn:
+                conn.execute("DELETE FROM generation_pins WHERE pin_id = ?", (token,))
+                conn.commit()
+
+    def generation_is_pinned(self, generation_id: str) -> bool:
+        with self.mutation() as conn:
+            self._ensure_lifecycle_schema(conn)
+            return conn.execute("SELECT 1 FROM generation_pins WHERE generation_id = ? "
+                                "AND lease_until > ? LIMIT 1", (generation_id, time.time())).fetchone() is not None
+
+    def publish_import(self, generation_id: str, *, expected_generation: str,
+                       expected_epoch: int, store_uuid: str, snapshot_sha256: str = "",
+                       trusted: bool = False) -> int:
+        with self.mutation() as conn:
+            self._ensure_lifecycle_schema(conn)
+            row = self._read_meta(conn)
+            if str(row[5]) != expected_generation or int(row[3]) != expected_epoch:
+                raise StoreConflict("Import CAS failed: active generation or epoch changed")
+            record = conn.execute("SELECT path, state FROM generation_registry WHERE generation_id = ?",
+                                  (generation_id,)).fetchone()
+            if record is None or str(record[1]) != "validated":
+                raise SnapshotInvalid("Import generation has not been validated")
+            if not is_within(record[0], self.layout.generations_dir):
+                raise SnapshotInvalid("Import generation escaped local storage")
+            epoch = int(row[3]) + 1
+            conn.execute("UPDATE control_meta SET active_document_generation = ?, vault_epoch = ?, "
+                         "store_uuid = ? WHERE id = 1", (generation_id, epoch, store_uuid))
+            conn.execute("UPDATE generation_registry SET state = 'retained' WHERE generation_id = ?",
+                         (expected_generation,))
+            conn.execute("UPDATE generation_registry SET state = 'ready' WHERE generation_id = ?",
+                         (generation_id,))
+            if snapshot_sha256:
+                conn.execute("INSERT OR REPLACE INTO import_confirmations VALUES (?, ?, ?, ?)",
+                             (snapshot_sha256, int(trusted), generation_id, time.time()))
+            conn.commit()
+            return epoch
+
     def list_generations(self) -> list[GenerationRecord]:
         with self.mutation():
             conn = self._require_conn()
@@ -1081,6 +1141,125 @@ class ControlStore:
                 "ORDER BY generation_id"
             ).fetchall()
         return [GenerationRecord(str(r[0]), str(r[1]), str(r[2]), str(r[3]), float(r[4])) for r in rows]
+
+    # ------------------------------------------- 付费授权 / 发送意图（§20.7B/§20.7F）
+
+    def _ensure_payment_schema(self, conn: sqlite3.Connection) -> None:
+        """惰性补建付费面表：既有控制库（schema_version=1）无需迁移即可获得。
+
+        与 lifecycle 表同一策略：**只加表、不改版本号**，避免把「未建表」误判成本机
+        控制库损坏；表内只存哈希/定位与脱敏阶段，不存正文或 key。
+        """
+        conn.execute("CREATE TABLE IF NOT EXISTS payment_authorizations ("
+                     "profile_fingerprint TEXT PRIMARY KEY, scope TEXT NOT NULL, "
+                     "cost_summary_json TEXT NOT NULL DEFAULT '{}', note TEXT NOT NULL DEFAULT '', "
+                     "authorized_at REAL NOT NULL, revoked_at REAL)")
+        conn.execute("CREATE TABLE IF NOT EXISTS request_intents ("
+                     "request_id TEXT PRIMARY KEY, kind TEXT NOT NULL, payload_hash TEXT NOT NULL, "
+                     "endpoint TEXT NOT NULL, profile_fingerprint TEXT NOT NULL DEFAULT '', "
+                     "attempt INTEGER NOT NULL DEFAULT 1, state TEXT NOT NULL, reason TEXT NOT NULL DEFAULT '', "
+                     "created_at REAL NOT NULL, updated_at REAL NOT NULL)")
+        conn.commit()
+
+    def authorize_paid_profile(self, profile_fingerprint: str, *, scope: str,
+                               cost_summary: dict | None = None, note: str = "") -> None:
+        """显式授权精确 profile 的付费请求；scope 记录授权范围（如 reembed/query/rerank）。"""
+        if not isinstance(profile_fingerprint, str) or not profile_fingerprint:
+            raise StoreContractError("profile_fingerprint 必填")
+        if not isinstance(scope, str) or not scope:
+            raise StoreContractError("scope 必填")
+        with self.mutation() as conn:
+            self._ensure_payment_schema(conn)
+            conn.execute(
+                "INSERT OR REPLACE INTO payment_authorizations "
+                "(profile_fingerprint, scope, cost_summary_json, note, authorized_at, revoked_at) "
+                "VALUES (?, ?, ?, ?, ?, NULL)",
+                (profile_fingerprint, scope, _dump_json(cost_summary or {}, "cost_summary"), str(note), time.time()),
+            )
+            conn.commit()
+
+    def revoke_paid_authorization(self, profile_fingerprint: str) -> None:
+        with self.mutation() as conn:
+            self._ensure_payment_schema(conn)
+            conn.execute("UPDATE payment_authorizations SET revoked_at = ? WHERE profile_fingerprint = ?",
+                         (time.time(), profile_fingerprint))
+            conn.commit()
+
+    def paid_authorization_state(self, profile_fingerprint: str) -> str:
+        """返回 `authorized` / `revoked` / `absent`（未授权的 profile 不得被当成已授权）。"""
+        if not isinstance(profile_fingerprint, str) or not profile_fingerprint:
+            return "absent"
+        with self.mutation() as conn:
+            self._ensure_payment_schema(conn)
+            row = conn.execute("SELECT revoked_at FROM payment_authorizations WHERE profile_fingerprint = ?",
+                               (profile_fingerprint,)).fetchone()
+        if row is None:
+            return "absent"
+        return "revoked" if row[0] is not None else "authorized"
+
+    def paid_profile_authorized(self, profile_fingerprint: str) -> bool:
+        return self.paid_authorization_state(profile_fingerprint) == "authorized"
+
+    def list_payment_authorizations(self) -> list[dict]:
+        with self.mutation() as conn:
+            self._ensure_payment_schema(conn)
+            rows = conn.execute("SELECT profile_fingerprint, scope, cost_summary_json, note, "
+                               "authorized_at, revoked_at FROM payment_authorizations "
+                               "ORDER BY authorized_at").fetchall()
+        return [{"profile_fingerprint": r[0], "scope": r[1],
+                 "cost_summary": _load_json(r[2], "cost_summary", {}), "note": r[3],
+                 "authorized_at": r[4], "revoked_at": r[5]} for r in rows]
+
+    def record_send_intent(self, request_id: str, *, kind: str, payload_hash: str, endpoint: str,
+                           profile_fingerprint: str = "", attempt: int = 1) -> None:
+        """非幂等计费 POST 实际发送**之前**落意图并固化尝试次数（§20.7F）。"""
+        for name, value in (("request_id", request_id), ("kind", kind), ("payload_hash", payload_hash),
+                            ("endpoint", endpoint)):
+            if not isinstance(value, str) or not value:
+                raise StoreContractError(f"{name} 必填")
+        if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1:
+            raise StoreContractError("attempt 必须是 >= 1 的整数")
+        with self.mutation() as conn:
+            self._ensure_payment_schema(conn)
+            conn.execute(
+                "INSERT OR REPLACE INTO request_intents "
+                "(request_id, kind, payload_hash, endpoint, profile_fingerprint, attempt, state, reason, "
+                "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'prepared', '', "
+                "COALESCE((SELECT created_at FROM request_intents WHERE request_id = ?), ?), ?)",
+                (request_id, kind, payload_hash, endpoint, profile_fingerprint, int(attempt),
+                 request_id, time.time(), time.time()),
+            )
+            conn.commit()
+
+    def mark_intent(self, request_id: str, state: str, reason: str = "") -> None:
+        if state not in {"success", "submission_unknown", "abandoned"}:
+            raise StoreContractError(f"unknown intent state: {state}")
+        with self.mutation() as conn:
+            self._ensure_payment_schema(conn)
+            cursor = conn.execute("UPDATE request_intents SET state = ?, reason = ?, updated_at = ? "
+                                  "WHERE request_id = ?", (state, str(reason), time.time(), request_id))
+            conn.commit()
+            if cursor.rowcount == 0:
+                raise StoreContractError(f"未记录的发送意图：{request_id!r}")
+
+    def intent_state(self, request_id: str) -> str | None:
+        with self.mutation() as conn:
+            self._ensure_payment_schema(conn)
+            row = conn.execute("SELECT state FROM request_intents WHERE request_id = ?", (request_id,)).fetchone()
+            return None if row is None else str(row[0])
+
+    def list_request_intents(self, *, state: str = "") -> list[dict]:
+        with self.mutation() as conn:
+            self._ensure_payment_schema(conn)
+            rows = conn.execute(
+                "SELECT request_id, kind, payload_hash, endpoint, profile_fingerprint, attempt, state, "
+                "reason, created_at, updated_at FROM request_intents "
+                "WHERE (? = '' OR state = ?) ORDER BY created_at",
+                (state, state),
+            ).fetchall()
+        keys = ("request_id", "kind", "payload_hash", "endpoint", "profile_fingerprint",
+                "attempt", "state", "reason", "created_at", "updated_at")
+        return [dict(zip(keys, row)) for row in rows]
 
     def close(self) -> None:
         conn = self._conn()
@@ -1431,10 +1610,11 @@ class DocumentStore:
         return ""
 
     def _ensure_read_generation(self) -> str:
-        if self._generation_id:
-            return self._generation_id
-        self._generation_id = self._resolve_generation(write=False)
-        return self._generation_id
+        gen = self._resolve_generation(write=False)
+        if gen != self._generation_id:
+            self.close()
+            self._generation_id = gen
+        return gen
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -1512,6 +1692,12 @@ class DocumentStore:
                     or self._allocate_generation()
                 )
                 self._generation_id = gen
+            active = self._active_generation()
+            if not self._requested_generation and active and active != self._generation_id:
+                self.close()
+                self._generation_id = active
+            elif self._requested_generation and active != self._requested_generation:
+                raise StoreConflict("An inactive retained generation is read-only")
             path = self._store_path(self._generation_id)
             path.parent.mkdir(parents=True, exist_ok=True)
             depth = int(getattr(self._tls, "mutation_depth", 0))
@@ -1777,8 +1963,10 @@ class DocumentStore:
 
         with self.mutation() as conn:
             if job_id:
-                self._require_job_owner(conn, job_id, owner_token)
+                job = self._require_job_owner(conn, job_id, owner_token)
                 self._assert_job_not_superseded(conn, job_id)
+                if job.source != rel or job.source_sha256 != source_sha256:
+                    raise StoreConflict("staged source/SHA does not match job")
             limit = self._quota_limit_bytes()
             if limit > 0:
                 md_b, media_b, page_b, _mc, _p = self._logical_breakdown(conn)
@@ -1944,7 +2132,8 @@ class DocumentStore:
 
     def put_media_blob(self, *, data: bytes, mime_type: str, width: int | None = None,
                        height: int | None = None, duration_ms: int | None = None,
-                       sample_rate: int | None = None) -> str:
+                       sample_rate: int | None = None, job_id: str = "",
+                       owner_token: str = "") -> str:
         """把一项媒体**逐项**写入 `media_blobs`（内容寻址），返回 blob_id（§13.2）。
 
         这是流式 sink 的第一阶段：解析时每读到一个成员就落库并释放 RAM，
@@ -1958,6 +2147,9 @@ class DocumentStore:
             raise StoreContractError("mime_type 必填")
         blob_id = hashlib.sha256(payload).hexdigest()
         with self.mutation() as conn:
+            if job_id:
+                self._require_job_owner(conn, job_id, owner_token)
+                self._assert_job_not_superseded(conn, job_id)
             existing = conn.execute(
                 "SELECT mime_type, byte_size FROM media_blobs WHERE blob_id = ?", (blob_id,)
             ).fetchone()
@@ -2054,7 +2246,7 @@ class DocumentStore:
     ) -> int:
         """单事务发布（§12.5 第 5 步）：CAS + 切 active + change_seq+1 + 保留策略。"""
         with self.mutation() as conn:
-            return self._commit_locked(
+            seq = self._commit_locked(
                 conn,
                 revision_id,
                 expected_change_seq=expected_change_seq,
@@ -2063,6 +2255,8 @@ class DocumentStore:
                 source_mtime_ns=source_mtime_ns,
                 policy_version=policy_version,
             )
+            conn.commit()
+            return seq
 
     def commit_job_revision(
         self,
@@ -2087,8 +2281,15 @@ class DocumentStore:
                 f"commit_job_revision 的终态必须是 {JOB_TERMINAL_STATES} 之一（或 'staged'），收到 {state!r}"
             )
         with self.mutation() as conn:
-            self._require_job_owner(conn, job_id, owner_token)
+            job = self._require_job_owner(conn, job_id, owner_token)
             self._assert_job_not_superseded(conn, job_id)
+            candidate = conn.execute(
+                "SELECT d.source, r.source_sha256 FROM document_revisions r "
+                "JOIN documents d ON d.doc_id = r.doc_id WHERE r.revision_id = ?",
+                (revision_id,),
+            ).fetchone()
+            if candidate is None or (str(candidate[0]), str(candidate[1])) != (job.source, job.source_sha256):
+                raise StoreConflict("revision source/SHA does not match job")
             seq = self._commit_locked(
                 conn,
                 revision_id,
@@ -2225,7 +2426,6 @@ class DocumentStore:
             "DELETE FROM document_revisions WHERE doc_id = ? AND state = 'staged'", (doc_id,)
         )
         self._prune_committed(conn, doc_id, keep=[revision_id, prev_active])
-        conn.commit()
         return new_seq
 
     def _prune_committed(self, conn: sqlite3.Connection, doc_id: str, keep: Sequence[str]) -> None:
@@ -2312,6 +2512,8 @@ class DocumentStore:
                 f"job {job_id} 的 owner_token 不匹配（旧 owner 晚到或被重新领取）",
                 fix="旧 worker 必须放弃该候选：重新 claim 或让新 owner 继续。",
             )
+        if job.vault_epoch != self._current_epoch():
+            raise OwnershipLost(f"job {job_id} 的 vault epoch 已失效")
         if job.state in JOB_TERMINAL_STATES:
             raise OwnershipLost(f"job {job_id} 已处于终态 {job.state}，不能再写")
         if job.lease_until <= time.time():
@@ -2363,6 +2565,14 @@ class DocumentStore:
             raise StoreContractError("parser_fingerprint 必填")
         with self.mutation() as conn:
             epoch = self._current_epoch()
+            unknown = conn.execute(
+                "SELECT job_id FROM ingest_jobs WHERE source = ? "
+                "AND (error_code = 'SUBMISSION_UNKNOWN' OR phase = 'submission_unknown') LIMIT 1",
+                (rel,),
+            ).fetchone()
+            if unknown is not None:
+                raise StoreConflict("SUBMISSION_UNKNOWN: source has an unresolved paid request",
+                                    fix="人工核对受理与费用；force/自动扫描不得绕过未知受理。")
             depth_row = conn.execute(
                 "SELECT COUNT(*) FROM ingest_jobs WHERE state IN ('queued', 'parsing', 'staged')"
             ).fetchone()
@@ -2377,6 +2587,14 @@ class DocumentStore:
                 ).fetchone()
                 if existing is not None:
                     return self._row_to_job(existing), False
+            pending_remote = conn.execute(
+                "SELECT job_id FROM ingest_jobs WHERE source = ? AND state <> 'done' "
+                "AND phase IN ('send_intent', 'submitted', 'polling', 'downloaded') LIMIT 1",
+                (rel,),
+            ).fetchone()
+            if pending_remote is not None:
+                raise StoreConflict("SUBMISSION_UNKNOWN: unresolved remote request cannot be superseded",
+                                    fix="先核对旧远端任务；force、取消或新源SHA均不是费用确认。")
             limit = self._queue_limit()
             if depth >= limit:
                 raise QueueFull(
@@ -2433,6 +2651,14 @@ class DocumentStore:
         stamp = time.time() if now is None else float(now)
         lease = max(float(lease_seconds), 1.0)
         with self.mutation() as conn:
+            conn.execute(
+                "UPDATE ingest_jobs SET state = 'failed', phase = 'submission_unknown', "
+                "error_code = 'SUBMISSION_UNKNOWN', error_summary = 'expired remote submission requires review', "
+                "owner_token = '', lease_until = 0, updated_at = ? "
+                "WHERE state IN ('parsing', 'staged') AND lease_until <= ? "
+                "AND phase IN ('send_intent', 'submitted', 'polling', 'downloaded', 'submission_unknown')",
+                (stamp, stamp),
+            )
             rows = conn.execute(
                 "SELECT job_id FROM ingest_jobs "
                 "WHERE state = 'queued' "
@@ -2459,6 +2685,7 @@ class DocumentStore:
                     lease_seconds: float = DEFAULT_LEASE_SECONDS) -> JobRecord:
         """续租 CAS：影响 0 行 → OWNERSHIP_LOST（不无条件覆盖 job）。"""
         with self.mutation() as conn:
+            self._require_job_owner(conn, job_id, owner_token)
             stamp = time.time()
             cursor = conn.execute(
                 "UPDATE ingest_jobs SET lease_until = ?, updated_at = ? WHERE job_id = ? "
@@ -2549,6 +2776,10 @@ class DocumentStore:
                     f"job {job_id} 当前状态 {job.state} 不可重试",
                     fix="只有 failed/cancelled 的任务可以显式重试。",
                 )
+            if (job.error_code == "SUBMISSION_UNKNOWN"
+                    or job.phase in {"send_intent", "submitted", "polling", "downloaded", "submission_unknown"}):
+                raise StoreConflict("SUBMISSION_UNKNOWN: retry requires a bound manual confirmation",
+                                    fix="当前窗口未实现费用确认入口；不得把显式 retry 当确认。")
             stamp = time.time()
             self._write(
                 conn,
@@ -2783,6 +3014,10 @@ class DocumentStore:
                 f"derived status 必须是 pending/building/ready/failed/stale，收到 {status!r}"
             )
         with self.mutation() as conn:
+            if status == "ready":
+                current = conn.execute("SELECT change_seq FROM store_meta WHERE id = 1").fetchone()
+                if current is None or int(current[0]) != int(change_seq):
+                    status = "stale"
             conn.execute(
                 "INSERT INTO derived_generations (profile_key, change_seq, chunker_fingerprint, "
                 "space_fingerprint, status, last_error) VALUES (?, ?, ?, ?, ?, ?) "
@@ -2827,6 +3062,22 @@ class DocumentStore:
             active_revision=active_revision,
             revision=revision,
         )
+
+    def list_documents(self, visibility: str | None = None) -> list[DocumentRecord]:
+        if visibility is not None and visibility not in _VISIBILITIES:
+            raise StoreContractError("invalid document visibility")
+        gen = self._ensure_read_generation()
+        if not gen:
+            return []
+        rows = self._query_all(
+            self._open_conn(gen),
+            "SELECT doc_id, source, visibility, active_revision, updated_at FROM documents"
+            + (" WHERE visibility = ?" if visibility is not None else "") + " ORDER BY source",
+            (visibility,) if visibility is not None else (),
+            what="文档可见性列表",
+        )
+        return [DocumentRecord(str(row[0]), str(row[1]), str(row[2]),
+                               str(row[3] or ""), float(row[4])) for row in rows]
 
     def iter_visible_documents(self) -> Iterator[DocumentRecord]:
         gen = self._ensure_read_generation()
@@ -2897,8 +3148,15 @@ class DocumentStore:
     # ------------------------------------------------------------------ 维护/恢复
 
     def gc_unreferenced(self) -> int:
-        """删除无任何 media_occurrences / media_variants 引用的 blob（内容寻址 GC）。"""
+        """无活解析租约时，删除无 occurrence / variant 引用的 blob。"""
         with self.mutation() as conn:
+            live = conn.execute(
+                "SELECT 1 FROM ingest_jobs WHERE state IN ('parsing', 'staged') "
+                "AND lease_until > ? LIMIT 1", (time.time(),),
+            ).fetchone()
+            if live is not None:
+                raise StoreConflict("GC blocked by an active parse lease",
+                                    fix="等待解析发布或租约结束，不能回收尚未 attach 的媒体。")
             rows = conn.execute(
                 "SELECT b.blob_id FROM media_blobs b "
                 "WHERE NOT EXISTS (SELECT 1 FROM media_occurrences o WHERE o.blob_id = b.blob_id) "
@@ -2909,6 +3167,245 @@ class DocumentStore:
                 conn.execute("DELETE FROM media_blobs WHERE blob_id = ?", (str(blob_id),))
             conn.commit()
             return len(rows)
+
+    @contextlib.contextmanager
+    def pin_generation(self, *, lease_seconds: float = 300):
+        ctrl = ControlStore(self.layout)
+        try:
+            ctrl.open(create=False)
+            with ctrl.pin_generation(lease_seconds=lease_seconds) as generation:
+                yield generation
+        finally:
+            ctrl.close()
+
+    def list_media(self, source: str, *, revision_id: str = "", offset: int = 0,
+                   limit: int = 100) -> list[dict]:
+        active = self.get_active(source)
+        if active is None or (revision_id and active.revision.revision_id != revision_id):
+            raise StoreConflict("Media source/revision is stale or unavailable")
+        conn = self._open_conn(self._ensure_read_generation())
+        rows = conn.execute("SELECT occurrence_id, blob_id, kind, ordinal, page, caption, ocr, "
+                            "t_start_ms, t_end_ms, metadata_json FROM media_occurrences "
+                            "WHERE revision_id=? ORDER BY ordinal LIMIT ? OFFSET ?",
+                            (active.revision.revision_id, min(max(int(limit), 1), 1000), max(int(offset), 0)))
+        return [{"revision_id": active.revision.revision_id, "occurrence_id": r[0], "blob_id": r[1],
+                 "kind": r[2], "ordinal": r[3], "page": r[4], "caption": r[5], "ocr": r[6],
+                 "t_start_ms": r[7], "t_end_ms": r[8], "metadata": _load_json(r[9], "media", {})}
+                for r in rows]
+
+    def read_media(self, source: str, *, revision_id: str, occurrence_id: str,
+                   variant_id: str = "original", max_bytes: int = 20 * 1024 * 1024,
+                   include_data: bool = False) -> dict:
+        if type(include_data) is not bool or type(max_bytes) is not int or max_bytes <= 0:
+            raise StoreContractError("Invalid media read budget/options")
+        with self.pin_generation():
+            active = self.get_active(source)
+            if active is None or active.revision.revision_id != revision_id:
+                raise StoreConflict("Media source/revision is stale or unavailable")
+            conn = self._open_conn(self._ensure_read_generation())
+            if variant_id == "original":
+                row = conn.execute("SELECT b.blob_id, b.mime_type, b.byte_size, b.width, b.height, "
+                                   "b.duration_ms FROM media_occurrences o JOIN media_blobs b ON b.blob_id=o.blob_id "
+                                   "WHERE o.revision_id=? AND o.occurrence_id=?", (revision_id, occurrence_id)).fetchone()
+            else:
+                row = conn.execute("SELECT b.blob_id, b.mime_type, b.byte_size, b.width, b.height, b.duration_ms "
+                                   "FROM media_variants v JOIN media_blobs b ON b.blob_id=v.blob_id "
+                                   "WHERE v.revision_id=? AND v.occurrence_id=? AND v.variant_id=?",
+                                   (revision_id, occurrence_id, variant_id)).fetchone()
+            if row is None:
+                raise StoreContractError("MEDIA_NOT_FOUND")
+            result = dict(zip(("blob_id", "mime_type", "byte_size", "width", "height", "duration_ms"), row))
+            result.update(source=source, revision_id=revision_id, occurrence_id=occurrence_id, variant_id=variant_id)
+            if include_data:
+                if row[2] > max_bytes:
+                    raise StoreQuotaExceeded("MEDIA_TOO_LARGE")
+                result["data"] = bytes(conn.execute("SELECT data FROM media_blobs WHERE blob_id=?", (row[0],)).fetchone()[0])
+            return result
+
+    def put_media_variant(self, *, revision_id: str, occurrence_id: str, data: bytes,
+                          mime_type: str, kind: str = "preview", variant_id: str = "preview",
+                          parent_blob_id: str | None = None, preprocess_version: str = "",
+                          range_json: str | None = None, width: int | None = None,
+                          height: int | None = None, duration_ms: int | None = None) -> str:
+        """写入**派生媒体变体**（preview 等，§20.7D）：blob 内容寻址 + 变体关联。
+
+        - `original` 不是变体：它由 occurrence 直接指向原 blob，禁止在这里重复登记；
+        - occurrence 必须已提交存在（FK + 显式检查），拒绝挂孤立变体；
+        - `parent_blob_id` 留空时写 NULL（不是空串），否则外键会指向不存在的 blob；
+        - 同一 `(revision, occurrence, variant_id)` 覆盖为最新，重复写入天然幂等。
+        返回变体 blob_id；quota/归属不满足时抛错，由调用方决定是否降级。
+        """
+        if not isinstance(variant_id, str) or not variant_id:
+            raise StoreContractError("variant_id 必填")
+        if variant_id == "original":
+            raise StoreContractError("original 不是派生变体；occurrence 已直接指向原 blob")
+        if not isinstance(kind, str) or not kind:
+            raise StoreContractError("variant kind 必填")
+        blob_id = self.put_media_blob(data=data, mime_type=mime_type, width=width,
+                                     height=height, duration_ms=duration_ms)
+        with self.mutation() as conn:
+            row = conn.execute("SELECT state FROM document_revisions WHERE revision_id = ?",
+                               (revision_id,)).fetchone()
+            if row is None or str(row[0]) != "committed":
+                raise StoreContractError(
+                    f"revision {revision_id!r} 未提交，不能挂派生变体",
+                    fix="先 commit_revision，再写 preview/segment 变体。",
+                )
+            exists = conn.execute("SELECT 1 FROM media_occurrences WHERE revision_id = ? "
+                                  "AND occurrence_id = ?", (revision_id, occurrence_id)).fetchone()
+            if exists is None:
+                raise StoreContractError(f"occurrence {occurrence_id!r} 不属于该 revision，拒绝孤立变体")
+            conn.execute(
+                "INSERT OR REPLACE INTO media_variants (revision_id, occurrence_id, variant_id, "
+                "blob_id, parent_blob_id, kind, preprocess_version, range_json) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (revision_id, occurrence_id, variant_id, blob_id,
+                 (str(parent_blob_id) if parent_blob_id else None), kind,
+                 str(preprocess_version), range_json),
+            )
+            conn.commit()
+        return blob_id
+
+    def _ensure_media_links(self, conn: sqlite3.Connection) -> None:
+        conn.execute("CREATE TABLE IF NOT EXISTS media_chunk_links (revision_id TEXT NOT NULL, "
+                     "occurrence_id TEXT NOT NULL, profile_key TEXT NOT NULL, chunker_fingerprint TEXT NOT NULL, "
+                     "derived_generation_id TEXT NOT NULL, chunk_id TEXT NOT NULL, relation TEXT NOT NULL, "
+                     "PRIMARY KEY(revision_id, occurrence_id, profile_key, derived_generation_id, chunk_id, relation), "
+                     "FOREIGN KEY(revision_id, occurrence_id) REFERENCES media_occurrences(revision_id, occurrence_id) ON DELETE CASCADE)")
+
+    def set_media_chunk_links(self, *, revision_id: str, occurrence_id: str, profile_key: str,
+                             chunker_fingerprint: str, derived_generation_id: str,
+                             links: Sequence[Mapping[str, str]]) -> None:
+        with self.mutation() as conn:
+            self._ensure_media_links(conn)
+            conn.execute("DELETE FROM media_chunk_links WHERE revision_id=? AND occurrence_id=? "
+                         "AND profile_key=? AND derived_generation_id=?",
+                         (revision_id, occurrence_id, profile_key, derived_generation_id))
+            for link in links:
+                conn.execute("INSERT INTO media_chunk_links VALUES (?, ?, ?, ?, ?, ?, ?)",
+                             (revision_id, occurrence_id, profile_key, chunker_fingerprint,
+                              derived_generation_id, str(link["chunk_id"]), str(link["relation"])))
+            conn.commit()
+
+    def get_media_chunk_links(self, *, revision_id: str, profile_key: str,
+                             derived_generation_id: str, occurrence_id: str = "") -> list[dict]:
+        gen = self._ensure_read_generation()
+        if not gen:
+            return []
+        conn = self._open_conn(gen)
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE name='media_chunk_links'").fetchone() is None:
+            return []
+        rows = conn.execute("SELECT occurrence_id, chunk_id, relation, chunker_fingerprint FROM media_chunk_links "
+                            "WHERE revision_id=? AND profile_key=? AND derived_generation_id=? "
+                            "AND (?='' OR occurrence_id=?)",
+                            (revision_id, profile_key, derived_generation_id, occurrence_id, occurrence_id))
+        return [dict(zip(("occurrence_id", "chunk_id", "relation", "chunker_fingerprint"), row)) for row in rows]
+
+    def prepare_import(self, backup: str | Path, *, trust_parsed_documents: bool = False) -> dict:
+        if type(trust_parsed_documents) is not bool:
+            raise StoreContractError("trust_parsed_documents must be bool")
+        self._enforce_writable()
+        source = Path(backup)
+        if source.stat().st_size > self._quota_limit_bytes():
+            raise StoreQuotaExceeded("Imported document database exceeds local quota")
+        validate_backup(source)
+        ctrl = ControlStore(self.layout)
+        ctrl.open(create=True, write=True)
+        try:
+            state = ctrl.state()
+            gen = ctrl.allocate_generation()
+            target_path = self._store_path(gen)
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            incoming = sqlite3.connect(_readonly_uri(source), uri=True)
+            target = sqlite3.connect(str(target_path))
+            try:
+                incoming.execute("PRAGMA trusted_schema=OFF")
+                target.executescript(_DOCSTORE_SCHEMA)
+                target.execute("PRAGMA foreign_keys=ON")
+                target.execute("BEGIN")
+                target.execute("PRAGMA defer_foreign_keys=ON")
+                for table in _DOCSTORE_TABLES:
+                    columns = [str(r[1]) for r in target.execute(f'PRAGMA table_info("{table}")')]
+                    quoted = ",".join('"' + c + '"' for c in columns)
+                    placeholders = ",".join("?" for _ in columns)
+                    for row in incoming.execute(f'SELECT {quoted} FROM "{table}"'):
+                        target.execute(f'INSERT INTO "{table}" ({quoted}) VALUES ({placeholders})', row)
+                for (source_path,) in target.execute("SELECT source FROM documents"):
+                    normalize_source_path(source_path, self.layout.vault_path)
+                for row in target.execute("SELECT source_sha256, render_sha256, parsed_markdown "
+                                          "FROM document_revisions"):
+                    if len(str(row[0])) != 64 or any(c not in "0123456789abcdef" for c in str(row[0])) or hashlib.sha256(
+                            str(row[2]).encode("utf-8")).hexdigest() != row[1]:
+                        raise SnapshotInvalid("Imported revision hash is invalid")
+                for blob_id, checksum, size, data in target.execute(
+                        "SELECT blob_id, checksum, byte_size, data FROM media_blobs"):
+                    if len(data) != size or hashlib.sha256(data).hexdigest() not in (blob_id, checksum):
+                        raise SnapshotInvalid("Imported media checksum is invalid")
+                target.execute("DELETE FROM ingest_jobs")
+                target.execute("DELETE FROM ingest_subjobs")
+                target.execute("DELETE FROM derived_generations")
+                target.execute("UPDATE documents SET visibility='unverified'")
+                if trust_parsed_documents:
+                    for doc_id, relative, source_sha in target.execute(
+                            "SELECT doc_id, source, source_sha256 FROM documents"):
+                        physical = self.layout.vault_path / relative
+                        if physical.is_file() and _file_sha256(physical) == source_sha:
+                            target.execute("UPDATE documents SET visibility='active' WHERE doc_id=?", (doc_id,))
+                target.execute("UPDATE store_meta SET vault_binding=?, vault_epoch=? WHERE id=1",
+                               (self._binding, state.epoch + 1))
+                if target.execute("PRAGMA foreign_key_check").fetchone():
+                    raise SnapshotInvalid("Imported references are invalid")
+                logical = sum(self._logical_breakdown(target)[:3])
+                if logical > self._quota_limit_bytes():
+                    raise StoreQuotaExceeded("Imported logical assets exceed local quota")
+                store_uuid = str(target.execute("SELECT store_uuid FROM store_meta WHERE id=1").fetchone()[0])
+                target.commit()
+                target.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+            finally:
+                incoming.close()
+                target.close()
+            ctrl.register_generation(gen, target_path.parent, "document", "validated")
+            return {"generation_id": gen, "expected_generation": state.active_document_generation,
+                    "expected_epoch": state.epoch, "store_uuid": store_uuid}
+        finally:
+            ctrl.close()
+
+    def publish_import(self, prepared: dict, *, snapshot_sha256: str = "", trusted: bool = False) -> int:
+        ctrl = ControlStore(self.layout)
+        try:
+            ctrl.open(create=False, write=True)
+            epoch = ctrl.publish_import(**prepared, snapshot_sha256=snapshot_sha256, trusted=trusted)
+            self.close()
+            self._generation_id = ""
+            self.open(create=False)
+            return epoch
+        finally:
+            ctrl.close()
+
+    def restore_generation(self, generation_id: str) -> int:
+        path = self._store_path(generation_id)
+        validate_backup(path)
+        ctrl = ControlStore(self.layout)
+        try:
+            ctrl.open(create=False, write=True)
+            state = ctrl.state()
+            ctrl.register_generation(generation_id, path.parent, "document", "validated")
+            conn = sqlite3.connect(_readonly_uri(path), uri=True)
+            try:
+                store_uuid = str(conn.execute("SELECT store_uuid FROM store_meta WHERE id=1").fetchone()[0])
+            finally:
+                conn.close()
+            return self.publish_import({"generation_id": generation_id,
+                "expected_generation": state.active_document_generation,
+                "expected_epoch": state.epoch, "store_uuid": store_uuid})
+        finally:
+            ctrl.close()
+
+    def retained_backup(self, path: str | Path) -> dict:
+        with self.pin_generation() as generation:
+            self.backup_to(path)
+            return {"path": str(path), "generation_id": generation,
+                    "change_seq": self.change_seq(), "retained": True}
 
     def backup_to(self, path: str | Path) -> Path:
         """`sqlite3.Connection.backup` 一致性备份（不是 copy 主文件，§20.2）。"""
@@ -2967,8 +3464,53 @@ class DocumentStore:
 # --------------------------------------------------------------------------- 备份校验
 
 
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 def _readonly_uri(path: Path) -> str:
     return path.resolve().as_uri() + "?mode=ro"
+
+
+def _assert_backup_schema(conn: sqlite3.Connection) -> None:
+    """备份 schema 白名单校验（只读、trusted_schema=OFF、禁扩展）。
+
+    只承认与本机受信 schema **逐字一致**的对象集合（`media_chunk_links` 允许缺失）；
+    trigger/view/虚拟表/额外对象一律拒。垃圾文件或非 SQLite 内容在这里第一次读
+    schema 时就会失败，必须转成稳定 `SnapshotInvalid`（fail closed、不删文件）——
+    调用方按 code 判「快照坏了」，不能让原生 sqlite3 错误漏出去。
+    """
+    try:
+        conn.execute("PRAGMA trusted_schema=OFF")
+        conn.enable_load_extension(False)
+        expected = sqlite3.connect(":memory:")
+        try:
+            expected.executescript(_DOCSTORE_SCHEMA)
+            objects = {str(r[0]): (str(r[1]), str(r[2])) for r in expected.execute(
+                "SELECT name, type, sql FROM sqlite_master WHERE sql IS NOT NULL")}
+            actual = {str(r[0]): (str(r[1]), str(r[2])) for r in conn.execute(
+                "SELECT name, type, sql FROM sqlite_master WHERE sql IS NOT NULL")}
+            optional = actual.pop("media_chunk_links", None)
+            if optional is not None:
+                helper = DocumentStore.__new__(DocumentStore)
+                helper._ensure_media_links(expected)
+                wanted = expected.execute(
+                    "SELECT type, sql FROM sqlite_master WHERE name='media_chunk_links'").fetchone()
+                if optional != (str(wanted[0]), str(wanted[1])):
+                    raise SnapshotInvalid("Snapshot media link schema is invalid")
+            if actual != objects:
+                raise SnapshotInvalid("Snapshot schema differs from the trusted local schema")
+        finally:
+            expected.close()
+    except sqlite3.DatabaseError as exc:
+        raise SnapshotInvalid(
+            f"备份不是合法的 SQLite 数据库：{exc}",
+            fix="保留原文件，重新导出快照；不要就地修改或覆盖。",
+        ) from exc
 
 
 def validate_backup(path: str | Path) -> dict:
@@ -2981,6 +3523,8 @@ def validate_backup(path: str | Path) -> dict:
     except sqlite3.Error as exc:
         raise SnapshotInvalid(f"无法以只读方式打开备份：{exc}", fix="检查文件权限。") from exc
     try:
+        # 垃圾文件/非 SQLite 内容在首次读 schema 时暴露：统一转成稳定 `SnapshotInvalid`
+        _assert_backup_schema(conn)
         try:
             row = conn.execute("SELECT schema_version FROM store_meta WHERE id = 1").fetchone()
             present = {

@@ -167,3 +167,24 @@ def test_limits_never_disable_safety_with_zero_or_nan():
     assert limits.media_max_bytes == defaults.media_max_bytes
     assert limits.extracted_max_bytes == defaults.extracted_max_bytes
     assert limits.max_members == defaults.max_members
+
+
+@pytest.mark.parametrize('prefix,newline', [('', '\r\n'), ('\ufeff', '\r\n'), ('\ufeff', '\n')])
+def test_page_map_uses_normalized_offsets(monkeypatch, tmp_path, prefix, newline):
+    blocks = [{'page_idx': 0, 'text': 'Alpha'}, {'page_idx': 1, 'text': 'Beta'}]
+    archive = _make_zip({'full.md': (prefix + 'Alpha' + newline + 'Beta' + newline).encode(),
+                         'content_list.json': json.dumps(blocks).encode()})
+    result = _run_v4(monkeypatch, tmp_path, archive)
+    assert result.markdown == 'Alpha\nBeta\n'
+    assert result.page_map == [PageSpan(page=1, char_start=0, char_end=6),
+                               PageSpan(page=2, char_start=6, char_end=11)]
+    assert result.markdown[result.page_map[1].char_start:result.page_map[1].char_end] == 'Beta\n'
+
+
+def test_mixed_valid_and_unknown_json_is_partial(monkeypatch, tmp_path):
+    archive = _make_zip({'full.md': b'Alpha\n', 'a.json': b'{"page_count":1}',
+                         'z.json': b'{"unknown":true}'})
+    result = _run_v4(monkeypatch, tmp_path, archive)
+    assert result.quality == 'partial'
+    assert not result.capability('structured_json')
+    assert PARSE_PARTIAL in result.warnings
