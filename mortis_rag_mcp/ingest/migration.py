@@ -12,6 +12,7 @@ from ..doc_store import (
     DocStoreError,
     DocumentStore,
     MediaOccurrenceSpec,
+    StoreConflict,
     is_within,
     normalize_source_path,
 )
@@ -208,6 +209,38 @@ def resolve_excluded_mirrors(root: Path, candidates: Mapping[str, str], *, quota
     return excluded, reasons
 
 
+def _existing_fact_state(store: DocumentStore, source: str, source_sha256: str,
+                         parser: str) -> tuple[str, str]:
+    """迁移前核**全部可见性**的已提交事实（E03-b）。
+
+    返回 `(kind, detail)`：`kind` ∈ {"absent","already","blocked"}。
+    现代解析结果、hidden/exempt/unverified fact、以及归属不明的既有事实一律
+    `blocked`——迁移只能新增历史事实，绝不覆盖它们。只有完全相同的本次迁移
+    结果才算 `already`（幂等）。
+    """
+    try:
+        documents = [doc for doc in store.list_documents() if doc.source == source]
+    except Exception:
+        return "blocked", "existing facts could not be enumerated"
+    if not documents:
+        return "absent", ""
+    visibility = str(documents[0].visibility)
+    if visibility != "active":
+        return "blocked", f"source visibility is {visibility!r}; refusing to overwrite a hidden fact"
+    active = store.get_active(source)
+    if active is None:
+        return "blocked", "source has a document row but no committed active revision"
+    revision = active.revision
+    if revision.parser_fingerprint == parser and revision.source_sha256 == source_sha256:
+        return "already", ""
+    if not str(revision.parser_fingerprint).startswith(MIGRATION_VERSION + ":"):
+        return "blocked", f"modern result {revision.parser_fingerprint!r} is already committed"
+    return "blocked", (
+        f"another legacy result is committed (sha={str(revision.source_sha256)[:12]}…, "
+        f"parser={revision.parser_fingerprint!r})"
+    )
+
+
 def migrate_legacy_mirrors(store: DocumentStore, *, apply: bool = False) -> dict:
     if type(apply) is not bool:
         raise ValueError("apply must be bool")
@@ -269,32 +302,58 @@ def migrate_legacy_mirrors(store: DocumentStore, *, apply: bool = False) -> dict
         if counts[item["source"]] != 1:
             item.update(status="pending_manual", reason="conflicting mirrors for the same source")
             continue
-        if not apply:
+        # 不覆盖保护（含 dry-run）：现代/hidden/归属不明的已提交事实 → pending_manual。
+        kind, detail = _existing_fact_state(store, item["source"], item["source_sha256"],
+                                            item["parser"])
+        if kind == "blocked":
+            item.update(status="pending_manual", reason=detail)
             continue
-        active = store.get_active(item["source"])
-        if active is not None and active.revision.source_sha256 == item["source_sha256"] and active.revision.parser_fingerprint == item["parser"]:
+        if kind == "already":
             item["status"] = "already_migrated"
             excluded.append(item["mirror"])
             continue
-        candidate = store.stage_revision(source=item["source"], source_sha256=item["source_sha256"],
-            render_sha256=hashlib.sha256(body.encode("utf-8")).hexdigest(),
-            parser_fingerprint=item["parser"], markdown=body,
-            capabilities={"migration_version": MIGRATION_VERSION, "legacy_mirror": item["mirror"]})
-        if assets:
-            # 已验证资产作为真正 Blob/Occurrence 入库（§20.1）：迁移后的历史图片可经
-            # kb_read_media 读取；anchor 来自正文引用位置，读路径据此做媒体邻接。
-            specs = []
-            for ordinal, asset in enumerate(assets, start=1):
-                blob_id = store.put_media_blob(data=asset["path"].read_bytes(),
-                                               mime_type=asset["mime_type"])
-                specs.append(MediaOccurrenceSpec(
-                    occurrence_id=f"mirror-{ordinal}", blob_id=blob_id, kind="image",
-                    ordinal=ordinal, mime_type=asset["mime_type"],
-                    metadata={"anchor_start": asset["anchor_start"], "anchor_end": asset["anchor_end"],
-                              "name": asset["ref"], "legacy_mirror": item["mirror"]}))
-            store.attach_occurrences(candidate.revision_id, specs)
-            migrated_assets += len(specs)
-        store.commit_revision(candidate.revision_id, source_sha256=item["source_sha256"])
+        if not apply:
+            continue
+        try:
+            with store.mutation():
+                # 提交前在锁内重核：另一 writer 可能刚刚发布了事实。
+                kind, detail = _existing_fact_state(store, item["source"], item["source_sha256"],
+                                                    item["parser"])
+                if kind != "absent":
+                    item.update(status="pending_manual",
+                                reason=detail or "another writer published a fact during migration")
+                    continue
+                expected_seq = store.change_seq()
+                candidate = store.stage_revision(source=item["source"], source_sha256=item["source_sha256"],
+                    render_sha256=hashlib.sha256(body.encode("utf-8")).hexdigest(),
+                    parser_fingerprint=item["parser"], markdown=body,
+                    capabilities={"migration_version": MIGRATION_VERSION, "legacy_mirror": item["mirror"]})
+                if assets:
+                    # 已验证资产作为真正 Blob/Occurrence 入库（§20.1）：迁移后的历史图片可经
+                    # kb_read_media 读取；anchor 来自正文引用位置，读路径据此做媒体邻接。
+                    specs = []
+                    for ordinal, asset in enumerate(assets, start=1):
+                        blob_id = store.put_media_blob(data=asset["path"].read_bytes(),
+                                                       mime_type=asset["mime_type"])
+                        specs.append(MediaOccurrenceSpec(
+                            occurrence_id=f"mirror-{ordinal}", blob_id=blob_id, kind="image",
+                            ordinal=ordinal, mime_type=asset["mime_type"],
+                            metadata={"anchor_start": asset["anchor_start"], "anchor_end": asset["anchor_end"],
+                                      "name": asset["ref"], "legacy_mirror": item["mirror"]}))
+                    store.attach_occurrences(candidate.revision_id, specs)
+                    migrated_assets += len(specs)
+                # 发布前重新读物理源 SHA/stat：staged SHA 不能冒充源复核。
+                physical = root / item["source"]
+                stat = physical.stat()
+                fresh_sha = _file_sha256(physical)
+                if fresh_sha != item["source_sha256"]:
+                    raise StoreConflict("source changed after preflight")
+                store.commit_revision(candidate.revision_id, source_sha256=fresh_sha,
+                                      source_size=stat.st_size, source_mtime_ns=stat.st_mtime_ns,
+                                      expected_change_seq=expected_seq)
+        except (DocStoreError, OSError, ValueError) as exc:
+            item.update(status="pending_manual", reason=f"migration publish failed: {exc}")
+            continue
         item["status"] = "migrated"
         migrated += 1
         excluded.append(item["mirror"])

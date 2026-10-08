@@ -84,12 +84,12 @@ def test_migration_dry_run_no_control_or_vault_write(tmp_path, monkeypatch):
     store.close()
 
 
-def _write_legacy_mirror(root, body, *, extra_fields="", sha=None, assets=None):
+def _write_legacy_mirror(root, body, *, extra_fields="", sha=None, assets=None, source="paper.pdf"):
     sha = sha or hashlib.sha256(b"original").hexdigest()
     mirrors = root / ".mortis-parsed"
     mirrors.mkdir(parents=True, exist_ok=True)
     (mirrors / "paper.md").write_text(
-        f"---\nsource_pdf: \"paper.pdf\"{extra_fields}\nsource_sha256: \"{sha}\"\nparsed_by: \"vlm\"\n---\n{body}",
+        f"---\nsource_pdf: \"{source}\"{extra_fields}\nsource_sha256: \"{sha}\"\nparsed_by: \"vlm\"\n---\n{body}",
         encoding="utf-8",
     )
     for rel, payload in (assets or {}).items():
@@ -97,14 +97,17 @@ def _write_legacy_mirror(root, body, *, extra_fields="", sha=None, assets=None):
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(payload)
     (mirrors / ".ingest_state.json").write_text(
-        json.dumps({"jobs": {"j1": {"source": "paper.pdf", "state": "done", "sha256": sha}}}),
+        json.dumps({"jobs": {"j1": {"source": source, "state": "done", "sha256": sha}}}),
         encoding="utf-8",
     )
 
 
 def test_migration_apply_is_idempotent_and_source_precise(tmp_path, monkeypatch):
     store = make_store(tmp_path, monkeypatch)
-    _write_legacy_mirror(store.layout.vault_path, "旧解析正文。\n")
+    # `make_store` 已为 'paper.pdf' 提交了一条归属不同的事实；E03-b 起迁移不得覆盖
+    # 它，故本用例改用一条**没有既有事实**的源来验证迁移/幂等/来源精确排除。
+    (store.layout.vault_path / "legacy.pdf").write_bytes(b"original")
+    _write_legacy_mirror(store.layout.vault_path, "旧解析正文。\n", source="legacy.pdf")
 
     first = migrate_legacy_mirrors(store, apply=True)
     assert first["migrated"] == 1
