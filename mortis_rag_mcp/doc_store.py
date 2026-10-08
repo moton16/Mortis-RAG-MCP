@@ -358,6 +358,10 @@ class MediaOccurrenceSpec:
     ocr: str = ""
     width: int | None = None
     height: int | None = None
+    #: 正文字符半开区间 `[anchor_start, anchor_end)`——**媒体尺寸是 width/height，
+    #: 绝不能写进 anchor 列**（E08-a）。缺省 None = 没有证据，不是 0。
+    anchor_start: int | None = None
+    anchor_end: int | None = None
     metadata: Mapping[str, Any] | None = None
 
 
@@ -382,6 +386,33 @@ class MediaSpec:
     anchor_start: int | None = None
     anchor_end: int | None = None
     metadata: Mapping[str, Any] | None = None
+
+
+def _resolve_media_anchor(item: MediaOccurrenceSpec) -> tuple[int | None, int | None]:
+    """解析 occurrence 的**正文**字符半开区间 `[start, end)`（E08-a）。
+
+    优先级：显式 `anchor_start/anchor_end` 字段 > 已核验的 metadata 锚点 >
+    无证据（`None`，不猜）。媒体尺寸 `width/height` **不是**正文位置，任何情况下
+    都不参与这个解析——旧实现把它们写进 anchor 列，读取侧据此定位必然错位。
+    """
+    meta = dict(item.metadata or {})
+    raw_start = item.anchor_start if item.anchor_start is not None else meta.get("anchor_start")
+    raw_end = item.anchor_end if item.anchor_end is not None else meta.get("anchor_end")
+    if raw_start is None and raw_end is None:
+        return None, None
+    if raw_start is None or raw_end is None:
+        raise StoreContractError(
+            "media anchor requires both anchor_start and anchor_end",
+            fix="给出完整半开区间；只有一端没有证据时不猜另一端。",
+        )
+    if any(isinstance(value, bool) or not isinstance(value, int) for value in (raw_start, raw_end)):
+        raise StoreContractError("media anchor must be integer character offsets")
+    if raw_start < 0 or raw_end < raw_start:
+        raise StoreContractError(
+            "media anchor must be a nonnegative half-open span",
+            fix="anchor_end 必须 >= anchor_start。",
+        )
+    return raw_start, raw_end
 
 
 # --------------------------------------------------------------------------- 路径工具
@@ -2311,7 +2342,15 @@ class DocumentStore:
                         f"blob {item.blob_id} 不存在", fix="先用 put_media_blob 落 blob 再挂出现。"
                     )
                 bbox_json = _dump_json(list(item.bbox), "media.bbox") if item.bbox is not None else None
-                meta_json = _dump_json(item.metadata or {}, "media.metadata")
+                # E08-a：anchor 列只写**正文字符半开区间**。旧实现把 width/height 写进
+                # anchor_start/anchor_end（尺寸冒充正文位置），读取侧据此定位必然错位。
+                # 优先级：显式 `anchor_start/anchor_end` > 已核验 metadata 锚点 > 无证据(None)。
+                anchor_start, anchor_end = _resolve_media_anchor(item)
+                meta = dict(item.metadata or {})
+                if anchor_start is not None:
+                    meta.setdefault("anchor_start", anchor_start)
+                    meta.setdefault("anchor_end", anchor_end)
+                meta_json = _dump_json(meta, "media.metadata")
                 try:
                     conn.execute(
                         "INSERT INTO media_occurrences (revision_id, occurrence_id, blob_id, kind, ordinal, "
@@ -2323,8 +2362,8 @@ class DocumentStore:
                             _validate_opt_int(item.t_start_ms, "media.t_start_ms", min_value=0),
                             _validate_opt_int(item.t_end_ms, "media.t_end_ms", min_value=0),
                             str(item.caption or ""), str(item.ocr or ""),
-                            _validate_opt_int(item.width, "media.width", min_value=0),
-                            _validate_opt_int(item.height, "media.height", min_value=0),
+                            _validate_opt_int(anchor_start, "media.anchor_start", min_value=0),
+                            _validate_opt_int(anchor_end, "media.anchor_end", min_value=0),
                             meta_json,
                         ),
                     )

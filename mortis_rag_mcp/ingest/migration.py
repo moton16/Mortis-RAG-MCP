@@ -338,6 +338,7 @@ def migrate_legacy_mirrors(store: DocumentStore, *, apply: bool = False) -> dict
                         specs.append(MediaOccurrenceSpec(
                             occurrence_id=f"mirror-{ordinal}", blob_id=blob_id, kind="image",
                             ordinal=ordinal, mime_type=asset["mime_type"],
+                            anchor_start=asset["anchor_start"], anchor_end=asset["anchor_end"],
                             metadata={"anchor_start": asset["anchor_start"], "anchor_end": asset["anchor_end"],
                                       "name": asset["ref"], "legacy_mirror": item["mirror"]}))
                     store.attach_occurrences(candidate.revision_id, specs)

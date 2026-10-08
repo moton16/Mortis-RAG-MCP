@@ -48,12 +48,17 @@ def _text(value: Any, limit: int) -> str:
 
 
 def occurrence_span(markdown: str, occurrence: Any) -> tuple[int, int] | None:
-    """Only explicit parser spans or an exact Markdown image target are anchors."""
+    """Only explicit parser spans or an exact Markdown image target are anchors.
+
+    E08-a 读取优先级：**已核验的 metadata 锚点优先于 anchor 列**。历史上
+    `attach_occurrences` 把 width/height 写进了 anchor_start/anchor_end 列，
+    「先取列值」会让像素尺寸冒充正文位置；metadata 锚点只在有证据时才写入。
+    """
     meta = _get(occurrence, "metadata", {}) or {}
-    start = _get(occurrence, "anchor_start", meta.get("anchor_start"))
-    end = _get(occurrence, "anchor_end", meta.get("anchor_end"))
-    if start is None:
-        start, end = meta.get("anchor_start"), meta.get("anchor_end")
+    start, end = meta.get("anchor_start"), meta.get("anchor_end")
+    if start is None or end is None:
+        start = _get(occurrence, "anchor_start")
+        end = _get(occurrence, "anchor_end")
     if (isinstance(start, int) and not isinstance(start, bool)
             and isinstance(end, int) and not isinstance(end, bool)
             and 0 <= start <= end <= len(markdown)):
@@ -192,10 +197,13 @@ def media_chunk_links(chunks: Sequence[Chunk], occurrences: Sequence[Any], *, re
         for occurrence in occurrences:
             oid = _get(occurrence, "occurrence_id")
             meta = _get(occurrence, "metadata", {}) or {}
-            start = _get(occurrence, "anchor_start")
-            end = _get(occurrence, "anchor_end")
-            if start is None:
-                start, end = meta.get("anchor_start"), meta.get("anchor_end")
+            # 与 `occurrence_span` 同口径：metadata 锚点优先（E08-a）。
+            start, end = meta.get("anchor_start"), meta.get("anchor_end")
+            if start is None or end is None:
+                start = _get(occurrence, "anchor_start")
+                end = _get(occurrence, "anchor_end")
+            if start is None or end is None:
+                start, end = None, None
             if start is None:
                 anchor = _global_span({k: meta.get(k) for k in ("line", "start_char", "end_char")}, markdown)
                 start, end = anchor if anchor is not None else (None, None)

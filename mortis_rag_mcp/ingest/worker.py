@@ -911,6 +911,7 @@ class StoreMediaSink:
             page: int | None = None, bbox: Any = None, caption: str = "",
             ocr: str = "", width: int | None = None, height: int | None = None,
             t_start_ms: int | None = None, t_end_ms: int | None = None,
+            anchor_start: int | None = None, anchor_end: int | None = None,
             metadata: dict[str, Any] | None = None) -> str:
         from ..doc_store import MediaOccurrenceSpec
 
@@ -935,6 +936,9 @@ class StoreMediaSink:
             height=height,
             t_start_ms=t_start_ms,
             t_end_ms=t_end_ms,
+            # E08-a：正文锚点透传（媒体尺寸走 width/height，绝不冒充 anchor）。
+            anchor_start=anchor_start,
+            anchor_end=anchor_end,
             metadata=meta,
         ))
         return occurrence_id
