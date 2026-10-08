@@ -10,6 +10,10 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from .config import EmbeddingConfig, RerankerConfig
+from .embedding_capabilities import (
+    EmbeddingContractError, ResolvedEmbeddingProfile,
+    resolve_embedding_profile, validate_vector,
+)
 
 # 测试注入点：monkeypatch `_sleep` 即可断言退避序列，不必真的等待。
 _sleep = time.sleep
@@ -81,6 +85,14 @@ class _JsonHttpProvider:
         self.timeout = timeout
         self.max_retries = max_retries
         self.retry_backoff = retry_backoff
+        self.request_journal: Any = None
+        self.paid_guard: Any = None
+        self.request_profile = ""
+
+    def configure_paid_requests(self, journal: Any, guard: Any, profile_fingerprint: str) -> None:
+        self.request_journal = journal
+        self.paid_guard = guard
+        self.request_profile = profile_fingerprint
 
     def _post(self, payload: dict[str, Any]) -> Any:
         headers = {"Content-Type": "application/json", "Accept": "application/json"}
@@ -93,17 +105,20 @@ class _JsonHttpProvider:
             headers=headers,
             method="POST",
         )
-        for attempt in range(self.max_retries + 1):
-            try:
-                with urlopen(request, timeout=self.timeout) as response:
-                    return json.loads(response.read().decode("utf-8"))
-            except (HTTPError, URLError, OSError, ValueError, json.JSONDecodeError) as exc:
-                delay = self._backoff_seconds(attempt, exc)
-                if delay is None or attempt >= self.max_retries:
-                    raise ProviderError(
-                        f"provider request failed after {attempt + 1} attempts: {exc}"
-                    ) from exc
-                _sleep(delay)
+        journal = self.request_journal
+        if journal is None or self.paid_guard is None or not self.paid_guard(self.request_profile):
+            raise ProviderError("EMBEDDING_PENDING_APPROVAL: paid request requires authorization and durable journal")
+        payload_hash = hashlib.sha256(request.data).hexdigest()
+        request_id = journal.before_send(payload_hash, self.endpoint, self.request_profile)
+        try:
+            # Non-idempotent POST: even 429/5xx may already have incurred cost.
+            with urlopen(request, timeout=self.timeout) as response:
+                result = json.loads(response.read().decode("utf-8"))
+            journal.mark_success(request_id)
+            return result
+        except (HTTPError, URLError, OSError, ValueError, json.JSONDecodeError) as exc:
+            journal.mark_unknown(request_id, "response_unconfirmed")
+            raise ProviderError("SUBMISSION_UNKNOWN: request outcome unknown; automatic retry disabled") from exc
 
     def _backoff_seconds(self, attempt: int, exc: BaseException) -> float | None:
         """返回本次失败应等待的秒数；None 表示不可重试，立即失败。"""
@@ -127,12 +142,16 @@ class _JsonHttpProvider:
 
 
 class ExternalEmbeddingProvider(_JsonHttpProvider):
-    def __init__(self, endpoint: str, model: str = "", api_key: str = "", timeout: float = 30.0, dimension: int | None = None, send_dimensions: bool = True, max_retries: int = 3, retry_backoff: float = 1.0, batch_size: int = 32) -> None:
+    def __init__(self, endpoint: str, model: str = "", api_key: str = "", timeout: float = 30.0, dimension: int | None = None, send_dimensions: bool = True, max_retries: int = 3, retry_backoff: float = 1.0, batch_size: int = 32, *, profile: ResolvedEmbeddingProfile | None = None) -> None:
         super().__init__(endpoint, api_key, timeout, max_retries, retry_backoff)
         self.model = model
         self.dimension = dimension
         self.send_dimensions = send_dimensions
         self.batch_size = batch_size
+        self.profile = profile
+        if profile is not None:
+            self.dimension = profile.effective_dim
+            self.send_dimensions = profile.request_dim is not None
 
     def embed(self, texts: Sequence[str]) -> list[list[float]]:
         if not texts:
@@ -163,21 +182,28 @@ class ExternalEmbeddingProvider(_JsonHttpProvider):
                 f"embedding response returned {len(data)} vectors for {len(batch)} inputs"
             )
         # OpenAI 兼容接口不保证返回顺序，data[i].index 才是权威位置。
-        try:
-            indexes = [
-                int(item["index"]) if isinstance(item, dict) and "index" in item else position
-                for position, item in enumerate(data)
-            ]
-        except (TypeError, ValueError) as exc:
-            raise ProviderError("embedding response contains invalid indexes") from exc
+        indexes = []
+        indexed = [isinstance(item, dict) and "index" in item for item in data]
+        if any(indexed) and not all(indexed):
+            raise ProviderError("embedding response mixes indexed and unindexed items")
+        for position, item in enumerate(data):
+            index = item.get("index", position) if isinstance(item, dict) else None
+            if isinstance(index, bool) or not isinstance(index, int):
+                raise ProviderError("embedding response contains invalid indexes")
+            indexes.append(index)
         if sorted(indexes) != list(range(len(batch))):
             raise ProviderError(
                 f"embedding response indexes {sorted(indexes)} do not match {len(batch)} inputs"
             )
         ordered = [item for _, item in sorted(zip(indexes, data), key=lambda pair: pair[0])]
         try:
-            return [list(item["embedding"]) for item in ordered]
-        except (KeyError, TypeError) as exc:
+            vectors = [list(item["embedding"]) for item in ordered]
+            profile = self.profile
+            if profile is None:
+                dim = self.dimension or (len(vectors[0]) if vectors else 0)
+                profile = ResolvedEmbeddingProfile("legacy-text", "openai", self.model, self.endpoint, "", "", dim, dim, None, "unsupported")
+            return [validate_vector(vector, profile) for vector in vectors]
+        except (KeyError, TypeError, EmbeddingContractError) as exc:
             raise ProviderError("embedding response contains invalid vectors") from exc
 
 
@@ -204,8 +230,11 @@ class ExternalRerankerProvider(_JsonHttpProvider):
 
 
 def create_embedding_provider(config: EmbeddingConfig) -> EmbeddingProvider:
+    profile = resolve_embedding_profile(config)
     if config.mode == "static":
-        return StaticEmbeddingProvider(config.dimension)
+        provider = StaticEmbeddingProvider(config.dimension)
+        provider.profile = profile
+        return provider
     if config.mode == "external":
         return ExternalEmbeddingProvider(
             config.endpoint,
@@ -217,6 +246,7 @@ def create_embedding_provider(config: EmbeddingConfig) -> EmbeddingProvider:
             config.max_retries,
             config.retry_backoff,
             config.batch_size,
+            profile=profile,
         )
     raise ValueError(f"unsupported embedding mode: {config.mode}")
 
