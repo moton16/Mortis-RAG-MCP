@@ -97,6 +97,49 @@ def resolve_default_cache_dir() -> str:
 DEFAULT_CACHE_DIR = os.path.join(os.path.expanduser("~"), ".mortis_rag_mcp_cache")
 
 
+_WINDOWS_RESERVED_NAMES = (
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{index}" for index in range(1, 10)}
+    | {f"LPT{index}" for index in range(1, 10)}
+)
+
+
+def is_windows_reserved_segment(segment: str) -> bool:
+    """路径段是否为 Windows 设备名（`NUL`、`CON`、`aux.txt`…）。
+
+    Win32 下这些名字不能作为普通文件/目录名：`vault/NUL` 之类会解析到设备而不是
+    库内文件，让「库内相对路径」的沙箱归属判断失去意义。POSIX 上 `aux.pdf` 是
+    合法文件名，因此只在 Windows 生效。
+    """
+    if os.name != "nt":
+        return False
+    stem = segment.split(".", 1)[0].rstrip(" ").upper()
+    return stem in _WINDOWS_RESERVED_NAMES
+
+
+def unsafe_cache_subdir(value: str) -> bool:
+    """`cache.subdir` 违反「安全相对子树」约束（§11.2，C91）。
+
+    绝对路径、盘符、UNC、NUL、`.`/`..`、Windows 设备名会让「显式 vault 的库内
+    缓存」逃出库根或落到与笔记同层：此时 cache 子树的 ignore/exempt 豁免、watch
+    的跳过判断全部失准——等于把库内持久缓存写进未声明的目录。校验必须发生在
+    配置加载期，而不是等到写盘时。
+    """
+    text = str(value).replace("\\", "/")
+    if not text or "\x00" in text:
+        return True
+    if text.startswith("/"):              # POSIX 绝对路径，以及 UNC 的 //host/share
+        return True
+    if ":" in text.split("/", 1)[0]:      # Windows 盘符（C:\ 与 C:\x 均含冒号）
+        return True
+    parts = [part for part in text.split("/") if part and part != "."]
+    if not parts or any(part == ".." for part in parts):
+        return True
+    if any(is_windows_reserved_segment(part) for part in parts):
+        return True
+    return False
+
+
 @dataclass(slots=True)
 class CacheConfig:
     # Programmatically constructed configs (e.g. unit tests) default to disabled;
@@ -121,6 +164,48 @@ class CacheConfig:
     # 0 disables the sweep.
     max_age_days: int = 0
 
+    def __post_init__(self) -> None:
+        # 库内缓存的子目录必须是**安全相对子树**（§11.2）。AppConfig 也会校验一次
+        # （唯一被 load_config/服务消费的入口），这里让 dataclass 自身也不可被塞进
+        # 逃逸值：否则 `vault/.mcp_cache` 的子树豁免、watch 跳过判断会全部失准。
+        if self.placement == "vault" and unsafe_cache_subdir(self.subdir):
+            raise ValueError(
+                "cache.subdir must be a safe relative sub-tree "
+                f"(no absolute path, drive letter, NUL or '..'): {self.subdir!r}"
+            )
+
+
+@dataclass(slots=True)
+class DocStoreConfig:
+    """版本化文档库（解析事实）的容量策略（v0.9.0 C92，§12.3 / §17.4）。
+
+    文档库不是可随时重建的派生索引：删掉它等于丢弃已付费的解析全文与媒体
+    （§11.2「删除它可能重新产生解析费用」）。因此这里只表达**逻辑容量上限**，
+    超额时拒绝新的提交；隐式清理被明确禁止，真正的资产清除必须走显式
+    `purge_documents` 授权（C97 落地）。
+    """
+
+    # 单库文档库逻辑容量上限（MiB）：含 active revision、上一 committed 版本、
+    # staged 候选与媒体 blob。0 **不是**「无限制」——关闭限额等于让计费资产无声
+    # 撑爆磁盘，所以配置解析直接拒绝 <1（§17.4「0不得关闭安全限制」同口径）。
+    max_size_mb: int = 2048
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.max_size_mb, bool)
+            or not isinstance(self.max_size_mb, int)
+            or self.max_size_mb < 1
+        ):
+            raise ValueError(
+                f"doc_store.max_size_mb must be an integer >= 1, got {self.max_size_mb!r}"
+            )
+
+    @property
+    def max_size_bytes(self) -> int:
+        return self.max_size_mb * 1024 * 1024
+
+
+
 
 @dataclass(slots=True)
 class IngestConfig:
@@ -139,7 +224,6 @@ class IngestConfig:
     table_convert_max_cells: int = 60
     auto_watch: bool = False             # 自动摄取（默认关闭：需显式授权）
     max_file_size_mb: int = 20           # 单文件尺寸上限（MiB，默认20；0表示不限）
-
     def __post_init__(self) -> None:
         if not isinstance(self.auto_watch, bool):
             raise ValueError(f"ingest.auto_watch must be a boolean, got {self.auto_watch!r}")
@@ -149,7 +233,6 @@ class IngestConfig:
             or self.max_file_size_mb < 0
         ):
             raise ValueError(f"ingest.max_file_size_mb must be an integer >= 0, got {self.max_file_size_mb!r}")
-
     @property
     def max_file_size_bytes(self) -> int:
         """Max file size in bytes (1024*1024 per MiB). 0 means unlimited."""
@@ -209,6 +292,7 @@ class AppConfig:
     reranker: RerankerConfig = field(default_factory=RerankerConfig)
     vector: VectorConfig = field(default_factory=VectorConfig)
     cache: CacheConfig = field(default_factory=CacheConfig)
+    doc_store: DocStoreConfig = field(default_factory=DocStoreConfig)
     ingest: IngestConfig = field(default_factory=IngestConfig)
     index: IndexConfig = field(default_factory=IndexConfig)
     diag: DiagConfig = field(default_factory=DiagConfig)
@@ -265,6 +349,11 @@ class AppConfig:
             raise ValueError("cache.placement must be 'home' or 'vault'")
         if not self.cache.subdir:
             raise ValueError("cache.subdir must not be empty")
+        if self.cache.placement == "vault" and unsafe_cache_subdir(self.cache.subdir):
+            raise ValueError(
+                "cache.subdir must be a safe relative sub-tree "
+                f"(no absolute path, drive letter, NUL or '..'): {self.cache.subdir!r}"
+            )
         if not self.cache.namespace:
             raise ValueError("cache.namespace must not be empty")
         if self.cache.max_age_days < 0:
@@ -444,6 +533,7 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
     reranker = {**data, **_section(data, "reranker")}
     vector = {**data, **_section(data, "vector")}
     cache = {**data, **_section(data, "cache")}
+    doc_store = {**data, **_section(data, "doc_store")}
     index = _section(data, "index")
 
     vault_path = _env(data.get("vault_path", vault.get("path", "")))
@@ -546,6 +636,9 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
         reranker=rer,
         vector=VectorConfig(backend=str(vector.get("backend", "memory")).lower()),
         cache=cch,
+        doc_store=DocStoreConfig(
+            max_size_mb=_numeric(doc_store, data, "max_size_mb", int, 2048, 1)
+        ),
         ingest=ing,
         index=IndexConfig(read_max_chars=read_max_chars),
         diag=dg,

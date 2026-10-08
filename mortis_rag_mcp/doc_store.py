@@ -1,0 +1,2196 @@
+"""版本化虚拟文档库（doc_store）——解析事实的唯一权威存储（v0.9.0 C92 / §12、§23.1）。
+
+职责边界（§12.1）：
+- 本模块**只依赖标准库**，外加 `from .config import AppConfig` 仅用于类型标注/取值。
+  禁止 import `indexer.py` / `server.py` / `_server/*`——依赖必须自底向上。
+- 顶层 `dependencies = []` 不可动摇；不引入 ORM、不引入新服务、不引入全局单例。
+
+持久化拓扑（§23.1，最终合同）：
+
+    {cache_root}/{namespace}/doc_store/
+      vault_<key>.control.sqlite     本机权威控制面（不在 generation 内，不从快照恢复）
+      vault_<key>.mutation.lock      固定 OS 锁（失败即拒，不 fail-open，§12.4）
+      vault_<key>/generations/<gen>/docstore.sqlite   生成代次内的文档库
+
+分层事实：
+- `ControlStore`：本机控制面。权威持有 store_uuid / vault_binding / 单调 epoch /
+  operation_seq / active_document_generation / writer_gate。
+- `DocumentStore`：某一 document generation 内的文档库。持有 source 身份、revision
+  事实、内容寻址 blob、媒体引用、quota 与备份/恢复。
+
+错误语义一律 fail-closed：未知更高 schema 拒绝（§12.3/§23.1）；OS 锁创建/获取失败
+必须抛 `LockUnavailable`（§12.4），不得像 `registry._process_file_lock` 那样 except 后
+照常执行。
+"""
+
+from __future__ import annotations
+
+import contextlib
+import hashlib
+import json
+import math
+import os
+import re
+import sqlite3
+import threading
+import time
+import uuid
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Iterator, Mapping, Sequence
+
+from .config import AppConfig, is_windows_reserved_segment
+
+# --------------------------------------------------------------------------- 常量
+
+#: 本模块认识的最新 schema 版本。更高版本必须拒绝（fail closed，§12.3/§23.1）。
+SCHEMA_VERSION = 1
+
+#: 控制面 mutation 锁的默认超时（秒）。可在 mutation(timeout=...) 覆盖，测试用短超时。
+MUTATION_LOCK_TIMEOUT = 5.0
+
+#: media/journal 之外的页面开销估算常量（quota 只做近似，不作 ACID 承诺）。
+PAGE_OVERHEAD_BYTES = 256
+
+#: doc_store 默认 quota（MiB），仅当 AppConfig 未提供 doc_store.max_size_mb 时兜底。
+DEFAULT_DOC_STORE_MAX_MB = 2048
+
+_DOCSTORE_TABLES = (
+    "store_meta",
+    "documents",
+    "document_revisions",
+    "media_blobs",
+    "media_occurrences",
+    "media_variants",
+    "ingest_jobs",
+    "ingest_subjobs",
+    "auto_seen",
+    "derived_generations",
+)
+
+
+# --------------------------------------------------------------------------- 错误
+
+
+class DocStoreError(RuntimeError):
+    """doc_store 系列错误的基类。对外稳定 `code`；`retryable` 决定调用方是否重试。"""
+
+    code: str = "STORE_ERROR"
+    retryable: bool = False
+
+    def __init__(self, message: str, *, retryable: bool | None = None, fix: str = "") -> None:
+        super().__init__(message)
+        self.detail = message
+        self.fix = fix
+        if retryable is not None:
+            self.retryable = retryable
+
+    def __str__(self) -> str:  # pragma: no cover - 仅调试可读性
+        parts = [f"[{self.code}] {self.detail}"]
+        if self.fix:
+            parts.append(f"fix: {self.fix}")
+        parts.append(f"retryable={self.retryable}")
+        return " | ".join(parts)
+
+
+class StoragePathError(DocStoreError):
+    code = "STORAGE_PATH_INVALID"
+
+
+class VirtualStorageDisabled(DocStoreError):
+    code = "VIRTUAL_STORAGE_DISABLED"
+
+
+class StoreBindingMismatch(DocStoreError):
+    code = "STORE_BINDING_MISMATCH"
+
+
+class StoreSchemaUnsupported(DocStoreError):
+    code = "STORE_SCHEMA_UNSUPPORTED"
+
+
+class StoreBusy(DocStoreError):
+    code = "STORE_BUSY"
+    retryable = True
+
+
+class StoreCorrupt(DocStoreError):
+    code = "STORE_CORRUPT"
+
+
+class StoreQuotaExceeded(DocStoreError):
+    code = "STORE_QUOTA_EXCEEDED"
+
+
+class StoreConflict(DocStoreError):
+    code = "STORE_CONFLICT"
+
+
+class LockUnavailable(DocStoreError):
+    code = "LOCK_UNAVAILABLE"
+    retryable = True
+
+    def __init__(self, message: str, *, retryable: bool | None = None, fix: str = "") -> None:
+        super().__init__(message, retryable=True if retryable is None else retryable, fix=fix)
+
+
+class SourcePathError(DocStoreError):
+    code = "SOURCE_PATH_INVALID"
+
+
+class StoreContractError(DocStoreError):
+    code = "CONTRACT_INVALID"
+
+
+class SnapshotInvalid(DocStoreError):
+    code = "SNAPSHOT_INVALID"
+
+
+
+
+
+
+# --------------------------------------------------------------------------- 值对象
+
+
+@dataclass(frozen=True, slots=True)
+class StorageLayout:
+    """解析后的库路径布局（只做判决，不 mkdir、不写盘，§12.2/§11.2）。"""
+
+    vault_path: Path
+    cache_root: Path
+    namespace: str
+    vault_key: str
+    placement: str
+    enabled: bool
+    doc_store_dir: Path
+    vault_dir: Path
+    control_path: Path
+    mutation_lock_path: Path
+    generations_dir: Path
+    blocked_reason: str = ""
+
+    @property
+    def writable(self) -> bool:
+        """虚拟写入是否被允许：需持久化开启且真实归属不在库内（§11.2/§17.4）。"""
+        return self.enabled and not self.blocked_reason
+
+
+@dataclass(frozen=True, slots=True)
+class ControlState:
+    store_uuid: str
+    vault_binding: str
+    epoch: int
+    operation_seq: int
+    active_document_generation: str
+    writer_gate: int
+    schema_version: int
+
+
+@dataclass(frozen=True, slots=True)
+class GenerationRecord:
+    generation_id: str
+    path: str
+    kind: str
+    state: str
+    created_at: float
+
+
+@dataclass(frozen=True, slots=True)
+class DocumentRevision:
+    revision_id: str
+    doc_id: str
+    source_sha256: str
+    render_sha256: str
+    parser_fingerprint: str
+    parsed_markdown: str
+    page_map: list
+    quality: str
+    capabilities: Mapping[str, Any]
+    state: str
+    policy_version: str
+    created_at: float
+
+
+@dataclass(frozen=True, slots=True)
+class ActiveDocument:
+    doc_id: str
+    source: str
+    visibility: str
+    active_revision: str
+    revision: DocumentRevision
+
+
+@dataclass(frozen=True, slots=True)
+class DocumentRecord:
+    doc_id: str
+    source: str
+    visibility: str
+    active_revision: str
+    updated_at: float
+
+
+@dataclass(frozen=True, slots=True)
+class StagedRevision:
+    doc_id: str
+    revision_id: str
+    created_at: float
+
+
+@dataclass(frozen=True, slots=True)
+class StoreMeta:
+    schema_version: int
+    store_uuid: str
+    vault_binding: str
+    vault_epoch: int
+    change_seq: int
+    created_at: float
+    generation_id: str
+    document_count: int
+    revision_count: int
+    blob_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class QuotaStatus:
+    logical_bytes: int
+    limit_bytes: int
+    ratio: float
+    markdown_bytes: int
+    media_bytes: int
+    page_bytes: int
+    media_count: int
+    over_limit: bool
+
+
+
+
+
+
+
+
+@dataclass(frozen=True, slots=True)
+class MediaSpec:
+    """一条媒体出现（occurrence）的输入规格；`data` 是原始字节（内容寻址）。"""
+
+    occurrence_id: str
+    kind: str
+    mime_type: str
+    data: bytes
+    width: int | None = None
+    height: int | None = None
+    duration_ms: int | None = None
+    sample_rate: int | None = None
+    caption: str = ""
+    ocr: str = ""
+    page: int | None = None
+    bbox: Any = None
+    t_start_ms: int | None = None
+    t_end_ms: int | None = None
+    anchor_start: int | None = None
+    anchor_end: int | None = None
+    metadata: Mapping[str, Any] | None = None
+
+
+# --------------------------------------------------------------------------- 路径工具
+
+
+def is_within(child: str | Path, parent: str | Path) -> bool:
+    """真实归属判决：realpath + normcase 后做等值/包含比较（§12.2，不用字符串前缀）。"""
+    try:
+        c = os.path.normcase(os.path.realpath(os.fspath(child)))
+        p = os.path.normcase(os.path.realpath(os.fspath(parent)))
+    except (OSError, ValueError):
+        return False
+    if not p:
+        return False
+    if c == p:
+        return True
+    return c.startswith(p.rstrip("\\/") + os.sep)
+
+
+def _registry_read_path() -> Path:
+    """注册表的**只读**定位：env 覆盖 > 新名 > 旧名独占。
+
+    刻意不调用 `registry.registry_path()`：那条路径会把「新名不存在而旧名存在」
+    当作触发 `~/.vault_mcp` → `~/.mortis_rag_mcp` 原子迁移的时机。归属检测是读
+    判决，不该在别人的构造函数里搬动宿主数据目录。
+    """
+    override = (os.getenv("MORTIS_RAG_REGISTRY", "").strip()
+                or os.getenv("VAULT_MCP_REGISTRY", "").strip())
+    if override:
+        return Path(override).expanduser()
+    new = Path.home() / ".mortis_rag_mcp" / "vaults.toml"
+    if new.is_file():
+        return new
+    old = Path.home() / ".vault_mcp" / "vaults.toml"
+    return old if old.is_file() else new
+
+
+def registered_vault_paths() -> list[str]:
+    """读取已注册库路径（只读、无迁移副作用）；任何失败都返回 []（不阻断主流程）。"""
+    try:
+        from . import registry as _registry  # 惰性：避免顶层循环依赖
+
+        entries = _registry.VaultRegistry(_registry_read_path()).load()
+        return [str(entry.path) for entry in entries]
+    except Exception:
+        return []
+
+
+def vault_cache_key(config: AppConfig, vault_path: str | Path) -> str:
+    """库缓存身份 key，必须与 `indexer.MarkdownIndexer._cache_key` 逐字等价。
+
+    优先显式 cache.id（免疫路径拼写差异）→ sha256(cache.id)[:16]；
+    否则 raw = os.fspath(vault.resolve())，norm = normcase(realpath(raw))，
+    sha256(norm)[:16]。
+    """
+    if config.cache.id:
+        return hashlib.sha256(config.cache.id.encode("utf-8")).hexdigest()[:16]
+    raw = os.fspath(Path(vault_path).resolve())
+    normalized = os.path.normcase(os.path.realpath(raw))
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+
+
+def _detect_blocked_reason(
+    placement: str,
+    cache_root: Path,
+    vault: Path,
+    registered_vaults: Sequence[str | Path] | None,
+) -> str:
+    """§11.2 真实归属检测：返回非空 = 禁止虚拟摄取写入（不偷偷改路径）。
+
+    - `placement == "vault"`：subdir 是显式便携布局，**允许落在本库内**；只拒绝
+      它逃出库根或解析到库根本身（越界/上跳）。
+    - `placement == "home"`：cache_root 的真实路径落在本库或**显式传入的**已注册库内
+      → 拒绝（用户可能把 cache.dir 指向库内，或经 symlink/junction 落库内）。
+
+    `registered_vaults=None` 表示「只检测当前库」——本函数**不隐式读宿主注册表**：
+    读路径不该有宿主副作用（连注册表迁移都不该被触发）。跨库维度由写入门禁
+    `DocumentStore._enforce_writable` 补齐，或由调用方显式传入注册库列表（doctor）。
+    """
+    if placement == "vault":
+        if not is_within(cache_root, vault):
+            return (
+                f"cache.subdir 解析后逃出知识库根：{cache_root} 不在 {vault} 内。"
+                "修复：把 cache.subdir 改成库内的安全非根子树（如 .mcp_cache），不要上跳。"
+            )
+        if os.path.normcase(os.path.realpath(cache_root)) == os.path.normcase(
+            os.path.realpath(vault)
+        ):
+            return (
+                f"cache.subdir 解析到知识库根本身：{cache_root}。"
+                "修复：指定一个库内的非根子树，避免缓存与用户源文件混在同一目录。"
+            )
+        return ""
+
+    candidates: list[str] = [os.fspath(vault)]
+    if registered_vaults:
+        candidates.extend(os.fspath(v) for v in registered_vaults)
+    for candidate in candidates:
+        if candidate and is_within(cache_root, candidate):
+            return (
+                f"cache.dir 的真实路径落在知识库内（{cache_root} ⊆ {candidate}）。"
+                "虚拟摄取会向用户库写入文档库，已拒绝。"
+                "修复：把 cache.dir（或环境变量 MORTIS_RAG_CACHE_DIR）指向库外的本地目录。"
+            )
+    return ""
+
+
+def resolve_storage_layout(
+    config: AppConfig,
+    vault_path: str | Path,
+    *,
+    registered_vaults: Sequence[str | Path] | None = None,
+) -> StorageLayout:
+    """解析库路径布局；只做等值/包含判决，不 mkdir、不写盘（§12.2/§23.1）。"""
+    vault = Path(vault_path).expanduser()
+    placement = (config.cache.placement or "home").lower()
+    if placement == "vault":
+        subdir = config.cache.subdir or ".mcp_cache"
+        cache_root = vault / subdir
+    else:
+        cache_root = Path(config.cache.dir).expanduser()
+
+    namespace = config.cache.namespace or "default"
+    key = vault_cache_key(config, vault)
+
+    doc_store_dir = cache_root / namespace / "doc_store"
+    vault_dir = doc_store_dir / f"vault_{key}"
+    blocked = _detect_blocked_reason(placement, cache_root, vault, registered_vaults)
+
+    return StorageLayout(
+        vault_path=vault,
+        cache_root=cache_root,
+        namespace=namespace,
+        vault_key=key,
+        placement=placement,
+        enabled=bool(config.cache.enabled),
+        doc_store_dir=doc_store_dir,
+        vault_dir=vault_dir,
+        control_path=doc_store_dir / f"vault_{key}.control.sqlite",
+        mutation_lock_path=doc_store_dir / f"vault_{key}.mutation.lock",
+        generations_dir=vault_dir / "generations",
+        blocked_reason=blocked,
+    )
+
+
+_DRIVE_RE = re.compile(r"^[A-Za-z]:")
+
+
+def normalize_source_path(source: str, vault_path: str | Path) -> str:
+    """把 source 规范成库内相对 POSIX 路径（含原后缀），否则抛 `SourcePathError`。
+
+    拒绝：空、绝对路径、盘符、UNC、NUL、"."、".."、任何上跳、resolve 后不在库内。
+    `a.pdf` 与 `a.docx` 是不同源（后缀不可丢，§12.2）。
+    """
+    fix = "传入库内相对路径，例如 papers/attention.pdf（使用正斜杠，不得上跳或绝对化）"
+    if not isinstance(source, str) or not source:
+        raise SourcePathError("source 不能为空", fix=fix)
+    if "\x00" in source:
+        raise SourcePathError("source 含 NUL 字符", fix=fix)
+
+    raw = source.replace("\\", "/")
+    if raw.startswith("//"):
+        raise SourcePathError(f"source 是 UNC 路径，禁止：{source!r}", fix=fix)
+    if _DRIVE_RE.match(raw):
+        raise SourcePathError(f"source 含盘符，禁止：{source!r}", fix=fix)
+    if raw.startswith("/"):
+        raise SourcePathError(f"source 是绝对路径，禁止：{source!r}", fix=fix)
+
+    parts = raw.split("/")
+    for part in parts:
+        if part in ("", "."):
+            raise SourcePathError(f"source 含空段或 '.'，禁止：{source!r}", fix=fix)
+        if part == "..":
+            raise SourcePathError(f"source 含上跳 '..'，禁止：{source!r}", fix=fix)
+        if is_windows_reserved_segment(part):
+            raise SourcePathError(
+                f"source 含 Windows 设备名（{part!r}），禁止：{source!r}",
+                fix="Win32 下设备名不是普通文件；请重命名后再摄取。",
+            )
+
+    rel = "/".join(parts)
+    full = os.path.realpath(os.path.join(os.fspath(Path(vault_path).expanduser()), *parts))
+    if not is_within(full, vault_path):
+        raise SourcePathError(
+            f"source 经符号链接解析后越出知识库根：{source!r}", fix=fix
+        )
+    return rel
+
+
+# --------------------------------------------------------------------------- OS 锁
+
+_LOCK_REGISTRY: dict[str, "_FileMutex"] = {}
+_LOCK_REGISTRY_GUARD = threading.Lock()
+
+
+class _FileMutex:
+    """线程内可重入 + 跨线程/跨进程互斥的固定 OS 锁（§12.4）。
+
+    - 进程内：`threading.Lock` 保证同一路径同一时刻只有一个线程真正持锁；同一线程
+      重入直接放行（嵌套 mutation 不自死锁）。
+    - 跨进程：Windows msvcrt / POSIX fcntl 的字节范围锁。
+    - 超时或创建/打开失败一律不 fail-open：返回 False 或抛 `LockUnavailable`。
+    """
+
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path)
+        self._mutex = threading.Lock()
+        self._local = threading.local()
+        self._handle: Any = None
+
+    def acquire(self, timeout: float) -> bool:
+        depth = getattr(self._local, "depth", 0)
+        if depth > 0:
+            self._local.depth = depth + 1
+            return True
+        if not self._mutex.acquire(timeout=max(0.0, timeout)):
+            return False
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            handle = open(self.path, "a+b")
+        except OSError as exc:
+            self._mutex.release()
+            raise LockUnavailable(
+                f"无法创建/打开 mutation 锁文件 {self.path}: {exc}",
+                fix="检查缓存根目录权限；不要把缓存根放到只读或不可写位置。",
+            )
+        if not self._acquire_os(handle, timeout):
+            try:
+                handle.close()
+            finally:
+                self._mutex.release()
+            return False
+        self._handle = handle
+        self._local.depth = 1
+        return True
+
+    def release(self) -> None:
+        depth = getattr(self._local, "depth", 0)
+        if depth > 1:
+            self._local.depth = depth - 1
+            return
+        self._local.depth = 0
+        handle = self._handle
+        self._handle = None
+        try:
+            if handle is not None:
+                _release_os_lock(handle)
+        finally:
+            if handle is not None:
+                try:
+                    handle.close()
+                except OSError:
+                    pass
+            self._mutex.release()
+
+    @staticmethod
+    def _acquire_os(handle: Any, timeout: float) -> bool:
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            if _try_os_lock(handle):
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.03)
+
+
+def _try_os_lock(handle: Any) -> bool:
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            return True
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except OSError:
+        return False
+
+
+def _release_os_lock(handle: Any) -> None:
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass
+
+
+def _file_mutex_for(path: str | Path) -> _FileMutex:
+    """按规范化真实路径复用同一 `_FileMutex`，让同进程多实例也互相排斥。"""
+    try:
+        key = os.path.normcase(os.path.realpath(os.fspath(path)))
+    except OSError:
+        key = os.path.normcase(os.path.abspath(os.fspath(path)))
+    with _LOCK_REGISTRY_GUARD:
+        mutex = _LOCK_REGISTRY.get(key)
+        if mutex is None:
+            mutex = _FileMutex(path)
+            _LOCK_REGISTRY[key] = mutex
+        return mutex
+
+
+@contextlib.contextmanager
+def _mutation_lock(layout: StorageLayout, timeout: float = MUTATION_LOCK_TIMEOUT):
+    mutex = _file_mutex_for(layout.mutation_lock_path)
+    if not mutex.acquire(timeout):
+        raise LockUnavailable(
+            f"mutation 锁被占用，{timeout:.1f}s 内未取得：{layout.mutation_lock_path}",
+            fix="稍后重试；若长期占用，检查是否有崩溃残留的 writer 进程。",
+        )
+    try:
+        yield
+    finally:
+        mutex.release()
+
+
+# --------------------------------------------------------------------------- 校验/JSON
+
+_MAX_JSON_STRING = 1_000_000
+_MAX_JSON_DEPTH = 12
+_MAX_JSON_ITEMS = 200_000
+
+
+def _validate_json_value(value: Any, where: str, depth: int = 0) -> None:
+    """§12.3 末段：JSON 字段入库前校验类型/长度/有限数字。"""
+    if depth > _MAX_JSON_DEPTH:
+        raise StoreContractError(f"{where} 嵌套过深（> {_MAX_JSON_DEPTH}）")
+    if value is None or isinstance(value, bool):
+        return
+    if isinstance(value, int):
+        return
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise StoreContractError(f"{where} 含非有限数字（NaN/Inf），禁止入库")
+        return
+    if isinstance(value, str):
+        if len(value) > _MAX_JSON_STRING:
+            raise StoreContractError(f"{where} 字符串过长（> {_MAX_JSON_STRING}）")
+        return
+    if isinstance(value, (list, tuple)):
+        if len(value) > _MAX_JSON_ITEMS:
+            raise StoreContractError(f"{where} 数组元素过多（> {_MAX_JSON_ITEMS}）")
+        for item in value:
+            _validate_json_value(item, where, depth + 1)
+        return
+    if isinstance(value, Mapping):
+        if len(value) > _MAX_JSON_ITEMS:
+            raise StoreContractError(f"{where} 对象键过多（> {_MAX_JSON_ITEMS}）")
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise StoreContractError(f"{where} JSON 对象键必须是字符串")
+            if len(key) > 4096:
+                raise StoreContractError(f"{where} JSON 键过长")
+            _validate_json_value(item, where, depth + 1)
+        return
+    raise StoreContractError(f"{where} 含不可序列化类型 {type(value).__name__}")
+
+
+def _dump_json(value: Any, where: str) -> str:
+    _validate_json_value(value, where)
+    try:
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    except (TypeError, ValueError) as exc:
+        raise StoreContractError(f"{where} 无法序列化为 JSON: {exc}") from exc
+
+
+def _load_json(text: str | None, where: str, default: Any) -> Any:
+    if not text:
+        return default
+    try:
+        return json.loads(text)
+    except (TypeError, ValueError) as exc:
+        raise StoreCorrupt(f"{where} 不是合法 JSON: {exc}") from exc
+
+
+def _validate_page_map(page_map: Any, where: str = "page_map") -> list:
+    if page_map is None:
+        return []
+    if not isinstance(page_map, (list, tuple)):
+        raise StoreContractError(f"{where} 必须是数组")
+    normalized: list = []
+    for index, page in enumerate(page_map):
+        if page is None:
+            normalized.append(None)
+            continue
+        if isinstance(page, bool) or not isinstance(page, int):
+            raise StoreContractError(f"{where}[{index}] 页码必须是整数或 null")
+        if page < 1:
+            raise StoreContractError(f"{where}[{index}] 页码必须 >= 1（1-based）")
+        normalized.append(int(page))
+    return normalized
+
+
+def _validate_opt_int(value: Any, where: str, *, min_value: int | None = None,
+                      max_value: int | None = None) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise StoreContractError(f"{where} 必须是整数或 null")
+    if min_value is not None and value < min_value:
+        raise StoreContractError(f"{where} 必须 >= {min_value}")
+    if max_value is not None and value > max_value:
+        raise StoreContractError(f"{where} 必须 <= {max_value}")
+    return int(value)
+
+
+def _vault_binding(layout: StorageLayout) -> str:
+    """本机绑定指纹（跨进程稳定，§12.2）。
+
+    算法（v1）::
+
+        vault_real = normcase(realpath(vault_path))
+        payload    = "v1|" + vault_real + "|" + vault_key + "|" + namespace
+        binding    = sha256(payload.encode("utf-8")).hexdigest()[:32]
+
+    同一显式 `cache.id` 绑定两个不同实际库时，`vault_key` 相同但 `vault_real` 不同，
+    指纹不同 → 写入被拒（StoreBindingMismatch）。
+    """
+    vault_real = os.path.normcase(os.path.realpath(os.fspath(layout.vault_path)))
+    payload = f"v1|{vault_real}|{layout.vault_key}|{layout.namespace}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:32]
+
+
+def _configure_conn(conn: sqlite3.Connection) -> None:
+    conn.execute("PRAGMA journal_mode=DELETE")
+    conn.execute("PRAGMA synchronous=FULL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=5000")
+
+
+def _is_locked_error(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return "locked" in text or "busy" in text
+
+
+# --------------------------------------------------------------------------- ControlStore
+
+_CONTROL_SCHEMA = """
+CREATE TABLE IF NOT EXISTS control_meta (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  schema_version INTEGER NOT NULL,
+  store_uuid TEXT NOT NULL,
+  vault_binding TEXT NOT NULL,
+  vault_epoch INTEGER NOT NULL,
+  operation_seq INTEGER NOT NULL DEFAULT 0,
+  active_document_generation TEXT NOT NULL DEFAULT '',
+  writer_gate INTEGER NOT NULL DEFAULT 1,
+  created_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS generation_registry (
+  generation_id TEXT PRIMARY KEY,
+  path TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  state TEXT NOT NULL,
+  created_at REAL NOT NULL
+);
+"""
+
+
+class ControlStore:
+    """本机控制面 `vault_<key>.control.sqlite`（不在 generation 内，§12.4/§23.1）。
+
+    单行 `control_meta` 是权威发布指针；`generation_registry` 记录代次路径。以下对象
+    属于后续卡，**本 Lane 不建**（见 §23.1）：`generation_pins`/`profile_state`/
+    `payment_authorizations`/`request_intents`（C97/C98/C100）。
+    """
+
+    def __init__(self, layout: StorageLayout) -> None:
+        self.layout = layout
+        self._binding = _vault_binding(layout)
+        self._tls = threading.local()
+        self._degraded = False
+
+    # ------------------------------------------------------------------ conn io
+
+    def _conn(self) -> sqlite3.Connection | None:
+        return getattr(self._tls, "conn", None)
+
+    def _open_conn(self) -> sqlite3.Connection:
+        path = self.layout.control_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(path), check_same_thread=False)
+        try:
+            _configure_conn(conn)
+        except sqlite3.DatabaseError as exc:
+            conn.close()
+            raise StoreCorrupt(
+                f"控制库损坏或不是 SQLite 数据库：{path}: {exc}",
+                fix="保留文件，勿删除；用 doctor 诊断或从备份恢复。",
+            ) from exc
+        except Exception:
+            conn.close()
+            raise
+        self._tls.conn = conn
+        return conn
+
+    def _require_conn(self) -> sqlite3.Connection:
+        conn = self._conn()
+        if conn is None:
+            conn = self._open_conn()
+        return conn
+
+    def open(self, *, create: bool = True, write: bool = False) -> None:
+        """打开控制库；`create=False` 且文件不存在 → StoreCorrupt（明确 code）。"""
+        path = self.layout.control_path
+        exists = path.is_file() and path.stat().st_size > 0
+        if not exists and not create:
+            raise StoreCorrupt(
+                f"控制库不存在且 create=False: {path}",
+                fix="先用 create=True 初始化，或检查 cache.dir / namespace 是否指向了错误位置。",
+            )
+        conn = self._open_conn()
+        if not exists:
+            self._create_schema(conn)
+            return
+        row = self._read_meta(conn)
+        schema_version = int(row[0])
+        if schema_version > SCHEMA_VERSION:
+            raise StoreSchemaUnsupported(
+                f"控制库 schema_version={schema_version} 高于本程序支持 {SCHEMA_VERSION}",
+                fix="升级 Mortis-RAG-MCP；禁止降级或猜字段读取。",
+            )
+        if schema_version != SCHEMA_VERSION:
+            # 低于当前版本同样不是已知 schema：fail closed，不按 v1 猜字段（§23.1）。
+            raise StoreSchemaUnsupported(
+                f"控制库 schema_version={schema_version} 不是已知版本（本程序支持 {SCHEMA_VERSION}）",
+                fix="保留原文件，用匹配版本的程序打开或从备份恢复；禁止自动迁移。",
+            )
+        if str(row[2]) != self._binding:
+            if write:
+                raise StoreBindingMismatch(
+                    "控制库的 vault_binding 与本次绑定不一致"
+                    f"（库内 {row[2]} ≠ 计算 {self._binding}）",
+                    fix="同一 cache.id 不得绑定两个实际库；检查 cache.id / vault 路径是否被改动。",
+                )
+            # 读模式降级：允许只读检视，但任何写入都会被 mutation() 再次拒绝。
+            self._degraded = True
+
+    def _create_schema(self, conn: sqlite3.Connection) -> None:
+        conn.executescript(_CONTROL_SCHEMA)
+        now = time.time()
+        conn.execute(
+            "INSERT INTO control_meta (id, schema_version, store_uuid, vault_binding, "
+            "vault_epoch, operation_seq, active_document_generation, writer_gate, created_at) "
+            "VALUES (1, ?, ?, ?, 1, 0, '', 1, ?)",
+            (SCHEMA_VERSION, uuid.uuid4().hex, self._binding, now),
+        )
+        conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+        conn.commit()
+
+    def _read_meta(self, conn: sqlite3.Connection) -> tuple:
+        try:
+            row = conn.execute(
+                "SELECT schema_version, store_uuid, vault_binding, vault_epoch, "
+                "operation_seq, active_document_generation, writer_gate "
+                "FROM control_meta WHERE id = 1"
+            ).fetchone()
+        except sqlite3.DatabaseError as exc:
+            raise StoreCorrupt(
+                f"控制库损坏或不是 SQLite 数据库：{self.layout.control_path}: {exc}",
+                fix="保留文件，勿删除；用 doctor 诊断或从备份恢复。",
+            ) from exc
+        if row is None:
+            raise StoreCorrupt(
+                f"控制库缺少 control_meta 单行：{self.layout.control_path}",
+                fix="控制库不完整，需从备份恢复。",
+            )
+        return row
+
+    def _write(self, conn: sqlite3.Connection, sql: str, params: tuple = ()) -> None:
+        try:
+            conn.execute(sql, params)
+            conn.commit()
+        except sqlite3.OperationalError as exc:
+            if _is_locked_error(exc):
+                raise StoreBusy(f"控制库忙：{exc}", fix="稍后重试。") from exc
+            raise StoreCorrupt(f"控制库写入失败：{exc}") from exc
+        except sqlite3.DatabaseError as exc:
+            raise StoreCorrupt(f"控制库写入失败：{exc}") from exc
+
+    # ------------------------------------------------------------------ mutation
+
+    @contextlib.contextmanager
+    def mutation(self, timeout: float = MUTATION_LOCK_TIMEOUT):
+        """严格 OS 锁（线程内可重入，跨线程/跨进程互斥）；失败抛 `LockUnavailable`。"""
+        with _mutation_lock(self.layout, timeout):
+            if self._degraded:
+                raise StoreBindingMismatch(
+                    "控制库处于绑定降级（只读）状态，拒绝写入",
+                    fix="恢复正确的 cache.id / vault 路径，或从备份恢复控制库。",
+                )
+            if self._conn() is None:
+                self.open(create=True, write=True)
+            conn = self._require_conn()
+            depth = int(getattr(self._tls, "mutation_depth", 0))
+            self._tls.mutation_depth = depth + 1
+            try:
+                yield conn
+            except BaseException:
+                # 与 DocumentStore.mutation 同因：异常逃逸不得留下未提交事务
+                # （连接是线程复用的，下一次 commit 会把半截写入一并写实）。
+                self._rollback_quietly(conn)
+                raise
+            else:
+                # 只有最外层帧才清理「未显式 commit 的残留写入」：可重入锁允许嵌套
+                # mutation，内层正常退出若也 rollback 会回滚外层未提交事务（D5）。
+                if depth == 0 and conn.in_transaction:
+                    self._rollback_quietly(conn)
+            finally:
+                self._tls.mutation_depth = depth
+
+    @staticmethod
+    def _rollback_quietly(conn: sqlite3.Connection) -> None:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------ state/api
+
+    def state(self) -> ControlState:
+        with self.mutation():
+            row = self._read_meta(self._require_conn())
+        return ControlState(
+            store_uuid=str(row[1]),
+            vault_binding=str(row[2]),
+            epoch=int(row[3]),
+            operation_seq=int(row[4]),
+            active_document_generation=str(row[5]),
+            writer_gate=int(row[6]),
+            schema_version=int(row[0]),
+        )
+
+    def bump_epoch(self) -> int:
+        """单调 +1 并持久化（旧 worker 凭旧 epoch 不能通行，§12.4/§12.6）。"""
+        with self.mutation():
+            conn = self._require_conn()
+            row = self._read_meta(conn)
+            new_epoch = int(row[3]) + 1
+            self._write(conn, "UPDATE control_meta SET vault_epoch = ? WHERE id = 1", (new_epoch,))
+            return new_epoch
+
+    def next_operation_seq(self) -> int:
+        """单调 +1 并持久化（§20.7F）。"""
+        with self.mutation():
+            conn = self._require_conn()
+            row = self._read_meta(conn)
+            new_seq = int(row[4]) + 1
+            self._write(conn, "UPDATE control_meta SET operation_seq = ? WHERE id = 1", (new_seq,))
+            return new_seq
+
+    def allocate_generation(self) -> str:
+        """分配下一个 document generation id（`g0001` 递增）并登记。"""
+        with self.mutation():
+            conn = self._require_conn()
+            row = conn.execute(
+                "SELECT COALESCE(MAX(CAST(SUBSTR(generation_id, 2) AS INTEGER)), 0) "
+                "FROM generation_registry WHERE generation_id LIKE 'g%'"
+            ).fetchone()
+            number = int(row[0] or 0) + 1
+            gen_id = f"g{number:04d}"
+            gen_path = self.layout.generations_dir / gen_id
+            conn.execute(
+                "INSERT OR REPLACE INTO generation_registry "
+                "(generation_id, path, kind, state, created_at) VALUES (?, ?, 'document', 'ready', ?)",
+                (gen_id, str(gen_path), time.time()),
+            )
+            conn.commit()
+            return gen_id
+
+    def set_active_document_generation(self, gen_id: str) -> None:
+        """切换 active generation；必须已登记且 kind='document'。"""
+        with self.mutation():
+            conn = self._require_conn()
+            row = conn.execute(
+                "SELECT kind FROM generation_registry WHERE generation_id = ?", (gen_id,)
+            ).fetchone()
+            if row is None or str(row[0]) != "document":
+                raise StoreContractError(
+                    f"generation {gen_id!r} 未登记或不是 document 类型",
+                    fix="先 register_generation(...kind='document') 再切换 active 指针。",
+                )
+            self._write(
+                conn,
+                "UPDATE control_meta SET active_document_generation = ? WHERE id = 1",
+                (gen_id,),
+            )
+
+    def register_generation(self, gen_id: str, path: str | Path, kind: str, state: str) -> None:
+        with self.mutation():
+            conn = self._require_conn()
+            conn.execute(
+                "INSERT OR REPLACE INTO generation_registry "
+                "(generation_id, path, kind, state, created_at) VALUES (?, ?, ?, ?, ?)",
+                (gen_id, str(path), str(kind), str(state), time.time()),
+            )
+            conn.commit()
+
+    def list_generations(self) -> list[GenerationRecord]:
+        with self.mutation():
+            conn = self._require_conn()
+            rows = conn.execute(
+                "SELECT generation_id, path, kind, state, created_at FROM generation_registry "
+                "ORDER BY generation_id"
+            ).fetchall()
+        return [GenerationRecord(str(r[0]), str(r[1]), str(r[2]), str(r[3]), float(r[4])) for r in rows]
+
+    def close(self) -> None:
+        conn = self._conn()
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            self._tls.conn = None
+
+    def __enter__(self) -> "ControlStore":
+        return self
+
+    def __exit__(self, *exc_info: Any) -> None:
+        self.close()
+
+
+# --------------------------------------------------------------------------- schema
+
+_DOCSTORE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS store_meta (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  schema_version INTEGER NOT NULL,
+  store_uuid TEXT NOT NULL,
+  vault_binding TEXT NOT NULL,
+  vault_epoch INTEGER NOT NULL,
+  change_seq INTEGER NOT NULL DEFAULT 0,
+  created_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS documents (
+  doc_id TEXT PRIMARY KEY,
+  source TEXT NOT NULL UNIQUE,
+  active_revision TEXT,
+  visibility TEXT NOT NULL DEFAULT 'unverified'
+      CHECK (visibility IN ('active','exempt','deleted','unverified')),
+  source_size INTEGER,
+  source_mtime_ns INTEGER,
+  source_ctime_ns INTEGER,
+  source_sha256 TEXT,
+  policy_version TEXT NOT NULL DEFAULT '',
+  updated_at REAL NOT NULL,
+  FOREIGN KEY (doc_id, active_revision)
+      REFERENCES document_revisions (doc_id, revision_id)
+      DEFERRABLE INITIALLY DEFERRED
+);
+
+CREATE TABLE IF NOT EXISTS document_revisions (
+  revision_id TEXT PRIMARY KEY,
+  doc_id TEXT NOT NULL REFERENCES documents (doc_id) ON DELETE CASCADE,
+  source_sha256 TEXT NOT NULL,
+  render_sha256 TEXT NOT NULL,
+  parser_fingerprint TEXT NOT NULL,
+  parsed_markdown TEXT NOT NULL,
+  page_map_json TEXT NOT NULL DEFAULT '[]',
+  page_count INTEGER NOT NULL DEFAULT 0,
+  quality TEXT NOT NULL DEFAULT 'full',
+  capabilities_json TEXT NOT NULL DEFAULT '{}',
+  state TEXT NOT NULL CHECK (state IN ('staged','committed')),
+  policy_version TEXT NOT NULL DEFAULT '',
+  source_size INTEGER,
+  source_mtime_ns INTEGER,
+  vault_epoch INTEGER NOT NULL DEFAULT 1,
+  created_at REAL NOT NULL,
+  committed_at REAL,
+  UNIQUE (doc_id, revision_id)
+);
+CREATE INDEX IF NOT EXISTS idx_revisions_doc_state ON document_revisions (doc_id, state);
+
+CREATE TABLE IF NOT EXISTS media_blobs (
+  blob_id TEXT PRIMARY KEY,
+  mime_type TEXT NOT NULL,
+  byte_size INTEGER NOT NULL,
+  data BLOB NOT NULL,
+  checksum TEXT NOT NULL DEFAULT '',
+  width INTEGER,
+  height INTEGER,
+  duration_ms INTEGER,
+  sample_rate INTEGER,
+  created_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS media_occurrences (
+  revision_id TEXT NOT NULL REFERENCES document_revisions (revision_id) ON DELETE CASCADE,
+  occurrence_id TEXT NOT NULL,
+  blob_id TEXT NOT NULL REFERENCES media_blobs (blob_id),
+  kind TEXT NOT NULL,
+  ordinal INTEGER NOT NULL,
+  page INTEGER,
+  bbox_json TEXT,
+  t_start_ms INTEGER,
+  t_end_ms INTEGER,
+  caption TEXT NOT NULL DEFAULT '',
+  ocr TEXT NOT NULL DEFAULT '',
+  anchor_start INTEGER,
+  anchor_end INTEGER,
+  metadata_json TEXT NOT NULL DEFAULT '{}',
+  PRIMARY KEY (revision_id, occurrence_id)
+);
+CREATE INDEX IF NOT EXISTS idx_occurrence_rev_ord ON media_occurrences (revision_id, ordinal);
+CREATE INDEX IF NOT EXISTS idx_occurrence_blob ON media_occurrences (blob_id);
+
+CREATE TABLE IF NOT EXISTS media_variants (
+  revision_id TEXT NOT NULL,
+  occurrence_id TEXT NOT NULL,
+  variant_id TEXT NOT NULL,
+  blob_id TEXT NOT NULL REFERENCES media_blobs (blob_id),
+  parent_blob_id TEXT REFERENCES media_blobs (blob_id),
+  kind TEXT NOT NULL,
+  preprocess_version TEXT NOT NULL DEFAULT '',
+  range_json TEXT,
+  PRIMARY KEY (revision_id, occurrence_id, variant_id),
+  FOREIGN KEY (revision_id, occurrence_id)
+      REFERENCES media_occurrences (revision_id, occurrence_id) ON DELETE CASCADE
+);
+
+-- ingest_jobs / ingest_subjobs / auto_seen / derived_generations：
+-- 表已按 v1 合同建好，行为由 C94（队列/租约/发布CAS）/ C95（虚拟枚举/撤销/派生代次）/
+-- C93（有界 MinerU 结构结果）落地。本 Lane 只保证 schema 正确，不写这些表。
+CREATE TABLE IF NOT EXISTS ingest_jobs (
+  job_id TEXT PRIMARY KEY,
+  doc_id TEXT,
+  source TEXT,
+  source_sha256 TEXT,
+  parser_fingerprint TEXT,
+  vault_epoch INTEGER,
+  request_seq INTEGER NOT NULL DEFAULT 0,
+  state TEXT NOT NULL,
+  phase TEXT,
+  owner_token TEXT,
+  lease_until REAL,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  retry_after REAL,
+  result_revision TEXT,
+  error_code TEXT,
+  error_summary TEXT,
+  created_at REAL NOT NULL,
+  updated_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_jobs_state_lease ON ingest_jobs (state, lease_until);
+
+CREATE TABLE IF NOT EXISTS ingest_subjobs (
+  job_id TEXT NOT NULL,
+  ordinal INTEGER NOT NULL,
+  input_hash TEXT,
+  range_json TEXT,
+  state TEXT NOT NULL,
+  remote_task_id TEXT,
+  checkpoint TEXT,
+  error TEXT,
+  PRIMARY KEY (job_id, ordinal)
+);
+
+CREATE TABLE IF NOT EXISTS auto_seen (
+  source TEXT PRIMARY KEY,
+  source_sha256 TEXT,
+  last_job_id TEXT,
+  policy TEXT,
+  state TEXT,
+  source_size INTEGER,
+  source_mtime_ns INTEGER,
+  source_ctime_ns INTEGER,
+  last_seen_scan REAL
+);
+
+CREATE TABLE IF NOT EXISTS derived_generations (
+  profile_key TEXT PRIMARY KEY,
+  change_seq INTEGER,
+  chunker_fingerprint TEXT,
+  space_fingerprint TEXT,
+  status TEXT,
+  last_error TEXT
+);
+"""
+
+_VISIBILITIES = ("active", "exempt", "deleted", "unverified")
+
+
+class DocumentStore:
+    """某一 document generation 内的文档库 `generations/<gen>/docstore.sqlite`。"""
+
+    def __init__(
+        self,
+        layout: StorageLayout,
+        config: AppConfig | None = None,
+        *,
+        generation_id: str = "",
+    ) -> None:
+        self.layout = layout
+        self.config = config
+        self._requested_generation = generation_id or ""
+        self._generation_id = ""
+        self._binding = _vault_binding(layout)
+        self._tls = threading.local()
+        # 跨库归属检测只做一次（写门禁），避免每条 mutation 都读宿主注册表。
+        self._registry_checked = False
+
+    # ------------------------------------------------------------------ 连接
+
+    @property
+    def generation_id(self) -> str:
+        return self._generation_id
+
+    def _store_path(self, gen_id: str) -> Path:
+        return self.layout.generations_dir / gen_id / "docstore.sqlite"
+
+    def _conn(self) -> sqlite3.Connection | None:
+        return getattr(self._tls, "conn", None)
+
+    def _open_conn(self, gen_id: str) -> sqlite3.Connection:
+        conn = self._conn()
+        if conn is not None and getattr(self._tls, "gen", "") == gen_id:
+            return conn
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            self._tls.conn = None
+            self._tls.gen = ""
+        path = self._store_path(gen_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(path), check_same_thread=False)
+        try:
+            _configure_conn(conn)
+            self._ensure_schema(conn, path)
+        except DocStoreError:
+            conn.close()
+            raise
+        except sqlite3.DatabaseError as exc:
+            conn.close()
+            raise StoreCorrupt(
+                f"文档库损坏或不是 SQLite 数据库：{path}: {exc}",
+                fix="保留文件，勿删除；虚拟读取 fail-closed，物理文本仍可服务（§12.6）。",
+            ) from exc
+        except Exception:
+            conn.close()
+            raise
+        self._tls.conn = conn
+        self._tls.gen = gen_id
+        return conn
+
+    def _ensure_schema(self, conn: sqlite3.Connection, path: Path) -> None:
+        try:
+            size = path.stat().st_size
+        except OSError:
+            size = 0
+        if size == 0:
+            self._create_schema(conn)
+            return
+        try:
+            row = conn.execute("SELECT schema_version FROM store_meta WHERE id = 1").fetchone()
+        except sqlite3.DatabaseError as exc:
+            raise StoreCorrupt(
+                f"文档库损坏或不是 SQLite 数据库：{path}: {exc}",
+                fix="保留文件，勿删除；虚拟读取 fail-closed，物理文本仍可服务（§12.6）。",
+            ) from exc
+        if row is None:
+            raise StoreCorrupt(
+                f"文档库缺少 store_meta 单行：{path}",
+                fix="文件不完整；保留原文件并从备份恢复，不要自动重建覆盖。",
+            )
+        version = int(row[0])
+        if version > SCHEMA_VERSION:
+            raise StoreSchemaUnsupported(
+                f"文档库 schema_version={version} 高于本程序支持 {SCHEMA_VERSION}",
+                fix="升级 Mortis-RAG-MCP；禁止降级或猜字段读取。",
+            )
+        if version != SCHEMA_VERSION:
+            # 低于当前版本（例如手改/他程序产物）同样不是已知 schema：fail closed，
+            # 不按 v1 猜字段读取（§23.1「unknown schema fail closed」）。
+            raise StoreSchemaUnsupported(
+                f"文档库 schema_version={version} 不是已知版本（本程序支持 {SCHEMA_VERSION}）",
+                fix="保留原文件，用匹配版本的程序打开或从备份恢复；禁止自动迁移。",
+            )
+
+    def _create_schema(self, conn: sqlite3.Connection) -> None:
+        conn.executescript(_DOCSTORE_SCHEMA)
+        now = time.time()
+        conn.execute(
+            "INSERT INTO store_meta (id, schema_version, store_uuid, vault_binding, "
+            "vault_epoch, change_seq, created_at) VALUES (1, ?, ?, ?, ?, 0, ?)",
+            (SCHEMA_VERSION, uuid.uuid4().hex, self._binding, self._current_epoch(), now),
+        )
+        conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+        conn.commit()
+
+    def _current_epoch(self) -> int:
+        """当前本机 epoch；控制面**尚未建立**时按 1 计（首个 epoch）。
+
+        控制面存在却不可读（损坏/未知 schema/绑定冲突）时**不吞异常**：写路径若拿
+        伪造的 epoch 1 给 revision 打戳，fencing 判断就失真了（§12.4/§12.5）。
+        """
+        if not self._control_exists():
+            return 1
+        ctrl = ControlStore(self.layout)
+        try:
+            ctrl.open(create=False, write=False)
+            return ctrl.state().epoch
+        finally:
+            ctrl.close()
+
+    def _control_exists(self) -> bool:
+        """控制面文件是否已建立（只做存在性判断，不打开连接、不读注册表）。"""
+        path = self.layout.control_path
+        try:
+            return path.is_file() and path.stat().st_size > 0
+        except OSError:
+            return False
+
+    # ------------------------------------------------------------------ generation
+
+    def _active_generation(self) -> str:
+        """当前 active document generation；控制面**尚未建立**时返回 ""。
+
+        但文件存在却读不出来时**必须抛出**（损坏 / 未知 schema / 绑定冲突）：
+        把「store 损坏」吞成「这个源没入库」会让读端把 fail-closed 误当 not-found，
+        也可能瞒过跨库绑定冲突（§12.6「store 损坏 → 虚拟 fail closed」/§23.4
+        「parse done 不等于 index ready」）。
+        """
+        if not self._control_exists():
+            return ""
+        ctrl = ControlStore(self.layout)
+        try:
+            ctrl.open(create=False, write=False)
+            return ctrl.state().active_document_generation
+        finally:
+            ctrl.close()
+
+    def _allocate_generation(self) -> str:
+        ctrl = ControlStore(self.layout)
+        try:
+            ctrl.open(create=True, write=True)
+            gen_id = ctrl.allocate_generation()
+            ctrl.set_active_document_generation(gen_id)
+            return gen_id
+        finally:
+            ctrl.close()
+
+    def _resolve_generation(self, write: bool) -> str:
+        if self._requested_generation:
+            return self._requested_generation
+        gen = self._active_generation()
+        if gen:
+            return gen
+        if write:
+            return self._allocate_generation()
+        return ""
+
+    def _ensure_read_generation(self) -> str:
+        if self._generation_id:
+            return self._generation_id
+        self._generation_id = self._resolve_generation(write=False)
+        return self._generation_id
+
+    # ------------------------------------------------------------------ lifecycle
+
+    def _enforce_writable(self) -> None:
+        enabled = self.layout.enabled and (self.config is None or bool(self.config.cache.enabled))
+        if not enabled:
+            raise VirtualStorageDisabled(
+                "cache.enabled=False，虚拟摄取写入被拒绝（§17.4）",
+                fix="在 [cache] 中设置 enabled=true，或不要向 doc_store 摄取（物理文本不受影响）。",
+            )
+        if self.layout.blocked_reason:
+            raise VirtualStorageDisabled(
+                "虚拟存储写入被拒绝：" + self.layout.blocked_reason,
+                fix="把 cache.dir / cache.subdir 改到库外的本地目录后重试。",
+            )
+        self._check_registered_vaults_once()
+
+    def _check_registered_vaults_once(self) -> None:
+        """补齐 §11.2 的「cache 根落在**任一已注册库**内」维度（每个 store 只查一次）。
+
+        布局解析默认只检测当前库（见 `_detect_blocked_reason`：读路径不隐式读宿主
+        注册表）。跨库归属是**写**准入条件，所以在写门禁这里显式补查一次，避免
+        每条 mutation 都去读注册表。
+        """
+        if self._registry_checked:
+            return
+        self._registry_checked = True
+        if self.layout.placement != "home":
+            return
+        for candidate in registered_vault_paths():
+            if candidate and is_within(self.layout.cache_root, candidate):
+                raise VirtualStorageDisabled(
+                    f"cache 根的真实路径落在已注册知识库内（{self.layout.cache_root} ⊆ {candidate}）",
+                    fix="把 cache.dir（或环境变量 MORTIS_RAG_CACHE_DIR）指向库外的本地目录，"
+                    '或显式改用 cache.placement="vault"（库内缓存是显式例外）。',
+                )
+
+    def open(self, *, create: bool = True, write: bool = False) -> None:
+        """打开文档库；generation 为空时从 control 的 active_document_generation 取。"""
+        if write:
+            self._enforce_writable()
+        gen = self._resolve_generation(write=write)
+        if not gen:
+            self._generation_id = ""
+            return
+        self._generation_id = gen
+        self._open_conn(gen)
+
+    def close(self) -> None:
+        """关闭本线程连接（连接按线程独立；同线程重开即验证重启语义）。"""
+        conn = self._conn()
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            self._tls.conn = None
+            self._tls.gen = ""
+
+    @contextlib.contextmanager
+    def mutation(self, timeout: float = MUTATION_LOCK_TIMEOUT):
+        """严格 OS 锁（线程内可重入，嵌套调用不自死锁）；写门禁在此统一裁决。
+
+        失败路径**必须整体回滚**（§12.6）：sqlite3 在默认 isolation_level 下会为
+        DML 隐式 BEGIN，异常逃逸时事务会留在连接上，而连接是线程复用的——下一次
+        成功写入的 `commit()` 会把半截候选（例如只插了一半的 media_occurrence 与
+        blob）一并写实。这里在异常与「未显式 commit」两种出口都 rollback。
+        """
+        with _mutation_lock(self.layout, timeout):
+            self._enforce_writable()
+            if not self._generation_id:
+                gen = (
+                    self._requested_generation
+                    or self._active_generation()
+                    or self._allocate_generation()
+                )
+                self._generation_id = gen
+            path = self._store_path(self._generation_id)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            depth = int(getattr(self._tls, "mutation_depth", 0))
+            self._tls.mutation_depth = depth + 1
+            conn = self._open_conn(self._generation_id)
+            try:
+                yield conn
+            except BaseException:
+                self._rollback_quietly(conn)
+                raise
+            else:
+                # 没走到显式 commit 的写入同样不许逃逸到下一个事务；但只有**最外层**
+                # 帧有资格清理——可重入锁允许嵌套 mutation，内层正常退出若也 rollback
+                # 会把外层尚未提交的事务一并回滚（审核发现 D5）。
+                if depth == 0 and conn.in_transaction:
+                    self._rollback_quietly(conn)
+            finally:
+                self._tls.mutation_depth = depth
+
+    @staticmethod
+    def _rollback_quietly(conn: sqlite3.Connection) -> None:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+
+    def _write(self, conn: sqlite3.Connection, sql: str, params: tuple = ()) -> None:
+        try:
+            conn.execute(sql, params)
+        except sqlite3.IntegrityError as exc:
+            raise StoreContractError(f"约束冲突：{exc}") from exc
+        except sqlite3.OperationalError as exc:
+            if _is_locked_error(exc):
+                raise StoreBusy(f"文档库忙：{exc}", fix="稍后重试。") from exc
+            raise StoreCorrupt(f"文档库写入失败：{exc}") from exc
+
+    # ------------------------------------------------------------------ meta/quota
+
+    # ------------------------------------------------------------------ 读路径错误封装
+
+    def _query_one(
+        self, conn: sqlite3.Connection, sql: str, params: tuple = (), *, what: str
+    ) -> tuple | None:
+        """读路径统一把 sqlite 层错误翻成**稳定 code**（§12.6）。
+
+        `documents`/`document_revisions` 等表缺失（被外部删表、半截复制、旧备份、
+        手工改库）会让 `conn.execute` 抛**原生** `sqlite3.DatabaseError`，调用方只
+        拿到一个没有 `code` 的 OperationalError 文本，无法判定「该恢复还是该重扫」。
+        这里统一转 `STORE_CORRUPT` 并保留原始原因。
+        """
+        try:
+            return conn.execute(sql, params).fetchone()
+        except sqlite3.DatabaseError as exc:
+            raise StoreCorrupt(
+                f"{what} 读取失败（文档库不可用）：{exc}",
+                fix="保留文件；虚拟读取 fail closed，物理文本仍可服务；用 doctor 诊断或从备份恢复。",
+            ) from exc
+
+    def _query_all(
+        self, conn: sqlite3.Connection, sql: str, params: tuple = (), *, what: str
+    ) -> list[tuple]:
+        try:
+            return conn.execute(sql, params).fetchall()
+        except sqlite3.DatabaseError as exc:
+            raise StoreCorrupt(
+                f"{what} 读取失败（文档库不可用）：{exc}",
+                fix="保留文件；虚拟读取 fail closed，物理文本仍可服务；用 doctor 诊断或从备份恢复。",
+            ) from exc
+
+    def _meta_row(self, conn: sqlite3.Connection) -> tuple:
+        row = self._query_one(
+            conn,
+            "SELECT schema_version, store_uuid, vault_binding, vault_epoch, change_seq, created_at "
+            "FROM store_meta WHERE id = 1",
+            what="store_meta",
+        )
+        if row is None:
+            raise StoreCorrupt("文档库缺少 store_meta 单行", fix="从备份恢复。")
+        return row
+
+    def store_meta(self) -> StoreMeta:
+        gen = self._ensure_read_generation()
+        if not gen:
+            raise StoreContractError(
+                "doc_store 尚未初始化（无 active generation）",
+                fix="先用 DocumentStore.open(write=True) 建立首个 generation。",
+            )
+        conn = self._open_conn(gen)
+        row = self._meta_row(conn)
+        doc_row = self._query_one(conn, "SELECT COUNT(*) FROM documents", what="documents 计数")
+        rev_row = self._query_one(
+            conn, "SELECT COUNT(*) FROM document_revisions", what="document_revisions 计数"
+        )
+        blob_row = self._query_one(conn, "SELECT COUNT(*) FROM media_blobs", what="media_blobs 计数")
+        return StoreMeta(
+            schema_version=int(row[0]),
+            store_uuid=str(row[1]),
+            vault_binding=str(row[2]),
+            vault_epoch=int(row[3]),
+            change_seq=int(row[4]),
+            created_at=float(row[5]),
+            generation_id=gen,
+            document_count=int(doc_row[0]) if doc_row is not None else 0,
+            revision_count=int(rev_row[0]) if rev_row is not None else 0,
+            blob_count=int(blob_row[0]) if blob_row is not None else 0,
+        )
+
+    def change_seq(self) -> int:
+        gen = self._ensure_read_generation()
+        if not gen:
+            return 0
+        conn = self._open_conn(gen)
+        row = self._query_one(conn, "SELECT change_seq FROM store_meta WHERE id = 1", what="change_seq")
+        return int(row[0]) if row is not None else 0
+
+    def integrity_check(self) -> None:
+        gen = self._ensure_read_generation()
+        if not gen:
+            return
+        conn = self._open_conn(gen)
+        try:
+            row = conn.execute("PRAGMA integrity_check").fetchone()
+        except sqlite3.DatabaseError as exc:
+            raise StoreCorrupt(f"integrity_check 执行失败：{exc}") from exc
+        if not row or str(row[0]).lower() != "ok":
+            raise StoreCorrupt(
+                f"integrity_check 未通过：{row[0] if row else 'no result'}",
+                fix="保留文件，显式维护或从备份恢复，不要静默删除。",
+            )
+
+    def _quota_limit_bytes(self) -> int:
+        """逻辑容量上限（字节）。
+
+        非法/非正值一律**回落到默认上限**，绝不解释成「无限制」：§17.4 明确
+        「0 不得关闭安全限制」。`AppConfig` 会拒绝 max_size_mb<1，但程序化构造
+        （测试、外部调用方、直接改属性）仍可能塞进 0/bool/NaN——那时必须更严，
+        而不是更松。
+        """
+        doc_store_cfg = getattr(self.config, "doc_store", None) if self.config is not None else None
+        max_mb: Any = getattr(doc_store_cfg, "max_size_mb", None) if doc_store_cfg is not None else None
+        if isinstance(max_mb, bool) or not isinstance(max_mb, (int, float)):
+            max_mb = DEFAULT_DOC_STORE_MAX_MB
+        max_mb = float(max_mb)
+        if not math.isfinite(max_mb) or max_mb <= 0:
+            # 0/负数/NaN/Inf 一律回落默认：它们都不是「无限制」的表达方式。
+            max_mb = float(DEFAULT_DOC_STORE_MAX_MB)
+        return int(max_mb * 1024 * 1024)
+
+    def _logical_breakdown(self, conn: sqlite3.Connection) -> tuple[int, int, int, int, int]:
+        markdown_row = self._query_one(
+            conn,
+            "SELECT COALESCE(SUM(LENGTH(CAST(parsed_markdown AS BLOB))), 0) FROM document_revisions",
+            what="markdown 用量",
+        )
+        pages_row = self._query_one(
+            conn, "SELECT COALESCE(SUM(page_count), 0) FROM document_revisions", what="页用量"
+        )
+        media_row = self._query_one(
+            conn, "SELECT COALESCE(SUM(byte_size), 0) FROM media_blobs", what="媒体用量"
+        )
+        count_row = self._query_one(conn, "SELECT COUNT(*) FROM media_blobs", what="媒体计数")
+        markdown = int(markdown_row[0]) if markdown_row is not None else 0
+        pages = int(pages_row[0]) if pages_row is not None else 0
+        media_bytes = int(media_row[0]) if media_row is not None else 0
+        media_count = int(count_row[0]) if count_row is not None else 0
+        page_bytes = pages * PAGE_OVERHEAD_BYTES
+        return markdown, media_bytes, page_bytes, media_count, pages
+
+    def quota_status(self) -> QuotaStatus:
+        limit = self._quota_limit_bytes()
+        gen = self._ensure_read_generation()
+        if not gen:
+            return QuotaStatus(0, limit, 0.0, 0, 0, 0, 0, False)
+        conn = self._open_conn(gen)
+        markdown, media_bytes, page_bytes, media_count, _pages = self._logical_breakdown(conn)
+        logical = markdown + media_bytes + page_bytes
+        ratio = (logical / limit) if limit > 0 else 0.0
+        over = bool(limit > 0 and logical > limit)
+        return QuotaStatus(
+            logical_bytes=logical,
+            limit_bytes=limit,
+            ratio=ratio,
+            markdown_bytes=markdown,
+            media_bytes=media_bytes,
+            page_bytes=page_bytes,
+            media_count=media_count,
+            over_limit=over,
+        )
+
+    # ------------------------------------------------------------------ 读辅助
+
+    def _load_revision(self, conn: sqlite3.Connection, revision_id: str) -> DocumentRevision | None:
+        row = self._query_one(
+            conn,
+            "SELECT revision_id, doc_id, source_sha256, render_sha256, parser_fingerprint, "
+            "parsed_markdown, page_map_json, quality, capabilities_json, state, policy_version, created_at "
+            "FROM document_revisions WHERE revision_id = ?",
+            (revision_id,),
+            what=f"revision {revision_id!r}",
+        )
+        if row is None:
+            return None
+        return DocumentRevision(
+            revision_id=str(row[0]),
+            doc_id=str(row[1]),
+            source_sha256=str(row[2]),
+            render_sha256=str(row[3]),
+            parser_fingerprint=str(row[4]),
+            parsed_markdown=str(row[5]),
+            page_map=_load_json(row[6], "page_map", []),
+            quality=str(row[7]),
+            capabilities=_load_json(row[8], "capabilities", {}),
+            state=str(row[9]),
+            policy_version=str(row[10]),
+            created_at=float(row[11]),
+        )
+
+    # ------------------------------------------------------------------ 写入路径
+
+    def stage_revision(
+        self,
+        *,
+        source: str,
+        source_sha256: str,
+        render_sha256: str,
+        parser_fingerprint: str,
+        markdown: str,
+        page_map: list | None = None,
+        quality: str = "full",
+        capabilities: Mapping[str, Any] | None = None,
+        policy_version: str = "",
+        source_size: int | None = None,
+        source_mtime_ns: int | None = None,
+    ) -> StagedRevision:
+        '写入一个 staged revision 候选（解析事实，未发布，§12.5 第 3 步）。'
+        if not isinstance(markdown, str):
+            raise StoreContractError("markdown 必须是字符串")
+        if not isinstance(source_sha256, str) or not source_sha256:
+            raise StoreContractError("source_sha256 必填（二进制哈希）")
+        if not isinstance(render_sha256, str) or not render_sha256:
+            raise StoreContractError("render_sha256 必填（规范化 Markdown 哈希）")
+        if not isinstance(parser_fingerprint, str) or not parser_fingerprint:
+            raise StoreContractError("parser_fingerprint 必填")
+        if not isinstance(quality, str) or not quality:
+            raise StoreContractError("quality 必须是非空字符串")
+
+        rel = normalize_source_path(source, self.layout.vault_path)
+        pages = _validate_page_map(page_map)
+        caps = capabilities if capabilities is not None else {}
+        _validate_json_value(caps, "capabilities")
+        size = _validate_opt_int(source_size, "source_size", min_value=0)
+        mtime = _validate_opt_int(source_mtime_ns, "source_mtime_ns", min_value=0)
+        page_json = _dump_json(pages, "page_map")
+        caps_json = _dump_json(caps, "capabilities")
+        markdown_bytes = len(markdown.encode("utf-8"))
+
+        with self.mutation() as conn:
+            limit = self._quota_limit_bytes()
+            if limit > 0:
+                md_b, media_b, page_b, _mc, _p = self._logical_breakdown(conn)
+                projected = md_b + media_b + page_b + markdown_bytes + len(pages) * PAGE_OVERHEAD_BYTES
+                if projected > limit:
+                    raise StoreQuotaExceeded(
+                        f"写入后将超过 doc_store quota（{projected} > {limit} 字节）",
+                        fix="显式清理/维护或提高 doc_store.max_size_mb；不能偷偷删除计费资产。",
+                    )
+
+            now = time.time()
+            existing = conn.execute("SELECT doc_id FROM documents WHERE source = ?", (rel,)).fetchone()
+            if existing is not None:
+                doc_id = str(existing[0])
+            else:
+                doc_id = uuid.uuid4().hex
+                self._write(
+                    conn,
+                    "INSERT INTO documents (doc_id, source, active_revision, visibility, updated_at) "
+                    "VALUES (?, ?, NULL, 'unverified', ?)",
+                    (doc_id, rel, now),
+                )
+
+            revision_id = uuid.uuid4().hex
+            epoch = self._current_epoch()
+            self._write(
+                conn,
+                "INSERT INTO document_revisions (revision_id, doc_id, source_sha256, render_sha256, "
+                "parser_fingerprint, parsed_markdown, page_map_json, page_count, quality, capabilities_json, "
+                "state, policy_version, source_size, source_mtime_ns, vault_epoch, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'staged', ?, ?, ?, ?, ?)",
+                (
+                    revision_id, doc_id, source_sha256, render_sha256, parser_fingerprint,
+                    markdown, page_json, len(pages), quality, caps_json,
+                    str(policy_version or ""), size, mtime, epoch, now,
+                ),
+            )
+            # 同 doc 旧 staged 候选是易失的：先删（其 occurrences 级联删，blob 留给 gc）。
+            conn.execute(
+                "DELETE FROM document_revisions WHERE doc_id = ? AND state = 'staged' AND revision_id <> ?",
+                (doc_id, revision_id),
+            )
+            conn.commit()
+            return StagedRevision(doc_id=doc_id, revision_id=revision_id, created_at=now)
+
+    def append_media(self, revision_id: str, items: Sequence[MediaSpec]) -> list[str]:
+        '向 staged revision 追加媒体出现；blob 内容寻址，多文档共享同一 blob 行。'
+        media_items = list(items)
+        with self.mutation() as conn:
+            row = conn.execute(
+                "SELECT doc_id, state FROM document_revisions WHERE revision_id = ?", (revision_id,)
+            ).fetchone()
+            if row is None:
+                raise StoreContractError(
+                    f"revision {revision_id!r} 不存在",
+                    fix="先 stage_revision 得到 revision_id，再 append_media。",
+                )
+            if str(row[1]) != "staged":
+                raise StoreContractError(
+                    "仅 staged revision 可追加媒体（committed 已被读端复用）",
+                    fix="不要向已提交版本追加媒体；需要新版本请重新 stage_revision。",
+                )
+            # quota 必须在**任何插入之前**裁决（§12.3「超额拒绝提交」）：媒体是
+            # 文档库里最大的一块，只在 stage_revision 查 markdown 会留下「按配额
+            # 看似合法、追加媒体却能撑爆」的 fail-open 路径（审核实测发现）。
+            incoming = 0
+            seen_blobs: set[str] = set()
+            for item in media_items:
+                if not isinstance(item, MediaSpec) or not isinstance(item.data, (bytes, bytearray)):
+                    raise StoreContractError("items 必须是 MediaSpec 序列且 data 必须是 bytes")
+                blob_id = hashlib.sha256(bytes(item.data)).hexdigest()
+                if blob_id in seen_blobs:
+                    continue
+                seen_blobs.add(blob_id)
+                exists = conn.execute(
+                    "SELECT 1 FROM media_blobs WHERE blob_id = ?", (blob_id,)
+                ).fetchone()
+                if exists is None:
+                    incoming += len(item.data)
+            limit = self._quota_limit_bytes()
+            if limit > 0:
+                md_b, media_b, page_b, _mc, _p = self._logical_breakdown(conn)
+                projected = md_b + media_b + page_b + incoming
+                if projected > limit:
+                    raise StoreQuotaExceeded(
+                        f"追加媒体后将超过 doc_store quota（{projected} > {limit} 字节）",
+                        fix="显式清理/维护或提高 doc_store.max_size_mb；不能偷偷删除计费资产。",
+                    )
+            now = time.time()
+            blob_ids: list[str] = []
+            for ordinal, item in enumerate(media_items):
+                if not isinstance(item, MediaSpec):
+                    raise StoreContractError("items 必须是 MediaSpec 序列")
+                data = item.data
+                if not isinstance(data, (bytes, bytearray)):
+                    raise StoreContractError("MediaSpec.data 必须是 bytes")
+                data = bytes(data)
+                if not isinstance(item.kind, str) or not item.kind:
+                    raise StoreContractError("MediaSpec.kind 必须是非空字符串")
+                if not isinstance(item.mime_type, str) or not item.mime_type:
+                    raise StoreContractError("MediaSpec.mime_type 必须是非空字符串")
+                _validate_json_value(item.metadata or {}, "media.metadata")
+                page = _validate_opt_int(item.page, "media.page", min_value=1)
+                t_start = _validate_opt_int(item.t_start_ms, "media.t_start_ms", min_value=0)
+                t_end = _validate_opt_int(item.t_end_ms, "media.t_end_ms", min_value=0)
+                width = _validate_opt_int(item.width, "media.width", min_value=0)
+                height = _validate_opt_int(item.height, "media.height", min_value=0)
+                duration = _validate_opt_int(item.duration_ms, "media.duration_ms", min_value=0)
+                sample_rate = _validate_opt_int(item.sample_rate, "media.sample_rate", min_value=0)
+                bbox_json = _dump_json(list(item.bbox), "media.bbox") if item.bbox is not None else None
+                meta_json = _dump_json(item.metadata or {}, "media.metadata")
+
+                blob_id = hashlib.sha256(data).hexdigest()
+                existing = conn.execute(
+                    "SELECT mime_type, byte_size FROM media_blobs WHERE blob_id = ?", (blob_id,)
+                ).fetchone()
+                if existing is not None:
+                    if str(existing[0]) != item.mime_type or int(existing[1]) != len(data):
+                        raise StoreContractError(
+                            f"blob {blob_id} 已存在但 mime/byte_size 不一致"
+                            f"（库内 {existing[0]}/{existing[1]} ≠ {item.mime_type}/{len(data)}）",
+                            fix="内容寻址要求同一 blob_id 的字节与类型绝对一致；检查解析产物的确定性。",
+                        )
+                else:
+                    self._write(
+                        conn,
+                        "INSERT INTO media_blobs (blob_id, mime_type, byte_size, data, checksum, "
+                        "width, height, duration_ms, sample_rate, created_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            blob_id, item.mime_type, len(data), sqlite3.Binary(data), blob_id,
+                            width, height, duration, sample_rate, now,
+                        ),
+                    )
+                try:
+                    conn.execute(
+                        "INSERT INTO media_occurrences (revision_id, occurrence_id, blob_id, kind, ordinal, "
+                        "page, bbox_json, t_start_ms, t_end_ms, caption, ocr, anchor_start, anchor_end, "
+                        "metadata_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            revision_id, item.occurrence_id, blob_id, item.kind, ordinal,
+                            page, bbox_json, t_start, t_end, str(item.caption or ""), str(item.ocr or ""),
+                            _validate_opt_int(item.anchor_start, "media.anchor_start", min_value=0),
+                            _validate_opt_int(item.anchor_end, "media.anchor_end", min_value=0),
+                            meta_json,
+                        ),
+                    )
+                except sqlite3.IntegrityError as exc:
+                    raise StoreContractError(
+                        f"occurrence 主键冲突 (revision={revision_id}, occurrence={item.occurrence_id}): {exc}",
+                        fix="同一 revision 内 occurrence_id 必须唯一。",
+                    ) from exc
+                blob_ids.append(blob_id)
+            conn.commit()
+            return blob_ids
+
+
+
+    def commit_revision(
+        self,
+        revision_id: str,
+        *,
+        expected_change_seq: int | None = None,
+        source_sha256: str | None = None,
+        source_size: int | None = None,
+        source_mtime_ns: int | None = None,
+        policy_version: str | None = None,
+    ) -> int:
+        """单事务发布（§12.5 第 5 步）：CAS + 切 active + change_seq+1 + 保留策略。"""
+        with self.mutation() as conn:
+            row = conn.execute(
+                "SELECT doc_id, source_sha256, state, vault_epoch, policy_version "
+                "FROM document_revisions WHERE revision_id = ?",
+                (revision_id,),
+            ).fetchone()
+            if row is None:
+                raise StoreContractError(
+                    f"revision {revision_id!r} 不存在", fix="只能提交已 stage 的候选。"
+                )
+            doc_id = str(row[0])
+            staged_sha = str(row[1])
+            state = str(row[2])
+            rev_epoch = int(row[3])
+            rev_policy = str(row[4])
+            if state != "staged":
+                raise StoreContractError(
+                    "只能提交 staged revision", fix="committed 版本不可重复提交。"
+                )
+
+            cur_seq = int(conn.execute("SELECT change_seq FROM store_meta WHERE id = 1").fetchone()[0])
+            if expected_change_seq is not None and int(expected_change_seq) != cur_seq:
+                raise StoreConflict(
+                    f"expected_change_seq={expected_change_seq} 与当前 {cur_seq} 不符（发布被抢占）",
+                    fix="重新读取 change_seq 后重试；旧任务不得覆盖新事实。",
+                )
+            if source_sha256 is not None and str(source_sha256) != staged_sha:
+                raise StoreConflict(
+                    "提交时源 SHA 与 staged 记录不符（源在解析后又被改动）",
+                    fix="废弃候选并重新扫描源。",
+                )
+            cur_epoch = self._current_epoch()
+            if rev_epoch != cur_epoch:
+                raise StoreConflict(
+                    f"revision 记录于 epoch {rev_epoch}，当前 epoch {cur_epoch}（旧 worker 不能复活）",
+                    fix="移库/import/purge 后 epoch 递增，旧候选必须重新排队。",
+                )
+            # 发布前再核一次 quota：stage 之后其它文档可能已经吃掉了余量（§12.3）。
+            limit = self._quota_limit_bytes()
+            if limit > 0:
+                md_b, media_b, page_b, _mc, _p = self._logical_breakdown(conn)
+                if md_b + media_b + page_b > limit:
+                    raise StoreQuotaExceeded(
+                        f"提交后将超过 doc_store quota（{md_b + media_b + page_b} > {limit} 字节）",
+                        fix="显式清理/维护或提高 doc_store.max_size_mb；不能偷偷删除计费资产。",
+                    )
+
+            doc = conn.execute(
+                "SELECT visibility, active_revision FROM documents WHERE doc_id = ?", (doc_id,)
+            ).fetchone()
+            visibility = str(doc[0])
+            prev_active = str(doc[1]) if doc[1] else ""
+            effective_policy = policy_version if policy_version is not None else rev_policy
+            now = time.time()
+            new_seq = cur_seq + 1
+
+            conn.execute(
+                "UPDATE document_revisions SET state = 'committed', committed_at = ? WHERE revision_id = ?",
+                (now, revision_id),
+            )
+            if visibility == "exempt":
+                # §12.3：exempt 不发布——保留解析事实，不设 active_revision。
+                conn.execute(
+                    "UPDATE documents SET policy_version = ?, updated_at = ? WHERE doc_id = ?",
+                    (effective_policy, now, doc_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE documents SET active_revision = ?, visibility = 'active', "
+                    "source_size = COALESCE(?, source_size), source_mtime_ns = COALESCE(?, source_mtime_ns), "
+                    "source_sha256 = ?, policy_version = ?, updated_at = ? WHERE doc_id = ?",
+                    (
+                        revision_id,
+                        _validate_opt_int(source_size, "source_size", min_value=0),
+                        _validate_opt_int(source_mtime_ns, "source_mtime_ns", min_value=0),
+                        staged_sha, effective_policy, now, doc_id,
+                    ),
+                )
+            conn.execute("UPDATE store_meta SET change_seq = ? WHERE id = 1", (new_seq,))
+
+            # 保留 active + 上一 committed；删同 doc 其它 staged 与超保留的旧 committed。
+            conn.execute(
+                "DELETE FROM document_revisions WHERE doc_id = ? AND state = 'staged'", (doc_id,)
+            )
+            self._prune_committed(conn, doc_id, keep=[revision_id, prev_active])
+            conn.commit()
+            return new_seq
+
+
+
+    def _prune_committed(self, conn: sqlite3.Connection, doc_id: str, keep: Sequence[str]) -> None:
+        kept = {k for k in keep if k}
+        rows = conn.execute(
+            "SELECT revision_id FROM document_revisions WHERE doc_id = ? AND state = 'committed' "
+            "ORDER BY COALESCE(committed_at, created_at) DESC, created_at DESC",
+            (doc_id,),
+        ).fetchall()
+        for index, (rid,) in enumerate(rows):
+            rid = str(rid)
+            if rid in kept:
+                continue
+            if index == 0:
+                # 保底：最新 committed 永不删除（即使是 exempt 无 active 的情况）。
+                kept.add(rid)
+                continue
+            conn.execute("DELETE FROM document_revisions WHERE revision_id = ?", (rid,))
+
+    def discard_staged(self, revision_id: str) -> bool:
+        with self.mutation() as conn:
+            cur = conn.execute(
+                "SELECT state FROM document_revisions WHERE revision_id = ?", (revision_id,)
+            ).fetchone()
+            if cur is None or str(cur[0]) != "staged":
+                return False
+            conn.execute("DELETE FROM document_revisions WHERE revision_id = ?", (revision_id,))
+            conn.commit()
+            return True
+
+    # ------------------------------------------------------------------ 可见性
+
+    def get_active(self, source: str, *, include_hidden: bool = False) -> ActiveDocument | None:
+        rel = normalize_source_path(source, self.layout.vault_path)
+        gen = self._ensure_read_generation()
+        if not gen:
+            return None
+        conn = self._open_conn(gen)
+        row = self._query_one(
+            conn,
+            "SELECT doc_id, source, visibility, active_revision FROM documents WHERE source = ?",
+            (rel,),
+            what=f"documents（{rel!r}）",
+        )
+        if row is None:
+            return None
+        doc_id, src, visibility = str(row[0]), str(row[1]), str(row[2])
+        active_revision = str(row[3]) if row[3] else ""
+        if not active_revision:
+            return None
+        if not include_hidden and visibility != "active":
+            return None
+        revision = self._load_revision(conn, active_revision)
+        if revision is None or revision.state != "committed":
+            return None
+        return ActiveDocument(
+            doc_id=doc_id,
+            source=src,
+            visibility=visibility,
+            active_revision=active_revision,
+            revision=revision,
+        )
+
+    def iter_visible_documents(self) -> Iterator[DocumentRecord]:
+        gen = self._ensure_read_generation()
+        if not gen:
+            return
+        conn = self._open_conn(gen)
+        rows = self._query_all(
+            conn,
+            "SELECT doc_id, source, visibility, active_revision, updated_at FROM documents "
+            "WHERE visibility = 'active' AND active_revision IS NOT NULL ORDER BY source",
+            what="可见文档列表",
+        )
+        for row in rows:
+            yield DocumentRecord(
+                doc_id=str(row[0]),
+                source=str(row[1]),
+                visibility=str(row[2]),
+                active_revision=str(row[3]),
+                updated_at=float(row[4]),
+            )
+
+    def set_visibility(self, source: str, visibility: str) -> None:
+        if visibility not in _VISIBILITIES:
+            raise StoreContractError(
+                f"visibility 必须是 {_VISIBILITIES} 之一，收到 {visibility!r}",
+                fix="使用 active/exempt/deleted/unverified。",
+            )
+        rel = normalize_source_path(source, self.layout.vault_path)
+        with self.mutation() as conn:
+            cur = conn.execute("SELECT doc_id FROM documents WHERE source = ?", (rel,)).fetchone()
+            if cur is None:
+                raise StoreContractError(
+                    f"source 未登记：{rel}", fix="只能对已 stage 过的源设置可见性。"
+                )
+            conn.execute(
+                "UPDATE documents SET visibility = ?, updated_at = ? WHERE source = ?",
+                (visibility, time.time(), rel),
+            )
+            conn.commit()
+
+    def invalidate_source(self, source: str) -> None:
+        """标 unverified，**保留** active_revision 与解析事实（§12.6 权限/离线不误删）。"""
+        rel = normalize_source_path(source, self.layout.vault_path)
+        with self.mutation() as conn:
+            cur = conn.execute("SELECT doc_id FROM documents WHERE source = ?", (rel,)).fetchone()
+            if cur is None:
+                return
+            conn.execute(
+                "UPDATE documents SET visibility = 'unverified', updated_at = ? WHERE source = ?",
+                (time.time(), rel),
+            )
+            conn.commit()
+
+    def mark_deleted(self, source: str) -> None:
+        """visibility='deleted' 且清空 active_revision；解析事实保留待显式 purge（§12.6）。"""
+        rel = normalize_source_path(source, self.layout.vault_path)
+        with self.mutation() as conn:
+            cur = conn.execute("SELECT doc_id FROM documents WHERE source = ?", (rel,)).fetchone()
+            if cur is None:
+                return
+            conn.execute(
+                "UPDATE documents SET visibility = 'deleted', active_revision = NULL, updated_at = ? "
+                "WHERE source = ?",
+                (time.time(), rel),
+            )
+            conn.commit()
+
+    # ------------------------------------------------------------------ 维护/恢复
+
+    def gc_unreferenced(self) -> int:
+        """删除无任何 media_occurrences / media_variants 引用的 blob（内容寻址 GC）。"""
+        with self.mutation() as conn:
+            rows = conn.execute(
+                "SELECT b.blob_id FROM media_blobs b "
+                "WHERE NOT EXISTS (SELECT 1 FROM media_occurrences o WHERE o.blob_id = b.blob_id) "
+                "AND NOT EXISTS (SELECT 1 FROM media_variants v "
+                "                WHERE v.blob_id = b.blob_id OR v.parent_blob_id = b.blob_id)"
+            ).fetchall()
+            for (blob_id,) in rows:
+                conn.execute("DELETE FROM media_blobs WHERE blob_id = ?", (str(blob_id),))
+            conn.commit()
+            return len(rows)
+
+    def backup_to(self, path: str | Path) -> Path:
+        """`sqlite3.Connection.backup` 一致性备份（不是 copy 主文件，§20.2）。"""
+        gen = self._ensure_read_generation()
+        if not gen:
+            raise StoreContractError(
+                "无 active generation，无法备份", fix="先建立 doc_store。"
+            )
+        conn = self._open_conn(gen)
+        dest = Path(path)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if dest.exists():
+            dest.unlink()
+        target = sqlite3.connect(str(dest))
+        try:
+            conn.backup(target)
+            target.commit()
+        finally:
+            target.close()
+        return dest
+
+    def recover(self, *, stale_before: float | None = None) -> int:
+        with self.mutation() as conn:
+            rows = conn.execute(
+                "SELECT revision_id FROM document_revisions WHERE state = 'staged'"
+                + (" AND created_at < ?" if stale_before is not None else ""),
+                ((float(stale_before),) if stale_before is not None else ()),
+            ).fetchall()
+            for (revision_id,) in rows:
+                conn.execute("DELETE FROM document_revisions WHERE revision_id = ?", (str(revision_id),))
+            conn.commit()
+            return len(rows)
+
+
+# --------------------------------------------------------------------------- 备份校验
+
+
+def _readonly_uri(path: Path) -> str:
+    return path.resolve().as_uri() + "?mode=ro"
+
+
+def validate_backup(path: str | Path) -> dict:
+    """只读校验备份：schema_version / 必需表 / integrity_check（§20.2/§23.1）。"""
+    target = Path(path)
+    if not target.is_file():
+        raise SnapshotInvalid(f"备份文件不存在：{target}", fix="检查备份路径。")
+    try:
+        conn = sqlite3.connect(_readonly_uri(target), uri=True)
+    except sqlite3.Error as exc:
+        raise SnapshotInvalid(f"无法以只读方式打开备份：{exc}", fix="检查文件权限。") from exc
+    try:
+        try:
+            row = conn.execute("SELECT schema_version FROM store_meta WHERE id = 1").fetchone()
+            present = {
+                str(r[0])
+                for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                ).fetchall()
+            }
+        except sqlite3.DatabaseError as exc:
+            raise SnapshotInvalid(
+                f"备份不是合法的 docstore 数据库：{exc}", fix="重新导出快照。"
+            ) from exc
+        missing = [table for table in _DOCSTORE_TABLES if table not in present]
+        if missing:
+            raise SnapshotInvalid(
+                f"备份缺少必需表：{missing}",
+                fix="快照导出不完整，请重新导出。",
+            )
+        if row is None:
+            raise StoreCorrupt(
+                "备份缺少 store_meta 单行", fix="快照导出不完整，请重新导出。"
+            )
+        version = int(row[0])
+        if version > SCHEMA_VERSION:
+            raise StoreSchemaUnsupported(
+                f"备份 schema_version={version} 高于本程序支持 {SCHEMA_VERSION}",
+                fix="升级 Mortis-RAG-MCP 后再导入；禁止降级读取。",
+            )
+        if version != SCHEMA_VERSION:
+            raise StoreSchemaUnsupported(
+                f"备份 schema_version={version} 不是已知版本（本程序支持 {SCHEMA_VERSION}）",
+                fix="用匹配版本的程序导入；禁止猜字段读取。",
+            )
+        integrity = conn.execute("PRAGMA integrity_check").fetchone()
+        if not integrity or str(integrity[0]).lower() != "ok":
+            raise StoreCorrupt(
+                f"备份 integrity_check 未通过：{integrity[0] if integrity else 'no result'}",
+                fix="备份已损坏，请重新导出。",
+            )
+        user_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+        return {
+            "schema_version": version,
+            "user_version": user_version,
+            "integrity": "ok",
+            "tables": sorted(present),
+            "path": str(target),
+        }
+    finally:
+        conn.close()

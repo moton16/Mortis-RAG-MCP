@@ -409,6 +409,12 @@ class VaultMcpServer:
                 indexer.stop_watching()
             except Exception:
                 pass
+            # v0.9.0 C92 接缝：文档库连接必须显式关闭，否则 Windows 上句柄会
+            # 锁住缓存目录（后续清理/替换失败）。
+            try:
+                indexer.close_document_store()
+            except Exception:
+                pass
 
     def _migrate_legacy(self) -> None:
         """First run after upgrading: import the legacy [vault].path into the
@@ -789,6 +795,14 @@ class VaultMcpServer:
             indexer._ingest_hook = None
             indexer.stop_watching()  # idempotent; joins the watch thread & scan thread
             watcher_stopped = True
+            # C92 接缝：库被移出注册表后释放文档库连接——Windows 上未关闭的 sqlite
+            # 句柄会锁住缓存文件，让后续清理/替换（移库、换机、显式 purge）失败。
+            # 注意：文档库**保留**在缓存根（移库默认保 store 以便重新注册，§20.3），
+            # 这里只关连接，不删资产。
+            try:
+                indexer.close_document_store()
+            except Exception:
+                pass
         self.registry.remove(entry.path)
         cache_purged = False
         if purge and indexer is not None:
@@ -823,7 +837,7 @@ class VaultMcpServer:
             with self._ingest_managers_lock:
                 manager = self._ingest_managers.get(key)
                 if manager is None:
-                    def _on_job_finished(source: str, out_md: Path | str) -> None:
+                    def _on_job_finished(source: str, out_md: Path) -> None:
                         try:
                             indexer = self._indexers.get(key)
                             if indexer is not None:
@@ -1153,6 +1167,12 @@ class VaultMcpServer:
     @staticmethod
     def _close_probe_indexer(probe: MarkdownIndexer) -> None:
         """关闭临时探测 indexer 持有的 sqlite 连接（探测不该留下句柄）。"""
+        close_store = getattr(probe, "close_document_store", None)
+        if callable(close_store):
+            try:
+                close_store()
+            except Exception:
+                pass
         fts = getattr(probe, "_fts", None)
         if fts is not None:
             try:

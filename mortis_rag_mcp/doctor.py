@@ -528,6 +528,61 @@ def check_cache_dir(cfg: object | None) -> dict:
         return _section(True, f"缓存目录检查跳过：{_sanitize_free_text(exc)}")
 
 
+def check_doc_store(cfg: object | None) -> dict:
+    """文档库（解析事实）布局归属诊断：只读解析，不建库、不写盘（C91/C92）。
+
+    口径区别（§23.4）：这里只说明「配置上虚拟摄取是否可用、缓存根的真实归属是否
+    落在已注册库内」。它**不**替用户搬动路径、**不**创建文档库、**不**推进 epoch：
+    home 根落在库内时必须报可操作的修复建议（改 `cache.dir` 或显式
+    `cache.placement="vault"`），而不是静默改道。
+    """
+    try:
+        from typing import cast
+
+        from .config import AppConfig
+        from .doc_store import DocStoreError, registered_vault_paths, resolve_storage_layout
+
+        if cfg is None:
+            return _section(True, "跳过：配置未加载")
+        # doctor 各检查统一以 object 收参（本文件多个 check_* 的既有签名），
+        # 布局解析需要 AppConfig：这里显式收敛类型，不做 duck-typing 猜测。
+        app_cfg = cast(AppConfig, cfg)
+        cache = getattr(cfg, "cache", None)
+        enabled = bool(getattr(cache, "enabled", False))
+        placement = str(getattr(cache, "placement", "home"))
+        vaults = registered_vault_paths()
+        if not vaults:
+            return _section(
+                True,
+                f"placement={placement}，缓存 {'启用' if enabled else '关闭'}；未注册知识库（虚拟摄取不可用）",
+            )
+        blocked: list[str] = []
+        roots: set[str] = set()
+        for vault in vaults:
+            try:
+                layout = resolve_storage_layout(app_cfg, vault, registered_vaults=vaults)
+            except DocStoreError as exc:
+                blocked.append(f"{_sanitize_free_text(Path(vault).name)}：{exc.code}")
+                continue
+            roots.add(str(layout.doc_store_dir))
+            if layout.blocked_reason:
+                blocked.append(f"{_sanitize_free_text(Path(vault).name)}：{layout.blocked_reason}")
+        detail = f"placement={placement}，缓存 {'启用' if enabled else '关闭'}"
+        if len(roots) == 1:
+            root = next(iter(roots))
+            exists = "存在" if Path(root).exists() else "首次虚拟摄取时创建"
+            detail += f"，根 {_sanitize_free_text(root)}（{exists}）"
+        elif roots:
+            detail += f"，{len(roots)} 个库缓存根"
+        if blocked:
+            return _section(False, f"{detail}；虚拟摄取不可用：" + "；".join(blocked))
+        if not enabled:
+            return _section(True, f"{detail}；虚拟摄取需 cache.enabled=true（物理文本不受影响）")
+        return _section(True, f"{detail}；虚拟摄取可用")
+    except Exception as exc:
+        return _section(True, f"文档库检查跳过：{_sanitize_free_text(exc)}")
+
+
 def probe_embedding(cfg: object) -> dict:
     try:
         from .providers import create_embedding_provider
@@ -636,6 +691,7 @@ def render_md(data: dict) -> str:
     labels = {
         "python": "Python", "package": "包导入", "optional_deps": "可选依赖",
         "config": "配置", "registry": "注册表", "cache": "缓存目录",
+        "doc_store": "文档库（解析存储）",
         "ingest": "文档摄取",
         "embedding_api": "embedding API", "reranker_api": "reranker API", "tests": "单元测试（开发观测）",
     }
@@ -690,6 +746,7 @@ def run(full: bool = True, app_config: str | None = None, quiet: bool = False) -
         sections["registry"] = check_registry()
         sections["optional_deps"] = check_optional_deps()
         sections["cache"] = check_cache_dir(cfg)
+        sections["doc_store"] = check_doc_store(cfg)
         sections["ingest"] = check_ingest(cfg)
         if full and cfg is not None:
             sections["embedding_api"] = probe_embedding(cfg)

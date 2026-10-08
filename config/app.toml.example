@@ -90,6 +90,19 @@ embedding_max_workers = 2
 placement = "home"
 subdir = ".mcp_cache"
 
+# ── 版本化文档库（v0.9.0 起，解析事实的容量策略）──────────────────
+# 虚拟摄取把 PDF/Office 的解析 Markdown 与媒体存进缓存根下的文档库
+# （cache.dir/<namespace>/doc_store/），默认不再在知识库里生成 .mortis-parsed/ 镜像。
+# 文档库是**解析事实**而不是可重建的派生索引：删除它可能重新产生解析费用，
+# 所以普通清缓存/kb_rebuild 不会碰它，只有显式 purge 授权才会清理。
+# 虚拟摄取要求 [cache] enabled = true 且放置位置不在任何已注册知识库内
+# （cache.placement="vault" 是显式例外）；否则入队前即拒绝，不会静默改写路径。
+[doc_store]
+# 单库文档库逻辑容量上限（MiB）。含 active 版本、上一 committed 版本、staged 候选
+# 与媒体 blob；超额时拒绝新的提交并提示显式维护，绝不隐式删除计费资产。
+# 0 不是「无限制」：配置解析会拒绝小于 1 的值。
+max_size_mb = 2048
+
 # The current indexer always filters .md files, .obsidian, and common
 # temporary Markdown names (~*.md, *.tmp.md, *.swp.md, *.swo.md).
 # Those filters are implementation defaults, not configurable keys today.

@@ -11,6 +11,14 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from .config import AppConfig
+from .doc_store import (
+    DocStoreError,
+    DocumentStore,
+    StorageLayout,
+    is_within,
+    resolve_storage_layout,
+    vault_cache_key,
+)
 from .fsnotify import WindowsDirectoryWatcher
 from .fts import FtsIndex
 from .ingest import INGEST_EXTS
@@ -209,6 +217,12 @@ class MarkdownIndexer:
             "chunks_done": 0,
             "chunks_total": 0,
         }
+        # v0.9.0 Lane A（C91/C92）：版本化文档库（解析事实）与派生索引分离。
+        # 布局只在这里解析路径，store 连接惰性建立——读路径不因为一次查询就建库。
+        self._storage_layout: StorageLayout | None = None
+        self._doc_store: DocumentStore | None = None
+        self._doc_store_write_opened = False
+        self._doc_store_lock = threading.Lock()
         self._chunks_cache_path: Path | None = None
         self._chunks_cache_loaded: bool = False
         self._vectors_cache_path: Path | None = None
@@ -264,12 +278,11 @@ class MarkdownIndexer:
         path (case-insensitive on Windows, symlinks resolved). Either way the key
         is stable across agents and sessions, so a cache built by one agent is
         found by another.
+
+        v0.9.0 C91：实现统一到 `doc_store.vault_cache_key` —— 派生缓存与文档库
+        必须是同一个身份，否则同一个库会分裂出第二份 store 绑定（§12.2）。
         """
-        if self.config.cache.id:
-            return hashlib.sha256(self.config.cache.id.encode("utf-8")).hexdigest()[:16]
-        raw = os.fspath(self.vault_path.resolve())
-        normalized = os.path.normcase(os.path.realpath(raw))
-        return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+        return vault_cache_key(self.config, self.vault_path)
 
     def _init_cache_paths(self, *, load_vectors: bool = True) -> None:
         root = self._cache_root()
@@ -297,6 +310,12 @@ class MarkdownIndexer:
         # 失败名单：与 chunks/vectors/fts 平级的纯可观测性文件，进程重启后
         # 让 kb_stats 仍能报出上一轮的失败原因。
         self._failed_cache_path = base / f"vault_{key}.failed.json"
+        # 文档库布局（C91）：只解析路径与真实归属，不建目录。归属冲突/路径非法
+        # 不阻断物理文本路径，只让虚拟存储保持不可写（打开 store 时报明确错误）。
+        try:
+            self._storage_layout = resolve_storage_layout(self.config, self.vault_path)
+        except DocStoreError:
+            self._storage_layout = None
         self._load_chunks_cache()
         self._load_failed_files()
         # With the disk-backed sqlite_vec backend, vectors are not loaded into
@@ -306,6 +325,18 @@ class MarkdownIndexer:
             self._load_vectors_cache()
         self._sweep_stale_cache()
 
+    def _protected_cache_subtree(self) -> Path | None:
+        """缓存根下**不得**被 TTL/清理触碰的子树：文档库与 control 所在目录。
+
+        §12.6「TTL 仅明确白名单派生文件，不递归删所有 sqlite」：文档库是解析事实
+        （可能等于已付费的解析全文与媒体），按 TTL 删掉它等于丢资产。
+        """
+        try:
+            layout = self._storage_layout or resolve_storage_layout(self.config, self.vault_path)
+        except DocStoreError:
+            return None
+        return layout.doc_store_dir
+
     def _sweep_stale_cache(self) -> None:
         """Delete cache files older than cache.max_age_days (0 disables)."""
         max_age = self.config.cache.max_age_days
@@ -313,8 +344,11 @@ class MarkdownIndexer:
             return
         cutoff = time.time() - max_age * 86400
         root = self._cache_root()
+        protected = self._protected_cache_subtree()
         for pattern in ("*.bin", "*.sqlite"):
             for cache_file in root.rglob(pattern):
+                if protected is not None and is_within(cache_file, protected):
+                    continue
                 try:
                     if cache_file.stat().st_mtime < cutoff:
                         cache_file.unlink()
@@ -326,6 +360,43 @@ class MarkdownIndexer:
             # Keep vectors next to the notes, inside a hidden subfolder of the vault.
             return Path(self.vault_path).expanduser() / self.config.cache.subdir
         return Path(self.config.cache.dir).expanduser()
+
+    # --------------------------------------------------------- 文档库（C91/C92）
+
+    def document_store(self, *, write: bool = False) -> DocumentStore:
+        """本库的版本化文档库（解析事实）——C92 接缝，连接惰性建立。
+
+        只负责解析布局与打开连接；摄取、对账与发布由 Lane B 起的 worker 调用。
+        读路径不得因为一次查询就建库：`write=False` 走只读语义，库不存在时由
+        store 报出明确错误，这里不 mkdir。归属冲突（home 根落库内等）或
+        `cache.enabled=false` 时由 store 抛 `VirtualStorageDisabled`。
+        """
+        with self._doc_store_lock:
+            store = self._doc_store
+            if store is None:
+                layout = self._storage_layout or resolve_storage_layout(self.config, self.vault_path)
+                self._storage_layout = layout
+                store = DocumentStore(layout, self.config)
+                self._doc_store = store
+                store.open(write=write)
+                self._doc_store_write_opened = write
+            elif write and not self._doc_store_write_opened:
+                # 先被只读路径打开过：补齐写门禁与 generation 解析（open 幂等）。
+                store.open(write=True)
+                self._doc_store_write_opened = True
+            return store
+
+    def close_document_store(self) -> None:
+        """释放本库文档库连接（幂等）。退出/探测路径必须调用，别留句柄。"""
+        with self._doc_store_lock:
+            store = self._doc_store
+            self._doc_store = None
+            self._doc_store_write_opened = False
+        if store is not None:
+            try:
+                store.close()
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------ cache
 
@@ -1119,6 +1190,10 @@ class MarkdownIndexer:
 
         Returns True when both cache files are gone afterwards. Safe to call
         when caching is disabled (returns False, nothing to purge).
+
+        v0.9.0（C92）：这里只删**派生**文件。文档库（doc_store/）是解析事实，
+        普通清理与 kb_rebuild 一律不碰它——清除解析资产需要独立的
+        `purge_documents` 显式授权并提示重新解析费用（§20.3）。
         """
         removed = True
         with self._cache_lock:
@@ -1159,7 +1234,11 @@ class MarkdownIndexer:
         return removed
 
     def rebuild(self) -> list[Chunk]:
-        """Drop both cache layers and the in-memory index, then rebuild from scratch."""
+        """Drop both cache layers and the in-memory index, then rebuild from scratch.
+
+        v0.9.0（C92）：重建的是**派生**层。文档库（doc_store/）与账本保留，
+        因此重建不会重新调用 MinerU 计费解析（§12.6「rebuild 只重建派生」）。
+        """
         with self._cache_lock:
             for cache_file in (
                 self._chunks_cache_path,
