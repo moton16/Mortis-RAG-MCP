@@ -821,6 +821,290 @@
 >   - 新增 `test_stdio_release_smoke_v081` 协议冒烟用例：验证 initialize 返回 0.8.1、15 个核心工具完整可见、新参数（`compact`, `start_char`, `group_offsets`, `heading`）暴露正确、`ping` 正常响应、越界行号与重名标题歧义均正确返回协议级 `isError=True`；
 > - `docs/v0.8.1/PLAN.md`：
 >   - 全量卡片状态核验收口：C60 打勾完成，7.2 发布清单 12 项全部核销。
+
+---
+
+## v0.9.0（Lane A–E，C90–C104 + 集中 review；2026-10-07 ~ 2026-10-08）
+
+> **本节状态**：8 个提交**全部未 push、未 merge、未发版**（分支 `feat/v0.9.0-lane-ab`，
+> 截至 `ad87d69`）。版本号、`CHANGELOG_user.md`、`docs/v0.9.0` 忽略规则均未动。
+> **作者署名口径**：本节 8 个提交同属 v0.9.0 连续窗口，署名沿用本仓库同期口径
+> `moton16` + `CodeBuddy,Deepseek-V4.1-Flash`；Lane A/B 两个窗口未在仓库留下独立署名，
+> 如需更正请直接改标题行。
+> **目标与合同**：`docs/v0.9.0/RESEARCH_REPORT.rev1.md`（C90–C104 卡片定义与执行回填）；
+> 逐卡报告 `docs/v0.9.0/Lane_A_REPORT_2026-10-07.md`、`Lane_B_REPORT_2026-10-07.md`、
+> `Lane_CDE_EXECUTION_2026-10-08.md`；集中 review `docs/v0.9.0/Lane_CDE_REVIEW_2026-10-08.md`
+> 与待裁定清单 `docs/v0.9.0/DECISIONS_PENDING_2026-10-08.md`（后两者为本地证据，未入库）。
+
+### Lane A（C90/C91/C92） — moton16,2026-10-07,CodeBuddy,Deepseek-V4.1-Flash — feat(v0.9.0): Lane A —— C90/C91/C92（doc_store/doctor/indexer/tests）
+
+> **涵盖提交**：
+> - `11d0ec0` `feat(v0.9.0): Lane A —— C90/C91/C92（doc_store/doctor/indexer/tests）`
+>
+> **代码改动概况**：
+> - `mortis_rag_mcp/doc_store.py`（**新增，2196 行**）：版本化文档库 —— generation 层
+>   `docstore.sqlite` + 库外控制面 `vault_<key>.control.sqlite`（权威发布指针 `control_meta`
+>   与 `generation_registry`）；`StorageLayout` 解析、vault 绑定与归属冲突检测、
+>   `recover()`、TTL/配额、写门禁与事务回滚语义、稳定错误 code（`StoreCorrupt`/`StoreBusy`/
+>   `StoreConflict`/`StoreBindingMismatch`…）。
+> - `mortis_rag_mcp/config.py` + `config/app.toml.example`（+97 / +13）：缓存身份统一到
+>   `doc_store.vault_cache_key`（显式 `cache.id` 优先，否则规范化 vault 路径，跨进程/跨会话稳定）。
+> - `mortis_rag_mcp/indexer.py`（+91）：`document_store(write=…)` 惰性接缝（读路径不得因一次查询建库）。
+> - `mortis_rag_mcp/server.py`（+22）与 `mortis_rag_mcp/doctor.py`（+57）：宿主隔离诊断与
+>   存储布局/文档库状态接线。
+> - 测试：`tests/test_doc_store.py`（371 行）、`tests/test_doc_store_recovery.py`（370 行）、
+>   `tests/test_virtual_config.py`（474 行）。
+>
+> **验证**：
+> - Lane A 窗口本地全量回归 **616 passed / 4 skipped**（`--basetemp` 钉在仓库 `.runtime/`，未写 `%TEMP%`），
+>   本轮新增测试 61 个。
+> - 独立对抗审核（全新上下文子代理，5 组复现脚本）判定 **FAIL（无 P1）**；审核提出的 D3/D5
+>   与主代理先行复现的事务泄漏均已修复并复核。遗留 P3 显式归档（见 Lane A 报告 §8）。
+
+### Lane B（C93/C94） — moton16,2026-10-07,CodeBuddy,Deepseek-V4.1-Flash — feat(v0.9.0): Lane B —— C93/C94（ingest/doc_store/config/server/tests）
+
+> **涵盖提交**：
+> - `1bcaa6c` `feat(v0.9.0): Lane B —— C93/C94（ingest/doc_store/config/server/tests）`
+>
+> **代码改动概况**：
+> - `mortis_rag_mcp/ingest/models.py`（**新增，510 行**）：`ResourceLimits`/`PageSpan`/
+>   `MediaOccurrence`/`ParseResult`/`MediaSink`/`DictMediaSink`、`parser_fingerprint`、
+>   `parse_retry_after`、`normalize_markdown`、图片头与像素预算、`redact_*` 脱敏与稳定 code 常量。
+> - `mortis_rag_mcp/ingest/mineru.py`（+1090）：**构造前**归档准入（EOCD/中央目录/ZIP64/
+>   多 disk/声明≠实际/压缩比/成员数）、`Retry-After` 三种形态（秒/HTTP-date/拒 NaN-Inf-负数）、
+>   `_read_bounded` 的「声明尺寸」与「实际字节」双路径记账、逐字保留 `_put_upload` 空 Content-Type。
+> - `mortis_rag_mcp/ingest/worker.py`（**新增，537 行**）：任务队列、租约与 owner fencing、
+>   phase/subjob 上报、发布 CAS 与 `commit_job_revision`（发布+done 同事务）。
+> - `mortis_rag_mcp/doc_store.py`（+1002）：`enqueue_job`（容量/合并/force 递增 request_seq/supersede）、
+>   `claim_job`（UPDATE…WHERE CAS，多进程只有一个 owner）、`renew_lease`/`report_phase`/`fail_job`/
+>   `cancel_job`/`retry_job`/`job_status`/`list_jobs`/`queue_depth`、`put_media_blob`/`attach_occurrences`
+>   （流式媒体两阶段）、`record_auto_seen`/`iter_auto_seen`/`migrate_legacy_ledger`（只迁终态事实、
+>   幂等、中间态不复活）、`get_derived_generation`/`mark_derived_generation`。
+> - `mortis_rag_mcp/config.py` + `config/app.toml.example`（+65 / +19）：`ingest.storage/network_policy/
+>   archive_max_mb/extracted_max_mb/markdown_max_mb/json_max_mb/media_max_mb/memory_budget_mb/
+>   queue_limit/max_parse_workers`，`__post_init__`+`AppConfig`+`load_config` 三层校验。
+> - `mortis_rag_mcp/server.py`（+46）：`_ingest_manager_for` 改走 `make_ingest_manager`
+>   （virtual 先确保 indexer 存在，且在取 manager 锁**之前**，避免双锁嵌套）、`_kb_remove` 停 manager、
+>   `shutdown()` 顺序、`kb_stats` 的无 state 文件容错。
+> - 测试：`tests/test_ingest_archive_limits.py`（236 行）、`test_ingest_publication.py`（316 行）、
+>   `test_ingest_virtual.py`（167 行）、`test_parsed_document_contract.py`（169 行）、
+>   `test_ingest_mineru.py`（+125）。
+>
+> **验证**：
+> - Lane B 窗口靶向批次 **317 passed / 1 skipped**（主代理本机运行结果）；C95 与审核修复在该窗口
+>   已实现但**未提交**，逐位并入本节后续提交。
+> - 独立对抗审核两路（`audit-c95`、`audit-ingest-r2`）收敛 3 个 P1 + 4 个 P2；原 `audit-ingest`
+>   代理失败，不计其交付。
+> - **如实记录未覆盖项**：`_ingest_manager_for(virtual)` 无独立单测；真实 MinerU/预签名 PUT 端点、
+>   server virtual stdio 全链路、Linux 锁/权限/symlink/SMB 未测。
+
+### Lane C（1/6：C96/C98 基础设施） — moton16,2026-10-08,CodeBuddy,Deepseek-V4.1-Flash — feat(v0.9.0): Lane C —— C96/C98（config/_indexer 切块身份/embedding profile/依赖 extras）
+
+> **涵盖提交**：
+> - `6e370f3` `feat(v0.9.0): Lane C —— C96/C98（config/_indexer 切块身份/embedding profile/依赖 extras）`
+>
+> **代码改动概况**（13 文件）：
+> - `mortis_rag_mcp/config.py` + `config/app.toml.example`：`ingest.storage` 默认 **`virtual`**
+>   （`legacy` 保留为显式回退）、切块/估算器/媒体配置口径。
+> - `mortis_rag_mcp/_indexer/token_chunking.py`（**新增**）+ `embedding_capabilities.py`（**新增**）：
+>   捕获 profile 驱动切块、`revision_id` 作用域的 chunk id、`embedding_key`（含模板实际输入与
+>   媒体哈希）、oversize/`embedding_disabled` 统一跳过、估算器改名。
+> - `_indexer/chunking.py`、`exemptions.py`、`scanning.py`、`watch.py`、`vector.py`：
+>   切块代际与扫描/撤销/监听接缝更新。
+> - `pyproject.toml`：新增 `[docs]`（PyMuPDF/pypdf/python-docx/python-pptx/openpyxl，注明
+>   PyMuPDF 为 AGPL/commercial，非全 MIT）与 `[media]`（Pillow）可选 extras。
+> - 测试：`tests/test_token_chunking.py`、`test_embedding_profiles.py`、`test_lane_be_config.py`（均新增）。
+>
+> **验证**：见本节末「批量验证」；本条提交后在提交内容上复跑受影响批次仍为 531 passed / 1 skipped。
+
+### Lane C（2/6：C96 虚拟读取身份链路） — moton16,2026-10-08,CodeBuddy,Deepseek-V4.1-Flash — feat(v0.9.0): Lane C —— C96 虚拟读取身份链路与索引器接线（indexer/_indexer）
+
+> **涵盖提交**：
+> - `73a6f83` `feat(v0.9.0): Lane C —— C96 虚拟读取身份链路与索引器接线（indexer/_indexer）`
+>
+> **代码改动概况**（10 文件）：
+> - `mortis_rag_mcp/indexer.py` + `_indexer/reading.py`：**虚拟与物理读取彻底分流** ——
+>   虚拟 chunk 以自身捕获的 `revision_id`/`source_sha256`/`render_sha256` 做严格核验，
+>   任一缺失即判 stale；物理签名（`_signatures`，虚拟源处为 `virtual:…` 串）**永不**被当作
+>   虚拟 chunk 的校验依据；`allow_stale` 对 chunk 版本寻址无效（恒 STALE）。
+> - 行号口径统一为 `rendered_markdown`；`resolve_virtual_source`（媒体/显式路径入口）与
+>   `read_virtual_result` 共用同一 fail-closed 序列（ignore → 库归属 → active+committed →
+>   物理源 SHA → 复核期 revision 变化）。
+> - `_indexer/sync_engine.py`：**镜像精确排除**（已入库 active source 的镜像逐条精确不索引，
+>   非目录级忽略；用户自建同名文件仍索引）、派生代际记账、向量按 `embedding_key` 复用。
+> - `_indexer/search.py`：查询向量与 rerank 的闸门调用点。
+> - 测试：`tests/test_virtual_read.py`、`test_virtual_read_server.py`、`test_virtual_sync.py`、
+>   `test_chunk_identity.py`、`test_mirror_exclusion.py`、`test_lane_b_adversarial.py`（均新增）。
+>
+> **集中 review 修复随本提交落地**：
+> - **F-2**：外部嵌入按 `batch_size` 切片时，某批结果未知后只拦失败批会让每轮 sync 重发
+>   **已成功计费的前导批**且文件永不完结 → 改为索引批量路径按 profile 整体暂停（外部请求数为 0），
+>   查询期嵌入不受影响。
+> - **F-3**：换 embedding model/dimension 会让向量缓存**文件名**变化 → 旧文件根本找不到 →
+>   闸门按「首次使用」放行未授权全库重付费嵌入 → 新增 `_note_foreign_embedding_profile`
+>   检测同 cache key 下的其它向量文件并置 pending，逼出显式 `--approve-reembedding`。
+>
+> **验证**：复现探针实测「修复前 sync#1=1、sync#2=2、sync#3=3 次外部请求」→「修复后 2→2→2 且
+> `_embedding_paused=True`」；漂移探针实测修复前 `may_use_paid_profile(新 fp)=True` 并发出请求、
+> 修复后 pending=True。
+
+### Lane C（3/6：C97 文档库/快照与迁移） — moton16,2026-10-08,CodeBuddy,Deepseek-V4.1-Flash — feat(v0.9.0): Lane C —— C97 文档库/快照导入导出与 legacy 镜像迁移
+
+> **涵盖提交**：
+> - `2718068` `feat(v0.9.0): Lane C —— C97 文档库/快照导入导出与 legacy 镜像迁移`
+>
+> **代码改动概况**（8 文件）：
+> - `mortis_rag_mcp/_indexer/snapshot.py`：快照 v1/v2 导入导出。**构造 `ZipFile` 之前**做
+>   EOCD/中央目录准入（复用 mineru 的只读准入，mmap 不整读入内存）；校验与 staging 阶段
+>   **零活动状态变化**；跨文件回滚（`_backup_live_derived`/`_restore_live_derived`）；
+>   `prepare_import` → 锁内 `change_seq` 复核 → `publish_import`（CAS）；
+>   未知来源包默认拒绝，显式 `replace=true`+`confirm_replace=true` 才替换且被替换代登记
+>   `retained_backup`；`_require_no_active_ingest` 忙线门禁。
+> - `mortis_rag_mcp/doc_store.py`：`prepare_import`/`publish_import`/`restore_generation`、
+>   generation 注册表状态机、`import_confirmations`。
+>   **归属标注**：本文件按文件粒度归档在本提交，其中还含属 C98（派生代际表）、
+>   C100（`payment_authorizations`/`request_intents` 与 `record_send_intent`/`mark_intent`/
+>   `paid_authorization_state`）、C101/C103（媒体 Blob/Occurrence、`put_media_variant`）
+>   的新增部分 —— 同一文件混着多张卡的 hunk，无法按卡拆分，故在此显式标注。
+> - `mortis_rag_mcp/ingest/migration.py`（**新增**）：legacy `.mortis-parsed` 镜像迁移 ——
+>   默认 **dry-run**、逐项校验 frontmatter/源相对安全路径（拒绝对化/上跳/盘符/UNC/symlink 逃逸）/
+>   源 SHA/正文 NUL/媒体子树与 magic/配额，无法证明归属记 `pending_manual`，幂等
+>   `already_migrated`，**不删除旧镜像、不重嵌**；已验证资产入 Blob/Occurrence。
+> - 测试：`tests/test_snapshot_import_safety.py`、`test_snapshot_v2_store.py`、`test_migration_media.py`
+>   （均新增）与 `tests/test_snapshot.py`、`test_parsed_document_contract.py`（追加）。
+>
+> **集中 review 修复随本提交落地**：
+> - **F-4（P1）**：v2 导入原先把**包内**（不可信）chunk 正文以空签名写进活动 `chunks.bin` ——
+>   当前进程看不见，但**重启/第二个会话**经 `_load_chunks_cache()` 会把投毒正文载回索引并可检索。
+>   现改为与 v1 同口径：包内正文与包内 `fts.sqlite` **一律不发布**，只保留向量按 chunk.id
+>   进补挂池；`kb_import` 返回体相应改为 `files=0/chunks=0` + `packaged_files/packaged_chunks/
+>   text_published=false`（**属工具响应变更，需在 C106 一并确认对外文案**）。
+> - **F-5（P2）**：导入失败时未 publish 的 staged generation 永远停在 `validated`（看似可用、
+>   且无回收路径）→ 失败路径登记为 `aborted`，且**只标能确认非活动代者**。
+> - **F-6（P2）**：忙线门禁 `list_jobs()` 抛异常时旧实现当作「无活跃任务」放行（fail-open）
+>   → 改为 fail closed（`IMPORT_BUSY`）。
+> - **F-7（P2）**：`published` 标志只在 `publish_import` **返回**后为真，控制面 CAS 已提交但
+>   重新打开失败的窗口里派生层被回滚而 docstore 留在导入代 → 改为用一次**新鲜控制面读**
+>   重判「是否实际已发布」，据此尝试回滚 docstore，且标签侧 fail closed（读不到活动代时不猜）。
+>
+> **验证**：探针实测 —— 修复前「失败导入残留 `('g0002','validated')` + 新实例 `_chunks=['a.md']`、
+> `search('POISONED')=1`、正文=`POISONED PAYLOAD ZZZ`」；修复后「残留=`aborted`、新实例 `_chunks` 空、
+> 命中 0」；失败导入前后 `active` 指针与 `change_seq` **逐项不变**。
+
+### Lane E（4/6：C100 付费请求闸门） — moton16,2026-10-08,CodeBuddy,Deepseek-V4.1-Flash — feat(v0.9.0): Lane E —— C100 付费请求闸门（持久意图 journal + profile 授权）
+
+> **涵盖提交**：
+> - `42107ed` `feat(v0.9.0): Lane E —— C100 付费请求闸门（持久意图 journal + profile 授权）`
+>
+> **代码改动概况**（4 文件）：
+> - `mortis_rag_mcp/paid_requests.py`（**新增**）：`PaidRequestJournal`（`before_send` 先落持久意图、
+>   `mark_success`/`mark_unknown`、`pending()`）+ `paid_request_guard`（授权/撤销/pending 三态）+
+>   `open_paid_control`。合同：结果只有 success/submission_unknown；不存正文只存哈希；
+>   **闸门 fail closed**（控制面不可用即拒绝外部付费请求）。
+> - `mortis_rag_mcp/providers.py`：`_JsonHttpProvider._post` 统一闸门（embed/rerank 共用；
+>   journal 或 guard 缺失即拒绝），网络类异常标 `SUBMISSION_UNKNOWN`；JSON 准入与退避契约
+>   （`Retry-After` 上界、jitter、`max_retries` 校验）。
+> - `mortis_rag_mcp/doc_store.py`（本提交未改文件，但表结构在 3/6 内）：`payment_authorizations`
+>   与 `request_intents` 两张表及 `authorize_paid_profile`/`revoke_paid_authorization`/
+>   `paid_authorization_state`/`record_send_intent`/`mark_intent`/`list_request_intents`。
+> - 测试：`tests/test_paid_request_journal.py`、`tests/test_http_json_admission.py`（均新增）。
+>
+> **集中 review 修复随本提交落地**：
+> - **F-1（P1）**：`SUBMISSION_UNKNOWN` 后下一次 `sync()` 会把**同一载荷**重新发出去（异常文案
+>   宣称 "automatic retry disabled"，实现里却只有"写"没有"读"）→ `before_send` 在落意图前检查
+>   同 `kind+payload_hash+endpoint+profile` 的未决意图并拒绝（`PAID_REQUEST_UNRESOLVED`）；
+>   `pending()` 同时列出 `prepared` 与 `submission_unknown`（此前后者在可观测性上消失）。
+> - 恢复路径：人工确认/放弃该意图用公开 API `ControlStore.mark_intent(id,"abandoned")`；
+>   `kb_stats` 会给出 `pending_paid_requests`（含 request_id）。**产品面尚无解绑 CLI**（待裁定 D5）。
+>
+> **验证**：修复前实测 sync#1=1 次外部请求、sync#2=2 次（journal 两条 `submission_unknown`，
+> attempt 1/2）；修复后 sync#2 新增 0 次请求，未决期间外部请求数为 0。
+
+### Lane D/E（5/6：C99/C101/C102/C104 摄取与媒体） — moton16,2026-10-08,CodeBuddy,Deepseek-V4.1-Flash — feat(v0.9.0): Lane D/E —— C99/C101/C102/C104（摄取路由、媒体索引、音频骨架与媒体闸门）
+
+> **涵盖提交**：
+> - `1b71b93` `feat(v0.9.0): Lane D/E —— C99/C101/C102/C104（摄取路由、媒体索引、音频骨架与媒体闸门）`
+>
+> **代码改动概况**（15 文件）：
+> - `mortis_rag_mcp/ingest/router.py`（**新增**）+ `ingest/local.py`（**新增**）：`decide_route`
+>   实际路由决策、`local_only` 语义、**进程级共享 `ParseBudget`**；legacy 音频路径明确拒绝（两处）。
+> - `mortis_rag_mcp/ingest/worker.py`、`ingest/models.py`、`ingest/mineru.py`：虚拟摄取管线接线、
+>   发布与准入（对照 1/6–4/6 的存储契约）。
+> - `mortis_rag_mcp/_indexer/media.py`（**新增**）：确定性 image proxy、双向锚定、
+>   逐行→全局 span、profile/generation 链接、oversize 切分、媒体代理 chunk 的 `line_basis`。
+> - `mortis_rag_mcp/media_providers.py`（**新增**）：native 媒体 provider 走同一付费闸门；
+>   **C102 保持闸门关闭**（缺 EG2 模型卡/部署/真实响应 fixture，不得猜协议）。
+> - `mortis_rag_mcp/ingest/audio.py`（**新增**）：PCM 分段/时间锚定/`metadata_only`、
+>   checkpoint+resume（按片段 SHA 幂等）、coverage 统计；**真实转录保持 unsupported**（无端点证据）。
+> - 测试：`test_document_router.py`、`test_audio_ingest.py`、`test_ingest_route_audio.py`、
+>   `test_media_indexing.py`（新增）与 `test_ingest_archive_limits.py`、`test_ingest_publication.py`、
+>   `test_ingest_virtual.py`（追加）。
+>
+> **验证**：随本节批量验证；C102/C104 的**外部证据缺项**如实保留（见节末清单）。
+
+### Lane C/E（6/6：C96/C103 工具面） — moton16,2026-10-08,CodeBuddy,Deepseek-V4.1-Flash — feat(v0.9.0): Lane C/E —— C96/C103 工具面（server/doctor/媒体只读派发）
+
+> **涵盖提交**：
+> - `ad87d69` `feat(v0.9.0): Lane C/E —— C96/C103 工具面（server/doctor/媒体只读派发）`
+>
+> **代码改动概况**（8 文件）：
+> - `mortis_rag_mcp/server.py`：`kb_read` 的虚拟分流与短名歧义报错、媒体 refs 分页、
+>   `kb_read_media` 工具（工具数 15 → 16）、`--approve-reembedding` 与 `--migrate-ingest`
+>   （dry-run 默认）CLI、`kb_stats` 的付费闸门状态段。
+> - `mortis_rag_mcp/_server/media_dispatch.py`（**新增**）：真实 `resolve_virtual_source` +
+>   真实 store 签名、`metadata` 默认 / `inline` 显式、**整包 JSON-RPC 预算不截断 base64**、
+>   MIME 魔术字节与「当前 active revision」双重复核、preview 变体持久化并复用（C103）。
+> - `mortis_rag_mcp/doctor.py`：探活不越权（`cache.enabled=false` 即跳过并给出原因，
+>   探活只落自己的持久意图，不写授权表、不解除任何库的 pending 审批）。
+> - 测试：`tests/test_kb_read_media.py`、`test_media_dispatch.py`、`test_lane_be_server.py`（新增）与
+>   `tests/test_doctor.py`、`tests/test_ingest_server.py`（追加）。
+>
+> **集中 review 修复随本提交落地**：`kb_stats` 暴露 `pending_paid_requests`
+> （request_id/kind/state/attempt）与「未决暂停」的 `embedding_paused_reason`
+> —— 否则「嵌入静默暂停」看起来像坏了；该可观测性也是 D5（解绑入口）的前置。
+
+### v0.9.0 集中 review（第三窗口；未单独成提交，见 `Lane_CDE_REVIEW_2026-10-08.md`）
+
+> **范围**：只读核对 + **3 轮对抗式独立证伪**（子代理全新上下文）+ 只修 review 确认的核心故障。
+> 未做新功能、未加通用框架、未动版本号与用户 changelog、未并入 v0.8.2 DCGFH。
+>
+> **3 轮证伪的净收益**（子代理初稿全为静态推理，逐条由主代理回源码或写实测探针复核后采信）：
+> - 第 1 轮（4 路子代理，按用户点名方向：虚拟签名身份、付费闸门可绕过/fail-open、
+>   快照导入活动状态与残留、迁移/镜像误伤、媒体只读越权与本地路径泄漏）：
+>   确认上表 F-1、F-3（P1）与快照侧 3 条 P2；并**否决**了其「新鲜库回滚不完整」的 P1 断言
+>   （`prev_generation==""` 时登记函数提前返回，该场景不可达）。
+> - 第 2 轮（3 路子代理，被明确要求把第 1 轮结论与**我刚写完的修复**当证伪对象）：
+>   证伪并修掉**主代理自己引入的回归** F-2（多批切片重发前导批）与 F-5/F-7 的误标问题。
+> - 第 3 轮（2 路子代理，证伪第 2 版修复）：证伪并修掉「未决暂停放进共用 guard 会连查询期嵌入
+>   一起拦掉、语义检索静默退回词法」，收窄为只暂停索引批量路径；并修掉 `store.generation_id`
+>   作为「当前活动代」的 fail-open 用法（改为新鲜控制面读）。边际收益递减后主动停在 3 轮。
+>
+> **本节 58 个文件的构成**：27 个已修改跟踪文件 + 31 个新增文件（10 个产品模块 + 21 个测试文件），
+> 分 6 个提交按子系统归档（同一文件同时含多张卡的 hunk 时无法按卡拆分，沿用 Lane A/B 的 areas 约定；
+> review 修复以 **F-1..F-7** 标注在提交正文，可用 `git log --grep=F-4` 定位）。
+>
+> **批量验证（本机、bundled Python、`--basetemp` 钉 `.runtime/`、未写 `%TEMP%`）**：
+> - 38 个受影响测试文件：**review 前 524 passed / 1 skipped** → **review 后与提交后 531 passed / 1 skipped**
+>   （新增 7 个用例、按新合同重写 1 个；跳过项为既有 `sqlite_vec` 未安装 best-effort）。
+> - 复现探针（均在 `.runtime/review-cde-20261008/probe/`，属本地证据）：
+>   `probe_paid_gate.py`（F-1/F-3）、`probe_multibatch.py`（F-2）、`probe_snapshot.py`（F-4/F-5）、
+>   `probe_drift.py`（漂移检测）；`git diff --check` 通过、IDE 诊断 0。
+>
+> **仍未测 / 外部证据阻塞（不得据此宣称通过）**：全仓 pytest 与 CI（`gh pr checks`）、
+> Windows+Linux×Python 3.10–3.13 矩阵、真实语料金测、10x 负载与故障注入、
+> `sqlite_vec` 后端下的「导入→重启→零重嵌」链路（未安装该扩展）；
+> EG2/native 媒体（C102 保持关闭）、真实转录端点（C104 保持 unsupported）、
+> 真实宿主 image/audio 显示（`host_media_verified` 恒为 false）、`[docs]` extras 平台与许可证、
+> 真实 MinerU/预签名 PUT 端点。
+>
+> **有意偏差与待裁定**（详见 `docs/v0.9.0/DECISIONS_PENDING_2026-10-08.md`，共 16 项）：
+> ① `cache.enabled=false` 时外部付费请求一律拒绝（含 doctor 探活）；
+> ② `ingest.storage` 默认切 `virtual` 的用户可见行为变更口径；
+> ③ 镜像排除采用索引器侧精确排除而非 per-source ignore 登记；
+> ④ v1/v2 均丢弃包内 `fts.sqlite`（FTS 与文本层统一由本机 sync 重建，导入后到首次 sync
+> 之间词法检索为空）；⑤ legacy MinerU 通道**不在**付费闸门内（措辞需限定）；
+> ⑥ 代际无回收路径（失败导入会留一份 docstore 拷贝，标签已诚实为 `aborted`）；
+> ⑦ 改 `cache.dir`/`namespace`/`placement` 会绕过漂移检测；⑧ 未决付费意图暂无 CLI 解绑入口。
 >
 > **验证**：
 > - 语法编译检查通过：`.\.venv\Scripts\python.exe -m compileall -q mortis_rag_mcp`
