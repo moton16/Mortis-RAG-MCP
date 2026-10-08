@@ -95,7 +95,7 @@ def test_post_gate_and_single_send_unknown(monkeypatch):
         sends.append(1)
         raise URLError("lost response")
     monkeypatch.setattr("mortis_rag_mcp.providers.urlopen", send)
-    with pytest.raises(ProviderError, match="PENDING_APPROVAL"):
+    with pytest.raises(ProviderError, match="CONTROL_UNAVAILABLE"):
         provider.embed(["x"])
     assert sends == []
     events = []

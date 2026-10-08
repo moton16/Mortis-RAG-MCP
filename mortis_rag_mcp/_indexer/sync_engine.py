@@ -330,8 +330,7 @@ def embed_missing(owner: MarkdownIndexer) -> bool:
     }
 
     if owner.config.embedding.mode == "external" and not _paid_embedding_allowed(owner):
-        # §20.7B：审批未通过（profile/space/切块代际变化且会付费）时外部请求数必须为 0。
-        # 这里不能把每个文件都标 failed（那是「永久撒谎」），只标记暂停，等显式授权。
+        # R2：仅明确撤销、控制不可用、未决批量意图暂停索引，不创建漂移审批。
         owner._embedding_paused = True
         owner._sync_progress["phase"] = "embedding_paused"
         return False

@@ -348,31 +348,7 @@ class MarkdownIndexer:
         # _ensure_disk_vectors_migrated() on first sync.
         if load_vectors and self.config.vector.backend != "sqlite_vec":
             self._load_vectors_cache()
-        # 必须在两个 load 之后：`_load_chunks_cache` 会**赋值**（不是 |=）pending 标志。
-        self._note_foreign_embedding_profile(vectors_dir)
         self._sweep_stale_cache()
-
-    def _note_foreign_embedding_profile(self, vectors_dir: Path) -> None:
-        """检测本库是否曾用**另一个** embedding 身份（model/dimension）建过向量。
-
-        只靠向量缓存 meta 比对找不到这类漂移：文件名本身带 model_hash + dimension，
-        换模型/换维度后本机**根本不存在**旧文件（`_VectorsCodec.load` 直接返回 None），
-        于是最贵的一次 profile 漂移（全库重新付费嵌入）反而不置 pending 审批，
-        闸门按「首次使用」放行一个从未授权过的 fingerprint（§20.7B）。
-        这里按同一 cache key 下的**其它**向量文件判定漂移，逼出显式授权流程。
-        """
-        if self.config.embedding.mode != "external" or self._vectors_cache_path is None:
-            return
-        prefix = f"vault_{self._cache_key()}."
-        current = self._vectors_cache_path.stem
-        try:
-            entries = list(vectors_dir.iterdir())
-        except OSError:
-            return
-        for candidate in entries:
-            if candidate.name.startswith(prefix) and candidate.stem != current:
-                self._paid_profile_requires_approval = True
-                return
 
     def _protected_cache_subtree(self) -> Path | None:
         """缓存根下**不得**被 TTL/清理触碰的子树：文档库与 control 所在目录。
@@ -492,13 +468,12 @@ class MarkdownIndexer:
     def _paid_guard_for(self, fingerprint: str, kind: str):
         def guard(profile_fingerprint: str) -> bool:
             if profile_fingerprint != fingerprint:
-                # profile 漂移（配置被改过）必须重新授权，不能沿用旧授权放行。
+                # 装配身份不一致仍拒绝，不能把旧空间用于新配置。
                 return False
             control = self._paid_control_store()
             if control is None:
                 return False
-            pending = bool(self._paid_profile_requires_approval) if kind == "embed" else False
-            return paid_request_guard(control, profile_fingerprint, pending_approval=pending)
+            return paid_request_guard(control, profile_fingerprint)
         return guard
 
     def has_unresolved_paid_intents(self, control: ControlStore, kind: str,
@@ -555,27 +530,8 @@ class MarkdownIndexer:
         return bool(self._paid_guard_for(profile_fingerprint, kind)(profile_fingerprint))
 
     def reembedding_approval_summary(self) -> dict[str, Any] | None:
-        """待授权重嵌的保守估算（§20.7B）。未校准时必须如实写 `cost_basis=unknown`。
-
-        pending 状态本身由「缓存 meta 与本机 profile 不一致」确定性推导（跨重启稳定），
-        这里只按当前已索引 chunk 给出上界估算，不预生成新 chunk，也不尝试联网。
-        """
-        if not self._paid_profile_requires_approval:
-            return None
-        chunks = self.all_chunks()
-        counted = [chunk for chunk in chunks if not chunk.metadata.get("embedding_disabled")]
-        chars = sum(len(chunk.content) for chunk in counted)
-        batch = max(1, int(getattr(self.config.embedding, "batch_size", 32) or 32))
-        return {
-            "profile_fingerprint": self._embedding_profile.fingerprint,
-            "chunk_count": len(counted),
-            "skipped_embedding_disabled": len(chunks) - len(counted),
-            "estimated_embed_chars": chars,
-            "estimated_requests": -(-len(counted) // batch),
-            "estimated_cost": None,
-            "cost_basis": "unknown",
-            "note": "estimator is not offline-calibrated; approve the exact fingerprint to re-embed",
-        }
+        """旧 public 入口保留；R2 不再派生新的费用审批需求。"""
+        return None
 
     # ------------------------------------------------------------------ cache
 
@@ -639,7 +595,6 @@ class MarkdownIndexer:
                 self._chunking_config = replace(self._chunking_config, **values)
                 self._chunking_compatibility_notice = "Existing library chunking profile retained; explicit mode required to migrate."
         if meta != self._chunks_meta():
-            self._paid_profile_requires_approval = bool(files)
             return
         self._chunks_cache_loaded = True
         self._chunks = {source: chunks for source, (_, chunks) in files.items()}
@@ -659,7 +614,6 @@ class MarkdownIndexer:
             return
         meta, vectors = loaded
         if meta != self._vectors_meta():
-            self._paid_profile_requires_approval = bool(vectors) or self._paid_profile_requires_approval
             return
         if not self._chunks:
             # 文本层缓存被判失效时（chunker 版本提升），初始化到这一步

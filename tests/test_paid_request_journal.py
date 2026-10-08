@@ -1,9 +1,9 @@
-"""C100：付费请求闸门（持久 send_intent journal + profile 授权）合同。
+"""C100 / beta2 R2：持久 journal 和显式撤销兼容合同。
 
 钉住：
 - 外部付费 POST 发送前必须先落持久意图，结果只允许 success / submission_unknown；
 - 控制面不可用（cache 关闭）时 fail closed，不得静默放行；
-- 升级/pending 审批期间外部请求数必须为 0（embed_missing 只是暂停，不谎报失败）；
+- R2 替换旧漂移/pending审批断言：正常重建不增加审批，空间仍隔离；
 - `--approve-reembedding` 只授权精确 fingerprint，配置漂移后自动失效。
 """
 from __future__ import annotations
@@ -62,7 +62,7 @@ def test_guard_semantics(tmp_path):
     control = _open_control(tmp_path, cfg)
     try:
         assert paid_request_guard(control, "fp-a") is True          # 首次使用：无 pending
-        assert paid_request_guard(control, "fp-a", pending_approval=True) is False
+        assert paid_request_guard(control, "fp-a", pending_approval=True) is True  # R2 compatibility
         control.authorize_paid_profile("fp-a", scope="reembedding")
         assert paid_request_guard(control, "fp-a", pending_approval=True) is True
         control.revoke_paid_authorization("fp-a")
@@ -172,6 +172,8 @@ def test_multi_batch_unknown_pauses_instead_of_resending_leading_batches(tmp_pat
         assert _paid_embedding_allowed(indexer) is False, "索引批量路径必须暂停"
         assert indexer.may_use_paid_profile(indexer._embedding_profile.fingerprint) is True, \
             "查询期闸门不得被索引期未决意图阻塞"
+        indexer.search("独立查询", use_rerank=False)
+        assert len(sent) == 3 and sent[-1] == "独立查询", "暂停索引仍允许独立查询 POST"
 
         # 人工确认/放弃未决意图之后才恢复发送。
         control = indexer._paid_control_store()
@@ -179,13 +181,13 @@ def test_multi_batch_unknown_pauses_instead_of_resending_leading_batches(tmp_pat
             if item["state"] == "submission_unknown":
                 control.mark_intent(item["request_id"], "abandoned", "operator reviewed")
         indexer.sync()
-        assert len(sent) > 2, "放弃未决意图后应恢复"
+        assert len(sent) > 3, "放弃未决意图后应恢复"
     finally:
         indexer.close_document_store()
 
 
-def test_profile_drift_requires_explicit_approval(tmp_path, monkeypatch):
-    """换 model/dimension = 全库重新付费嵌入，必须显式授权，不得按「首次使用」放行。"""
+def test_profile_drift_rebuilds_without_new_approval(tmp_path, monkeypatch):
+    """R2 替换旧 requires_explicit_approval：漂移重建，不混用旧空间。"""
     vault = tmp_path / "vault"
     vault.mkdir()
     (vault / "a.md").write_text("# A\n\nbody text drift\n", encoding="utf-8")
@@ -203,6 +205,8 @@ def test_profile_drift_requires_explicit_approval(tmp_path, monkeypatch):
     try:
         first.sync()
         assert calls, "首次建立向量缓存应当发出请求"
+        old_path = first._vectors_cache_path
+        old_bytes = old_path.read_bytes()
     finally:
         first.close_document_store()
 
@@ -210,19 +214,16 @@ def test_profile_drift_requires_explicit_approval(tmp_path, monkeypatch):
     drifted = MarkdownIndexer(vault, make_config(tmp_path, model="another-model"))
     try:
         fingerprint = drifted._embedding_profile.fingerprint
-        assert drifted._paid_profile_requires_approval is True, "旧模型的向量文件存在 = 漂移"
-        assert drifted.may_use_paid_profile(fingerprint) is False
-        drifted.sync()
-        assert calls == [], "未授权期间外部请求数必须为 0"
-        assert drifted._embedding_paused is True
-        assert not drifted.failed_files, "暂停不得把每个文件谎报为失败"
-        summary = drifted.reembedding_approval_summary()
-        assert summary["profile_fingerprint"] == fingerprint
-        # 显式授权精确 fingerprint 后放行
-        drifted._paid_control_store().authorize_paid_profile(fingerprint, scope="reembedding")
+        assert drifted._paid_profile_requires_approval is False
+        assert not any(c.embedding for c in drifted.all_chunks()), "不得载入旧空间向量"
         assert drifted.may_use_paid_profile(fingerprint) is True
         drifted.sync()
-        assert calls, "授权后应恢复付费嵌入"
+        assert calls and all(p["model"] == "another-model" for p in calls)
+        assert drifted._embedding_paused is False
+        assert drifted.reembedding_approval_summary() is None
+        assert old_path.read_bytes() == old_bytes
+        assert drifted._vectors_cache_path != old_path
+        assert drifted._paid_control_store().list_payment_authorizations() == []
     finally:
         drifted.close_document_store()
 
@@ -274,7 +275,8 @@ def test_external_embedding_sends_with_journal(tmp_path, monkeypatch):
         indexer.close_document_store()
 
 
-def test_pending_approval_blocks_external_requests(tmp_path, monkeypatch):
+def test_legacy_pending_flag_does_not_block_external_requests(tmp_path, monkeypatch):
+    """R2 替换旧 pending_approval_blocks_external_requests；保留旧属性兼容。"""
     cfg = make_config(tmp_path)
     vault = tmp_path / "vault"
     vault.mkdir()
@@ -283,16 +285,19 @@ def test_pending_approval_blocks_external_requests(tmp_path, monkeypatch):
 
     def fake_urlopen(request, timeout=None):
         calls.append(json.loads(request.data.decode("utf-8")))
-        raise AssertionError("pending 审批期间不得发出任何外部请求")
+        return ResponseStub(json.dumps({"data": [
+            {"index": i, "embedding": [0.0] * 1023 + [1.0]}
+            for i in range(len(calls[-1]["input"]))
+        ]}).encode())
 
     monkeypatch.setattr("mortis_rag_mcp.providers.urlopen", fake_urlopen)
     indexer = MarkdownIndexer(vault, cfg)
     try:
         indexer._paid_profile_requires_approval = True
-        assert indexer.may_use_paid_profile(indexer._embedding_profile.fingerprint) is False
+        assert indexer.may_use_paid_profile(indexer._embedding_profile.fingerprint) is True
         indexer.sync()
-        assert calls == [], "pending 审批期间外部请求数必须为 0"
-        assert indexer._embedding_paused is True
+        assert calls
+        assert indexer._embedding_paused is False
         assert not indexer.failed_files, "暂停不得把每个文件谎报为失败"
         # 文本层仍然可用：暂停只影响付费向量，不影响词法检索
         assert indexer._chunks, "暂停付费嵌入不该阻止文本层建索引"
@@ -300,7 +305,7 @@ def test_pending_approval_blocks_external_requests(tmp_path, monkeypatch):
         indexer.close_document_store()
 
 
-def test_reembedding_approval_summary_is_honest(tmp_path):
+def test_legacy_approval_summary_no_longer_requests_approval(tmp_path):
     from mortis_rag_mcp._indexer.models import Chunk
     cfg = make_config(tmp_path)
     vault = tmp_path / "vault"
@@ -314,14 +319,7 @@ def test_reembedding_approval_summary_is_honest(tmp_path):
             Chunk("id-2", "x" * 9, "a.md", "t", {"chunk_index": 1, "start_line": 2, "end_line": 2,
                                                 "embedding_disabled": True}),
         ]
-        summary = indexer.reembedding_approval_summary()
-        assert summary["chunk_count"] == 1
-        assert summary["skipped_embedding_disabled"] == 1
-        assert summary["estimated_embed_chars"] == 5
-        # 估算器未校准：不得伪造费用数字
-        assert summary["estimated_cost"] is None
-        assert summary["cost_basis"] == "unknown"
-        assert summary["profile_fingerprint"] == indexer._embedding_profile.fingerprint
+        assert indexer.reembedding_approval_summary() is None
     finally:
         indexer.close_document_store()
 

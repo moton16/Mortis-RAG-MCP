@@ -1,6 +1,6 @@
 """持久付费请求闸门：发送意图 journal + profile 授权（§20.7B / §20.7F）。
 
-设计要点（都是被审核钉死过的合同，别放宽）：
+R2：正常启用配置不新增费用审批；明确撤销、持久意图和未知结果语义保留。
 
 * **先落意图再发送**：任何非幂等计费 POST 在实际发出前必须 `before_send`，
   把 `request_id / payload_hash / endpoint / profile / attempt` 写进本机 control。
@@ -69,22 +69,15 @@ class PaidRequestJournal:
             raise ProviderError("paid request journal requires an endpoint")
         control = self._resolve()
         try:
-            used = self._matching_intents(payload_hash, endpoint, profile_fingerprint)
-            blockers = [item for item in used if item["state"] in UNRESOLVED_INTENT_STATES]
-            if blockers:
-                last = blockers[-1]
-                raise ProviderError(
-                    "PAID_REQUEST_UNRESOLVED: 同一载荷的上一次请求结果未知"
-                    f"（request_id={last['request_id']} state={last['state']} attempt={last['attempt']}），"
-                    "已拒绝再次发送；确认/放弃该意图（ControlStore.mark_intent(id, 'abandoned')）"
-                    "之后再重试"
-                )
             request_id = uuid.uuid4().hex
             control.record_send_intent(
                 request_id, kind=self._kind, payload_hash=payload_hash, endpoint=endpoint,
-                profile_fingerprint=str(profile_fingerprint or ""), attempt=len(used) + 1,
+                profile_fingerprint=str(profile_fingerprint or ""), attempt=None,
+                reject_unresolved=True,
             )
         except (DocStoreError, StoreContractError) as exc:
+            if "PAID_REQUEST_UNRESOLVED" in str(exc):
+                raise ProviderError(str(exc)) from exc
             raise ProviderError(
                 "PAID_REQUEST_JOURNAL_UNAVAILABLE: 无法持久化发送意图，已拒绝外部付费请求"
             ) from exc
@@ -101,10 +94,12 @@ class PaidRequestJournal:
                 and item["profile_fingerprint"] == str(profile_fingerprint or "")]
 
     def mark_success(self, request_id: str) -> None:
-        self._resolve().mark_intent(request_id, "success")
+        if not self._resolve().mark_intent(request_id, "success", expected_states=("prepared",)):
+            raise ProviderError("REQUEST_INTENT_FINALIZED: late response discarded")
 
     def mark_unknown(self, request_id: str, reason: str = "response_unconfirmed") -> None:
-        self._resolve().mark_intent(request_id, "submission_unknown", str(reason)[:200])
+        self._resolve().mark_intent(request_id, "submission_unknown", str(reason)[:200],
+                                    expected_states=("prepared",))
 
     def pending(self) -> list[dict[str, Any]]:
         """仍无明确结果的意图（`prepared` / `submission_unknown`）。
@@ -119,13 +114,7 @@ class PaidRequestJournal:
 
 def paid_request_guard(control: ControlStore, profile_fingerprint: str, *,
                        pending_approval: bool = False) -> bool:
-    """统一 `may_use_paid_profile` 判据（§20.7B）。
-
-    * 显式授权 → 允许；显式撤销 → 拒绝（撤销优先于一切）；
-    * 未授权但**本机没有 pending 审批需求**（首次使用 / 已验证 profile 的增量）
-      → 允许，保持既有增量嵌入体验；
-    * pending 审批（profile/space/切块代际变化且会付费）→ 拒绝，直到
-      `authorize_paid_profile` 记录精确 fingerprint。
+    """R2：正常配置允许；明确撤销拒绝，旧 pending_approval 参数兼容但不再阻塞。
 
     注意这里**不**包含「有未决意图（结果未知）就暂停」这一条：那条只适用于
     **索引批量**路径（`sync_engine._paid_embedding_allowed`）。查询期嵌入是单次、
@@ -141,7 +130,7 @@ def paid_request_guard(control: ControlStore, profile_fingerprint: str, *,
         return True
     if state == "revoked":
         return False
-    return not pending_approval
+    return True
 
 
 def open_paid_control(layout: Any) -> ControlStore:

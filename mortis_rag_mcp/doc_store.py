@@ -1179,10 +1179,17 @@ class ControlStore:
             conn.commit()
 
     def revoke_paid_authorization(self, profile_fingerprint: str) -> None:
+        if not isinstance(profile_fingerprint, str) or not profile_fingerprint:
+            raise StoreContractError("profile_fingerprint 必填")
         with self.mutation() as conn:
             self._ensure_payment_schema(conn)
-            conn.execute("UPDATE payment_authorizations SET revoked_at = ? WHERE profile_fingerprint = ?",
-                         (time.time(), profile_fingerprint))
+            now = time.time()
+            conn.execute(
+                "INSERT INTO payment_authorizations "
+                "(profile_fingerprint, scope, authorized_at, revoked_at) VALUES (?, 'revoked', ?, ?) "
+                "ON CONFLICT(profile_fingerprint) DO UPDATE SET revoked_at = excluded.revoked_at",
+                (profile_fingerprint, now, now),
+            )
             conn.commit()
 
     def paid_authorization_state(self, profile_fingerprint: str) -> str:
@@ -1211,36 +1218,63 @@ class ControlStore:
                  "authorized_at": r[4], "revoked_at": r[5]} for r in rows]
 
     def record_send_intent(self, request_id: str, *, kind: str, payload_hash: str, endpoint: str,
-                           profile_fingerprint: str = "", attempt: int = 1) -> None:
-        """非幂等计费 POST 实际发送**之前**落意图并固化尝试次数（§20.7F）。"""
+                           profile_fingerprint: str = "", attempt: int | None = 1,
+                           reject_unresolved: bool = False) -> None:
+        """在同一 mutation 锁内检查未决并落意图；网络发送始终在锁外。
+
+        journal 使用 reject_unresolved=True / attempt=None，自动计数而不授权重发。
+        旧调用仍接受显式 attempt；同一 request_id 不得覆盖既有记录。
+        """
         for name, value in (("request_id", request_id), ("kind", kind), ("payload_hash", payload_hash),
                             ("endpoint", endpoint)):
             if not isinstance(value, str) or not value:
                 raise StoreContractError(f"{name} 必填")
-        if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1:
+        if attempt is not None and (isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1):
             raise StoreContractError("attempt 必须是 >= 1 的整数")
         with self.mutation() as conn:
             self._ensure_payment_schema(conn)
+            used = conn.execute(
+                "SELECT request_id, state, attempt FROM request_intents "
+                "WHERE kind = ? AND payload_hash = ? AND endpoint = ? AND profile_fingerprint = ?",
+                (kind, payload_hash, endpoint, str(profile_fingerprint or "")),
+            ).fetchall()
+            if reject_unresolved:
+                for row in used:
+                    if row[1] in {"prepared", "submission_unknown"}:
+                        raise StoreContractError(
+                            f"PAID_REQUEST_UNRESOLVED: request_id={row[0]} state={row[1]} attempt={row[2]}"
+                        )
+            if attempt is None:
+                attempt = len(used) + 1
             conn.execute(
-                "INSERT OR REPLACE INTO request_intents "
+                "INSERT INTO request_intents "
                 "(request_id, kind, payload_hash, endpoint, profile_fingerprint, attempt, state, reason, "
-                "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'prepared', '', "
-                "COALESCE((SELECT created_at FROM request_intents WHERE request_id = ?), ?), ?)",
+                "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'prepared', '', ?, ?)",
                 (request_id, kind, payload_hash, endpoint, profile_fingerprint, int(attempt),
-                 request_id, time.time(), time.time()),
+                 time.time(), time.time()),
             )
             conn.commit()
 
-    def mark_intent(self, request_id: str, state: str, reason: str = "") -> None:
+    def mark_intent(self, request_id: str, state: str, reason: str = "", *,
+                    expected_states: Sequence[str] = ("prepared", "submission_unknown")) -> bool:
+        """CAS 更新未决状态。False 表示已有终态/竞争丢失；不存在仍报错。
+
+        success/abandoned 不可被迟到响应覆盖，abandon 不触发任何网络动作。
+        """
         if state not in {"success", "submission_unknown", "abandoned"}:
             raise StoreContractError(f"unknown intent state: {state}")
+        if not expected_states or any(s not in {"prepared", "submission_unknown"} for s in expected_states):
+            raise StoreContractError("expected_states must contain unresolved intent states")
         with self.mutation() as conn:
             self._ensure_payment_schema(conn)
-            cursor = conn.execute("UPDATE request_intents SET state = ?, reason = ?, updated_at = ? "
-                                  "WHERE request_id = ?", (state, str(reason), time.time(), request_id))
-            conn.commit()
-            if cursor.rowcount == 0:
+            if conn.execute("SELECT 1 FROM request_intents WHERE request_id = ?", (request_id,)).fetchone() is None:
                 raise StoreContractError(f"未记录的发送意图：{request_id!r}")
+            placeholders = ",".join("?" for _ in expected_states)
+            cursor = conn.execute("UPDATE request_intents SET state = ?, reason = ?, updated_at = ? "
+                                  f"WHERE request_id = ? AND state IN ({placeholders})",
+                                  (state, str(reason), time.time(), request_id, *expected_states))
+            conn.commit()
+            return cursor.rowcount == 1
 
     def intent_state(self, request_id: str) -> str | None:
         with self.mutation() as conn:

@@ -107,7 +107,7 @@ class _JsonHttpProvider:
         )
         journal = self.request_journal
         if journal is None or self.paid_guard is None or not self.paid_guard(self.request_profile):
-            raise ProviderError("EMBEDDING_PENDING_APPROVAL: paid request requires authorization and durable journal")
+            raise ProviderError("PAID_REQUEST_CONTROL_UNAVAILABLE: durable journal required; profile may be revoked")
         payload_hash = hashlib.sha256(request.data).hexdigest()
         request_id = journal.before_send(payload_hash, self.endpoint, self.request_profile)
         try:
