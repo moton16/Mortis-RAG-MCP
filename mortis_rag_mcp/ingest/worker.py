@@ -1309,67 +1309,116 @@ class VirtualIngestWorker:
     def _audio_resume(self, store: Any, job: Any) -> dict[int, dict[str, Any]]:
         """读回已完成片段的 checkpoint（resume **只补缺失片段**）。
 
-        `ingest_subjobs` 目前只有 `report_phase`（ordinal 0）这一个写入面，**没有**读回
-        API；因此仅当 store 暴露 `list_subjobs(job_id)` 时才真正跨进程恢复，否则返回 {}。
-        需要的读回 API（见最终报告）：
-            DocumentStore.list_subjobs(job_id) -> list[SubjobRecord]  # .checkpoint 为 JSON
+        真实读回面是 `DocumentStore.list_subjobs(job_id)`（E02）。ordinal 0 是父任务的
+        远端 submission 阶段，不参与段级恢复；只有 `state == 'done'` 且父源 SHA 未变的
+        记录才可复用。**坏记录不再静默回退成首次解析**（那会重复计费）。
         """
         reader = getattr(store, "list_subjobs", None)
         if reader is None:
             return {}
-        try:
-            rows = reader(job.job_id)
-        except Exception:
-            return {}
+        rows = reader(job.job_id)
         resumed: dict[int, dict[str, Any]] = {}
+        job_sha = str(getattr(job, "source_sha256", "") or "")
         for row in rows or []:
+            ordinal = int(getattr(row, "ordinal", 0) or 0)
+            if ordinal < 1:
+                continue  # 父任务远端阶段，不是段级 checkpoint
+            if str(getattr(row, "state", "") or "") != "done":
+                continue
+            raw = getattr(row, "checkpoint", "") or ""
+            if not raw:
+                continue
             try:
-                payload = json.loads(getattr(row, "checkpoint", "") or "")
-            except (TypeError, ValueError):
-                continue
-            if not isinstance(payload, dict):
-                continue
-            for item in payload.get("completed", []):
-                try:
-                    ordinal = int(item["ordinal"])
-                except (KeyError, TypeError, ValueError):
-                    continue
-                resumed[ordinal] = dict(item)
+                payload = json.loads(raw)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"audio checkpoint for ordinal {ordinal} is corrupt; refusing to resume "
+                    "silently (that would re-run confirmed transcripts)"
+                ) from exc
+            if not isinstance(payload, dict) or not str(payload.get("sha256") or ""):
+                raise ValueError(f"audio checkpoint for ordinal {ordinal} lacks segment evidence")
+            parent = str(payload.get("parent_source_sha256") or "")
+            if parent and job_sha and parent != job_sha:
+                continue  # 父源已变，这条记录不能复用
+            resumed[ordinal] = dict(payload)
         return resumed
 
     def _audio_checkpoint(self, store: Any, job: Any, owner: str, segment: Any,
-                          transcript: str) -> None:
-        """逐片段记录进度（partial coverage 的事实来源），供重试/恢复只补缺失片段。"""
+                          transcript: str, media: dict[str, Any] | None = None) -> None:
+        """逐片段记录进度（partial coverage 的事实来源），供重试/恢复只补缺失片段。
+
+        `media` 是该片段已落库媒体的定位（occurrence_id/blob_id/...），E02 恢复要靠它
+        把**已确认**的媒体重新挂回新 revision，而不是重新 sink 一份。
+        """
         progress = self._audio_progress.setdefault(job.job_id, {})
-        progress[int(segment.ordinal)] = {
+        item: dict[str, Any] = {
             "ordinal": int(segment.ordinal),
             "t_start_ms": int(segment.t_start_ms),
             "t_end_ms": int(segment.t_end_ms),
             "sha256": segment.input_sha256,
             "text": transcript,
         }
+        if media:
+            payload = {key: value for key, value in dict(media).items() if value not in (None, "")}
+            item["media"] = payload
+            if payload.get("blob_id"):
+                item["blob_id"] = str(payload["blob_id"])
+        progress[int(segment.ordinal)] = item
         self._persist_audio_checkpoint(store, job, owner, progress)
 
     @staticmethod
     def _persist_audio_checkpoint(store: Any, job: Any, owner: str,
                                   progress: dict[int, dict[str, Any]]) -> None:
-        """用现成的 `report_phase`（ordinal 0 + checkpoint 列）持久化片段进度。
+        """逐 ordinal 写段级 checkpoint（E02）：完整 JSON、不截断、写前限额拒绝。
 
-        这是「用现成 ingest_subjobs API」的最小落地；真正的 per-ordinal 分卷/音频
-        subjob 状态机需要 `record_subjob`（见最终报告）。持久化失败绝不阻断解析。
+        写失败**不再静默吞掉**：吞掉之后进程会继续转录，崩溃恢复时这些片段没有
+        记录 → 重复转录与重复 sink（重复计费）。
         """
-        reporter = getattr(store, "report_phase", None)
-        if reporter is None:
-            return
-        try:
-            payload = json.dumps(
-                {"completed": sorted(progress.values(), key=lambda item: item["ordinal"])},
-                ensure_ascii=False, separators=(",", ":"),
-            )[:8192]
-            phase = str(getattr(job, "phase", "") or "prepared")
-            reporter(job.job_id, owner, phase=phase, checkpoint=payload)
-        except Exception:
-            pass
+        recorder = getattr(store, "record_subjob", None)
+        if recorder is None:
+            raise AttributeError(
+                "checkpoint persistence unavailable: the store does not expose record_subjob()"
+            )
+        for ordinal in sorted(progress):
+            item = dict(progress[ordinal])
+            payload = dict(item)
+            payload["parent_source_sha256"] = str(getattr(job, "source_sha256", "") or "")
+            payload["parser_fingerprint"] = str(getattr(job, "parser_fingerprint", "") or "")
+            recorder(job.job_id, owner, ordinal=int(ordinal),
+                     input_hash=str(item.get("sha256") or ""),
+                     range={"kind": "audio_ms", "start": int(item.get("t_start_ms") or 0),
+                            "end": int(item.get("t_end_ms") or 0)},
+                     state="done", checkpoint=payload)
+
+    @staticmethod
+    def _resumed_occurrences(resume_state: dict[int, dict[str, Any]],
+                             sink: Any) -> list[Any]:
+        """把已确认片段的媒体定位重组成 occurrence（E02：不重复 sink，但必须复挂）。"""
+        from ..doc_store import MediaOccurrenceSpec
+
+        known = {str(getattr(item, "occurrence_id", "") or "")
+                 for item in getattr(sink, "items", []) or []}
+        specs: list[Any] = []
+        for ordinal in sorted(resume_state):
+            item = resume_state[ordinal]
+            media = item.get("media") if isinstance(item, dict) else None
+            if not isinstance(media, dict):
+                continue
+            occurrence_id = str(media.get("occurrence_id") or "")
+            blob_id = str(media.get("blob_id") or "")
+            if not occurrence_id or not blob_id or occurrence_id in known:
+                continue
+            specs.append(MediaOccurrenceSpec(
+                occurrence_id=occurrence_id, blob_id=blob_id,
+                kind=str(media.get("kind") or "audio"), ordinal=int(ordinal),
+                mime_type=str(media.get("mime_type") or "audio/wav"),
+                caption=str(media.get("caption") or item.get("text") or ""),
+                t_start_ms=int(media.get("t_start_ms") or item.get("t_start_ms") or 0),
+                t_end_ms=int(media.get("t_end_ms") or item.get("t_end_ms") or 0),
+                metadata=dict(media.get("metadata") or {}),
+            ))
+            known.add(occurrence_id)
+        return specs
 
     def _client_or_make(self) -> MineruClient:
         if self._client is None:
@@ -1442,8 +1491,11 @@ class VirtualIngestWorker:
                 result = parse_audio(
                     src, self.config, sink=sink, adapter=self.audio_adapter,
                     cancelled=self._stop.is_set, resume=resume_state,
-                    checkpoint=lambda segment, transcript: self._audio_checkpoint(
-                        store, job, owner, segment, transcript))
+                    checkpoint=lambda segment, transcript, media=None: self._audio_checkpoint(
+                        store, job, owner, segment, transcript, media))
+                # 已确认片段的媒体必须重新挂回本次 revision（不重新 sink）。
+                if resume_state:
+                    sink.items.extend(self._resumed_occurrences(resume_state, sink))
             else:
                 decision = decide_route(src, self.config, limits=self._limits())
                 if decision.route == "local":

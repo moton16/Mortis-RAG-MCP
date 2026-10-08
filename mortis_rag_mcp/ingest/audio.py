@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import io
 import wave
+from inspect import signature
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -138,6 +139,11 @@ def parse_audio(path: Path, config: Any, *, sink: Any = None, adapter: Any = Non
             raise AudioUnsupported("remote audio adapter requires durable paid-request scheduler")
     resume_map = dict(resume or {})
     limits = ResourceLimits.from_config(config)
+    # 兼容旧的 2 参 checkpoint 回调（不强制消费媒体定位）。
+    try:
+        _checkpoint_accepts_media = len(signature(checkpoint).parameters) >= 3
+    except (TypeError, ValueError):
+        _checkpoint_accepts_media = False
     digest = hashlib.sha256()
     with path.open("rb") as stream:
         for block in iter(lambda: stream.read(65536), b""):
@@ -162,19 +168,33 @@ def parse_audio(path: Path, config: Any, *, sink: Any = None, adapter: Any = Non
                 transcript = str(response.get("text", ""))
                 if len(transcript.encode("utf-8")) > limits.markdown_max_bytes:
                     raise AudioUnsupported("transcript output byte budget exceeded")
+            media_ref: dict[str, Any] | None = None
             if sink is not None:
-                sink.add(name=f"segment-{ordinal}.wav", data=segment.data, kind="audio",
-                         ordinal=ordinal, mime_type="audio/wav", caption=transcript,
-                         t_start_ms=segment.t_start_ms, t_end_ms=segment.t_end_ms,
-                         metadata={"parent_source_sha256": parent_sha, "segment_sha256": segment.input_sha256,
-                                   "start_frame": segment.start_frame, "end_frame": segment.end_frame,
-                                   "preprocess_version": getattr(adapter, "fingerprint", "core-pcm-v1")})
+                occurrence_id = sink.add(
+                    name=f"segment-{ordinal}.wav", data=segment.data, kind="audio",
+                    ordinal=ordinal, mime_type="audio/wav", caption=transcript,
+                    t_start_ms=segment.t_start_ms, t_end_ms=segment.t_end_ms,
+                    metadata={"parent_source_sha256": parent_sha, "segment_sha256": segment.input_sha256,
+                              "start_frame": segment.start_frame, "end_frame": segment.end_frame,
+                              "preprocess_version": getattr(adapter, "fingerprint", "core-pcm-v1")})
+                # E02：媒体定位必须进 checkpoint —— 否则恢复时省了转录却丢了媒体。
+                items = getattr(sink, "items", None)
+                blob_id = ""
+                if items:
+                    blob_id = str(getattr(items[-1], "blob_id", "") or "")
+                media_ref = {"occurrence_id": str(occurrence_id or ""), "blob_id": blob_id,
+                             "kind": "audio", "mime_type": "audio/wav",
+                             "t_start_ms": int(segment.t_start_ms), "t_end_ms": int(segment.t_end_ms),
+                             "caption": transcript}
         if transcript:
             lines.extend([f"[{segment.t_start_ms}-{segment.t_end_ms} ms] {transcript}", ""])
         coverage.append([segment.t_start_ms, segment.t_end_ms])
         completed.append(ordinal)
         if not already_done and checkpoint is not None:
-            checkpoint(segment, transcript)
+            if _checkpoint_accepts_media:
+                checkpoint(segment, transcript, media_ref)
+            else:
+                checkpoint(segment, transcript)
     text = "\n".join(lines)
     if len(text.encode("utf-8")) > limits.markdown_max_bytes:
         raise AudioUnsupported("audio markdown budget exceeded")

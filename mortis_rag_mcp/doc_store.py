@@ -167,6 +167,14 @@ JOB_TERMINAL_STATES = ("done", "failed", "cancelled", "superseded")
 JOB_PHASES = (
     "prepared", "send_intent", "submitted", "polling", "downloaded", "staged", "committed", "submission_unknown",
 )
+#: 段级 subjob 状态（ordinal >= 1；ordinal 0 是父任务的远端 submission phase）。
+SUBJOB_STATES = ("pending", "running", "done", "failed")
+#: checkpoint `range` 的语义标签：音频帧 / 音频毫秒 / 文档页（半开区间，不能混用）。
+SUBJOB_RANGE_KINDS = ("audio_frames", "audio_ms", "document_pages")
+#: 单个 checkpoint 的编码上限（字节）。超限必须**在写前**拒绝，绝不截断字符串。
+CHECKPOINT_MAX_BYTES = 1_048_576
+#: 释放 checkpoint 引用保护的终态（显式取消/被取代后不再视为可恢复）。
+CHECKPOINT_RELEASE_STATES = ("cancelled", "superseded")
 #: 租约时长常量（§23.1：租约/锁值必须有常量与配置边界，不散落 magic number）。
 DEFAULT_LEASE_SECONDS = 120.0
 DEFAULT_QUEUE_LIMIT = 1000
@@ -327,6 +335,22 @@ class GenerationPin:
     lease_until: float
     change_seq: int
     epoch: int
+
+
+@dataclass(frozen=True, slots=True)
+class SubjobRecord:
+    """`ingest_subjobs` 一行的值对象（E02）：段级 checkpoint 的真实读回形态。"""
+
+    job_id: str
+    ordinal: int
+    state: str
+    input_hash: str
+    range_kind: str
+    range_start: int | None
+    range_end: int | None
+    remote_task_id: str
+    checkpoint: str
+    error: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -2872,6 +2896,112 @@ class DocumentStore:
             )
             conn.commit()
 
+    def list_subjobs(self, job_id: str) -> list[SubjobRecord]:
+        """读回该 job 的全部 subjob/checkpoint 行（E02）。
+
+        ordinal 0 是**父任务的远端 submission 阶段**；1..n 是段/分卷记录。
+        """
+        gen = self._ensure_read_generation()
+        if not gen:
+            return []
+        conn = self._open_conn(gen)
+        rows = self._query_all(
+            conn,
+            "SELECT job_id, ordinal, input_hash, range_json, state, remote_task_id, checkpoint, error "
+            "FROM ingest_subjobs WHERE job_id = ? ORDER BY ordinal",
+            (str(job_id),),
+            what="subjob 列表",
+        )
+        records: list[SubjobRecord] = []
+        for row in rows:
+            kind, start, end = "", None, None
+            try:
+                payload = _load_json(row[3], "subjob.range", None) if row[3] else None
+                if isinstance(payload, dict):
+                    kind = str(payload.get("kind") or "")
+                    start = int(payload["start"]) if payload.get("start") is not None else None
+                    end = int(payload["end"]) if payload.get("end") is not None else None
+            except Exception:
+                kind, start, end = "", None, None
+            records.append(SubjobRecord(
+                job_id=str(row[0]), ordinal=int(row[1]), state=str(row[4] or ""),
+                input_hash=str(row[2] or ""), range_kind=kind, range_start=start, range_end=end,
+                remote_task_id=str(row[5] or ""), checkpoint=str(row[6] or ""),
+                error=str(row[7] or "")))
+        return records
+
+    def record_subjob(self, job_id: str, owner_token: str, *, ordinal: int,
+                      input_hash: str = "", range: Mapping[str, Any] | None = None,
+                      state: str = "", checkpoint: Mapping[str, Any] | None = None,
+                      remote_task_id: str = "", error: str = "") -> bool:
+        """段级 checkpoint 写入（E02：合法阶段 + 完整 JSON + 写前限额拒绝）。
+
+        * `ordinal == 0`：父任务的远端 submission 阶段，`state` 必须是 `JOB_PHASES` 之一；
+        * `ordinal >= 1`：段/分卷记录，`state` 必须是 `SUBJOB_STATES` 之一。
+          两者**不得混用**——否则段完成会把父任务的远端阶段覆盖掉。
+        * `range`：`{"kind": audio_frames|audio_ms|document_pages, "start": int, "end": int}`
+          半开区间；缺 kind 或区间非法一律拒绝（不得把页范围当毫秒）。
+        * `checkpoint`：完整 JSON 编码，**不截断**；超过 `CHECKPOINT_MAX_BYTES`
+          在写前明确拒绝（不写失败假成功）。
+        """
+        ordinal = int(ordinal)
+        if ordinal == 0:
+            if state not in JOB_PHASES:
+                raise StoreContractError(
+                    f"ordinal 0 的 state 必须是 {JOB_PHASES} 之一（父任务远端阶段），收到 {state!r}",
+                    fix="段级状态请用 ordinal >= 1。",
+                )
+        elif ordinal >= 1:
+            if state not in SUBJOB_STATES:
+                raise StoreContractError(
+                    f"ordinal {ordinal} 的 state 必须是 {SUBJOB_STATES} 之一，收到 {state!r}")
+        else:
+            raise StoreContractError("ordinal 必须 >= 0")
+        range_json = None
+        if range is not None:
+            if not isinstance(range, Mapping):
+                raise StoreContractError("subjob range 必须是 mapping")
+            kind = str(range.get("kind") or "")
+            if kind not in SUBJOB_RANGE_KINDS:
+                raise StoreContractError(
+                    f"subjob range kind 必须是 {SUBJOB_RANGE_KINDS} 之一，收到 {kind!r}",
+                    fix="音频用 audio_frames/audio_ms，文档用 document_pages，不得混用。",
+                )
+            start, end = range.get("start"), range.get("end")
+            for label, value in (("start", start), ("end", end)):
+                if isinstance(value, bool) or not isinstance(value, int):
+                    raise StoreContractError(f"subjob range {label} 必须是整数")
+            if start < 0 or end < start:
+                raise StoreContractError("subjob range 必须是非负半开区间 [start, end)")
+            range_json = _dump_json({"kind": kind, "start": start, "end": end}, "subjob.range")
+        payload = ""
+        if checkpoint is not None:
+            if not isinstance(checkpoint, Mapping):
+                raise StoreContractError("subjob checkpoint 必须是 mapping")
+            payload = json.dumps(checkpoint, ensure_ascii=False, separators=(",", ":"))
+            if len(payload.encode("utf-8")) > CHECKPOINT_MAX_BYTES:
+                raise StoreContractError(
+                    f"subjob checkpoint 编码后 {len(payload.encode('utf-8'))} 字节，超过 "
+                    f"{CHECKPOINT_MAX_BYTES} 字节上限",
+                    fix="缩小 checkpoint（只存引用与状态，不存大块正文）；绝不截断字符串。",
+                )
+        with self.mutation() as conn:
+            self._require_job_owner(conn, job_id, owner_token)
+            conn.execute(
+                "INSERT INTO ingest_subjobs (job_id, ordinal, input_hash, range_json, state, "
+                "remote_task_id, checkpoint, error) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(job_id, ordinal) DO UPDATE SET input_hash = excluded.input_hash, "
+                "range_json = COALESCE(excluded.range_json, ingest_subjobs.range_json), "
+                "state = excluded.state, "
+                "remote_task_id = CASE WHEN excluded.remote_task_id <> '' "
+                "                      THEN excluded.remote_task_id ELSE ingest_subjobs.remote_task_id END, "
+                "checkpoint = excluded.checkpoint, error = excluded.error",
+                (str(job_id), ordinal, str(input_hash or ""), range_json, str(state),
+                 str(remote_task_id or ""), payload, str(error or "")[:500]),
+            )
+            conn.commit()
+            return True
+
     def fail_job(self, job_id: str, owner_token: str, *, error_code: str,
                  error_summary: str = "", retryable: bool = False,
                  retry_after: float | None = None) -> JobRecord:
@@ -3289,8 +3419,63 @@ class DocumentStore:
 
     # ------------------------------------------------------------------ 维护/恢复
 
+    def _protected_checkpoint_blob_ids(self, conn: sqlite3.Connection) -> set[str]:
+        """有效 checkpoint 引用的 blob（E02 引用保护）。
+
+        崩溃/租约过期且**尚未 attach** 的媒体只要 checkpoint 仍可读、且所属 job 还有
+        恢复可能（非 cancelled/superseded），就不算"无引用"。坏 JSON、无归属行一律
+        跳过——不得让它们污染保护集合。
+        """
+        protected: set[str] = set()
+        placeholders = ",".join("?" for _ in CHECKPOINT_RELEASE_STATES)
+        rows = conn.execute(
+            "SELECT s.checkpoint FROM ingest_subjobs s "
+            "JOIN ingest_jobs j ON j.job_id = s.job_id "
+            f"WHERE s.ordinal >= 1 AND COALESCE(s.checkpoint, '') <> '' "
+            f"AND j.state NOT IN ({placeholders})",
+            tuple(CHECKPOINT_RELEASE_STATES),
+        ).fetchall()
+        for (raw,) in rows:
+            try:
+                payload = json.loads(raw)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            blob_id = payload.get("blob_id")
+            if isinstance(blob_id, str) and blob_id:
+                protected.add(blob_id)
+            media = payload.get("media")
+            if isinstance(media, dict):
+                for key in ("blob_id", "parent_blob_id"):
+                    value = media.get(key)
+                    if isinstance(value, str) and value:
+                        protected.add(value)
+        return protected
+
+    def _protected_checkpoint_revision_ids(self, conn: sqlite3.Connection) -> set[str]:
+        """持有可恢复 checkpoint 的源对应的 staged revision（E02：`recover` 保护）。"""
+        placeholders = ",".join("?" for _ in CHECKPOINT_RELEASE_STATES)
+        sources = conn.execute(
+            "SELECT DISTINCT j.source FROM ingest_jobs j "
+            "JOIN ingest_subjobs s ON s.job_id = j.job_id "
+            f"WHERE s.ordinal >= 1 AND COALESCE(s.checkpoint, '') <> '' "
+            f"AND j.state NOT IN ({placeholders}) AND COALESCE(j.source, '') <> ''",
+            tuple(CHECKPOINT_RELEASE_STATES),
+        ).fetchall()
+        sources = [str(row[0]) for row in sources if row[0]]
+        if not sources:
+            return set()
+        marks = ",".join("?" for _ in sources)
+        rows = conn.execute(
+            "SELECT revision_id FROM document_revisions WHERE state = 'staged' AND doc_id IN "
+            f"(SELECT doc_id FROM documents WHERE source IN ({marks}))",
+            tuple(sources),
+        ).fetchall()
+        return {str(row[0]) for row in rows}
+
     def gc_unreferenced(self) -> int:
-        """无活解析租约时，删除无 occurrence / variant 引用的 blob。"""
+        """无活解析租约时，删除无 occurrence / variant 引用**且未被 checkpoint 保护**的 blob。"""
         with self.mutation() as conn:
             live = conn.execute(
                 "SELECT 1 FROM ingest_jobs WHERE state IN ('parsing', 'staged') "
@@ -3299,16 +3484,21 @@ class DocumentStore:
             if live is not None:
                 raise StoreConflict("GC blocked by an active parse lease",
                                     fix="等待解析发布或租约结束，不能回收尚未 attach 的媒体。")
+            protected = self._protected_checkpoint_blob_ids(conn)
             rows = conn.execute(
                 "SELECT b.blob_id FROM media_blobs b "
                 "WHERE NOT EXISTS (SELECT 1 FROM media_occurrences o WHERE o.blob_id = b.blob_id) "
                 "AND NOT EXISTS (SELECT 1 FROM media_variants v "
                 "                WHERE v.blob_id = b.blob_id OR v.parent_blob_id = b.blob_id)"
             ).fetchall()
+            deleted = 0
             for (blob_id,) in rows:
+                if str(blob_id) in protected:
+                    continue
                 conn.execute("DELETE FROM media_blobs WHERE blob_id = ?", (str(blob_id),))
+                deleted += 1
             conn.commit()
-            return len(rows)
+            return deleted
 
     @contextlib.contextmanager
     def pin_generation(self, *, lease_seconds: float = 300):
@@ -3699,10 +3889,17 @@ class DocumentStore:
                     + (" AND created_at < ?" if stale_before is not None else ""),
                     ((float(stale_before),) if stale_before is not None else ()),
                 ).fetchall()
+            # E02：持有可恢复 checkpoint 的 staged 候选不得被清掉——它的媒体还没 attach，
+            # 清掉等于把已确认的转录/sink 事实变成不可恢复。
+            protected = self._protected_checkpoint_revision_ids(conn)
+            deleted = 0
             for (revision_id,) in rows:
+                if str(revision_id) in protected:
+                    continue
                 conn.execute("DELETE FROM document_revisions WHERE revision_id = ?", (str(revision_id),))
+                deleted += 1
             conn.commit()
-            return len(rows)
+            return deleted
 
 
 # --------------------------------------------------------------------------- 备份校验
