@@ -425,6 +425,7 @@ def run_sync(owner: MarkdownIndexer) -> list[Chunk]:
             if any(chunk.metadata.get("revision_id") for chunk in chunks):
                 revoked = revoke_source(owner, source, reason="store_unavailable") or revoked
     hidden = {doc.source for doc in documents if doc.visibility != "active"}
+    hidden_keys = {source_compare_key(source) for source in hidden}
     virtual_sources = {source_compare_key(doc.source): doc.source for doc in documents
                        if doc.visibility == "active" and doc.active_revision}
     # §20.1「来源精确排除」：解析事实已进文档库的 source，其**同名旧镜像**不再作为
@@ -442,7 +443,7 @@ def run_sync(owner: MarkdownIndexer) -> list[Chunk]:
             excluded_mirrors.add(mirror_prefix + source.rsplit(".", 1)[0] + ".md")
     for source in set(owner._chunks) | set(owner.failed_files):
         canonical = virtual_sources.get(source_compare_key(source))
-        if (source in hidden or source in excluded_mirrors or matcher.is_ignored(source)[0]
+        if (source_compare_key(source) in hidden_keys or source in excluded_mirrors or matcher.is_ignored(source)[0]
                 or (canonical is not None and source != canonical)
                 or any(source == path or source.startswith(path + "/") for path in scan.policy_pruned)):
             revoked = revoke_source(owner, source, reason="visibility/policy") or revoked
@@ -451,7 +452,8 @@ def run_sync(owner: MarkdownIndexer) -> list[Chunk]:
     # 时间戳刻度探测的样本：直接复用本循环本来就要做的 stat（零额外 I/O）。
     mtime_samples: list[int] = []
     files = [path for path in scan.found
-             if owner._source(path) not in hidden and owner._source(path) not in excluded_mirrors
+             if source_compare_key(owner._source(path)) not in hidden_keys
+             and owner._source(path) not in excluded_mirrors
              and source_compare_key(owner._source(path)) not in virtual_sources]
     owner._sync_progress["files_total"] = len(files)
     for i, path in enumerate(files):

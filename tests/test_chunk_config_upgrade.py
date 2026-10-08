@@ -147,7 +147,8 @@ def test_explicit_rechunk_normal_rebuild_no_approval(tmp_path, transport):
 
 
 @pytest.mark.skipif(os.name != "nt", reason="actual Windows filesystem case alias")
-def test_case_alias_virtual_wins_even_with_incomplete_scan(tmp_path, monkeypatch):
+@pytest.mark.parametrize("visibility", ["active", "exempt", "deleted", "unverified"])
+def test_case_alias_virtual_wins_even_with_incomplete_scan(tmp_path, monkeypatch, visibility):
     from mortis_rag_mcp._indexer import scanning
     cfg = AppConfig()
     cfg.cache.dir = str(tmp_path / "cache")
@@ -168,6 +169,8 @@ def test_case_alias_virtual_wins_even_with_incomplete_scan(tmp_path, monkeypatch
             render_sha256=hashlib.sha256(body.encode()).hexdigest(),
             parser_fingerprint="fixture", markdown=body)
         store.commit_revision(staged.revision_id, source_sha256=sha)
+        if visibility != "active":
+            store.set_visibility("note.markdown", visibility)
         denied = vault / "denied"
         denied.mkdir()
         original = scanning.os.scandir
@@ -177,6 +180,12 @@ def test_case_alias_virtual_wins_even_with_incomplete_scan(tmp_path, monkeypatch
             return original(path)
         monkeypatch.setattr(scanning.os, "scandir", partial)
         owner.sync()
+        if visibility != "active":
+            from mortis_rag_mcp._indexer.reading import VirtualReadError
+            assert owner._chunks == {}
+            with pytest.raises(VirtualReadError, match="UNAVAILABLE"):
+                owner.read("Note.MARKDOWN")
+            return
         assert set(owner._chunks) == {"note.markdown"}
         assert all("virtual unique" in c.content for c in owner.all_chunks())
         assert owner.read("Note.MARKDOWN") == "virtual unique"
