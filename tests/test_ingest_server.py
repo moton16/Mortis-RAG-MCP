@@ -41,7 +41,8 @@ def test_tool_definitions_includes_kb_ingest():
     schema = ingest_tool["inputSchema"]
     assert schema["required"] == ["action"]
     assert "action" in schema["properties"]
-    assert schema["properties"]["action"]["enum"] == ["submit", "status", "pending"]
+    # E06：新增 action=retry（消费 E02 已验的 failed/cancelled 重试）。
+    assert schema["properties"]["action"]["enum"] == ["submit", "status", "pending", "retry"]
     assert "sources" in schema["properties"]
     assert "job_id" in schema["properties"]
     assert "vault_path" in schema["properties"]

@@ -30,7 +30,9 @@ SERVER_INSTRUCTIONS = (
     "2) 不确定有哪些库时先 kb_list 查看各库 description 再选库。"
     "3) kb_read 尽量带 start_line/end_line 限定范围，避免一次拉全篇。"
     "4) 环境状态以 ~/.mortis_rag_mcp/STATUS.md 为准：标注有效且未过期时，禁止做环境/依赖/key 预检，"
-    "直接调用工具；若状态为 ❌，仅允许运行一次 python -m mortis_rag_mcp --doctor 重测，仍为 ❌ 则严禁重试，直接报错向用户求助。"
+    "直接调用工具。状态过期或某次工具报错**不代表**要自动运行 --doctor（它会发起真实 API 探测）："
+    "先按工具返回的错误处理；只有用户明确要求时才可以运行一次 python -m mortis_rag_mcp --doctor，"
+    "仍为 ❌ 则不再重试，直接把错误与 STATUS.md 结论报给用户求助。"
 )
 
 
@@ -341,13 +343,13 @@ def _tool_definitions() -> list[dict[str, Any]]:
         },
         {
             "name": "kb_ingest",
-            "description": "PDF/Office 文档摄取（默认关闭，需 [ingest] enabled=true）。action=submit：解析指定文档（sources 为库内相对路径列表；省略则扫描全库未解析/已变更文档），后台异步执行并立即返回任务列表；action=status：查进度（可带 job_id）；action=pending：只列待解析文档不启动。产物写入库内 .mortis-parsed/ 子目录，完成后自动进索引。",
+            "description": "PDF/Office 文档摄取（默认关闭，需 [ingest] enabled=true）。action=submit：解析指定文档（sources 为库内相对路径列表；省略则扫描全库未解析/已变更文档），后台异步执行并立即返回任务列表；action=status：查进度（可带 job_id）；action=pending：只列待解析文档不启动；action=retry：对 failed/cancelled 的既有任务显式重试（结果未知的远端任务不会被重试）。虚拟存储（ingest.storage=virtual）下产物进文档库并由 kb_read 虚拟读取，legacy 下写入库内 .mortis-parsed/ 子目录；完成后都会自动进索引。",
             "inputSchema": {"type": "object", "required": ["action"], "properties": {
-                "action": {"type": "string", "enum": ["submit", "status", "pending"],
-                           "description": "submit=启动解析（异步）；status=查进度；pending=只列待解析"},
+                "action": {"type": "string", "enum": ["submit", "status", "pending", "retry"],
+                           "description": "submit=启动解析（异步）；status=查进度；pending=只列待解析；retry=重试失败/已取消的既有任务"},
                 "sources": {"type": "array", "items": {"type": "string"},
                             "description": "可选，库内相对路径列表（如 ['教材/数电.pdf']）；仅 submit 有效，省略=扫描全库待解析"},
-                "job_id": {"type": "string", "description": "可选，仅 status：查单个任务"},
+                "job_id": {"type": "string", "description": "可选，status 查单个任务；retry 必填（要重试的任务 id）"},
                 "vault_path": {"type": "string", "description": "可选，已注册知识库的绝对路径；仅注册了一个库时可省略"},
             }},
         },
@@ -919,8 +921,8 @@ class VaultMcpServer:
 
     def _kb_ingest(self, arguments: dict[str, Any]) -> dict[str, Any]:
         action = str(arguments.get("action", "")).strip()
-        if action not in {"submit", "status", "pending"}:
-            raise ValueError("action must be one of: submit, status, pending")
+        if action not in {"submit", "status", "pending", "retry"}:
+            raise ValueError("action must be one of: submit, status, pending, retry")
         target_raw = (
             arguments.get("vault_path")
             or arguments.get("vault")
@@ -932,6 +934,12 @@ class VaultMcpServer:
         manager = self._ingest_manager_for(vault)
         if action == "pending":
             return {"pending": manager.scan_pending()}
+        if action == "retry":
+            # E06：只转发 E02 已验的 failed/cancelled 重试；unknown 保状态与 next action。
+            retry = getattr(manager, "retry", None)
+            if retry is None:
+                raise ValueError("action=retry requires ingest.storage=virtual (document store queue)")
+            return retry(str(arguments.get("job_id", "")).strip())
         if action == "status":
             res = manager.status(str(arguments.get("job_id", "")).strip() or None)
             if not self.config.ingest.enabled and self.config.ingest.auto_watch:
@@ -939,8 +947,11 @@ class VaultMcpServer:
             return res
         force = bool(arguments.get("force", False))
         result = manager.submit(arguments.get("sources") or None, force=force)
-        result["hint"] = ("解析在后台进行，用 kb_ingest(action='status') 查进度；"
-                          "done 的文档已写入 .mortis-parsed/ 并可被 kb_search 检索。")
+        result["hint"] = (
+            "解析在后台进行，用 kb_ingest(action='status') 查进度；"
+            "done 的文档在 ingest.storage=virtual 时进入文档库（kb_read 走虚拟读取），"
+            "legacy 时写入 .mortis-parsed/；两种存储下都会被 kb_search 检索。"
+        )
         return result
 
     def _fanout_search(
@@ -1716,6 +1727,12 @@ class VaultMcpServer:
         indexer.request_refresh()
         r_status = indexer.refresh_status()
         stats = indexer.stats()
+        # E04-b：与检索/导入同一口径的 additive 索引状态（ready 不激活隔离事实）。
+        index_state = indexer.index_state()
+        stats["index_state"] = index_state["index_state"]
+        stats["isolated_facts"] = index_state["isolated_facts"]
+        if index_state["next_action"]:
+            stats["next_action"] = index_state["next_action"]
         # 付费闸门状态必须可观测：否则「检索退回词法」看起来像向量算错，实际是
         # 等待显式重嵌授权（§20.7B）。这里只报告事实，不做任何隐式授权动作。
         unresolved_intents = indexer.unresolved_paid_intents()
@@ -2004,6 +2021,91 @@ def migrate_ingest(*, apply: bool = False, config_path: str | Path | None = None
         store.close()
 
 
+def _explicit_config_problem(explicit: str | Path | None) -> str:
+    """显式 `--app-config` 或**实际选中**的配置环境变量无效时返回原因（调用方退出 2）。
+
+    优先级 CLI > 新 env (`MORTIS_RAG_CONFIG`) > 旧 env (`VAULT_MCP_CONFIG`) > 默认：
+    坏路径**绝不**静默回落到另一份宿主配置；未选中的低优先级坏值不误伤。
+    """
+    if explicit is not None:
+        candidate = Path(explicit).expanduser()
+        if not candidate.is_file():
+            return f"invalid --app-config: {candidate} is not a readable file"
+        return ""
+    for name in ("MORTIS_RAG_CONFIG", "VAULT_MCP_CONFIG"):
+        raw = os.getenv(name, "").strip()
+        if not raw:
+            continue
+        if not Path(raw).expanduser().is_file():
+            return f"invalid {name}: {raw} is not a readable file"
+        break
+    return ""
+
+
+def _control_for(vault_path: str | Path, config_path: str | Path | None = None):
+    config = load_config(resolve_config_path(config_path))
+    target = Path(vault_path).expanduser()
+    return resolve_storage_layout(config, target)
+
+
+def list_requests(*, vault_path: str | Path, config_path: str | Path | None = None) -> dict[str, Any]:
+    """只读列出本机付费请求意图（E06）：不发起任何网络请求，不授权任何 profile。"""
+    from .doc_store import ControlStore
+
+    layout = _control_for(vault_path, config_path)
+    control = ControlStore(layout)
+    try:
+        control.open(create=False, write=False)
+        rows = control.list_request_intents()
+    finally:
+        control.close()
+    requests = [{"request_id": str(row["request_id"]), "kind": str(row["kind"]),
+                 "state": str(row["state"]), "attempt": int(row["attempt"] or 0),
+                 "next_action": _request_next_action(str(row["state"]))} for row in rows]
+    return {"vault_path": str(Path(vault_path).expanduser()), "count": len(requests),
+            "requests": requests,
+            "hint": "只读列表：放弃用 --abandon-request REQUEST_ID（只改本机记录，不重发请求）"}
+
+
+def _request_next_action(state: str) -> str:
+    """按状态给出脱敏的下一步提示（不含 endpoint/密钥等内部字段）。"""
+    if state == "prepared":
+        return "outcome unknown: keep this record, query the original remote task, or abandon it explicitly"
+    if state == "submission_unknown":
+        return "remote outcome unknown: do not resend; confirm the original task or abandon this record"
+    if state == "success":
+        return "settled: no action"
+    if state == "abandoned":
+        return "abandoned: a later explicit submission may repeat work that was already paid for"
+    return ""
+
+
+def abandon_request(request_id: str, *, vault_path: str | Path,
+                    config_path: str | Path | None = None) -> dict[str, Any]:
+    """放弃一条未决付费请求意图（E06）。
+
+    只改**该目标**记录的 prepared/submission_unknown → abandoned：不 POST、不 mark
+    success、不授权 profile。终态/竞争丢失返回 `abandoned=False` 与当前状态。
+    帮助文本明确：此后再次显式提交可能重复此前已处理的工作。
+    """
+    from .doc_store import ControlStore
+
+    layout = _control_for(vault_path, config_path)
+    control = ControlStore(layout)
+    try:
+        control.open(create=False, write=True)
+        moved = control.mark_intent(request_id, "abandoned",
+                                    reason="abandoned by explicit --abandon-request",
+                                    expected_states=("prepared", "submission_unknown"))
+        state = control.intent_state(request_id) or "unknown"
+    finally:
+        control.close()
+    return {"request_id": request_id, "abandoned": bool(moved), "state": str(state),
+            "next_action": _request_next_action(str(state)),
+            "warning": ("abandoning only drops this local intent; a later explicit submission may "
+                        "repeat work that was already processed (and billed) before")}
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = ArgumentParser(prog="mortis-rag-mcp")
     parser.add_argument("--serve-mcp-stdio", action="store_true")
@@ -2014,10 +2116,49 @@ def main(argv: list[str] | None = None) -> int:
                         help="显式授权精确 embedding profile 的付费重嵌（只写本机授权记录，不调用 API）")
     parser.add_argument("--migrate-ingest", action="store_true",
                         help="迁移旧 .mortis-parsed 镜像到文档库（默认 dry-run；不联网、不删除旧镜像）")
-    parser.add_argument("--apply", action="store_true", help="--migrate-ingest 时真正写库")
-    parser.add_argument("--vault", default=None, help="--approve-reembedding / --migrate-ingest 的目标库路径（默认取配置的 vault_path）")
+    parser.add_argument("--apply", action="store_true", help="仅 --migrate-ingest 可用：真正写库")
+    parser.add_argument("--list-requests", action="store_true",
+                        help="只读列出本机付费请求意图（需 --vault；不发起请求）")
+    parser.add_argument("--abandon-request", default=None, metavar="REQUEST_ID",
+                        help="放弃一条未决付费请求意图（需 --vault；只改本机记录，不重发、不授权）")
+    parser.add_argument("--vault", default=None, help="管理操作（--approve-reembedding / --migrate-ingest / --list-requests / --abandon-request）的目标库路径")
     parser.add_argument("--quiet", action="store_true", help="静默模式，禁止输出到 stdout")
     args = parser.parse_args(argv)
+    # 管理 action 互斥（E06）：一次只做一件事，避免组合出意外副作用。
+    selected = [name for name, value in (
+        ("--serve-mcp-stdio", args.serve_mcp_stdio),
+        ("--doctor", args.doctor),
+        ("--migrate-ingest", args.migrate_ingest),
+        ("--approve-reembedding", args.approve_reembedding is not None),
+        ("--list-requests", args.list_requests),
+        ("--abandon-request", args.abandon_request is not None),
+    ) if value]
+    if len(selected) > 1:
+        parser.error("management actions are mutually exclusive: " + ", ".join(selected))
+    if args.apply and not args.migrate_ingest:
+        parser.error("--apply is only valid with --migrate-ingest")
+    if not selected and not args.serve_mcp_stdio:
+        parser.error("--serve-mcp-stdio is required")
+    if selected and "--serve-mcp-stdio" not in selected:
+        # 管理操作必须显式指向目标库（正常 serve 不受此限制）。
+        if not args.vault:
+            parser.error("--vault is required for " + ", ".join(selected))
+    # 坏配置绝不静默回落：显式 --app-config 或实际选中的 env 无效 → 退出 2。
+    problem = _explicit_config_problem(args.app_config)
+    if problem:
+        sys.stderr.write(problem + "\n")
+        return 2
+    if args.list_requests:
+        result = list_requests(vault_path=args.vault, config_path=args.app_config)
+        if not args.quiet:
+            sys.stdout.write(json.dumps(result, ensure_ascii=False) + "\n")
+        return 0
+    if args.abandon_request is not None:
+        result = abandon_request(args.abandon_request, vault_path=args.vault,
+                                 config_path=args.app_config)
+        if not args.quiet:
+            sys.stdout.write(json.dumps(result, ensure_ascii=False) + "\n")
+        return 0
     if args.migrate_ingest:
         result = migrate_ingest(apply=args.apply, config_path=args.app_config, vault_path=args.vault)
         if not args.quiet:

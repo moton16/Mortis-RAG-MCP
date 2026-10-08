@@ -1238,6 +1238,49 @@ class VirtualIngestWorker:
             "storage": "virtual",
         }
 
+    def retry(self, job_id: str) -> dict[str, Any]:
+        """显式重试既有任务（E06/E02-b）。
+
+        只转发 `DocumentStore.retry_job` 的 failed/cancelled → queued；**结果未知的远端
+        任务**（SUBMISSION_UNKNOWN / submission phase）保持原状态，返回 remote 事实与
+        next action，绝不强转 queued，也不自动重发。
+        """
+        from ..doc_store import StoreContractError, StoreConflict
+
+        job_id = str(job_id or "").strip()
+        if not job_id:
+            raise ValueError("retry requires job_id")
+        store = self._store()
+        job = store.job_status(job_id)
+        if job is None:
+            raise ValueError(f"unknown job_id: {job_id}")
+        unknown = (str(job.error_code) == "SUBMISSION_UNKNOWN"
+                   or str(job.phase) in {"send_intent", "submitted", "polling", "downloaded",
+                                         "submission_unknown"})
+        if unknown:
+            remote_task_id = ""
+            for row in store.list_subjobs(job_id):
+                if row.ordinal == 0:
+                    remote_task_id = row.remote_task_id
+                    break
+            view = self._job_view(job)
+            view.update(retried=False, retryable=False, reason="SUBMISSION_UNKNOWN",
+                        remote_task_id=remote_task_id,
+                        next_action=("do not resend; query the original remote task for this job "
+                                     "and resolve it explicitly (abandon or accept) before retrying"))
+            return view
+        try:
+            updated = store.retry_job(job_id)
+        except (StoreContractError, StoreConflict) as exc:
+            view = self._job_view(store.job_status(job_id) or job)
+            view.update(retried=False, retryable=False, reason=str(exc),
+                        next_action="only failed/cancelled jobs can be retried")
+            return view
+        view = self._job_view(updated)
+        view.update(retried=True, retryable=True, reason="",
+                    next_action="queued: the worker will pick it up on the next claim")
+        return view
+
     def status(self, job_id: str | None = None) -> dict:
         store = self._store()
         if job_id:
