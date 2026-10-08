@@ -14,7 +14,7 @@ from ..ingest.tables import iter_table_blocks
 from .models import Chunk
 
 ESTIMATOR_VERSION = "unicode-estimate-v1"
-STRUCTURE_GUARD_VERSION = "markdown-guard-v1"
+STRUCTURE_GUARD_VERSION = "markdown-guard-v2"
 
 
 def _value(profile: Any, key: str, default: Any) -> Any:
@@ -48,7 +48,8 @@ def chunking_profile(profile: Any = None) -> dict[str, Any]:
     if not 0 <= values["overlap"] < values["target"] <= values["hard_limit"]:
         raise ValueError("require 0 <= overlap < target <= hard_limit")
     result = {"mode": mode, **values, "estimator_version": ESTIMATOR_VERSION,
-              "structure_guard_version": STRUCTURE_GUARD_VERSION, "proxy_version": "proxy-v1"}
+              "structure_guard_version": ("markdown-guard-v1" if mode == "legacy_chars"
+                                          else STRUCTURE_GUARD_VERSION), "proxy_version": "proxy-v1"}
     if mode == "legacy_chars":
         # legacy 字符参数（chunk_size/chunk_overlap）此前完全不在身份指纹里：改这两个
         # 值不会改变 fingerprint → 虚拟 chunk ID、derived generation 与缓存判据都会
@@ -162,6 +163,33 @@ def _render(items, prefix: str = "", suffix: str = "") -> str:
     return prefix + "\n".join(item[0] for item in items) + suffix
 
 
+def _pipe_tables(lines):
+    """Recognize pipe tables outside actual-length fences, without altering legacy."""
+    result = {}
+    fence_token = None
+    i = 0
+    while i < len(lines):
+        match = re.match(r"^\s*(`{3,}|~{3,})(.*)$", lines[i])
+        if match:
+            token = match.group(1)
+            if fence_token is None:
+                fence_token = token
+            elif token[0] == fence_token[0] and len(token) >= len(fence_token) and not match.group(2).strip():
+                fence_token = None
+            i += 1
+            continue
+        if (fence_token is None and i + 1 < len(lines) and "|" in lines[i]
+                and re.fullmatch(r"\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*", lines[i + 1])):
+            end = i + 1
+            while end + 1 < len(lines) and "|" in lines[end + 1] and lines[end + 1].strip():
+                end += 1
+            result[i] = end
+            i = end + 1
+        else:
+            i += 1
+    return result
+
+
 def make_token_chunks(source, title, tags, sections, *, profile, new_chunk_fn,
                       mtime=None, source_pdf=None, aliases=None, source_text=None,
                       virtual_identity=None) -> list[Chunk]:
@@ -253,7 +281,8 @@ def make_token_chunks(source, title, tags, sections, *, profile, new_chunk_fn,
             emit(heading, current, prefix, suffix, kind)
 
     for heading, start, lines in sections:
-        tables = dict(iter_table_blocks(lines))
+        html_tables = dict(iter_table_blocks(lines, strict_fences=True))
+        tables = {**_pipe_tables(lines), **html_tables}
         offset = 0
         ordinary = []
         while offset < len(lines):
@@ -270,6 +299,11 @@ def make_token_chunks(source, title, tags, sections, *, profile, new_chunk_fn,
                 items = [_item(lines[i], start + i) for i in range(offset, end + 1)]
                 if estimate_tokens(_render(items)) <= hard:
                     emit(heading, items)
+                elif offset in html_tables:
+                    # Unknown rowspan/multiline headers cannot be guessed losslessly.
+                    # Consume one intact table, explicitly non-embedding; never drop cells
+                    # or invent source spans for repeated markup.
+                    emit(heading, items, oversize=True)
                 else:
                     header = items[:2]
                     emit(heading, header, oversize=estimate_tokens(_render(header)) > hard)

@@ -29,7 +29,7 @@ _FENCE_START_RE = re.compile(r"^\s*(`{3,}|~{3,})")
 _FENCE_RE = _FENCE_START_RE
 
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp", ".avif"}
-_INDEXABLE_TEXT_EXTS = frozenset({".md", ".txt"})
+_INDEXABLE_TEXT_EXTS = frozenset({".md", ".markdown", ".txt"})
 _CHAPTER_HEADING_RE = re.compile(
     r"^\s*(第[0-9一二三四五六七八九十百千]+[章回节卷]|Chapter\s+[0-9]+)\s*(.*)$",
     re.IGNORECASE,
@@ -637,8 +637,9 @@ def chunk_file(
         title=title,
         tags=tags,
         sections=sections,
-        chunk_size=getattr(config, "chunk_size", 800),
-        chunk_overlap=getattr(config, "chunk_overlap", 120),
+        chunk_size=getattr(chunking_config, "legacy_chunk_size", 0) or getattr(config, "chunk_size", 800),
+        chunk_overlap=(getattr(chunking_config, "legacy_chunk_overlap", 0)
+                       if getattr(chunking_config, "legacy_chunk_size", 0) else getattr(config, "chunk_overlap", 120)),
         mtime=mtime,
         source_pdf=properties.get("source_pdf"),
         aliases=aliases if aliases else None,

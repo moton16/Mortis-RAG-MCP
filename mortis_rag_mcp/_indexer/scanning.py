@@ -152,7 +152,8 @@ def ignored_name(name: str) -> bool:
     """编辑器临时/交换文件名排除（原 MarkdownIndexer._ignored_name 逐字迁移）。"""
     lower = name.lower()
     return name.startswith("~") or lower.endswith(
-        (".tmp.md", ".swp.md", ".swo.md", ".tmp.txt", ".swp.txt", ".swo.txt")
+        (".tmp.md", ".swp.md", ".swo.md", ".tmp.markdown", ".swp.markdown", ".swo.markdown",
+         ".tmp.txt", ".swp.txt", ".swo.txt")
     )
 
 

@@ -18,7 +18,7 @@ _SPAN_ATTR = re.compile(r"rowspan\s*=|colspan\s*=", re.IGNORECASE)
 _FENCE_RE = re.compile(r"^\s*([`~]{3,})")
 
 
-def iter_table_blocks(lines: list[str]) -> list[tuple[int, int]]:
+def iter_table_blocks(lines: list[str], *, strict_fences: bool = False) -> list[tuple[int, int]]:
     """返回所有 <table>...</table> 块的 (start, end) 行号区间（闭区间）。
     用配对计数而不是单行判断：MinerU 输出的表格可能跨行。"""
     blocks: list[tuple[int, int]] = []
@@ -30,8 +30,9 @@ def iter_table_blocks(lines: list[str]) -> list[tuple[int, int]]:
         if m:
             token = m.group(1)
             if fence_token is None:
-                fence_token = token[:3]
-            elif token.startswith(fence_token):
+                fence_token = token if strict_fences else token[:3]
+            elif (token.startswith(fence_token)
+                  and (not strict_fences or not line[m.end():].strip())):
                 fence_token = None
         if fence_token is not None:
             continue
@@ -284,4 +285,3 @@ def split_table_into_chunks(tbl_lines: list[str], chunk_size: int) -> list[tuple
         flush()
 
     return chunks
-

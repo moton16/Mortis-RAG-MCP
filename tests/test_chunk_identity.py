@@ -87,7 +87,7 @@ def test_document_template_flows_into_exact_input_and_key(tmp_path):
         indexer._stamp_embedding_keys()
         raw_key = chunk.metadata["embedding_key"]
         assert _document_input(indexer, "raw content") == "raw content"
-        assert _document_provider(indexer) is indexer.embedding_provider
+        assert _document_provider(indexer)._provider is indexer.embedding_provider
 
         indexer._embedding_profile = replace(indexer._embedding_profile,
                                              document_template="passage: {text}")
@@ -99,7 +99,7 @@ def test_document_template_flows_into_exact_input_and_key(tmp_path):
 
             def embed(self, texts):
                 self.seen.extend(texts)
-                return [[0.0] * 1024 for _ in texts]
+                return [[1.0] + [0.0] * 1023 for _ in texts]
 
         provider = _Provider()
         indexer.embedding_provider = provider
@@ -107,13 +107,13 @@ def test_document_template_flows_into_exact_input_and_key(tmp_path):
         assert provider.seen == ["passage: abc"], "模板必须作用在真正发送的输入上"
 
         # embedding_key 必须描述**实际输入**：模板变化 → key 变化（旧向量不复用）
-        chunk.metadata.pop("embedding_key")
         indexer._stamp_embedding_keys()
         assert chunk.metadata["embedding_key"] != raw_key
-        # 坏模板回退原文，不静默丢正文
+        # E05/R2: no asymmetric silent fallback; bad templates are rejected.
         indexer._embedding_profile = replace(indexer._embedding_profile,
                                              document_template="{missing_slot}")
-        assert _document_input(indexer, "raw content") == "raw content"
+        with pytest.raises(KeyError):
+            _document_input(indexer, "raw content")
     finally:
         indexer.close_document_store()
 

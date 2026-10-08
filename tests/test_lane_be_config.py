@@ -14,7 +14,7 @@ def load_text(tmp_path, text):
 
 
 def test_new_install_and_programmatic_compatibility(tmp_path):
-    assert AppConfig().chunking.mode == "legacy_chars"
+    assert AppConfig().chunking.mode == "estimated_tokens"  # R2 unified new-library default.
     cfg = load_text(tmp_path, "")
     assert cfg.chunking.mode == "estimated_tokens"
     assert cfg.chunking.mode_explicit is False

@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -76,7 +76,7 @@ def _positive_fields(config: Any, prefix: str, names: tuple[str, ...]) -> None:
 
 @dataclass(slots=True)
 class ChunkingConfig:
-    mode: str = "legacy_chars"
+    mode: str = "estimated_tokens"
     target_tokens: int = 384
     overlap_tokens: int = 64
     hard_limit_tokens: int = 768
@@ -482,6 +482,9 @@ class AppConfig:
 
     def __post_init__(self) -> None:
         self.vault_path = os.fspath(self.vault_path)
+        if (not self.chunking.mode_explicit and not self.chunking.legacy_explicit
+                and (self.chunk_size, self.chunk_overlap) != (1200, 0)):
+            self.chunking = replace(self.chunking, mode="legacy_chars", legacy_explicit=True)
         if self.embedding.mode not in {"static", "external"}:
             raise ValueError("embedding.mode must be 'static' or 'external'")
         if self.embedding.dimension < 1:

@@ -61,6 +61,9 @@ estimator_profile = "unicode-estimate-v1"
 # Type: 纯标准库 Unicode 权重估算（未离线校准），不是真实 LLM tokenizer；
 # legacy 别名 "calibrated-v1" 仅为读取旧库缓存保留，不使用也不代表已校准。
 # Existing explicit chunk_size/chunk_overlap without a new mode retain legacy_chars.
+# R2: AppConfig() 和空 TOML 的新库默认一致；已有缓存模式/字符参数保留，
+# 迁移已有库请显式设置 mode。硬上限不是 embedding 向量维度。
+# estimated 超硬上限的 HTML 表格完整保留并标 embedding_disabled，不猜表头/丢单元格。
 
 [index]
 # chunk_size = 1200

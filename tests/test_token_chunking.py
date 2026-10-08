@@ -108,3 +108,31 @@ def test_injected_caption_not_claimed_as_source_line():
     for c in output:
         for span in c.metadata["source_spans"]:
             assert text.splitlines()[span["line"] - 1][span["start_char"]:span["end_char"]] in c.content
+
+
+def test_pipe_table_repeats_header_and_retains_spans():
+    text = "| name | value |\n| --- | --- |\n" + "| hello | world |\n" * 25
+    output = chunks(text)
+    assert_coverage(text, output)
+    assert len(output) > 1
+    assert all("| name | value |" in c.content for c in output)
+    assert any(s["kind"] == "table_header" for c in output for s in c.metadata["synthetic_segments"])
+
+
+def test_estimated_html_table_keeps_all_cells_and_multiline_header():
+    text = ("<table>\n<thead>\n<tr><th>first</th></tr>\n<tr><th>second</th></tr>\n</thead>\n"
+            "<tr><td>" + "长" * 1000 + "</td><td>SECOND_CELL_SENTINEL</td></tr>\n</table>\nafter")
+    output = chunks(text)
+    assert_coverage(text, output)
+    table = next(c for c in output if "<table>" in c.content)
+    assert "SECOND_CELL_SENTINEL" in table.content and "<th>second</th>" in table.content
+    assert table.metadata["oversize"] and table.metadata["embedding_disabled"]
+    assert output[-1].content == "after"
+
+
+def test_four_tick_fence_is_not_closed_by_three_ticks_or_html():
+    text = "````html\n```\n<table>\n<tr><td>inside</td></tr>\n</table>\n````\nafter"
+    output = chunks(text)
+    assert_coverage(text, output)
+    assert output[-1].content == "after"
+    assert all("````" in c.content for c in output[:-1])

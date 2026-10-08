@@ -148,6 +148,10 @@ class MarkdownIndexer:
             legacy_chunk_size=int(self.config.chunk_size),
             legacy_chunk_overlap=int(self.config.chunk_overlap),
         )
+        # Programmatic legacy callers may set character parameters after AppConfig().
+        if (not self._chunking_config.mode_explicit
+                and (self.config.chunk_size, self.config.chunk_overlap) != (1200, 0)):
+            self._chunking_config = replace(self._chunking_config, mode="legacy_chars", legacy_explicit=True)
         self._embedding_profile = resolve_embedding_profile(self.config.embedding)
         self._paid_profile_requires_approval = False
         self._paid_profile_error: str | None = None
@@ -556,8 +560,8 @@ class MarkdownIndexer:
         profile = self._chunking_config
         return {
             "key": self._cache_key(),
-            "chunk_size": self.config.chunk_size,
-            "chunk_overlap": self.config.chunk_overlap,
+            "chunk_size": profile.legacy_chunk_size,
+            "chunk_overlap": profile.legacy_chunk_overlap,
             # 图片注入会改写 chunk.content（继而改写 chunk.id），必须参与失效
             # 判据。此前漏了它：缓存失效只看文件字节 sha256，翻转这个开关后
             # 文件字节没变 → 存量库既不重切块也不重嵌，CHANGELOG 承诺的
@@ -570,7 +574,8 @@ class MarkdownIndexer:
             "overlap_tokens": profile.overlap_tokens,
             "hard_limit_tokens": profile.hard_limit_tokens,
             "estimator_profile": profile.estimator_profile,
-            "structure_guard_version": "structure-v1",
+            "structure_guard_version": ("structure-estimated-v2" if profile.mode == "estimated_tokens"
+                                        else "structure-v1"),
             "proxy_version": "media-proxy-v1",
         }
 
@@ -602,13 +607,19 @@ class MarkdownIndexer:
         if not loaded:
             return
         meta, files = loaded
-        if not self._chunking_config.mode_explicit:
+        if (not self._chunking_config.mode_explicit and not self._chunking_config.legacy_explicit
+                and self.config.chunking.mode != "legacy_chars"):
             mode = meta.get("chunking_mode", "legacy_chars")
             if mode in {"legacy_chars", "estimated_tokens"}:
                 values = {"mode": mode}
                 for name in ("target_tokens", "overlap_tokens", "hard_limit_tokens", "estimator_profile"):
                     if name in meta:
                         values[name] = meta[name]
+                for cached, effective in (("chunk_size", "legacy_chunk_size"),
+                                          ("chunk_overlap", "legacy_chunk_overlap")):
+                    value = meta.get(cached)
+                    if isinstance(value, int) and not isinstance(value, bool) and value >= (1 if cached == "chunk_size" else 0):
+                        values[effective] = value
                 self._chunking_config = replace(self._chunking_config, **values)
                 self._chunking_compatibility_notice = "Existing library chunking profile retained; explicit mode required to migrate."
         if meta != self._chunks_meta():
@@ -1377,7 +1388,7 @@ class MarkdownIndexer:
                             exempt_count += 1
                         continue
                     if suffix in _INDEXABLE_TEXT_EXTS:
-                        if suffix == ".md":
+                        if suffix in {".md", ".markdown"}:
                             try:
                                 raw = path.read_bytes()
                                 lines = raw.decode("utf-8-sig", errors="ignore").splitlines()

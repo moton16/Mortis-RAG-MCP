@@ -14,7 +14,7 @@ def test_sample_pages_deduplicated():
     assert router.sample_pages(1) == (0,)
     assert router.sample_pages(2) == (0, 1)
     assert router.sample_pages(0) == ()
-    assert router.sample_pages(100) == (0, 1, 2, 49, 50, 51, 99)
+    assert router.sample_pages(100) == (0, 1, 2, 24, 25, 49, 50, 51, 74, 75, 99)
 
 
 def test_missing_docs_uses_only_authorized_cloud(tmp_path, monkeypatch):
@@ -118,3 +118,75 @@ def test_invalid_routing_policy_rejected(tmp_path):
     cfg.routing = "bogus"
     with pytest.raises(local.LocalUnsupported, match="invalid routing"):
         router.decide_route(path, cfg)
+
+
+def test_quality_upgrade_decision_exactly_once():
+    first = router.RouteDecision("local", .9, ("sampled",))
+    second = router.upgrade_route_once(first, config(), quality_reasons=("columns",), failed_pages=(75,))
+    assert first.route == "local" and first.upgrade_count == 0
+    assert second.route == "mineru" and second.upgrade_count == 1
+    assert second.initial_route == "local" and second.failed_pages == (75,) and second.partial
+    assert second.as_dict()["upgrade_count"] == 1
+    with pytest.raises(local.LocalUnsupported, match="already used"):
+        router.upgrade_route_once(second, config(), quality_reasons=("columns",))
+
+
+@pytest.mark.parametrize("changes,reasons", [
+    ({"routing": "local"}, ("columns",)),
+    ({"network_policy": "local_only"}, ("columns",)),
+    ({"enabled": False}, ("columns",)),
+    ({}, ("cancelled",)),
+    ({}, ("budget",)),
+    ({}, ("format",)),
+])
+def test_quality_upgrade_does_not_expand_other_errors(changes, reasons):
+    cfg = config()
+    for name, value in changes.items():
+        setattr(cfg, name, value)
+    with pytest.raises(local.LocalUnsupported):
+        router.upgrade_route_once(router.RouteDecision("local", .9, ()), cfg, quality_reasons=reasons)
+
+
+def test_mixed_pdf_late_page_quality_and_partial_sampling(tmp_path, monkeypatch):
+    path = tmp_path / "mixed.pdf"
+    path.write_bytes(b"%PDF-1.7\n")
+    class Page:
+        rect = SimpleNamespace(width=100)
+        def __init__(self, number):
+            self.number = number
+        def get_text(self, kind):
+            if kind == "text":
+                return "printable body"
+            if self.number == 75:
+                return [(0, 0, 30, 20, "left", 0, 0), (60, 0, 90, 20, "right", 1, 0)]
+            return [(0, 0, 100, 20, "body", 0, 0)]
+        def get_images(self):
+            return []
+    class Document:
+        is_encrypted = False
+        def __len__(self):
+            return 100
+        def __getitem__(self, index):
+            return Page(index + 1)
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            return False
+    monkeypatch.setattr(router, "pdf_backend", lambda: ("pymupdf", SimpleNamespace(open=lambda p: Document())))
+    result = router.decide_route(path, config())
+    assert result.route == "mineru" and 75 in result.failed_pages and result.partial
+    assert any("columns" in reason for reason in result.reasons)
+    assert len(result.sampled_pages) < 100
+
+
+@pytest.mark.parametrize("text,blocks,images,reason", [
+    ("∑ formula", [(0, 0, 100, 20, "body", 0, 0)], [], "formula"),
+    ("| a | b |", [(0, 0, 100, 20, "body", 0, 0)], [], "table"),
+    ("body", [], [], "geometry_unknown"),
+    ("body", [(0, 0, 100, 20, "body", 0, 0)], [object()], "images"),
+    ("", [(0, 0, 100, 20, "body", 0, 0)], [], "empty_or_garbled"),
+])
+def test_page_quality_distinct_reasons(text, blocks, images, reason):
+    page = SimpleNamespace(rect=SimpleNamespace(width=100),
+        get_text=lambda kind: text if kind == "text" else blocks, get_images=lambda: images)
+    assert reason in router.pdf_page_quality(page)
