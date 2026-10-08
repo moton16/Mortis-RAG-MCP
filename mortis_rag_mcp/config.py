@@ -205,6 +205,8 @@ class DocStoreConfig:
         return self.max_size_mb * 1024 * 1024
 
 
+_INGEST_STORAGE_VALUES = {"legacy", "virtual"}
+_INGEST_NETWORK_POLICY_VALUES = {"configured", "local_only"}
 
 
 @dataclass(slots=True)
@@ -224,6 +226,21 @@ class IngestConfig:
     table_convert_max_cells: int = 60
     auto_watch: bool = False             # 自动摄取（默认关闭：需显式授权）
     max_file_size_mb: int = 20           # 单文件尺寸上限（MiB，默认20；0表示不限）
+    # --- v0.9.0 C93/C94 新增（§17.4）------------------------------------------------
+    # storage：解析事实落点。**本 Lane 默认 legacy**：物理镜像（.mortis-parsed/*.md）仍是
+    # 当前唯一可读路径——虚拟文档的读取适配器属 C96（Lane C）。在 C96 落地前把默认改成
+    # virtual 会让已摄取文档不可读，故默认沿用 legacy，virtual 需显式配置。
+    storage: str = "legacy"              # legacy | virtual
+    network_policy: str = "configured"   # configured | local_only（local_only 在入队前拒云路径）
+    archive_max_mb: int = 32             # 压缩响应上限（安全配额，0 不关闭限制）
+    extracted_max_mb: int = 200          # 累计解压上限
+    markdown_max_mb: int = 16            # 单 markdown 上限
+    json_max_mb: int = 8                 # 单 JSON 上限
+    media_max_mb: int = 8                # 单媒体上限
+    memory_budget_mb: int = 128          # 全局受控缓冲预算（不是 RSS 承诺）
+    queue_limit: int = 1000              # 队列容量上限
+    max_parse_workers: int = 1           # 同时解析数（本 Lane 只实现 1）
+
     def __post_init__(self) -> None:
         if not isinstance(self.auto_watch, bool):
             raise ValueError(f"ingest.auto_watch must be a boolean, got {self.auto_watch!r}")
@@ -233,6 +250,16 @@ class IngestConfig:
             or self.max_file_size_mb < 0
         ):
             raise ValueError(f"ingest.max_file_size_mb must be an integer >= 0, got {self.max_file_size_mb!r}")
+        if self.storage not in _INGEST_STORAGE_VALUES:
+            raise ValueError(
+                f"ingest.storage must be one of {sorted(_INGEST_STORAGE_VALUES)}, got {self.storage!r}"
+            )
+        if self.network_policy not in _INGEST_NETWORK_POLICY_VALUES:
+            raise ValueError(
+                "ingest.network_policy must be one of "
+                f"{sorted(_INGEST_NETWORK_POLICY_VALUES)}, got {self.network_policy!r}"
+            )
+
     @property
     def max_file_size_bytes(self) -> int:
         """Max file size in bytes (1024*1024 per MiB). 0 means unlimited."""
@@ -387,6 +414,34 @@ class AppConfig:
             or self.ingest.max_file_size_mb < 0
         ):
             raise ValueError(f"ingest.max_file_size_mb must be an integer >= 0, got {self.ingest.max_file_size_mb!r}")
+        if self.ingest.storage not in _INGEST_STORAGE_VALUES:
+            raise ValueError(
+                f"ingest.storage must be one of {sorted(_INGEST_STORAGE_VALUES)}, got {self.ingest.storage!r}"
+            )
+        if self.ingest.network_policy not in _INGEST_NETWORK_POLICY_VALUES:
+            raise ValueError(
+                "ingest.network_policy must be one of "
+                f"{sorted(_INGEST_NETWORK_POLICY_VALUES)}, got {self.ingest.network_policy!r}"
+            )
+        for _key in (
+            "archive_max_mb",
+            "extracted_max_mb",
+            "markdown_max_mb",
+            "json_max_mb",
+            "media_max_mb",
+            "memory_budget_mb",
+            "queue_limit",
+            "max_parse_workers",
+        ):
+            _value = getattr(self.ingest, _key, None)
+            if isinstance(_value, bool) or not isinstance(_value, int) or _value < 1:
+                raise ValueError(
+                    f"ingest.{_key} must be an integer >= 1, got {_value!r}"
+                )
+        if self.ingest.max_parse_workers != 1:
+            raise ValueError(
+                "ingest.max_parse_workers 目前只支持 1（进程级资源池在 C100 才引入多并发）"
+            )
         if self.diag.max_bytes < 1:
             raise ValueError("diag.max_bytes must be positive")
         if self.diag.files < 1:
@@ -588,6 +643,16 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
         table_convert_max_cells=_numeric(ingest, data, "table_convert_max_cells", int, 60, 1),
         auto_watch=raw_auto_watch,
         max_file_size_mb=_numeric(ingest, data, "max_file_size_mb", int, 20, 0),
+        storage=str(ingest.get("storage", "legacy")).strip().lower() or "legacy",
+        network_policy=str(ingest.get("network_policy", "configured")).strip().lower() or "configured",
+        archive_max_mb=_numeric(ingest, data, "archive_max_mb", int, 32, 1),
+        extracted_max_mb=_numeric(ingest, data, "extracted_max_mb", int, 200, 1),
+        markdown_max_mb=_numeric(ingest, data, "markdown_max_mb", int, 16, 1),
+        json_max_mb=_numeric(ingest, data, "json_max_mb", int, 8, 1),
+        media_max_mb=_numeric(ingest, data, "media_max_mb", int, 8, 1),
+        memory_budget_mb=_numeric(ingest, data, "memory_budget_mb", int, 128, 1),
+        queue_limit=_numeric(ingest, data, "queue_limit", int, 1000, 1),
+        max_parse_workers=_numeric(ingest, data, "max_parse_workers", int, 1, 1),
     )
     raw_exclude_patterns = index.get("exclude_patterns", data.get("exclude_patterns", DEFAULT_EXCLUDE_PATTERNS))
     if isinstance(raw_exclude_patterns, str):

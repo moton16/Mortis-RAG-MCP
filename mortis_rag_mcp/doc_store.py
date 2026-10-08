@@ -146,8 +146,30 @@ class SnapshotInvalid(DocStoreError):
     code = "SNAPSHOT_INVALID"
 
 
+class OwnershipLost(DocStoreError):
+    """租约/owner 丢失（续租失败、过期后旧 owner 再写、job 被抢占）。"""
+
+    code = "OWNERSHIP_LOST"
 
 
+class QueueFull(DocStoreError):
+    code = "QUEUE_FULL"
+    retryable = True
+
+
+#: 任务状态机（§12.5）：queued -> parsing -> staged -> done，可 retryable failed 回 queued。
+JOB_STATES = ("queued", "parsing", "staged", "done", "failed", "cancelled", "superseded")
+#: 非终态（持有/等待资源）。
+JOB_ACTIVE_STATES = ("queued", "parsing", "staged")
+#: 终态。
+JOB_TERMINAL_STATES = ("done", "failed", "cancelled", "superseded")
+#: §12.5 提交阶段（远端恢复）：prepared/submitted/polling/downloaded/staged/committed/submission_unknown。
+JOB_PHASES = (
+    "prepared", "submitted", "polling", "downloaded", "staged", "committed", "submission_unknown",
+)
+#: 租约时长常量（§23.1：租约/锁值必须有常量与配置边界，不散落 magic number）。
+DEFAULT_LEASE_SECONDS = 120.0
+DEFAULT_QUEUE_LIMIT = 1000
 
 
 # --------------------------------------------------------------------------- 值对象
@@ -263,10 +285,64 @@ class QuotaStatus:
     over_limit: bool
 
 
+@dataclass(frozen=True, slots=True)
+class JobRecord:
+    """`ingest_jobs` 一行的值对象（§12.5）。"""
+
+    job_id: str
+    doc_id: str
+    source: str
+    source_sha256: str
+    parser_fingerprint: str
+    vault_epoch: int
+    request_seq: int
+    state: str
+    phase: str
+    owner_token: str
+    lease_until: float
+    attempts: int
+    retry_after: float
+    result_revision: str
+    error_code: str
+    error_summary: str
+    created_at: float
+    updated_at: float
+
+    @property
+    def lease_active(self) -> bool:
+        return bool(self.owner_token) and self.lease_until > time.time()
 
 
+@dataclass(frozen=True, slots=True)
+class DerivedGeneration:
+    """`derived_generations` 一行的值对象（C95）：派生层相对文档事实的代次进度。"""
+
+    profile_key: str
+    change_seq: int
+    chunker_fingerprint: str
+    space_fingerprint: str
+    status: str
+    last_error: str
 
 
+@dataclass(frozen=True, slots=True)
+class MediaOccurrenceSpec:
+    """引用**已存在** blob 的媒体出现规格（C94 流式 sink 用：解析阶段先落 blob）。"""
+
+    occurrence_id: str
+    blob_id: str
+    kind: str
+    ordinal: int
+    mime_type: str = ""
+    page: int | None = None
+    bbox: Any = None
+    t_start_ms: int | None = None
+    t_end_ms: int | None = None
+    caption: str = ""
+    ocr: str = ""
+    width: int | None = None
+    height: int | None = None
+    metadata: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1669,8 +1745,15 @@ class DocumentStore:
         policy_version: str = "",
         source_size: int | None = None,
         source_mtime_ns: int | None = None,
+        job_id: str = "",
+        owner_token: str = "",
     ) -> StagedRevision:
-        '写入一个 staged revision 候选（解析事实，未发布，§12.5 第 3 步）。'
+        """写入一个 staged revision 候选（解析事实，未发布，§12.5 第 3 步）。
+
+        传入 `job_id` + `owner_token` 时启用 **owner/租约 fencing**：token 不匹配（旧 owner
+        晚到、租约过期后 job 被重新领取）→ `OWNERSHIP_LOST`，并且**不允许**覆盖更高
+        `request_seq` 的候选（§12.5「force 增 request_seq，旧任务不能覆盖新任务」）。
+        """
         if not isinstance(markdown, str):
             raise StoreContractError("markdown 必须是字符串")
         if not isinstance(source_sha256, str) or not source_sha256:
@@ -1693,6 +1776,9 @@ class DocumentStore:
         markdown_bytes = len(markdown.encode("utf-8"))
 
         with self.mutation() as conn:
+            if job_id:
+                self._require_job_owner(conn, job_id, owner_token)
+                self._assert_job_not_superseded(conn, job_id)
             limit = self._quota_limit_bytes()
             if limit > 0:
                 md_b, media_b, page_b, _mc, _p = self._logical_breakdown(conn)
@@ -1738,10 +1824,17 @@ class DocumentStore:
             conn.commit()
             return StagedRevision(doc_id=doc_id, revision_id=revision_id, created_at=now)
 
-    def append_media(self, revision_id: str, items: Sequence[MediaSpec]) -> list[str]:
-        '向 staged revision 追加媒体出现；blob 内容寻址，多文档共享同一 blob 行。'
+    def append_media(self, revision_id: str, items: Sequence[MediaSpec], *,
+                     job_id: str = "", owner_token: str = "") -> list[str]:
+        """向 staged revision 追加媒体出现；blob 内容寻址，多文档共享同一 blob 行。
+
+        传入 `job_id` + `owner_token` 时同样做 owner/租约 CAS（旧 owner 追加媒体 0 行）。
+        """
         media_items = list(items)
         with self.mutation() as conn:
+            if job_id:
+                self._require_job_owner(conn, job_id, owner_token)
+                self._assert_job_not_superseded(conn, job_id)
             row = conn.execute(
                 "SELECT doc_id, state FROM document_revisions WHERE revision_id = ?", (revision_id,)
             ).fetchone()
@@ -1849,7 +1942,105 @@ class DocumentStore:
             conn.commit()
             return blob_ids
 
+    def put_media_blob(self, *, data: bytes, mime_type: str, width: int | None = None,
+                       height: int | None = None, duration_ms: int | None = None,
+                       sample_rate: int | None = None) -> str:
+        """把一项媒体**逐项**写入 `media_blobs`（内容寻址），返回 blob_id（§13.2）。
 
+        这是流式 sink 的第一阶段：解析时每读到一个成员就落库并释放 RAM，
+        出现（occurrence）在 revision 建立后再用 `attach_occurrences` 挂上去。
+        尚无引用的 blob 由 `gc_unreferenced()` 回收，不会泄漏。
+        """
+        if not isinstance(data, (bytes, bytearray)):
+            raise StoreContractError("media data 必须是 bytes")
+        payload = bytes(data)
+        if not isinstance(mime_type, str) or not mime_type:
+            raise StoreContractError("mime_type 必填")
+        blob_id = hashlib.sha256(payload).hexdigest()
+        with self.mutation() as conn:
+            existing = conn.execute(
+                "SELECT mime_type, byte_size FROM media_blobs WHERE blob_id = ?", (blob_id,)
+            ).fetchone()
+            if existing is not None:
+                if str(existing[0]) != mime_type or int(existing[1]) != len(payload):
+                    raise StoreContractError(
+                        f"blob {blob_id} 已存在但 mime/byte_size 不一致"
+                        f"（库内 {existing[0]}/{existing[1]} ≠ {mime_type}/{len(payload)}）"
+                    )
+                return blob_id
+            limit = self._quota_limit_bytes()
+            if limit > 0:
+                md_b, media_b, page_b, _mc, _p = self._logical_breakdown(conn)
+                if md_b + media_b + page_b + len(payload) > limit:
+                    raise StoreQuotaExceeded(
+                        f"写入媒体后将超过 doc_store quota（{md_b + media_b + page_b + len(payload)} > {limit}）",
+                        fix="显式清理/维护或提高 doc_store.max_size_mb；不能偷偷删除计费资产。",
+                    )
+            self._write(
+                conn,
+                "INSERT INTO media_blobs (blob_id, mime_type, byte_size, data, checksum, width, "
+                "height, duration_ms, sample_rate, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (blob_id, mime_type, len(payload), sqlite3.Binary(payload), blob_id,
+                 _validate_opt_int(width, "width", min_value=0),
+                 _validate_opt_int(height, "height", min_value=0),
+                 _validate_opt_int(duration_ms, "duration_ms", min_value=0),
+                 _validate_opt_int(sample_rate, "sample_rate", min_value=0), time.time()),
+            )
+            conn.commit()
+        return blob_id
+
+    def attach_occurrences(self, revision_id: str, occurrences: Sequence[MediaOccurrenceSpec], *,
+                           job_id: str = "", owner_token: str = "") -> int:
+        """把已落库的 blob 挂成 staged revision 的媒体出现（流式 sink 的第二阶段）。"""
+        items = list(occurrences)
+        with self.mutation() as conn:
+            if job_id:
+                self._require_job_owner(conn, job_id, owner_token)
+                self._assert_job_not_superseded(conn, job_id)
+            row = conn.execute(
+                "SELECT state FROM document_revisions WHERE revision_id = ?", (revision_id,)
+            ).fetchone()
+            if row is None:
+                raise StoreContractError(f"revision {revision_id!r} 不存在")
+            if str(row[0]) != "staged":
+                raise StoreContractError("仅 staged revision 可挂媒体出现")
+            inserted = 0
+            for item in items:
+                if not isinstance(item, MediaOccurrenceSpec):
+                    raise StoreContractError("occurrences 必须是 MediaOccurrenceSpec 序列")
+                exists = conn.execute(
+                    "SELECT 1 FROM media_blobs WHERE blob_id = ?", (item.blob_id,)
+                ).fetchone()
+                if exists is None:
+                    raise StoreContractError(
+                        f"blob {item.blob_id} 不存在", fix="先用 put_media_blob 落 blob 再挂出现。"
+                    )
+                bbox_json = _dump_json(list(item.bbox), "media.bbox") if item.bbox is not None else None
+                meta_json = _dump_json(item.metadata or {}, "media.metadata")
+                try:
+                    conn.execute(
+                        "INSERT INTO media_occurrences (revision_id, occurrence_id, blob_id, kind, ordinal, "
+                        "page, bbox_json, t_start_ms, t_end_ms, caption, ocr, anchor_start, anchor_end, "
+                        "metadata_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            revision_id, item.occurrence_id, item.blob_id, item.kind, int(item.ordinal),
+                            _validate_opt_int(item.page, "media.page", min_value=1), bbox_json,
+                            _validate_opt_int(item.t_start_ms, "media.t_start_ms", min_value=0),
+                            _validate_opt_int(item.t_end_ms, "media.t_end_ms", min_value=0),
+                            str(item.caption or ""), str(item.ocr or ""),
+                            _validate_opt_int(item.width, "media.width", min_value=0),
+                            _validate_opt_int(item.height, "media.height", min_value=0),
+                            meta_json,
+                        ),
+                    )
+                except sqlite3.IntegrityError as exc:
+                    raise StoreContractError(
+                        f"occurrence 主键冲突 (revision={revision_id}, occurrence={item.occurrence_id}): {exc}",
+                        fix="同一 revision 内 occurrence_id 必须唯一。",
+                    ) from exc
+                inserted += 1
+            conn.commit()
+            return inserted
 
     def commit_revision(
         self,
@@ -1863,94 +2054,179 @@ class DocumentStore:
     ) -> int:
         """单事务发布（§12.5 第 5 步）：CAS + 切 active + change_seq+1 + 保留策略。"""
         with self.mutation() as conn:
-            row = conn.execute(
-                "SELECT doc_id, source_sha256, state, vault_epoch, policy_version "
-                "FROM document_revisions WHERE revision_id = ?",
-                (revision_id,),
-            ).fetchone()
-            if row is None:
-                raise StoreContractError(
-                    f"revision {revision_id!r} 不存在", fix="只能提交已 stage 的候选。"
-                )
-            doc_id = str(row[0])
-            staged_sha = str(row[1])
-            state = str(row[2])
-            rev_epoch = int(row[3])
-            rev_policy = str(row[4])
-            if state != "staged":
-                raise StoreContractError(
-                    "只能提交 staged revision", fix="committed 版本不可重复提交。"
-                )
+            return self._commit_locked(
+                conn,
+                revision_id,
+                expected_change_seq=expected_change_seq,
+                source_sha256=source_sha256,
+                source_size=source_size,
+                source_mtime_ns=source_mtime_ns,
+                policy_version=policy_version,
+            )
 
-            cur_seq = int(conn.execute("SELECT change_seq FROM store_meta WHERE id = 1").fetchone()[0])
-            if expected_change_seq is not None and int(expected_change_seq) != cur_seq:
-                raise StoreConflict(
-                    f"expected_change_seq={expected_change_seq} 与当前 {cur_seq} 不符（发布被抢占）",
-                    fix="重新读取 change_seq 后重试；旧任务不得覆盖新事实。",
-                )
-            if source_sha256 is not None and str(source_sha256) != staged_sha:
-                raise StoreConflict(
-                    "提交时源 SHA 与 staged 记录不符（源在解析后又被改动）",
-                    fix="废弃候选并重新扫描源。",
-                )
-            cur_epoch = self._current_epoch()
-            if rev_epoch != cur_epoch:
-                raise StoreConflict(
-                    f"revision 记录于 epoch {rev_epoch}，当前 epoch {cur_epoch}（旧 worker 不能复活）",
-                    fix="移库/import/purge 后 epoch 递增，旧候选必须重新排队。",
-                )
-            # 发布前再核一次 quota：stage 之后其它文档可能已经吃掉了余量（§12.3）。
-            limit = self._quota_limit_bytes()
-            if limit > 0:
-                md_b, media_b, page_b, _mc, _p = self._logical_breakdown(conn)
-                if md_b + media_b + page_b > limit:
-                    raise StoreQuotaExceeded(
-                        f"提交后将超过 doc_store quota（{md_b + media_b + page_b} > {limit} 字节）",
-                        fix="显式清理/维护或提高 doc_store.max_size_mb；不能偷偷删除计费资产。",
-                    )
+    def commit_job_revision(
+        self,
+        job_id: str,
+        owner_token: str,
+        revision_id: str,
+        *,
+        expected_change_seq: int | None = None,
+        source_sha256: str | None = None,
+        source_size: int | None = None,
+        source_mtime_ns: int | None = None,
+        policy_version: str | None = None,
+        state: str = "done",
+    ) -> int:
+        """**同一事务**完成「发布 revision + 任务终态」（§12.5 第 5 步：不能先 done 后写库）。
 
-            doc = conn.execute(
-                "SELECT visibility, active_revision FROM documents WHERE doc_id = ?", (doc_id,)
-            ).fetchone()
-            visibility = str(doc[0])
-            prev_active = str(doc[1]) if doc[1] else ""
-            effective_policy = policy_version if policy_version is not None else rev_policy
+        任一步失败（owner 丢失 / CAS 冲突 / quota）→ 整批回滚：不会出现
+        「库里有新事实、任务还是 parsing」或「任务已 done、库没变」的半套状态。
+        """
+        if state not in JOB_TERMINAL_STATES and state != "staged":
+            raise StoreContractError(
+                f"commit_job_revision 的终态必须是 {JOB_TERMINAL_STATES} 之一（或 'staged'），收到 {state!r}"
+            )
+        with self.mutation() as conn:
+            self._require_job_owner(conn, job_id, owner_token)
+            self._assert_job_not_superseded(conn, job_id)
+            seq = self._commit_locked(
+                conn,
+                revision_id,
+                expected_change_seq=expected_change_seq,
+                source_sha256=source_sha256,
+                source_size=source_size,
+                source_mtime_ns=source_mtime_ns,
+                policy_version=policy_version,
+            )
             now = time.time()
-            new_seq = cur_seq + 1
-
-            conn.execute(
-                "UPDATE document_revisions SET state = 'committed', committed_at = ? WHERE revision_id = ?",
-                (now, revision_id),
+            row = conn.execute(
+                "SELECT source FROM ingest_jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            source = str(row[0]) if row is not None and row[0] else ""
+            doc_id = ""
+            doc_row = conn.execute(
+                "SELECT doc_id FROM document_revisions WHERE revision_id = ?", (revision_id,)
+            ).fetchone()
+            if doc_row is not None:
+                doc_id = str(doc_row[0])
+            self._write(
+                conn,
+                "UPDATE ingest_jobs SET state = ?, phase = ?, result_revision = ?, doc_id = COALESCE(NULLIF(?, ''), doc_id), "
+                "error_code = '', error_summary = '', updated_at = ? WHERE job_id = ? AND owner_token = ?",
+                (state, "committed" if state == "done" else "staged", revision_id, doc_id, now, job_id, owner_token),
             )
-            if visibility == "exempt":
-                # §12.3：exempt 不发布——保留解析事实，不设 active_revision。
-                conn.execute(
-                    "UPDATE documents SET policy_version = ?, updated_at = ? WHERE doc_id = ?",
-                    (effective_policy, now, doc_id),
+            if source:
+                self._write(
+                    conn,
+                    "UPDATE auto_seen SET state = ?, last_job_id = ?, source_sha256 = COALESCE(source_sha256, source_sha256), "
+                    "last_seen_scan = ? WHERE source = ?",
+                    (state, job_id, now, source),
                 )
-            else:
-                conn.execute(
-                    "UPDATE documents SET active_revision = ?, visibility = 'active', "
-                    "source_size = COALESCE(?, source_size), source_mtime_ns = COALESCE(?, source_mtime_ns), "
-                    "source_sha256 = ?, policy_version = ?, updated_at = ? WHERE doc_id = ?",
-                    (
-                        revision_id,
-                        _validate_opt_int(source_size, "source_size", min_value=0),
-                        _validate_opt_int(source_mtime_ns, "source_mtime_ns", min_value=0),
-                        staged_sha, effective_policy, now, doc_id,
-                    ),
-                )
-            conn.execute("UPDATE store_meta SET change_seq = ? WHERE id = 1", (new_seq,))
-
-            # 保留 active + 上一 committed；删同 doc 其它 staged 与超保留的旧 committed。
-            conn.execute(
-                "DELETE FROM document_revisions WHERE doc_id = ? AND state = 'staged'", (doc_id,)
-            )
-            self._prune_committed(conn, doc_id, keep=[revision_id, prev_active])
             conn.commit()
-            return new_seq
+            return seq
 
+    def _commit_locked(
+        self,
+        conn: sqlite3.Connection,
+        revision_id: str,
+        *,
+        expected_change_seq: int | None = None,
+        source_sha256: str | None = None,
+        source_size: int | None = None,
+        source_mtime_ns: int | None = None,
+        policy_version: str | None = None,
+    ) -> int:
+        """`commit_revision` 的事务主体（调用方已在 mutation 锁内）。
 
+        CAS 顺序（§12.5 第 4/5 步）：state=staged → expected_change_seq → 源 SHA →
+        epoch fencing → quota 复核 → 切 active → change_seq+1 → 保留策略。
+        """
+        row = conn.execute(
+            "SELECT doc_id, source_sha256, state, vault_epoch, policy_version "
+            "FROM document_revisions WHERE revision_id = ?",
+            (revision_id,),
+        ).fetchone()
+        if row is None:
+            raise StoreContractError(
+                f"revision {revision_id!r} 不存在", fix="只能提交已 stage 的候选。"
+            )
+        doc_id = str(row[0])
+        staged_sha = str(row[1])
+        state = str(row[2])
+        rev_epoch = int(row[3])
+        rev_policy = str(row[4])
+        if state != "staged":
+            raise StoreContractError(
+                "只能提交 staged revision", fix="committed 版本不可重复提交。"
+            )
+
+        cur_seq = int(conn.execute("SELECT change_seq FROM store_meta WHERE id = 1").fetchone()[0])
+        if expected_change_seq is not None and int(expected_change_seq) != cur_seq:
+            raise StoreConflict(
+                f"expected_change_seq={expected_change_seq} 与当前 {cur_seq} 不符（发布被抢占）",
+                fix="重新读取 change_seq 后重试；旧任务不得覆盖新事实。",
+            )
+        if source_sha256 is not None and str(source_sha256) != staged_sha:
+            raise StoreConflict(
+                "提交时源 SHA 与 staged 记录不符（源在解析后又被改动）",
+                fix="废弃候选并重新扫描源。",
+            )
+        cur_epoch = self._current_epoch()
+        if rev_epoch != cur_epoch:
+            raise StoreConflict(
+                f"revision 记录于 epoch {rev_epoch}，当前 epoch {cur_epoch}（旧 worker 不能复活）",
+                fix="移库/import/purge 后 epoch 递增，旧候选必须重新排队。",
+            )
+        # 发布前再核一次 quota：stage 之后其它文档可能已经吃掉了余量（§12.3）。
+        limit = self._quota_limit_bytes()
+        if limit > 0:
+            md_b, media_b, page_b, _mc, _p = self._logical_breakdown(conn)
+            if md_b + media_b + page_b > limit:
+                raise StoreQuotaExceeded(
+                    f"提交后将超过 doc_store quota（{md_b + media_b + page_b} > {limit} 字节）",
+                    fix="显式清理/维护或提高 doc_store.max_size_mb；不能偷偷删除计费资产。",
+                )
+
+        doc = conn.execute(
+            "SELECT visibility, active_revision FROM documents WHERE doc_id = ?", (doc_id,)
+        ).fetchone()
+        visibility = str(doc[0])
+        prev_active = str(doc[1]) if doc[1] else ""
+        effective_policy = policy_version if policy_version is not None else rev_policy
+        now = time.time()
+        new_seq = cur_seq + 1
+
+        conn.execute(
+            "UPDATE document_revisions SET state = 'committed', committed_at = ? WHERE revision_id = ?",
+            (now, revision_id),
+        )
+        if visibility == "exempt":
+            # §12.3：exempt 不发布——保留解析事实，不设 active_revision。
+            conn.execute(
+                "UPDATE documents SET policy_version = ?, updated_at = ? WHERE doc_id = ?",
+                (effective_policy, now, doc_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE documents SET active_revision = ?, visibility = 'active', "
+                "source_size = COALESCE(?, source_size), source_mtime_ns = COALESCE(?, source_mtime_ns), "
+                "source_sha256 = ?, policy_version = ?, updated_at = ? WHERE doc_id = ?",
+                (
+                    revision_id,
+                    _validate_opt_int(source_size, "source_size", min_value=0),
+                    _validate_opt_int(source_mtime_ns, "source_mtime_ns", min_value=0),
+                    staged_sha, effective_policy, now, doc_id,
+                ),
+            )
+        conn.execute("UPDATE store_meta SET change_seq = ? WHERE id = 1", (new_seq,))
+
+        # 保留 active + 上一 committed；删同 doc 其它 staged 与超保留的旧 committed。
+        conn.execute(
+            "DELETE FROM document_revisions WHERE doc_id = ? AND state = 'staged'", (doc_id,)
+        )
+        self._prune_committed(conn, doc_id, keep=[revision_id, prev_active])
+        conn.commit()
+        return new_seq
 
     def _prune_committed(self, conn: sqlite3.Connection, doc_id: str, keep: Sequence[str]) -> None:
         kept = {k for k in keep if k}
@@ -1979,6 +2255,545 @@ class DocumentStore:
             conn.execute("DELETE FROM document_revisions WHERE revision_id = ?", (revision_id,))
             conn.commit()
             return True
+
+    # ------------------------------------------------------------------ 任务/租约（C94）
+
+    _JOB_COLUMNS = (
+        "job_id, doc_id, source, source_sha256, parser_fingerprint, vault_epoch, request_seq, "
+        "state, phase, owner_token, lease_until, attempts, retry_after, result_revision, "
+        "error_code, error_summary, created_at, updated_at"
+    )
+
+    @staticmethod
+    def _row_to_job(row: Sequence[Any]) -> JobRecord:
+        return JobRecord(
+            job_id=str(row[0]),
+            doc_id=str(row[1] or ""),
+            source=str(row[2] or ""),
+            source_sha256=str(row[3] or ""),
+            parser_fingerprint=str(row[4] or ""),
+            vault_epoch=int(row[5] or 0),
+            request_seq=int(row[6] or 0),
+            state=str(row[7]),
+            phase=str(row[8] or ""),
+            owner_token=str(row[9] or ""),
+            lease_until=float(row[10] or 0.0),
+            attempts=int(row[11] or 0),
+            retry_after=float(row[12] or 0.0),
+            result_revision=str(row[13] or ""),
+            error_code=str(row[14] or ""),
+            error_summary=str(row[15] or ""),
+            created_at=float(row[16] or 0.0),
+            updated_at=float(row[17] or 0.0),
+        )
+
+    def _job_row(self, conn: sqlite3.Connection, job_id: str) -> JobRecord | None:
+        row = conn.execute(
+            f"SELECT {self._JOB_COLUMNS} FROM ingest_jobs WHERE job_id = ?", (job_id,)
+        ).fetchone()
+        return None if row is None else self._row_to_job(row)
+
+    def _queue_limit(self) -> int:
+        ingest = getattr(self.config, "ingest", None) if self.config is not None else None
+        raw = getattr(ingest, "queue_limit", None) if ingest is not None else None
+        if isinstance(raw, bool) or not isinstance(raw, int) or raw < 1:
+            return DEFAULT_QUEUE_LIMIT
+        return int(raw)
+
+    def _require_job_owner(self, conn: sqlite3.Connection, job_id: str, owner_token: str) -> JobRecord:
+        """租约 fencing 的唯一判据（§12.5）：token 必须匹配、状态允许、租约未过期。"""
+        job = self._job_row(conn, job_id)
+        if job is None:
+            raise StoreContractError(
+                f"job {job_id!r} 不存在", fix="先 enqueue_job / 从 store 里读任务。"
+            )
+        if not owner_token or not job.owner_token or job.owner_token != owner_token:
+            raise OwnershipLost(
+                f"job {job_id} 的 owner_token 不匹配（旧 owner 晚到或被重新领取）",
+                fix="旧 worker 必须放弃该候选：重新 claim 或让新 owner 继续。",
+            )
+        if job.state in JOB_TERMINAL_STATES:
+            raise OwnershipLost(f"job {job_id} 已处于终态 {job.state}，不能再写")
+        if job.lease_until <= time.time():
+            raise OwnershipLost(
+                f"job {job_id} 的租约已过期（lease_until={job.lease_until}）",
+                fix="续租成功后才能继续写；过期后的旧 owner 一律 0 行。",
+            )
+        return job
+
+    def _assert_job_not_superseded(self, conn: sqlite3.Connection, job_id: str) -> None:
+        """旧任务不得覆盖新任务（§12.5：force 增 request_seq 后旧任务作废）。"""
+        job = self._job_row(conn, job_id)
+        if job is None:
+            return
+        if job.state == "superseded":
+            raise OwnershipLost(f"job {job_id} 已被更新的请求取代（superseded）")
+        if not job.source:
+            return
+        row = conn.execute(
+            "SELECT MAX(request_seq) FROM ingest_jobs WHERE source = ? "
+            "AND state NOT IN ('cancelled', 'superseded')",
+            (job.source,),
+        ).fetchone()
+        if row is not None and row[0] is not None and int(row[0]) > job.request_seq:
+            raise StoreConflict(
+                f"源 {job.source} 已存在更新的任务（request_seq={int(row[0])} > {job.request_seq}）",
+                fix="旧任务的结果必须废弃；不要用晚到的解析覆盖新事实。",
+            )
+
+    def enqueue_job(
+        self,
+        *,
+        source: str,
+        source_sha256: str,
+        parser_fingerprint: str,
+        policy_version: str = "",
+        force: bool = False,
+        request_seq: int | None = None,
+    ) -> tuple[JobRecord, bool]:
+        """入队（§12.5 第 1 步）：容量、合并、force 递增 request_seq。
+
+        返回 `(job, created)`；`created=False` 表示命中「同源 + 同 SHA + 同 parser + 同 epoch」
+        的活跃任务（合并，不重复解析）。
+        """
+        rel = normalize_source_path(source, self.layout.vault_path)
+        if not isinstance(source_sha256, str) or not source_sha256:
+            raise StoreContractError("source_sha256 必填")
+        if not isinstance(parser_fingerprint, str) or not parser_fingerprint:
+            raise StoreContractError("parser_fingerprint 必填")
+        with self.mutation() as conn:
+            epoch = self._current_epoch()
+            depth_row = conn.execute(
+                "SELECT COUNT(*) FROM ingest_jobs WHERE state IN ('queued', 'parsing', 'staged')"
+            ).fetchone()
+            depth = int(depth_row[0]) if depth_row is not None else 0
+            if not force:
+                existing = conn.execute(
+                    f"SELECT {self._JOB_COLUMNS} FROM ingest_jobs WHERE source = ? AND source_sha256 = ? "
+                    "AND parser_fingerprint = ? AND vault_epoch = ? "
+                    "AND state IN ('queued', 'parsing', 'staged') "
+                    "ORDER BY request_seq DESC LIMIT 1",
+                    (rel, source_sha256, parser_fingerprint, epoch),
+                ).fetchone()
+                if existing is not None:
+                    return self._row_to_job(existing), False
+            limit = self._queue_limit()
+            if depth >= limit:
+                raise QueueFull(
+                    f"摄取队列已满（{depth}/{limit}）",
+                    fix="等待现有任务结束或提高 ingest.queue_limit；不要丢弃已有任务。",
+                )
+            now = time.time()
+            if request_seq is None:
+                seq_row = conn.execute(
+                    "SELECT COALESCE(MAX(request_seq), 0) FROM ingest_jobs WHERE source = ?", (rel,)
+                ).fetchone()
+                request_seq = int(seq_row[0]) + 1 if seq_row is not None else 1
+            request_seq = int(request_seq)
+            if force:
+                conn.execute(
+                    "UPDATE ingest_jobs SET state = 'superseded', owner_token = '', lease_until = 0, "
+                    "updated_at = ? WHERE source = ? AND state IN ('queued', 'parsing', 'staged') "
+                    "AND request_seq < ?",
+                    (now, rel, request_seq),
+                )
+            doc_row = conn.execute("SELECT doc_id FROM documents WHERE source = ?", (rel,)).fetchone()
+            doc_id = str(doc_row[0]) if doc_row is not None else ""
+            job_id = uuid.uuid4().hex
+            self._write(
+                conn,
+                "INSERT INTO ingest_jobs (job_id, doc_id, source, source_sha256, parser_fingerprint, "
+                "vault_epoch, request_seq, state, phase, owner_token, lease_until, attempts, retry_after, "
+                "result_revision, error_code, error_summary, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', 'prepared', '', 0, 0, 0, '', '', '', ?, ?)",
+                (job_id, doc_id, rel, source_sha256, parser_fingerprint, epoch, request_seq, now, now),
+            )
+            conn.execute(
+                "INSERT INTO auto_seen (source, source_sha256, last_job_id, policy, state, "
+                "source_size, source_mtime_ns, source_ctime_ns, last_seen_scan) "
+                "VALUES (?, ?, ?, ?, 'queued', NULL, NULL, NULL, ?) "
+                "ON CONFLICT(source) DO UPDATE SET source_sha256 = excluded.source_sha256, "
+                "last_job_id = excluded.last_job_id, state = 'queued', policy = excluded.policy, "
+                "last_seen_scan = excluded.last_seen_scan",
+                (rel, source_sha256, job_id, str(policy_version or ""), now),
+            )
+            conn.commit()
+            row = self._job_row(conn, job_id)
+            assert row is not None
+            return row, True
+
+    def claim_job(self, owner_token: str, *, lease_seconds: float = DEFAULT_LEASE_SECONDS,
+                  now: float | None = None) -> JobRecord | None:
+        """原子领取（§12.5 第 2 步）：换 owner_token + 续租；跨进程只有一个 owner。
+
+        CAS 条件写在 UPDATE 的 WHERE 里，两个进程同时领同一 job 只有一个 `rowcount == 1`。
+        """
+        if not owner_token:
+            raise StoreContractError("claim_job 需要非空 owner_token")
+        stamp = time.time() if now is None else float(now)
+        lease = max(float(lease_seconds), 1.0)
+        with self.mutation() as conn:
+            rows = conn.execute(
+                "SELECT job_id FROM ingest_jobs "
+                "WHERE state = 'queued' "
+                "   OR (state = 'parsing' AND (lease_until IS NULL OR lease_until <= ?)) "
+                "ORDER BY created_at, job_id LIMIT 16",
+                (stamp,),
+            ).fetchall()
+            for (job_id,) in rows:
+                cursor = conn.execute(
+                    "UPDATE ingest_jobs SET owner_token = ?, lease_until = ?, state = 'parsing', "
+                    "phase = 'parsing', attempts = attempts + 1, error_code = '', error_summary = '', "
+                    "updated_at = ? WHERE job_id = ? "
+                    "  AND (state = 'queued' "
+                    "       OR (state = 'parsing' AND (lease_until IS NULL OR lease_until <= ?)))",
+                    (owner_token, stamp + lease, stamp, str(job_id), stamp),
+                )
+                if cursor.rowcount == 1:
+                    conn.commit()
+                    return self._job_row(conn, str(job_id))
+            conn.commit()
+            return None
+
+    def renew_lease(self, job_id: str, owner_token: str, *,
+                    lease_seconds: float = DEFAULT_LEASE_SECONDS) -> JobRecord:
+        """续租 CAS：影响 0 行 → OWNERSHIP_LOST（不无条件覆盖 job）。"""
+        with self.mutation() as conn:
+            stamp = time.time()
+            cursor = conn.execute(
+                "UPDATE ingest_jobs SET lease_until = ?, updated_at = ? WHERE job_id = ? "
+                "AND owner_token = ? AND state IN ('parsing', 'staged') AND lease_until > ?",
+                (stamp + max(float(lease_seconds), 1.0), stamp, job_id, owner_token, stamp),
+            )
+            if cursor.rowcount != 1:
+                raise OwnershipLost(
+                    f"job {job_id} 续租失败（owner 不匹配、已终态或租约已过期）",
+                    fix="停止接收与发布；由新 owner 重新 claim，旧 owner 的一切写入必须 0 行。",
+                )
+            conn.commit()
+            row = self._job_row(conn, job_id)
+            assert row is not None
+            return row
+
+    def report_phase(self, job_id: str, owner_token: str, *, phase: str,
+                     remote_task_id: str = "", checkpoint: str = "",
+                     error: str = "") -> None:
+        """记录提交阶段（§12.5 远端恢复）与远端 task id。
+
+        `ingest_subjobs` 的 ordinal 0 保留给「整份文档的远端阶段」（分卷/音频用 1..n）。
+        """
+        if phase not in JOB_PHASES:
+            raise StoreContractError(f"phase 必须是 {JOB_PHASES} 之一，收到 {phase!r}")
+        with self.mutation() as conn:
+            self._require_job_owner(conn, job_id, owner_token)
+            stamp = time.time()
+            self._write(
+                conn,
+                "UPDATE ingest_jobs SET phase = ?, updated_at = ? WHERE job_id = ? AND owner_token = ?",
+                (phase, stamp, job_id, owner_token),
+            )
+            conn.execute(
+                "INSERT INTO ingest_subjobs (job_id, ordinal, input_hash, range_json, state, "
+                "remote_task_id, checkpoint, error) VALUES (?, 0, NULL, NULL, ?, ?, ?, ?) "
+                "ON CONFLICT(job_id, ordinal) DO UPDATE SET state = excluded.state, "
+                "remote_task_id = CASE WHEN excluded.remote_task_id <> '' "
+                "                      THEN excluded.remote_task_id ELSE ingest_subjobs.remote_task_id END, "
+                "checkpoint = excluded.checkpoint, error = excluded.error",
+                (job_id, phase, str(remote_task_id or ""), str(checkpoint or ""), str(error or "")),
+            )
+            conn.commit()
+
+    def fail_job(self, job_id: str, owner_token: str, *, error_code: str,
+                 error_summary: str = "", retryable: bool = False,
+                 retry_after: float | None = None) -> JobRecord:
+        """终态失败/可重试失败（§12.5）。可重试失败保持 `failed`，由显式 retry 回 queued。"""
+        with self.mutation() as conn:
+            self._require_job_owner(conn, job_id, owner_token)
+            stamp = time.time()
+            after = float(retry_after) if retry_after is not None else 0.0
+            self._write(
+                conn,
+                "UPDATE ingest_jobs SET state = 'failed', owner_token = '', lease_until = 0, "
+                "error_code = ?, error_summary = ?, retry_after = ?, updated_at = ? WHERE job_id = ?",
+                (str(error_code)[:120], str(error_summary)[:500], after, stamp, job_id),
+            )
+            job = self._job_row(conn, job_id)
+            assert job is not None
+            conn.execute(
+                "UPDATE auto_seen SET state = 'failed', last_seen_scan = ? WHERE source = ?",
+                (stamp, job.source),
+            )
+            conn.commit()
+            return job
+
+    def cancel_job(self, job_id: str) -> bool:
+        """合作式取消（§12.5：不能声称可强杀原生解析库）。终态任务不可取消。"""
+        with self.mutation() as conn:
+            stamp = time.time()
+            cursor = conn.execute(
+                "UPDATE ingest_jobs SET state = 'cancelled', owner_token = '', lease_until = 0, "
+                "updated_at = ? WHERE job_id = ? AND state IN ('queued', 'parsing', 'staged')",
+                (stamp, job_id),
+            )
+            conn.commit()
+            return cursor.rowcount == 1
+
+    def retry_job(self, job_id: str) -> JobRecord:
+        """显式重试：可重试失败回到 queued（**不是**自动重传；未知受理必须人工确认后调用）。"""
+        with self.mutation() as conn:
+            job = self._job_row(conn, job_id)
+            if job is None:
+                raise StoreContractError(f"job {job_id!r} 不存在")
+            if job.state not in ("failed", "cancelled"):
+                raise StoreContractError(
+                    f"job {job_id} 当前状态 {job.state} 不可重试",
+                    fix="只有 failed/cancelled 的任务可以显式重试。",
+                )
+            stamp = time.time()
+            self._write(
+                conn,
+                "UPDATE ingest_jobs SET state = 'queued', phase = 'prepared', owner_token = '', "
+                "lease_until = 0, error_code = '', error_summary = '', retry_after = 0, "
+                "updated_at = ? WHERE job_id = ?",
+                (stamp, job_id),
+            )
+            conn.execute(
+                "UPDATE auto_seen SET state = 'queued', last_seen_scan = ? WHERE source = ?",
+                (stamp, job.source),
+            )
+            conn.commit()
+            updated = self._job_row(conn, job_id)
+            assert updated is not None
+            return updated
+
+    def job_status(self, job_id: str) -> JobRecord | None:
+        gen = self._ensure_read_generation()
+        if not gen:
+            return None
+        conn = self._open_conn(gen)
+        return self._job_row(conn, job_id)
+
+    def list_jobs(self, *, source: str = "", state: str = "", limit: int = 50) -> list[JobRecord]:
+        gen = self._ensure_read_generation()
+        if not gen:
+            return []
+        conn = self._open_conn(gen)
+        clauses: list[str] = []
+        params: list[Any] = []
+        if source:
+            clauses.append("source = ?")
+            params.append(normalize_source_path(source, self.layout.vault_path))
+        if state:
+            if state not in JOB_STATES:
+                raise StoreContractError(f"state 必须是 {JOB_STATES} 之一，收到 {state!r}")
+            clauses.append("state = ?")
+            params.append(state)
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        rows = self._query_all(
+            conn,
+            f"SELECT {self._JOB_COLUMNS} FROM ingest_jobs {where} "
+            "ORDER BY created_at DESC, job_id DESC LIMIT ?",
+            (*params, max(1, int(limit))),
+            what="任务列表",
+        )
+        return [self._row_to_job(row) for row in rows]
+
+    def queue_depth(self) -> int:
+        gen = self._ensure_read_generation()
+        if not gen:
+            return 0
+        conn = self._open_conn(gen)
+        row = self._query_one(
+            conn,
+            "SELECT COUNT(*) FROM ingest_jobs WHERE state IN ('queued', 'parsing', 'staged')",
+            what="队列深度",
+        )
+        return int(row[0]) if row is not None else 0
+
+    # ------------------------------------------------------------ 去重账本/派生代次
+
+    def record_auto_seen(self, source: str, *, source_sha256: str = "", last_job_id: str = "",
+                         state: str = "", policy: str = "", source_size: int | None = None,
+                         source_mtime_ns: int | None = None,
+                         source_ctime_ns: int | None = None) -> None:
+        """写 `auto_seen` 去重事实（§12.3：历史 job 裁剪不删去重事实）。"""
+        rel = normalize_source_path(source, self.layout.vault_path)
+        with self.mutation() as conn:
+            now = time.time()
+            conn.execute(
+                "INSERT INTO auto_seen (source, source_sha256, last_job_id, policy, state, source_size, "
+                "source_mtime_ns, source_ctime_ns, last_seen_scan) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(source) DO UPDATE SET "
+                "source_sha256 = CASE WHEN excluded.source_sha256 <> '' THEN excluded.source_sha256 "
+                "                     ELSE auto_seen.source_sha256 END, "
+                "last_job_id = CASE WHEN excluded.last_job_id <> '' THEN excluded.last_job_id "
+                "                   ELSE auto_seen.last_job_id END, "
+                "policy = CASE WHEN excluded.policy <> '' THEN excluded.policy ELSE auto_seen.policy END, "
+                "state = CASE WHEN excluded.state <> '' THEN excluded.state ELSE auto_seen.state END, "
+                "source_size = COALESCE(excluded.source_size, auto_seen.source_size), "
+                "source_mtime_ns = COALESCE(excluded.source_mtime_ns, auto_seen.source_mtime_ns), "
+                "source_ctime_ns = COALESCE(excluded.source_ctime_ns, auto_seen.source_ctime_ns), "
+                "last_seen_scan = excluded.last_seen_scan",
+                (rel, str(source_sha256 or ""), str(last_job_id or ""), str(policy or ""),
+                 str(state or ""), _validate_opt_int(source_size, "source_size", min_value=0),
+                 _validate_opt_int(source_mtime_ns, "source_mtime_ns", min_value=0),
+                 _validate_opt_int(source_ctime_ns, "source_ctime_ns", min_value=0), now),
+            )
+            conn.commit()
+
+    def iter_auto_seen(self) -> Iterator[dict[str, Any]]:
+        gen = self._ensure_read_generation()
+        if not gen:
+            return
+        conn = self._open_conn(gen)
+        rows = self._query_all(
+            conn,
+            "SELECT source, source_sha256, last_job_id, policy, state, source_size, source_mtime_ns, "
+            "source_ctime_ns, last_seen_scan FROM auto_seen ORDER BY source",
+            what="去重账本",
+        )
+        for row in rows:
+            yield {
+                "source": str(row[0]),
+                "source_sha256": str(row[1] or ""),
+                "last_job_id": str(row[2] or ""),
+                "policy": str(row[3] or ""),
+                "state": str(row[4] or ""),
+                "source_size": None if row[5] is None else int(row[5]),
+                "source_mtime_ns": None if row[6] is None else int(row[6]),
+                "source_ctime_ns": None if row[7] is None else int(row[7]),
+                "last_seen_scan": float(row[8] or 0.0),
+            }
+
+    def migrate_legacy_ledger(self, payload: Mapping[str, Any]) -> dict[str, int]:
+        """把旧 `.ingest_state.json` 的**终态事实**按库迁入 store（§20.1 只读迁移）。
+
+        只恢复 `done` / `failed`（可靠终态）与 `auto_seen` 去重事实；
+        **不**恢复 `queued` / `parsing`（旧进程的中间态不得复活，也不得自动重传）。
+        幂等：同 source 的去重事实与同 job_id 的任务不会重复插入。
+        """
+        if not isinstance(payload, Mapping):
+            raise StoreContractError("旧账本必须是 JSON 对象")
+        jobs = payload.get("jobs") or {}
+        seen = payload.get("auto_seen") or {}
+        if not isinstance(jobs, Mapping) or not isinstance(seen, Mapping):
+            raise StoreContractError("旧账本 jobs/auto_seen 必须是对象")
+        restored_jobs = 0
+        restored_seen = 0
+        skipped_active = 0
+        with self.mutation() as conn:
+            now = time.time()
+            epoch = self._current_epoch()
+            for record in jobs.values():
+                if not isinstance(record, Mapping):
+                    continue
+                state = str(record.get("state") or "")
+                if state not in ("done", "failed"):
+                    skipped_active += 1
+                    continue
+                job_id = str(record.get("job_id") or "")
+                source = str(record.get("source") or "")
+                if not job_id or not source:
+                    continue
+                try:
+                    rel = normalize_source_path(source, self.layout.vault_path)
+                except DocStoreError:
+                    skipped_active += 1
+                    continue
+                exists = conn.execute(
+                    "SELECT 1 FROM ingest_jobs WHERE job_id = ?", (job_id,)
+                ).fetchone()
+                if exists is not None:
+                    continue
+                self._write(
+                    conn,
+                    "INSERT INTO ingest_jobs (job_id, doc_id, source, source_sha256, parser_fingerprint, "
+                    "vault_epoch, request_seq, state, phase, owner_token, lease_until, attempts, retry_after, "
+                    "result_revision, error_code, error_summary, created_at, updated_at) "
+                    "VALUES (?, '', ?, ?, '', ?, 0, ?, ?, '', 0, 0, 0, '', ?, ?, ?, ?)",
+                    (
+                        job_id, rel, str(record.get("sha256") or ""), epoch, state,
+                        "committed" if state == "done" else "",
+                        "MIGRATED_LEGACY" if state == "failed" else "",
+                        str(record.get("error") or "")[:500],
+                        float(record.get("submitted_at") or now),
+                        float(record.get("finished_at") or record.get("submitted_at") or now),
+                    ),
+                )
+                restored_jobs += 1
+            for source, record in seen.items():
+                if not isinstance(record, Mapping):
+                    continue
+                try:
+                    rel = normalize_source_path(str(source), self.layout.vault_path)
+                except DocStoreError:
+                    continue
+                exists = conn.execute(
+                    "SELECT 1 FROM auto_seen WHERE source = ?", (rel,)
+                ).fetchone()
+                if exists is not None:
+                    continue
+                conn.execute(
+                    "INSERT INTO auto_seen (source, source_sha256, last_job_id, policy, state, "
+                    "source_size, source_mtime_ns, source_ctime_ns, last_seen_scan) "
+                    "VALUES (?, ?, ?, '', ?, NULL, NULL, NULL, ?)",
+                    (rel, str(record.get("sha256") or ""), str(record.get("last_job_id") or ""),
+                     str(record.get("state") or "migrated"),
+                     float(record.get("submitted_at") or now)),
+                )
+                restored_seen += 1
+            conn.commit()
+        return {
+            "restored_jobs": restored_jobs,
+            "restored_auto_seen": restored_seen,
+            "skipped_active_states": skipped_active,
+        }
+
+    def get_derived_generation(self, profile_key: str) -> DerivedGeneration | None:
+        gen = self._ensure_read_generation()
+        if not gen:
+            return None
+        conn = self._open_conn(gen)
+        row = self._query_one(
+            conn,
+            "SELECT profile_key, change_seq, chunker_fingerprint, space_fingerprint, status, last_error "
+            "FROM derived_generations WHERE profile_key = ?",
+            (str(profile_key),),
+            what=f"derived_generations（{profile_key!r}）",
+        )
+        if row is None:
+            return None
+        return DerivedGeneration(
+            profile_key=str(row[0]),
+            change_seq=int(row[1] or 0),
+            chunker_fingerprint=str(row[2] or ""),
+            space_fingerprint=str(row[3] or ""),
+            status=str(row[4] or ""),
+            last_error=str(row[5] or ""),
+        )
+
+    def mark_derived_generation(self, profile_key: str, *, change_seq: int,
+                                chunker_fingerprint: str, space_fingerprint: str,
+                                status: str, last_error: str = "") -> None:
+        """派生层进度（C95）：只记「已构建到哪个 change_seq」，不替代源核验。"""
+        if not isinstance(profile_key, str) or not profile_key:
+            raise StoreContractError("profile_key 必填")
+        if status not in ("pending", "building", "ready", "failed", "stale"):
+            raise StoreContractError(
+                f"derived status 必须是 pending/building/ready/failed/stale，收到 {status!r}"
+            )
+        with self.mutation() as conn:
+            conn.execute(
+                "INSERT INTO derived_generations (profile_key, change_seq, chunker_fingerprint, "
+                "space_fingerprint, status, last_error) VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(profile_key) DO UPDATE SET change_seq = excluded.change_seq, "
+                "chunker_fingerprint = excluded.chunker_fingerprint, "
+                "space_fingerprint = excluded.space_fingerprint, status = excluded.status, "
+                "last_error = excluded.last_error",
+                (profile_key, int(change_seq), str(chunker_fingerprint), str(space_fingerprint),
+                 status, str(last_error or "")[:500]),
+            )
+            conn.commit()
 
     # ------------------------------------------------------------------ 可见性
 
@@ -2116,12 +2931,33 @@ class DocumentStore:
         return dest
 
     def recover(self, *, stale_before: float | None = None) -> int:
+        """丢弃 staged 候选；不触碰 committed 事实（§12.6）。
+
+        **活候选保护**（C94 修 Lane A 遗留 P3）：仍被「活跃租约任务」持有的源，其 staged
+        候选不清——否则 `recover()` 会删掉另一个活 writer 正在写的半成品。
+        """
         with self.mutation() as conn:
-            rows = conn.execute(
-                "SELECT revision_id FROM document_revisions WHERE state = 'staged'"
-                + (" AND created_at < ?" if stale_before is not None else ""),
-                ((float(stale_before),) if stale_before is not None else ()),
+            stamp = time.time()
+            live_rows = conn.execute(
+                "SELECT DISTINCT source FROM ingest_jobs WHERE state IN ('parsing', 'staged') "
+                "AND source IS NOT NULL AND source <> '' AND lease_until > ?",
+                (stamp,),
             ).fetchall()
+            live_sources = {str(row[0]) for row in live_rows}
+            if live_sources:
+                placeholders = ",".join("?" for _ in live_sources)
+                rows = conn.execute(
+                    "SELECT revision_id FROM document_revisions WHERE state = 'staged' "
+                    f"AND doc_id NOT IN (SELECT doc_id FROM documents WHERE source IN ({placeholders}))"
+                    + (" AND created_at < ?" if stale_before is not None else ""),
+                    (*sorted(live_sources), *((float(stale_before),) if stale_before is not None else ())),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT revision_id FROM document_revisions WHERE state = 'staged'"
+                    + (" AND created_at < ?" if stale_before is not None else ""),
+                    ((float(stale_before),) if stale_before is not None else ()),
+                ).fetchall()
             for (revision_id,) in rows:
                 conn.execute("DELETE FROM document_revisions WHERE revision_id = ?", (str(revision_id),))
             conn.commit()

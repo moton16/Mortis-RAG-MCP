@@ -1,5 +1,6 @@
 import io
 import json
+import time
 import urllib.error
 import urllib.request
 import zipfile
@@ -473,3 +474,127 @@ def test_agent_parse_timeout(monkeypatch, tmp_path: Path):
 
     assert "timeout" in str(exc_info.value)
     assert exc_info.value.retryable is True
+
+
+# ---------------------------------------------------------------- C93 新增（有界/安全/计费意图）
+
+
+def test_retry_after_seconds_date_and_rejects_nan_inf_negative():
+    from email.utils import formatdate
+
+    from mortis_rag_mcp.ingest.models import parse_retry_after
+
+    assert parse_retry_after("45") == 45.0
+    # 拒 NaN/Inf/负数 → 回落 default（不能让退避时间变成垃圾值）
+    assert parse_retry_after("nan") == 60.0
+    assert parse_retry_after("inf") == 60.0
+    assert parse_retry_after("-5") == 60.0
+    assert parse_retry_after("") == 60.0
+    assert parse_retry_after(None) == 60.0
+    # HTTP-date（RFC 9110 允许的第二种形式）
+    future = formatdate(time.time() + 30, usegmt=True)
+    value = parse_retry_after(future)
+    assert 20.0 <= value <= 35.0
+
+
+def test_bounded_read_rejects_declared_content_length_before_reading():
+    from mortis_rag_mcp.ingest.mineru import _read_bounded
+
+    class _Resp:
+        headers = {"Content-Length": "999999"}
+
+        def read(self, _n):  # pragma: no cover - 断言不应被调用
+            raise AssertionError("Content-Length 超限必须在读取前拒绝")
+
+    with pytest.raises(MineruError) as exc_info:
+        _read_bounded(_Resp(), 10)
+    assert exc_info.value.code_str == "RESOURCE_LIMIT"
+
+
+def test_bounded_read_counts_actual_bytes_not_declared():
+    from mortis_rag_mcp.ingest.mineru import _read_bounded
+
+    class _Resp:
+        headers = {}  # 无 Content-Length：只能靠实际字节数
+
+        def __init__(self):
+            self.calls = 0
+
+        def read(self, _n):
+            self.calls += 1
+            return b"x" * 7 if self.calls <= 2 else b""
+
+    with pytest.raises(MineruError) as exc_info:
+        _read_bounded(_Resp(), 10)
+    assert exc_info.value.code_str == "RESOURCE_LIMIT"
+
+
+def test_remote_url_policy_requires_https_and_public_host():
+    from mortis_rag_mcp.ingest.mineru import _validate_remote_url
+
+    _validate_remote_url("https://mineru.net/api/v4/file-urls/batch")
+    for bad in ("http://example.com/x", "https://127.0.0.1/x", "https://10.0.0.5/x",
+                "https://169.254.1.1/x", "https://0.0.0.0/x"):
+        with pytest.raises(MineruError):
+            _validate_remote_url(bad)
+    # 显式本地 sidecar 策略才允许 loopback
+    _validate_remote_url("http://127.0.0.1:8080/x", allow_loopback=True)
+
+
+def test_401_with_token_never_falls_back_to_agent(monkeypatch, tmp_path: Path):
+    client = MineruClient(api_key="v4-token")
+    doc_path = tmp_path / "test.pdf"
+    doc_path.write_bytes(b"%PDF test")
+
+    def fake_urlopen(*args, **kwargs):
+        raise urllib.error.HTTPError("https://mineru.net/api/v4/file-urls/batch", 401,
+                                     "Unauthorized", {}, io.BytesIO(b'{"msg": "bad token"}'))
+
+    def forbidden_agent(*args, **kwargs):  # pragma: no cover
+        raise AssertionError("有 key 时 401 绝不允许回落到免登 Agent 通道")
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(MineruClient, "_parse_agent", forbidden_agent)
+
+    with pytest.raises(MineruError) as exc_info:
+        client.parse(doc_path, poll_interval=0.001, poll_timeout=0.05)
+    assert exc_info.value.http_status == 401
+    assert exc_info.value.retryable is False
+
+
+def test_submission_unknown_does_not_resend_paid_post(monkeypatch, tmp_path: Path):
+    """非幂等付费 POST 在网络层失败 → SUBMISSION_UNKNOWN；意图序列 prepared→submission_unknown。"""
+    client = MineruClient(api_key="v4-token")
+    doc_path = tmp_path / "test.pdf"
+    doc_path.write_bytes(b"%PDF test")
+    intents: list[tuple[str, dict]] = []
+
+    def fake_http_json(req, timeout):
+        raise MineruError("network error: ConnectionResetError(10054)", retryable=True)
+
+    monkeypatch.setattr("mortis_rag_mcp.ingest.mineru._http_json", fake_http_json)
+    monkeypatch.setattr("mortis_rag_mcp.ingest.mineru._put_upload", lambda *a, **kw: None)
+
+    with pytest.raises(MineruError) as exc_info:
+        client.parse_structured(
+            doc_path, poll_interval=0.001, poll_timeout=1.0,
+            request_id="req-1",
+            intent_recorder=lambda kind, payload: intents.append((kind, payload)),
+        )
+
+    assert exc_info.value.code_str == "SUBMISSION_UNKNOWN"
+    assert exc_info.value.retryable is False
+    kinds = [kind for kind, _payload in intents]
+    assert kinds[0] == "prepared"
+    assert "submission_unknown" in kinds
+    assert "submitted" not in kinds          # 未拿到受理响应：不得声称已受理
+    assert intents[0][1]["endpoint"] == "https://mineru.net"   # 脱敏：无 path/query
+    assert intents[0][1]["payload_hash"]
+
+
+def test_endpoint_redaction_drops_path_query_and_fragment():
+    from mortis_rag_mcp.ingest.mineru import redact_endpoint
+
+    assert redact_endpoint("https://oss.example.com/up?Signature=SECRET&Expires=1") == "https://oss.example.com"
+    assert redact_endpoint("https://a.b/c#frag") == "https://a.b"
+    assert "SECRET" not in redact_endpoint("https://a.b/c?token=SECRET")

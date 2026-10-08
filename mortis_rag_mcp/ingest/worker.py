@@ -167,6 +167,12 @@ class IngestManager:
         """Mark a source as currently being copied/written (forces settle check)."""
         self._settling_files.add(Path(rel).as_posix())
 
+    def stop(self) -> None:
+        """等待进行中的单 job 收尾（幂等）。legacy 路径无租约，只能 join 线程。"""
+        thread = self._worker
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=5.0)
+
 
     def _size_limit_bytes(self) -> int:
         cap = getattr(self.config, "max_file_size_bytes", None)
@@ -837,3 +843,534 @@ class IngestManager:
             return "\n\n".join(page.get_text() for page in doc)
         finally:
             doc.close()
+
+
+# =====================================================================================
+# C94：虚拟（store）摄取路径
+# =====================================================================================
+"""虚拟路径与 legacy 路径的差别（都在本文件里，便于对照）：
+
+| 维度 | legacy（默认，兼容 .mortis-parsed/*.md） | virtual（C94） |
+|---|---|---|
+| 账本 | `output_dirname/.ingest_state.json` | `ingest_jobs` / `auto_seen`（按库隔离的 store） |
+| 任务归属 | 进程内 `threading.Lock` + 文件锁 | `owner_token` + `lease_until` 的 SQL CAS（跨进程 fencing） |
+| 发布 | 原子写 `.md` | `stage_revision` → 两次源核验 → `commit_job_revision`（done 与切 active **同事务**） |
+| 媒体 | 落 `*.assets/` 目录 | 逐项 `put_media_blob`（内存有界）→ `attach_occurrences` |
+| 计费重试 | 瞬时错误标 retryable 由用户重试 | 非幂等 POST 的网络失败 → `SUBMISSION_UNKNOWN`，**禁止自动重传** |
+
+为什么 legacy 仍是默认：虚拟文档的**读取**适配器属 C96（Lane C）。在 C96 落地前把默认
+切成 virtual，已摄取文档会变成「写了但读不出来」。故 `ingest.storage` 默认 `legacy`，
+virtual 必须显式配置；这条偏差要在计划卡里显式记录。
+"""
+
+
+class StoreMediaSink:
+    """把媒体**逐项**写进 docstore 的 sink（§13.2：直接写 staged store、释放 RAM）。
+
+    解析期间只做第一阶段（`put_media_blob`，每项写完即释放）；revision 建立后再由
+    worker 调 `attach_occurrences` 挂出现。未被挂上的 blob 由 `gc_unreferenced()` 回收。
+    """
+
+    def __init__(self, store: Any) -> None:
+        self.store = store
+        self.items: list[Any] = []
+
+    def add(self, *, name: str, data: bytes, kind: str, ordinal: int, mime_type: str,
+            page: int | None = None, bbox: Any = None, caption: str = "",
+            ocr: str = "", width: int | None = None, height: int | None = None,
+            metadata: dict[str, Any] | None = None) -> str:
+        from ..doc_store import MediaOccurrenceSpec
+
+        blob_id = self.store.put_media_blob(
+            data=data, mime_type=mime_type, width=width, height=height
+        )
+        occurrence_id = f"occ-{ordinal:05d}"
+        meta = {"archive_member": name}
+        meta.update(metadata or {})
+        self.items.append(MediaOccurrenceSpec(
+            occurrence_id=occurrence_id,
+            blob_id=blob_id,
+            kind=kind,
+            ordinal=ordinal,
+            mime_type=mime_type,
+            page=page,
+            bbox=bbox,
+            caption=caption,
+            ocr=ocr,
+            width=width,
+            height=height,
+            metadata=meta,
+        ))
+        return occurrence_id
+
+
+class VirtualIngestWorker:
+    """store 支撑的摄取 worker（C94）：队列/租约/发布 CAS/两次源核验。
+
+    公开面与 `IngestManager` 对齐（`submit` / `status` / `scan_pending` / `auto_submit` /
+    `mark_settling`），使 server 侧与既有 hook 不必区分两条路径。
+    """
+
+    def __init__(
+        self,
+        vault_path: str | Path,
+        config: Any,
+        store_provider: Callable[[], Any],
+        on_job_finished: Callable[[str, str], None] | None = None,
+        ignore_provider: Callable[[], Any] | None = None,
+    ) -> None:
+        self.vault_path = Path(vault_path).expanduser().resolve()
+        self.config = config
+        self._store_provider = store_provider
+        self.on_job_finished = on_job_finished
+        self.ignore_provider = ignore_provider
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._worker: threading.Thread | None = None
+        self._client: MineruClient | None = None
+        self._settling_files: set[str] = set()
+        self._lease_seconds = max(300.0, float(getattr(config, "poll_timeout", 600.0)) + 120.0)
+
+    # ---------------------------------------------------------------- helpers
+
+    def _store(self) -> Any:
+        store = self._store_provider()
+        layout = getattr(store, "layout", None)
+        if layout is not None and not layout.writable:
+            from ..doc_store import VirtualStorageDisabled
+
+            raise VirtualStorageDisabled(
+                f"虚拟摄取不可用：{layout.blocked_reason or '布局不可写'}",
+                fix="按 doctor 的提示修正 cache 归属/placement，或把 ingest.storage 设为 legacy。",
+            )
+        return store
+
+    def _limits(self) -> Any:
+        from .models import ResourceLimits
+
+        return ResourceLimits.from_config(self.config)
+
+    def _size_limit_bytes(self) -> int:
+        cap = getattr(self.config, "max_file_size_bytes", None)
+        if cap is not None:
+            return int(cap)
+        return int(getattr(self.config, "max_file_size_mb", 20)) * 1024 * 1024
+
+    def _check_file_size(self, size_bytes: int) -> bool:
+        limit = self._size_limit_bytes()
+        if limit <= 0:
+            return True
+        return size_bytes <= limit
+
+    def _matcher(self) -> Any:
+        if self.ignore_provider is None:
+            return None
+        matcher = self.ignore_provider()
+        if matcher is None:
+            raise ValueError(
+                "ignore matcher unavailable; 虚拟摄取拒绝在无法判定豁免规则时入队"
+            )
+        return matcher
+
+    def mark_settling(self, rel: str) -> None:
+        self._settling_files.add(Path(rel).as_posix())
+
+    def _assert_network_policy(self, source: str) -> None:
+        policy = str(getattr(self.config, "network_policy", "configured") or "configured")
+        if policy == "local_only":
+            raise ValueError(
+                f"ingest.network_policy=local_only 拒绝云端解析：{source}"
+                "（云路径必须在**入队前**拒绝，绝不会先上传再报错）"
+            )
+
+    def _job_view(self, job: Any, *, channel: str = "", error: str = "",
+                  parse_quality: str = "") -> dict[str, Any]:
+        return {
+            "job_id": job.job_id,
+            "source": job.source,
+            "sha256": job.source_sha256,
+            "state": job.state,
+            "phase": job.phase,
+            "attempts": job.attempts,
+            "channel": channel,
+            "error": error or (f"{job.error_code}: {job.error_summary}" if job.error_code else job.error_summary),
+            "parse_quality": parse_quality,
+            "revision_id": job.result_revision,
+            "owner_token": bool(job.owner_token),
+        }
+
+    # ---------------------------------------------------------------- public
+
+    def scan_pending(self) -> list[dict]:
+        """列出待摄取文档（与 auto_seen 账本比对；不写任何状态）。"""
+        store = self._store()
+        seen = {item["source"]: item for item in store.iter_auto_seen()}
+        pending: list[dict] = []
+        if not self.vault_path.exists():
+            return pending
+        matcher = self._matcher()
+        limit = self._size_limit_bytes()
+        out_dirname = str(getattr(self.config, "output_dirname", ".mortis-parsed"))
+        stack = [self.vault_path]
+        while stack:
+            current = stack.pop()
+            try:
+                with os.scandir(current) as entries:
+                    for entry in entries:
+                        try:
+                            if entry.is_dir(follow_symlinks=False):
+                                if _is_excluded_dir_name(entry.name, out_dirname):
+                                    continue
+                                rel_dir = Path(entry.path).relative_to(self.vault_path).as_posix()
+                                if _is_path_ignored(matcher, rel_dir, is_dir=True):
+                                    continue
+                                stack.append(Path(entry.path))
+                            elif entry.is_file(follow_symlinks=False):
+                                path = Path(entry.path)
+                                if path.suffix.lower() not in INGEST_EXTS:
+                                    continue
+                                rel = path.relative_to(self.vault_path).as_posix()
+                                if _is_path_ignored(matcher, rel):
+                                    continue
+                                stat = entry.stat()
+                                if not self._check_file_size(stat.st_size):
+                                    pending.append({"source": rel, "sha256": "", "mtime": stat.st_mtime,
+                                                    "size": stat.st_size, "limit_bytes": limit,
+                                                    "reason": "too_large"})
+                                    continue
+                                digest = _sha256(path)
+                                record = seen.get(rel)
+                                if record is None or record.get("source_sha256") != digest:
+                                    pending.append({
+                                        "source": rel,
+                                        "sha256": digest,
+                                        "mtime": stat.st_mtime,
+                                        "size": stat.st_size,
+                                        "reason": "new" if record is None else "changed",
+                                    })
+                        except OSError:
+                            continue
+            except OSError:
+                continue
+        return pending
+
+    def submit(self, sources: list[str] | None = None, force: bool = False) -> dict:
+        """提交虚拟摄取任务（异步）。校验→入队（store）→ 起 worker。"""
+        if not self.config.enabled:
+            raise ValueError(
+                "ingest disabled: PDF 摄取层默认关闭。请在 config/app.toml 设置 "
+                "[ingest] enabled = true 并重启 MCP 服务后重试。"
+            )
+        if sources is not None:
+            if not isinstance(sources, (list, tuple)):
+                raise TypeError(f"sources must be a list of relative file path strings, got {type(sources).__name__}")
+            for item in sources:
+                if not isinstance(item, str):
+                    raise TypeError(f"each item in sources must be a string, got {type(item).__name__}")
+        store = self._store()
+        matcher = self._matcher()
+        limit = self._size_limit_bytes()
+
+        if sources is None:
+            scanned = self.scan_pending()
+            targets = [t for t in scanned if t.get("reason") != "too_large"]
+            skipped_too_large = len([t for t in scanned if t.get("reason") == "too_large"])
+            skipped_ignored = 0
+        else:
+            targets = []
+            skipped_too_large = 0
+            skipped_ignored = 0
+            for rel in sources:
+                path = _validate_safe_source(self.vault_path, rel)
+                if _is_path_ignored(matcher, Path(rel).as_posix()):
+                    skipped_ignored += 1
+                    continue
+                self._assert_network_policy(rel)
+                stat = path.stat()
+                if not self._check_file_size(stat.st_size):
+                    raise ValueError(
+                        f"file size {stat.st_size} bytes exceeds limit {limit} bytes: {rel}"
+                    )
+                targets.append({
+                    "source": Path(rel).as_posix(),
+                    "sha256": _sha256(path),
+                    "mtime": stat.st_mtime,
+                    "size": stat.st_size,
+                    "reason": "explicit",
+                })
+
+        jobs: list[dict] = []
+        created = 0
+        for target in targets:
+            job, is_new = store.enqueue_job(
+                source=target["source"],
+                source_sha256=target["sha256"],
+                parser_fingerprint=self._parser_fingerprint(),
+                force=force,
+            )
+            created += 1 if is_new else 0
+            jobs.append(self._job_view(job))
+        if created:
+            self._ensure_worker(store)
+        return {
+            "submitted": created,
+            "new_jobs": created,
+            "jobs": jobs,
+            "skipped_too_large": skipped_too_large,
+            "skipped_ignored": skipped_ignored,
+            "storage": "virtual",
+        }
+
+    def auto_submit(self) -> dict:
+        """自动摄取扫描（virtual）：用**两次源核验**替代 legacy 的双采样判稳。
+
+        为什么不做双采样：virtual 的第二次源核验发生在发布前（hash 变化即废弃候选），
+        复制中途的文件必然在发布前被拦下并重新入队；再叠一层采样只会拖慢首摄。
+        """
+        if not (self.config.enabled and self.config.auto_watch):
+            return {"submitted": 0, "new_jobs": 0, "jobs": [], "status": "disabled",
+                    "skipped_too_large": 0, "skipped_ignored": 0, "rescan_after_seconds": 0.0}
+        store = self._store()
+        try:
+            matcher = self._matcher()
+        except ValueError as exc:
+            return {"submitted": 0, "new_jobs": 0, "jobs": [], "status": "fail_closed",
+                    "last_error": str(exc), "rescan_after_seconds": _SETTLE_RESCAN_SECONDS,
+                    "skipped_too_large": 0, "skipped_ignored": 0}
+        pending = self.scan_pending()
+        jobs: list[dict] = []
+        created = 0
+        skipped_seen = 0
+        too_large = 0
+        for target in pending:
+            if target.get("reason") == "too_large":
+                too_large += 1
+                continue
+            if _is_path_ignored(matcher, target["source"]):
+                continue
+            try:
+                self._assert_network_policy(target["source"])
+            except ValueError:
+                return {"submitted": 0, "new_jobs": 0, "jobs": [], "status": "network_policy_blocked",
+                        "rescan_after_seconds": 0.0, "skipped_too_large": too_large,
+                        "skipped_ignored": 0}
+            job, is_new = store.enqueue_job(
+                source=target["source"],
+                source_sha256=target["sha256"],
+                parser_fingerprint=self._parser_fingerprint(),
+            )
+            if is_new:
+                created += 1
+                jobs.append(self._job_view(job))
+            else:
+                skipped_seen += 1
+        if created:
+            self._ensure_worker(store)
+        return {
+            "submitted": created,
+            "new_jobs": created,
+            "jobs": jobs,
+            "status": "ok",
+            "skipped_too_large": too_large,
+            "skipped_seen": skipped_seen,
+            "skipped_ignored": 0,
+            "rescan_after_seconds": _SETTLE_RESCAN_SECONDS if self._settling_files else 0.0,
+            "storage": "virtual",
+        }
+
+    def status(self, job_id: str | None = None) -> dict:
+        store = self._store()
+        if job_id:
+            job = store.job_status(job_id)
+            if job is None:
+                raise ValueError(f"unknown job_id: {job_id}")
+            return {"job": self._job_view(job)}
+        jobs = [self._job_view(job) for job in store.list_jobs(limit=20)]
+        summary: dict[str, int] = {}
+        for record in store.list_jobs(limit=1000):
+            key = record.state
+            if key == "done" and record.phase == "committed":
+                key = "done"
+            summary[key] = summary.get(key, 0) + 1
+        return {"summary": summary, "jobs": jobs, "storage": "virtual",
+                "queue_depth": store.queue_depth()}
+
+    def cancel(self, job_id: str) -> bool:
+        return bool(self._store().cancel_job(job_id))
+
+    def stop(self) -> None:
+        self._stop.set()
+        thread = self._worker
+        if thread is not None:
+            thread.join(timeout=5.0)
+        self._worker = None
+
+    # ---------------------------------------------------------------- worker
+
+    def _parser_fingerprint(self) -> str:
+        """入队时的 parser 指纹（用于「同源同 SHA 同 parser 合并」）。
+
+        通道在领取时才解析，故这里用 `channel="auto"`；真正的解析事实指纹由
+        `parse_structured()` 产出并写进 `document_revisions.parser_fingerprint`。
+        """
+        from .mineru import ADAPTER_VERSION
+        from .models import parser_fingerprint
+
+        cfg = self.config
+        return parser_fingerprint(
+            adapter=ADAPTER_VERSION,
+            channel="auto",
+            model=str(getattr(cfg, "model_version", "vlm")),
+            language=str(getattr(cfg, "language", "ch")),
+            is_ocr=bool(getattr(cfg, "is_ocr", False)),
+            enable_table=bool(getattr(cfg, "enable_table", True)),
+            enable_formula=bool(getattr(cfg, "enable_formula", True)),
+        )
+
+    def _client_or_make(self) -> MineruClient:
+        if self._client is None:
+            cfg = self.config
+            self._client = MineruClient(
+                cfg.api_key, model_version=cfg.model_version, language=cfg.language,
+                is_ocr=cfg.is_ocr, enable_formula=cfg.enable_formula,
+                enable_table=cfg.enable_table, limits=self._limits(),
+            )
+        return self._client
+
+    def _ensure_worker(self, store: Any) -> None:
+        with self._lock:
+            if self._worker is not None and self._worker.is_alive():
+                return
+            self._worker = threading.Thread(target=self._loop, daemon=True,
+                                            name="ingest-virtual-worker")
+            self._worker.start()
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            store = self._store()
+            owner = f"w-{uuid.uuid4().hex[:12]}"
+            job = store.claim_job(owner, lease_seconds=self._lease_seconds)
+            if job is None:
+                return
+            try:
+                self._run_job(store, job, owner)
+            except Exception as exc:  # 单 job 失败不拖垮队列
+                try:
+                    store.fail_job(job.job_id, owner, error_code=type(exc).__name__,
+                                   error_summary=str(exc)[:500],
+                                   retryable=bool(getattr(exc, "retryable", False)))
+                except Exception:
+                    pass
+
+    def _run_job(self, store: Any, job: Any, owner: str) -> None:
+        src = _validate_safe_source(self.vault_path, job.source)
+        stat_before = src.stat()
+        if not self._check_file_size(stat_before.st_size):
+            raise ValueError(
+                f"file size {stat_before.st_size} bytes exceeds limit {self._size_limit_bytes()} bytes"
+            )
+        # 第一次源核验（解析前）：入队 hash 不符 → 废弃，不上传
+        if _sha256(src) != job.source_sha256:
+            store.fail_job(job.job_id, owner, error_code="SOURCE_CHANGED",
+                           error_summary="source_changed before parse", retryable=False)
+            return
+
+        sink = StoreMediaSink(store)
+        client = self._client_or_make()
+
+        def _record(kind: str, payload: dict[str, Any]) -> None:
+            try:
+                store.report_phase(job.job_id, owner, phase=kind,
+                                   remote_task_id=str(payload.get("remote_task_id") or ""),
+                                   checkpoint=str(payload.get("payload_hash") or ""))
+            except Exception:
+                pass
+
+        result = client.parse_structured(
+            src,
+            poll_interval=float(getattr(self.config, "poll_interval", 3.0)),
+            poll_timeout=float(getattr(self.config, "poll_timeout", 600.0)),
+            sink=sink,
+            intent_recorder=_record,
+            request_id=job.job_id,
+        )
+        # 第二次源核验（发布前）：stat 或 hash 变了 → 废弃候选并重新扫描
+        stat_after = src.stat()
+        if (stat_after.st_size, stat_after.st_mtime_ns) != (stat_before.st_size, stat_before.st_mtime_ns):
+            store.fail_job(job.job_id, owner, error_code="SOURCE_CHANGED",
+                           error_summary="source changed while parsing", retryable=False)
+            return
+        if _sha256(src) != job.source_sha256:
+            store.fail_job(job.job_id, owner, error_code="SOURCE_CHANGED",
+                           error_summary="source hash changed while parsing", retryable=False)
+            return
+        # 续租后再发布（跨越长时间解析后的 fencing）
+        store.renew_lease(job.job_id, owner, lease_seconds=self._lease_seconds)
+
+        capabilities = dict(result.capabilities)
+        capabilities["page_spans"] = [
+            {"page": span.page, "char_start": span.char_start, "char_end": span.char_end}
+            for span in result.page_map
+        ]
+        capabilities["warnings"] = list(result.warnings)
+        capabilities["parser_fingerprint"] = result.parser_fingerprint
+        capabilities["duration_ms"] = round(result.duration_ms, 3)
+        staged = store.stage_revision(
+            source=job.source,
+            source_sha256=job.source_sha256,
+            render_sha256=_sha256_text(result.markdown),
+            parser_fingerprint=result.parser_fingerprint,
+            markdown=result.markdown,
+            page_map=[span.page for span in result.page_map],
+            quality=result.quality,
+            capabilities=capabilities,
+            source_size=stat_after.st_size,
+            source_mtime_ns=stat_after.st_mtime_ns,
+            job_id=job.job_id,
+            owner_token=owner,
+        )
+        if sink.items:
+            store.attach_occurrences(staged.revision_id, sink.items,
+                                     job_id=job.job_id, owner_token=owner)
+        store.commit_job_revision(
+            job.job_id, owner, staged.revision_id, source_sha256=job.source_sha256,
+            source_size=stat_after.st_size, source_mtime_ns=stat_after.st_mtime_ns,
+        )
+        store.record_auto_seen(
+            job.source, source_sha256=job.source_sha256, last_job_id=job.job_id,
+            state="done", source_size=stat_after.st_size, source_mtime_ns=stat_after.st_mtime_ns,
+        )
+        if self.on_job_finished is not None:
+            try:
+                self.on_job_finished(job.source, staged.revision_id)
+            except Exception:
+                pass
+
+
+def _sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def make_ingest_manager(
+    vault_path: str | Path,
+    config: Any,
+    *,
+    store_provider: Callable[[], Any] | None = None,
+    on_job_finished: Callable[..., None] | None = None,
+    ignore_provider: Callable[[], Any] | None = None,
+) -> Any:
+    """按 `ingest.storage` 选择摄取实现（唯一的路径分派点）。
+
+    `virtual` 需要 store 可用（门禁在 `DocumentStore.open(write=True)` 与
+    `layout.writable`）；拿不到 store 时**回落 legacy** 并保持可诊断，
+    绝不「半虚拟」地写盘。
+    """
+    storage = str(getattr(config, "storage", "legacy") or "legacy")
+    if storage == "virtual" and store_provider is not None:
+        return VirtualIngestWorker(
+            vault_path, config, store_provider,
+            on_job_finished=on_job_finished, ignore_provider=ignore_provider,
+        )
+    return IngestManager(
+        vault_path, config, on_job_finished=on_job_finished, ignore_provider=ignore_provider
+    )

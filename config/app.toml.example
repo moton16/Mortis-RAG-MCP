@@ -128,6 +128,25 @@ max_file_size_mb = 20
 # api_key = "${MINERU_API_KEY}"
 # model_version = "vlm"
 
+# ── v0.9.0 有界解析与队列（默认值即安全起点；0 不是「关闭限制」）─────────
+# storage：解析事实落点。legacy（默认）= 继续写 .mortis-parsed/*.md 物理镜像，
+# 这是当前唯一可读路径；virtual = 只写文档库（ingest_jobs/document_revisions），
+# 需要 C96 的虚拟读取适配器才能读回，故默认仍为 legacy。
+# storage = "legacy"
+# network_policy：configured（默认）允许已授权的云端解析；local_only 在**入队前**
+# 拒绝一切云路径（不会先上传再报错）。
+# network_policy = "configured"
+# 解压/归档安全配额（单位 MiB）。压缩响应上限、累计解压上限、单 markdown / 单 JSON /
+# 单媒体上限。这些是进程内可执行的消费预算，不是 RSS 保证；小于 1 的配置会被拒绝。
+# archive_max_mb = 32
+# extracted_max_mb = 200
+# markdown_max_mb = 16
+# json_max_mb = 8
+# media_max_mb = 8
+# memory_budget_mb = 128
+# queue_limit = 1000
+# max_parse_workers = 1
+
 # ── 本地诊断日志（默认关闭）────────────────────────────────
 # 开启后在本地输出结构化 jsonl 诊断日志，用于排查检索退化与阶段耗时。
 # 遵循严格隐私白名单（10 键）：仅记录 ts, corr_id, tool, stage, ms, result_count,

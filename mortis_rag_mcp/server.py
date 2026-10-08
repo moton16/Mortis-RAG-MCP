@@ -16,7 +16,7 @@ from typing import Any
 from . import __version__
 from .config import load_config, resolve_config_path
 from .indexer import Chunk, MarkdownIndexer, SearchFilter, path_prefix_match
-from .ingest import IngestManager, INGEST_EXTS
+from .ingest import IngestManager, INGEST_EXTS, make_ingest_manager
 from ._server import dispatch_search as _dispatch_search, fanout_search as _fanout_search_impl
 from .registry import VaultEntry, VaultRegistry, normalize_vault_key, registry_path
 
@@ -403,6 +403,15 @@ class VaultMcpServer:
 
     def shutdown(self) -> None:
         """停掉所有知识库的文件监听与摄取扫描（幂等，可重复调用）。"""
+        # C94：摄取 manager（可能是 virtual worker）必须先停，再关文档库连接。
+        for manager in list(self._ingest_managers.values()):
+            try:
+                stop = getattr(manager, "stop", None)
+                if callable(stop):
+                    stop()
+            except Exception:
+                pass
+        self._ingest_managers.clear()
         for indexer in list(self._indexers.values()):
             try:
                 indexer._ingest_hook = None
@@ -790,6 +799,16 @@ class VaultMcpServer:
             raise ValueError(f"vault not registered: {path}")
         key = str(Path(entry.path).resolve())
         indexer = self._indexers.pop(key, None)
+        # C94：移库/移除库时必须连**摄取 manager**一起停掉，而不只是停 watch 扫描线程；
+        # 否则 virtual worker 会拿着已失效的 store 继续跑（并在 old inode 上写成功）。
+        removed_manager = self._ingest_managers.pop(key, None)
+        if removed_manager is not None:
+            try:
+                stop = getattr(removed_manager, "stop", None)
+                if callable(stop):
+                    stop()
+            except Exception:
+                pass
         watcher_stopped = False
         if indexer is not None:
             indexer._ingest_hook = None
@@ -834,10 +853,17 @@ class VaultMcpServer:
         key = str(Path(vault_path).resolve())
         manager = self._ingest_managers.get(key)
         if manager is None:
+            # virtual 路径需要 indexer 的文档库接缝（唯一存储入口）：先确保 indexer 已建，
+            # 且**在取 manager 锁之前**完成，避免 indexers_lock / ingest_managers_lock 嵌套。
+            if str(getattr(self.config.ingest, "storage", "legacy")) == "virtual":
+                try:
+                    self._indexer_for({"vault_path": vault_path})
+                except Exception:
+                    pass
             with self._ingest_managers_lock:
                 manager = self._ingest_managers.get(key)
                 if manager is None:
-                    def _on_job_finished(source: str, out_md: Path) -> None:
+                    def _on_job_finished(source: str, out_md: Path | str) -> None:
                         try:
                             indexer = self._indexers.get(key)
                             if indexer is not None:
@@ -854,9 +880,18 @@ class VaultMcpServer:
                         # （此前只拿静态 exclude_patterns，vaultignore 豁免被绕过）。
                         return idx._ignore_matcher()
 
-                    manager = IngestManager(
+                    def _store_provider() -> Any:
+                        idx = self._indexers.get(key)
+                        if idx is None:
+                            raise RuntimeError(
+                                "virtual ingest requires an initialized indexer for this vault"
+                            )
+                        return idx.document_store(write=True)
+
+                    manager = make_ingest_manager(
                         vault_path,
                         self.config.ingest,
+                        store_provider=_store_provider,
                         on_job_finished=_on_job_finished,
                         ignore_provider=_ignore_provider,
                     )
@@ -1591,7 +1626,10 @@ class VaultMcpServer:
         skipped_too_large = 0
         skipped_seen = 0
         skipped_ignored = 0
-        if manager is not None and manager.state_path.exists():
+        # legacy 用 .ingest_state.json 快照；virtual 的账本在 store 里（无 state_path），
+        # 这里必须容错，不能因为换了实现就让 kb_stats 抛错。
+        state_path = getattr(manager, "state_path", None) if manager is not None else None
+        if manager is not None and state_path is not None and state_path.exists():
             try:
                 st_data = manager._load_state()
                 aw_st = st_data.get("auto_watch", {})
