@@ -314,6 +314,22 @@ class JobRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class GenerationPin:
+    """固定捕获版本 handle（E04-c）。
+
+    读取/导出/备份共用同一句柄：`validate` 在批次与最终响应前验租，过期**不复活**
+    （只能重新捕获），绝不把旧 chunk 与新 media 拼成一个包。
+    """
+
+    pin_id: str
+    generation_id: str
+    owner: str
+    lease_until: float
+    change_seq: int
+    epoch: int
+
+
+@dataclass(frozen=True, slots=True)
 class DerivedGeneration:
     """`derived_generations` 一行的值对象（C95）：派生层相对文档事实的代次进度。"""
 
@@ -1099,6 +1115,59 @@ class ControlStore:
             with self.mutation() as conn:
                 conn.execute("DELETE FROM generation_pins WHERE pin_id = ?", (token,))
                 conn.commit()
+
+    def acquire_generation_pin(self, owner: str, *, lease_seconds: float = 300) -> tuple[str, str, float]:
+        """固定**当前活动代**并返回 `(pin_id, generation_id, lease_until)`（E04-c）。"""
+        if not math.isfinite(lease_seconds) or lease_seconds <= 0:
+            raise StoreContractError("Invalid generation pin lease")
+        token = uuid.uuid4().hex
+        with self.mutation() as conn:
+            self._ensure_lifecycle_schema(conn)
+            generation = str(self._read_meta(conn)[5])
+            if not generation:
+                raise StoreConflict("No active generation to pin")
+            lease_until = time.time() + lease_seconds
+            conn.execute("INSERT INTO generation_pins VALUES (?, ?, ?, ?)",
+                         (token, generation, owner, lease_until))
+            conn.commit()
+        return token, generation, lease_until
+
+    def renew_generation_pin(self, pin_id: str, owner: str, *, lease_seconds: float = 300) -> bool:
+        """未到期 + 同 owner 的 CAS 续租；过期/换 owner 一律 0 行（不复活）。"""
+        if not math.isfinite(lease_seconds) or lease_seconds <= 0:
+            raise StoreContractError("Invalid generation pin lease")
+        now = time.time()
+        with self.mutation() as conn:
+            self._ensure_lifecycle_schema(conn)
+            cursor = conn.execute(
+                "UPDATE generation_pins SET lease_until = ? "
+                "WHERE pin_id = ? AND owner = ? AND lease_until > ?",
+                (now + lease_seconds, pin_id, owner, now),
+            )
+            conn.commit()
+            return cursor.rowcount == 1
+
+    def release_generation_pin(self, pin_id: str, owner: str) -> bool:
+        with self.mutation() as conn:
+            self._ensure_lifecycle_schema(conn)
+            cursor = conn.execute(
+                "DELETE FROM generation_pins WHERE pin_id = ? AND owner = ?", (pin_id, owner))
+            conn.commit()
+            return cursor.rowcount == 1
+
+    def pin_is_live(self, pin_id: str, owner: str, *, generation_id: str = "") -> bool:
+        """新鲜控制面读：租约未到期且仍指向（可选的）同一 generation。"""
+        with self.mutation() as conn:
+            self._ensure_lifecycle_schema(conn)
+            row = conn.execute(
+                "SELECT generation_id, lease_until FROM generation_pins WHERE pin_id = ? AND owner = ?",
+                (pin_id, owner),
+            ).fetchone()
+        if row is None:
+            return False
+        if float(row[1]) <= time.time():
+            return False
+        return (not generation_id) or str(row[0]) == generation_id
 
     def generation_is_pinned(self, generation_id: str) -> bool:
         with self.mutation() as conn:
@@ -3441,8 +3510,97 @@ class DocumentStore:
             return {"path": str(path), "generation_id": generation,
                     "change_seq": self.change_seq(), "retained": True}
 
-    def backup_to(self, path: str | Path) -> Path:
-        """`sqlite3.Connection.backup` 一致性备份（不是 copy 主文件，§20.2）。"""
+    def capture_generation_pin(self, *, lease_seconds: float = 300) -> GenerationPin:
+        """捕获固定版本 handle（E04-c）：控制面 active generation + change_seq + epoch。
+
+        捕获与当前读代不一致立即释放并报冲突——不允许跨代读取。
+        """
+        ctrl = ControlStore(self.layout)
+        try:
+            ctrl.open(create=False, write=True)
+            owner = f"pid{os.getpid()}:{uuid.uuid4().hex}"
+            pin_id, generation, lease_until = ctrl.acquire_generation_pin(
+                owner, lease_seconds=lease_seconds)
+            epoch = int(ctrl.state().epoch)
+        finally:
+            ctrl.close()
+        current = self._ensure_read_generation()
+        if current and generation and current != generation:
+            try:
+                ctrl = ControlStore(self.layout)
+                ctrl.open(create=False, write=True)
+                ctrl.release_generation_pin(pin_id, owner)
+            except Exception:
+                pass
+            finally:
+                try:
+                    ctrl.close()
+                except Exception:
+                    pass
+            raise StoreConflict(
+                f"captured generation {generation!r} differs from the readable generation {current!r}",
+                fix="重新捕获固定版本；跨代读取会把旧 chunk 与新 media 拼在一起。",
+            )
+        return GenerationPin(pin_id=pin_id, generation_id=generation, owner=owner,
+                             lease_until=lease_until, change_seq=self.change_seq(), epoch=epoch)
+
+    def validate_generation_pin(self, pin: GenerationPin) -> bool:
+        """批次/最终响应前验租（E04-c）：过期、被释放、换代或换 epoch 一律 False。"""
+        ctrl = ControlStore(self.layout)
+        try:
+            ctrl.open(create=False, write=False)
+            if not ctrl.pin_is_live(pin.pin_id, pin.owner, generation_id=pin.generation_id):
+                return False
+            state = ctrl.state()
+        except Exception:
+            return False
+        finally:
+            ctrl.close()
+        if str(state.active_document_generation or "") != pin.generation_id:
+            return False
+        return int(state.epoch) == pin.epoch
+
+    def renew_generation_pin(self, pin: GenerationPin, *, lease_seconds: float = 300) -> bool:
+        """未到期同 owner 续租；过期返回 False（不复活）。"""
+        ctrl = ControlStore(self.layout)
+        try:
+            ctrl.open(create=False, write=True)
+            return ctrl.renew_generation_pin(pin.pin_id, pin.owner, lease_seconds=lease_seconds)
+        finally:
+            ctrl.close()
+
+    def release_generation_pin(self, pin: GenerationPin) -> bool:
+        ctrl = ControlStore(self.layout)
+        try:
+            ctrl.open(create=False, write=True)
+            return ctrl.release_generation_pin(pin.pin_id, pin.owner)
+        finally:
+            ctrl.close()
+
+    def has_active_ingest(self) -> bool:
+        """全队列活跃/unknown 检查（E04-c）：不受 `list_jobs` 的 LIMIT 截断影响。
+
+        老 job 也可能仍在跑；只查最近 500 条会漏掉它们（§20.7F 门禁 fail closed）。
+        """
+        gen = self._ensure_read_generation()
+        if not gen:
+            return False
+        conn = self._open_conn(gen)
+        row = self._query_one(
+            conn,
+            "SELECT COUNT(*) FROM ingest_jobs WHERE state IN ('queued', 'parsing', 'staged') "
+            "OR phase IN ('send_intent', 'submitted', 'polling', 'downloaded', 'submission_unknown')",
+            what="活跃摄取任务计数",
+        )
+        return bool(row and int(row[0]) > 0)
+
+    def backup_to(self, path: str | Path, *, pages: int = -1, progress: Any = None) -> Path:
+        """`sqlite3.Connection.backup` 一致性备份（不是 copy 主文件，§20.2）。
+
+        E04-c：`pages`/`progress` 是可控分页与进度接缝——长时间备份按页推进并在进度
+        回调里续租/验租，不在一次调用里持有 store 事务；任何失败都删除临时输出，
+        不留半截备份冒充成功。
+        """
         gen = self._ensure_read_generation()
         if not gen:
             raise StoreContractError(
@@ -3455,10 +3613,23 @@ class DocumentStore:
             dest.unlink()
         target = sqlite3.connect(str(dest))
         try:
-            conn.backup(target)
+            conn.backup(target, pages=pages, progress=progress)
             target.commit()
+        except BaseException:
+            try:
+                target.close()
+            except Exception:
+                pass
+            try:
+                dest.unlink()
+            except OSError:
+                pass
+            raise
         finally:
-            target.close()
+            try:
+                target.close()
+            except Exception:
+                pass
         return dest
 
     def recover(self, *, stale_before: float | None = None) -> int:

@@ -324,22 +324,40 @@ def _require_free_disk(directory: Path, declared_total: int) -> None:
 
 
 def _export_v2(owner: MarkdownIndexer, out_path: str | Path) -> dict[str, Any]:
+    from ..doc_store import StoreConflict
+
     out = Path(out_path).expanduser()
     out.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="snapshot-", dir=out.parent) as temporary:
-        root = Path(temporary)
-        payloads = {"chunks.bin": owner._chunks_cache_path}
-        vectors = owner._vector_backend.get_vectors(chunk.id for chunk in owner.all_chunks())
-        if vectors:
-            transport = root / "vectors.bin"
-            _VectorsCodec.dump(transport, owner._vectors_meta(), vectors)
-            payloads["vectors.bin"] = transport
-        store = owner._existing_document_store()
-        store_manifest = None
-        if store is not None and store.generation_id:
-            with store.pin_generation():
+    pin = None
+    store = None
+    try:
+        with tempfile.TemporaryDirectory(prefix="snapshot-", dir=out.parent) as temporary:
+            root = Path(temporary)
+            payloads = {"chunks.bin": owner._chunks_cache_path}
+            vectors = owner._vector_backend.get_vectors(chunk.id for chunk in owner.all_chunks())
+            if vectors:
+                transport = root / "vectors.bin"
+                _VectorsCodec.dump(transport, owner._vectors_meta(), vectors)
+                payloads["vectors.bin"] = transport
+            store = owner._existing_document_store()
+            store_manifest = None
+            if store is not None and store.generation_id:
+                # E04-c：捕获固定版本 handle，导出全程持租，最终发布前再验一次。
+                pin = store.capture_generation_pin()
                 document = root / "docstore.sqlite"
-                store.backup_to(document)
+
+                def _backup_progress(status: int, remaining: int, total: int) -> None:
+                    from ..doc_store import StoreConflict
+
+                    # 长备份按页推进时续租/验租：租约过期即中止，不留下半截备份。
+                    if not store.validate_generation_pin(pin):
+                        raise StoreConflict(
+                            "READ_LEASE_EXPIRED: the pinned generation lease expired during the "
+                            "export backup; the temporary output was discarded"
+                        )
+                    store.renew_generation_pin(pin)
+
+                store.backup_to(document, pages=256, progress=_backup_progress)
                 # Portable backups contain facts, never live task credentials.
                 conn = sqlite3.connect(str(document))
                 try:
@@ -351,28 +369,41 @@ def _export_v2(owner: MarkdownIndexer, out_path: str | Path) -> dict[str, Any]:
                 finally:
                     conn.close()
                 payloads["docstore.sqlite"] = document
-        members = {}
-        for name, path in payloads.items():
-            size = path.stat().st_size
-            if size > _SNAPSHOT_MEMBER_LIMITS[name]:
-                raise ValueError(f"snapshot {name} exceeds export budget")
-            members[name] = {"size": size, "sha256": _sha_file(path)}
-        if sum(info["size"] for info in members.values()) > _SNAPSHOT_TOTAL_LIMIT:
-            raise ValueError("snapshot exceeds total export budget")
-        manifest = {"format": _SNAPSHOT_FORMAT, "format_version": 2,
-                    "chunks_meta": owner._chunks_meta(), "vectors_meta": owner._vectors_meta(),
-                    "members": members, "docstore": store_manifest,
-                    "total_budget_bytes": _SNAPSHOT_TOTAL_LIMIT,
-                    "budget_version": _SNAPSHOT_BUDGET_VERSION,
-                    "derived_status": "requires_local_source_verification",
-                    "data_classification": ["parsed_text", "media_originals_and_audio"],
-                    "stats": {"files": len(owner._chunks), "chunks": len(owner.all_chunks()), "vectors": len(vectors)}}
-        staged = root / "archive.zip"
-        with zipfile.ZipFile(staged, "w", zipfile.ZIP_DEFLATED) as archive:
-            archive.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False))
+            members = {}
             for name, path in payloads.items():
-                archive.write(path, name)
-        staged.replace(out)
+                size = path.stat().st_size
+                if size > _SNAPSHOT_MEMBER_LIMITS[name]:
+                    raise ValueError(f"snapshot {name} exceeds export budget")
+                members[name] = {"size": size, "sha256": _sha_file(path)}
+            if sum(info["size"] for info in members.values()) > _SNAPSHOT_TOTAL_LIMIT:
+                raise ValueError("snapshot exceeds total export budget")
+            manifest = {"format": _SNAPSHOT_FORMAT, "format_version": 2,
+                        "chunks_meta": owner._chunks_meta(), "vectors_meta": owner._vectors_meta(),
+                        "members": members, "docstore": store_manifest,
+                        "total_budget_bytes": _SNAPSHOT_TOTAL_LIMIT,
+                        "budget_version": _SNAPSHOT_BUDGET_VERSION,
+                        "derived_status": "requires_local_source_verification",
+                        "data_classification": ["parsed_text", "media_originals_and_audio"],
+                        "stats": {"files": len(owner._chunks), "chunks": len(owner.all_chunks()), "vectors": len(vectors)}}
+            staged = root / "archive.zip"
+            with zipfile.ZipFile(staged, "w", zipfile.ZIP_DEFLATED) as archive:
+                archive.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False))
+                for name, path in payloads.items():
+                    archive.write(path, name)
+            # 最终 replace 前必须再验一次租（E04-c）：hash/ZIP 期间代可能已被换掉，
+            # 绝不能把旧 chunk 与新 media 拼进同一个包。
+            if pin is not None and not store.validate_generation_pin(pin):
+                raise StoreConflict(
+                    "READ_LEASE_EXPIRED: the pinned generation changed before the export was "
+                    "published; nothing was written"
+                )
+            staged.replace(out)
+    finally:
+        if pin is not None and store is not None:
+            try:
+                store.release_generation_pin(pin)
+            except Exception:
+                pass
     return {"exported": True, "path": str(out), "format_version": 2,
             "contains_media": store_manifest is not None, **manifest["stats"]}
 
@@ -385,11 +416,15 @@ _ACTIVE_JOB_PHASES = frozenset(
 
 
 def _require_no_active_ingest(store: Any) -> None:
-    """存在活跃摄取任务 → IMPORT_BUSY，默认不导入（§20.7F）。只走公开读 API。"""
+    """存在活跃摄取任务 → IMPORT_BUSY，默认不导入（§20.7F）。只走公开读 API。
+
+    E04-c：全队扫描而不是 `list_jobs(limit=500)`——老 job 也可能还活着，
+    只查最近 500 条会漏掉它们。
+    """
     from ..doc_store import StoreBusy
 
     try:
-        jobs = store.list_jobs(limit=500)
+        active = bool(store.has_active_ingest())
     except Exception as exc:
         # 读不到队列 ≠ 没有队列：控制库被锁/损坏时旧实现直接当作「无活跃任务」放行，
         # 属安全门禁 fail-open。导入随后要打开同一个库，所以这里坚持 fail closed。
@@ -398,15 +433,71 @@ def _require_no_active_ingest(store: Any) -> None:
             "queue state is unknown",
             fix="先确认控制库可读（或修复/恢复控制库）再导入。",
         ) from exc
-    for job in jobs:
-        state = str(getattr(job, "state", "") or "")
-        phase = str(getattr(job, "phase", "") or "")
-        if state in _ACTIVE_JOB_STATES or phase in _ACTIVE_JOB_PHASES:
-            raise StoreBusy(
-                "IMPORT_BUSY: this vault has active ingestion tasks; refusing to import by "
-                "default so unfinished assets are not overwritten",
-                fix="等待任务终结或人工确认损失清单后再导入。",
-            )
+    if active:
+        raise StoreBusy(
+            "IMPORT_BUSY: this vault has active ingestion tasks; refusing to import by "
+            "default so unfinished assets are not overwritten",
+            fix="等待任务终结或人工确认损失清单后再导入。",
+        )
+
+
+def _capture_import_gate(store: Any) -> dict[str, Any]:
+    """导入前在**短**读取里捕获 generation/epoch/change_seq（E04-c）。
+
+    控制库与文档库是两个库，不存在跨库整体 ACID；这里只保证发布前能重核这三项。
+    """
+    from ..doc_store import ControlStore
+
+    ctrl = ControlStore(store.layout)
+    try:
+        ctrl.open(create=False, write=False)
+        state = ctrl.state()
+        return {"generation": str(state.active_document_generation or ""),
+                "epoch": int(state.epoch),
+                "change_seq": int(store.change_seq())}
+    finally:
+        ctrl.close()
+
+
+def _require_import_gate_unchanged(store: Any, gate: dict[str, Any]) -> None:
+    """发布前重核 generation/epoch/change_seq（E04-c）。"""
+    from ..doc_store import ControlStore, StoreConflict
+
+    ctrl = ControlStore(store.layout)
+    try:
+        ctrl.open(create=False, write=False)
+        state = ctrl.state()
+        generation = str(state.active_document_generation or "")
+        epoch = int(state.epoch)
+    except Exception as exc:
+        raise StoreConflict(
+            f"IMPORT_CONFLICT: control plane is unreadable at publish time: {exc}; "
+            "nothing was published"
+        ) from exc
+    finally:
+        ctrl.close()
+    if generation != gate["generation"] or epoch != gate["epoch"]:
+        raise StoreConflict(
+            "IMPORT_CONFLICT: control generation/epoch changed during import; "
+            "nothing was published and existing assets remain readable"
+        )
+    if int(store.change_seq()) != gate["change_seq"]:
+        raise StoreConflict(
+            "IMPORT_CONFLICT: document store changed during import validation; "
+            "nothing was published and existing assets remain readable"
+        )
+
+
+def _next_operation_seq(store: Any) -> int:
+    """本次导入的单调操作序号（E04-c：跨库操作的可审计 token）。"""
+    from ..doc_store import ControlStore
+
+    ctrl = ControlStore(store.layout)
+    try:
+        ctrl.open(create=False, write=True)
+        return int(ctrl.next_operation_seq())
+    finally:
+        ctrl.close()
 
 
 def _active_generation_id(store: Any) -> str | None:
@@ -616,6 +707,8 @@ def _import_v2(owner: MarkdownIndexer, src: Path, archive: zipfile.ZipFile,
         store = None
         prepared = None
         change_seq_before = 0
+        gate: dict[str, Any] = {}
+        operation_seq = 0
         if "docstore.sqlite" in names:
             committed = bool(existing is not None and existing.list_documents())
             if committed and not (replace and confirm_replace):
@@ -628,12 +721,15 @@ def _import_v2(owner: MarkdownIndexer, src: Path, archive: zipfile.ZipFile,
                 )
             store = owner.document_store(write=False)
             change_seq_before = store.change_seq()
+            gate = _capture_import_gate(store)
             prepared = store.prepare_import(root / "docstore.sqlite", trust_parsed_documents=trusted)
 
         # ---- 3) 发布阶段：锁内再校验；派生层先落地，最后 publish ---------------
         with owner._sync_lock:
             if store is not None:
                 _require_no_active_ingest(store)
+                # E04-c：发布前重核 generation/epoch/change_seq（跨库不是整体 ACID）。
+                _require_import_gate_unchanged(store, gate)
                 if store.change_seq() != change_seq_before:
                     raise StoreConflict(
                         "IMPORT_CONFLICT: document store changed during import validation; "
@@ -645,6 +741,8 @@ def _import_v2(owner: MarkdownIndexer, src: Path, archive: zipfile.ZipFile,
                 _stage_derived_layers(owner, text_target, vectors, compatible)
                 if prepared is not None:
                     prev_generation = str(prepared.get("expected_generation") or "")
+                    # 本次导入的单调操作序号（跨库操作的可审计 token，E04-c）。
+                    operation_seq = _next_operation_seq(store)
                     store.publish_import(prepared, snapshot_sha256=_sha_file(src), trusted=trusted)
                     published = True
                     _register_generation_state(store, prev_generation, "retained_backup")
@@ -687,6 +785,7 @@ def _import_v2(owner: MarkdownIndexer, src: Path, archive: zipfile.ZipFile,
                   "text_published": False,
                   "vectors": len(vectors) if compatible else 0, "vectors_imported": compatible,
                   "parsed_documents_trusted": trusted, "replaced": bool(published and replace),
+                  "operation_seq": operation_seq,
                   "warnings": ["local source reconciliation required"]}
         # 释放 mutation 之后才登记刷新（E04-a）。
         _register_post_import_refresh(owner, result)

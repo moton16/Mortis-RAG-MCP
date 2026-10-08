@@ -137,7 +137,9 @@ def test_unreadable_ingest_queue_blocks_import(tmp_path, monkeypatch):
     def boom(self, **kwargs):
         raise RuntimeError("control db locked")
 
-    monkeypatch.setattr(DocumentStore, "list_jobs", boom)
+    # E04-c：门禁改为全队扫描 `has_active_ingest()`（不再只查最近 500 条），
+    # 读不到队列仍然 fail closed。
+    monkeypatch.setattr(DocumentStore, "has_active_ingest", boom)
     with pytest.raises(StoreBusy, match="ingest queue"):
         snapshot_mod.import_snapshot(indexer, snapshot)
 
