@@ -90,6 +90,31 @@ def test_abandon_and_late_response_two_connections(tmp_path):
         second.close()
 
 
+def test_abandon_success_compete_two_connections(tmp_path):
+    layout = layout_for(tmp_path)
+    control = ControlStore(layout)
+    request_id = PaidRequestJournal(control, "embed").before_send("same", "https://example.invalid", "fp")
+    barrier = threading.Barrier(2)
+    def finish(state):
+        other = ControlStore(layout)
+        other.open(write=True)
+        try:
+            barrier.wait(timeout=5)
+            return state, other.mark_intent(request_id, state, expected_states=("prepared",))
+        finally:
+            other.close()
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(finish, ("success", "abandoned")))
+        winners = [state for state, changed in results if changed]
+        assert len(winners) == 1
+        assert control.intent_state(request_id) == winners[0]
+        assert control.mark_intent(request_id, "submission_unknown") is False
+        assert control.intent_state(request_id) == winners[0]
+    finally:
+        control.close()
+
+
 def test_revoke_absent_profile_records_explicit_revocation(tmp_path):
     control = ControlStore(layout_for(tmp_path))
     try:
