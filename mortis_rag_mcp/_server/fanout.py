@@ -1,7 +1,7 @@
 """跨库检索 Fan-out 编排（v0.8.0 自 server.py 提取）。
 
 核心契约：
-- 单次 Query Embedding：整个 fan-out 跨库流程只对 query 计算一次向量；
+- Query Embedding：每个实际参与的相同空间最多一次，失败亦不隐式重发；
 - 过滤/去重优先于 rerank：过滤与去重在 rerank 之前执行；
 - 库级权重保护：rerank 计算完成后将库级权重乘回 chunk.score；
 - 跨库分页：全局模式在整体排序后统一分页；分组模式按库切桶分别分页；
@@ -17,6 +17,7 @@ from typing import Any, TYPE_CHECKING
 from ..registry import VaultEntry, normalize_vault_key
 from .._indexer.models import Chunk, SearchFilter, dedupe_by_content_hash
 from .._indexer.search import rerank_chunks
+from ..embedding_capabilities import embed_with_profile
 
 if TYPE_CHECKING:
     from mortis_rag_mcp.server import VaultMcpServer
@@ -325,14 +326,9 @@ def fanout_search(
     errors: dict[str, str] = {}
     indexing_vaults: dict[str, Any] = {}
 
-    # Embed the query exactly once for the whole fan-out.
-    query_vector = None
-    if server.config.embedding.mode == "external":
-        try:
-            first = server._indexer_for({"vault_path": entries[0].path})
-            query_vector = first.embedding_provider.embed([query])[0]
-        except Exception as exc:
-            errors["_query_embedding"] = str(exc)
+    query = query.strip()
+    query_by_space: dict[str, Any] = {}
+    participating = []
 
     for entry in entries:
         try:
@@ -359,6 +355,20 @@ def fanout_search(
                 if r_status.get("refresh_error"):
                     v_info["indexing_error"] = r_status["refresh_error"]
                 indexing_vaults[entry.path] = v_info
+            query_vector = None
+            skip_semantic = False
+            if query and indexer.config.embedding.mode == "external" and indexer._vector_route_allowed():
+                profile = indexer._embedding_profile
+                space = profile.fingerprint
+                if space not in query_by_space:
+                    try:
+                        query_by_space[space] = embed_with_profile(
+                            indexer.embedding_provider, [query], profile, query=True)[0]
+                    except Exception as exc:
+                        query_by_space[space] = None
+                        errors[f"_query_embedding:{space}"] = str(exc)
+                query_vector = query_by_space[space]
+                skip_semantic = query_vector is None
             chunks = indexer.search(
                 query,
                 per_vault_k,
@@ -367,7 +377,9 @@ def fanout_search(
                 filters=per_vault_filters,
                 dedupe=dedupe,
                 exact_terms=exact_terms,
+                skip_semantic=skip_semantic,
             )
+            participating.append(indexer)
             for chunk in chunks:
                 merged.append((entry, chunk))
             searched.append(entry.path)
@@ -388,7 +400,7 @@ def fanout_search(
         pairs = dedupe_by_content_hash(pairs, chunk_of=lambda pair: pair[1])
     if use_rerank and merged:
         provider = None
-        for indexer in list(server._indexers.values()):
+        for indexer in participating:
             if indexer.reranker_provider is not None:
                 provider = indexer.reranker_provider
                 break
@@ -396,7 +408,7 @@ def fanout_search(
             # rerank 的候选池必须来自去重+加权后的 pairs，而不是未去重的
             # merged：否则去重被这条路径整体撤销。
             pool = [chunk for _, chunk in pairs]
-            reranked = rerank_chunks(query, pool, provider, cap=server.config.rerank_cap)
+            reranked = rerank_chunks(query, pool, provider, cap=indexer.config.rerank_cap)
             origin_map: dict[str, list[VaultEntry]] = {}
             for entry, chunk in pairs:
                 origin_map.setdefault(chunk.id, []).append(entry)

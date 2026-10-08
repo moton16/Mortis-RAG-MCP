@@ -8,6 +8,8 @@
 """
 from __future__ import annotations
 
+from ..embedding_capabilities import embed_with_profile
+
 from array import array
 from dataclasses import replace
 import re
@@ -244,6 +246,7 @@ def search_single_vault(
     dedupe: bool = True,
     *,
     exact_terms: list[str] | None = None,
+    skip_semantic: bool = False,
 ) -> list[Chunk]:
     """单库三路混合检索管线主逻辑。"""
     try:
@@ -337,10 +340,11 @@ def search_single_vault(
 
     semantic_chunks: list[Chunk] = []
     semantic_snapshot: dict[str, float] = {}
-    if owner.config.embedding.mode == "external" and owner._vector_route_allowed():
+    if not skip_semantic and owner.config.embedding.mode == "external" and owner._vector_route_allowed():
         try:
             if query_vector is None:
-                query_vector = owner.embedding_provider.embed([query])[0]
+                query_vector = embed_with_profile(owner.embedding_provider, [query],
+                                                  owner._embedding_profile, query=True)[0]
             vec_limit = max(top_k, owner.config.rrf_per_route, owner.config.rerank_cap)
             if filters is not None:
                 vec_limit = max(vec_limit, min(top_k * 20, vec_limit * 8))
@@ -428,6 +432,7 @@ class SearchEngine:
         dedupe: bool = True,
         *,
         exact_terms: list[str] | None = None,
+        skip_semantic: bool = False,
     ) -> list[Chunk]:
         return search_single_vault(
             self.owner,
@@ -438,6 +443,7 @@ class SearchEngine:
             filters=filters,
             dedupe=dedupe,
             exact_terms=exact_terms,
+            skip_semantic=skip_semantic,
         )
 
     @classmethod
@@ -452,6 +458,7 @@ class SearchEngine:
         dedupe: bool = True,
         *,
         exact_terms: list[str] | None = None,
+        skip_semantic: bool = False,
     ) -> list[Chunk]:
         return search_single_vault(
             owner,
@@ -462,4 +469,5 @@ class SearchEngine:
             filters=filters,
             dedupe=dedupe,
             exact_terms=exact_terms,
+            skip_semantic=skip_semantic,
         )

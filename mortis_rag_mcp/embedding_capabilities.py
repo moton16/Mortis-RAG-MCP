@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+from string import Formatter
 from dataclasses import asdict, dataclass, replace
 from struct import pack, unpack
 from types import MappingProxyType
@@ -69,7 +70,24 @@ CAPABILITY_PROFILES = MappingProxyType({
 })
 
 
+def validate_text_template(template: str) -> None:
+    """One intact text slot; escaped literal braces and !s are supported."""
+    if not isinstance(template, str):
+        raise EmbeddingContractError("embedding template must be a string")
+    try:
+        slots = [(field, spec, conversion) for _, field, spec, conversion in Formatter().parse(template)
+                 if field is not None]
+    except ValueError as exc:
+        raise EmbeddingContractError("invalid embedding template format") from exc
+    if len(slots) != 1 or slots[0][0] != "text" or slots[0][1] or slots[0][2] not in (None, "s"):
+        raise EmbeddingContractError("embedding template requires exactly one intact {text} slot")
+
+
 def resolve_embedding_profile(config: Any) -> ResolvedEmbeddingProfile:
+    query_template = getattr(config, "query_template", "{text}")
+    document_template = getattr(config, "document_template", "{text}")
+    validate_text_template(query_template)
+    validate_text_template(document_template)
     dim = config.dimension
     if isinstance(dim, bool) or not isinstance(dim, int) or dim <= 0:
         raise EmbeddingContractError("embedding dimension must be a positive integer")
@@ -81,7 +99,9 @@ def resolve_embedding_profile(config: Any) -> ResolvedEmbeddingProfile:
     if config.mode == "static":
         if slicing:
             raise EmbeddingContractError("static profile does not support client slicing")
-        return ResolvedEmbeddingProfile("static", "static", "sha256", "", "v1", "", dim, dim, None, "unsupported", evidence_reference="local-deterministic")
+        return ResolvedEmbeddingProfile("static", "static", "sha256", "", "v1", "", dim, dim, None, "unsupported",
+                                        query_template=query_template, document_template=document_template,
+                                        evidence_reference="local-deterministic")
     if name:
         if name not in CAPABILITY_PROFILES:
             raise EmbeddingContractError("unsupported capability_profile; provide verified endpoint evidence")
@@ -101,11 +121,15 @@ def resolve_embedding_profile(config: Any) -> ResolvedEmbeddingProfile:
         getattr(config, "endpoint_revision", ""), native, dim,
         dim if config.send_dimensions else None,
         "server" if config.send_dimensions else "unsupported",
+        query_template=query_template, document_template=document_template,
+        preprocess_version=getattr(config, "preprocess_version", "text-v1"),
         max_context=context, evidence_reference=evidence,
     )
 
 
 def validate_profile(profile: ResolvedEmbeddingProfile) -> None:
+    validate_text_template(profile.query_template)
+    validate_text_template(profile.document_template)
     if profile.dimensions_protocol not in {"unsupported", "server", "client"}:
         raise EmbeddingContractError("unsupported dimensions protocol")
     for dim in (profile.native_dim, profile.effective_dim):
@@ -161,6 +185,7 @@ def embedding_key(profile: ResolvedEmbeddingProfile, text: str, modality: str = 
 
 
 def embed_with_profile(provider: Any, texts: Any, profile: ResolvedEmbeddingProfile, *, query: bool = False) -> list[list[float]]:
+    validate_profile(profile)
     items = list(texts)
     if not items:
         return []

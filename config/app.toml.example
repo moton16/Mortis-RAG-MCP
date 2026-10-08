@@ -20,6 +20,12 @@ endpoint = "https://api.siliconflow.cn/v1/embeddings"
 model = "BAAI/bge-m3"
 # 是否向 API 发送 dimensions 参数（支持 MRL 裁剪的模型可开；标准定长端点请保持 false）。
 send_dimensions = false
+# R2 通用原样默认；仅按端点明确合同设置非对称模板，不按模型名猜前缀。
+query_template = "{text}"
+document_template = "{text}"
+# model_revision = ""
+# endpoint_revision = ""
+# preprocess_version = "text-v1"
 # Prefer environment interpolation over committing a secret.
 # api_key 为空时会自动回退读取环境变量 MORTIS_RAG_API_KEY（同时兼容 VAULT_MCP_API_KEY）。
 api_key = "${MORTIS_RAG_API_KEY}"

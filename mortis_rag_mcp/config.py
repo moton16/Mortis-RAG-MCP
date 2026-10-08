@@ -48,8 +48,19 @@ class EmbeddingConfig:
     capability_profile: str = ""
     adapter: str = "openai_text"
     client_slicing: bool = False
+    query_template: str = "{text}"
+    document_template: str = "{text}"
+    model_revision: str = ""
+    endpoint_revision: str = ""
+    preprocess_version: str = "text-v1"
 
     def __post_init__(self) -> None:
+        from .embedding_capabilities import validate_text_template
+        validate_text_template(self.query_template)
+        validate_text_template(self.document_template)
+        for name in ("model_revision", "endpoint_revision", "preprocess_version"):
+            if not isinstance(getattr(self, name), str):
+                raise ValueError(f"embedding.{name} must be a string")
         if not isinstance(self.client_slicing, bool):
             raise ValueError("embedding.client_slicing must be a boolean")
         if not isinstance(self.capability_profile, str) or not isinstance(self.adapter, str) or not self.adapter:
@@ -763,6 +774,11 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
         capability_profile=str(embedding.get("capability_profile", "")),
         adapter=str(embedding.get("adapter", "openai_text")),
         client_slicing=_boolean(embedding, "client_slicing", False),
+        query_template=embedding.get("query_template", "{text}"),
+        document_template=embedding.get("document_template", "{text}"),
+        model_revision=embedding.get("model_revision", ""),
+        endpoint_revision=embedding.get("endpoint_revision", ""),
+        preprocess_version=embedding.get("preprocess_version", "text-v1"),
     )
     rer = RerankerConfig(
         enabled=bool(reranker.get("enabled", False)),

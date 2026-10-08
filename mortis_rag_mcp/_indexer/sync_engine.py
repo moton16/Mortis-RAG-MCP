@@ -16,6 +16,7 @@ import time
 from typing import Any, Iterable, TYPE_CHECKING
 
 from ..providers import EmbeddingProvider, ProviderError
+from ..embedding_capabilities import embed_with_profile
 from .models import Chunk, _EMB_DTYPE
 from .scanning import _MTIME_TICK_PROBE_MAX_SAMPLES, scan_indexable_files
 
@@ -131,28 +132,21 @@ def _reuse_key(chunk: Chunk) -> str:
 def _document_input(owner: MarkdownIndexer, content: str) -> str:
     """文档嵌入的**实际输入**：应用 profile 的 `document_template`（§17.4）。
 
-    默认模板 `{text}` 是恒等变换；只有显式配置模板时才改变发送内容。模板里出现
-    未知占位符时按原文发送（不静默丢正文），并由 embedding_key 记录同一份输入。
+    与 embed_with_profile 的渲染一致；非法模板在配置/profile解析时拒绝。
     """
     profile = getattr(owner, "_embedding_profile", None)
-    template = getattr(profile, "document_template", "{text}") or "{text}"
-    if template == "{text}":
-        return content
-    try:
-        return template.format(text=content)
-    except (KeyError, IndexError, ValueError):
-        return content
+    return profile.document_template.format(text=content)
 
 
 class _TemplatingProvider:
     """在 provider 边界应用 `document_template`，其余行为（批量/合约校验）原样透传。"""
 
-    def __init__(self, provider: Any, apply: Any) -> None:
+    def __init__(self, provider: Any, profile: Any) -> None:
         self._provider = provider
-        self._apply = apply
+        self._profile = profile
 
     def embed(self, texts):
-        return self._provider.embed([self._apply(text) for text in texts])
+        return embed_with_profile(self._provider, texts, self._profile)
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._provider, name)
@@ -161,10 +155,7 @@ class _TemplatingProvider:
 def _document_provider(owner: MarkdownIndexer) -> Any:
     provider = owner.embedding_provider
     profile = getattr(owner, "_embedding_profile", None)
-    template = getattr(profile, "document_template", "{text}") or "{text}"
-    if template == "{text}":
-        return provider
-    return _TemplatingProvider(provider, lambda text: _document_input(owner, text))
+    return _TemplatingProvider(provider, profile)
 
 
 def _stamp_embedding_keys(owner: MarkdownIndexer) -> None:
@@ -179,7 +170,7 @@ def _stamp_embedding_keys(owner: MarkdownIndexer) -> None:
     template = getattr(profile, "preprocess_version", "") or "text-v1"
     for chunks in owner._chunks.values():
         for chunk in chunks:
-            if chunk.metadata.get("embedding_disabled") or chunk.metadata.get("embedding_key"):
+            if chunk.metadata.get("embedding_disabled"):
                 continue
             chunk.metadata["embedding_key"] = _embedding_key(
                 _document_input(owner, chunk.content), space, template,

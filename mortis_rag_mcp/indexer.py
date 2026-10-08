@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sqlite3
 import threading
 import time
 import zipfile
@@ -322,7 +323,14 @@ class MarkdownIndexer:
         key = self._cache_key()
         self._chunks_cache_path = chunks_dir / f"vault_{key}.chunks.bin"
         model_hash = hashlib.sha256(self.config.embedding.model.encode("utf-8")).hexdigest()[:8]
-        self._vectors_cache_path = vectors_dir / f"vault_{key}.{model_hash}.{self.config.embedding.dimension}.vec.bin"
+        stem = f"vault_{key}.{model_hash}.{self.config.embedding.dimension}"
+        space = self._embedding_profile.fingerprint
+        legacy_bin = vectors_dir / f"{stem}.vec.bin"
+        self._vectors_cache_path = vectors_dir / f"{stem}.{space}.vec.bin"
+        # Reuse a proven compatible pre-R2 path, never overwrite an incompatible space.
+        legacy = _VectorsCodec.load(legacy_bin) if legacy_bin.exists() else None
+        if legacy and legacy[0] == self._vectors_meta():
+            self._vectors_cache_path = legacy_bin
         self._fts_cache_path = fts_dir / f"vault_{key}.fts.sqlite"
         # sqlite-vec backend keeps its own db (never shares the FTS file).
         # 文件名必须带上 model 与 dimension：vec0 表的维度在建表时就固化了
@@ -330,8 +338,17 @@ class MarkdownIndexer:
         # IF NOT EXISTS 会静默保留旧表，之后所有插入都失败且被 upsert 的
         # except 吞掉 —— 向量库从此语义检索归零且不可自愈。
         self._vectors_db_path = (
-            vectors_dir / f"vault_{key}.{model_hash}.{self.config.embedding.dimension}.vec.sqlite"
+            vectors_dir / f"{stem}.{space}.vec.sqlite"
         )
+        legacy_db = vectors_dir / f"{stem}.vec.sqlite"
+        if legacy_db.exists():
+            try:
+                with sqlite3.connect(legacy_db.resolve().as_uri() + "?mode=ro", uri=True) as conn:
+                    row = conn.execute("SELECT value FROM vector_space_meta WHERE key='fingerprint'").fetchone()
+                if row and row[0] == space:
+                    self._vectors_db_path = legacy_db
+            except sqlite3.Error:
+                pass  # Unknown/mismatched old stores stay untouched.
         # 失败名单：与 chunks/vectors/fts 平级的纯可观测性文件，进程重启后
         # 让 kb_stats 仍能报出上一轮的失败原因。
         self._failed_cache_path = base / f"vault_{key}.failed.json"
@@ -1200,6 +1217,7 @@ class MarkdownIndexer:
         dedupe: bool = True,
         *,
         exact_terms: list[str] | None = None,
+        skip_semantic: bool = False,
     ) -> list[Chunk]:
         return _search.search_single_vault(
             self,
@@ -1210,6 +1228,7 @@ class MarkdownIndexer:
             filters=filters,
             dedupe=dedupe,
             exact_terms=exact_terms,
+            skip_semantic=skip_semantic,
         )
 
     @staticmethod
