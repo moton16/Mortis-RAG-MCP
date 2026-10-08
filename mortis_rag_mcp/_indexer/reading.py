@@ -1,8 +1,14 @@
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass
+import math
+import os
+from dataclasses import dataclass, replace
 from pathlib import Path
+import time
+from typing import Any, Protocol
+
+from ..doc_store import normalize_source_path
 
 
 @dataclass(frozen=True, slots=True)
@@ -16,6 +22,14 @@ class ReadResult:
     truncated: bool
     next_start_line: int | None
     next_start_char: int | None
+    source_kind: str = "physical"
+    revision_id: str | None = None
+    original_sha256: str | None = None
+    render_sha256: str | None = None
+    line_basis: str = "physical"
+    quality: str | None = None
+    coverage: Any = None
+    source_changed: bool = False
 
 
 class ReadFileNotFoundError(FileNotFoundError, ValueError):
@@ -134,6 +148,25 @@ def read_file_result(
             f"文件 '{source}' 编码不是合法的 UTF-8: [{exc.__class__.__name__}]；请将文件转为 UTF-8 编码"
         ) from exc
 
+    return slice_text_result(
+        text, source, source_sha256, start_line, end_line,
+        heading=heading, start_char=start_char, max_chars=max_chars,
+    )
+
+
+def slice_text_result(
+    text: str,
+    source: str,
+    render_sha256: str,
+    start_line: int | None = None,
+    end_line: int | None = None,
+    *,
+    heading: str | None = None,
+    start_char: int = 0,
+    max_chars: int | None = None,
+) -> ReadResult:
+    """Slice physical or rendered text using the same line and cursor contract."""
+    source_sha256 = render_sha256
     lines = text.splitlines()
     total_lines = len(lines)
 
@@ -277,3 +310,210 @@ def read_file_result(
         next_start_line=next_start_line,
         next_start_char=next_start_char,
     )
+
+
+class VirtualReadOwner(Protocol):
+    vault_path: Path
+    config: Any
+
+    def _existing_document_store(self) -> Any: ...
+
+    def _ignore_matcher(self) -> Any: ...
+
+
+class VirtualReadError(ValueError):
+    """Stable fail-closed read error without exposing physical paths."""
+
+    def __init__(self, code: str, source: str) -> None:
+        self.code = code
+        self.retryable = code in {"UNAVAILABLE", "VERIFICATION_PENDING"}
+        super().__init__(f"{code}: virtual source {source!r}")
+
+
+def _original_sha256(path: Path, source: str, limit: int, deadline: float) -> str:
+    digest = hashlib.sha256()
+    try:
+        before = path.stat()
+        if limit and before.st_size > limit:
+            raise VirtualReadError("RESOURCE_LIMIT", source)
+        consumed = 0
+        with path.open("rb") as stream:
+            opened = os.fstat(stream.fileno())
+            if (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino):
+                raise VirtualReadError("SOURCE_CHANGED", source)
+            while True:
+                if time.monotonic() >= deadline:
+                    raise VirtualReadError("VERIFICATION_PENDING", source)
+                block = stream.read(64 * 1024)
+                if not block:
+                    break
+                consumed += len(block)
+                if limit and consumed > limit:
+                    raise VirtualReadError("RESOURCE_LIMIT", source)
+                digest.update(block)
+            after_open = os.fstat(stream.fileno())
+        after = path.stat()
+    except OSError as exc:
+        raise VirtualReadError("UNAVAILABLE", source) from exc
+    def identity(stat: os.stat_result) -> tuple[int, int, int, int]:
+        return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns
+
+    # Windows path stat uses birth time for ctime while handle stat uses change time.
+    if not (identity(before) == identity(opened) == identity(after_open) == identity(after)) or (
+        before.st_ctime_ns != after.st_ctime_ns or opened.st_ctime_ns != after_open.st_ctime_ns
+    ):
+        raise VirtualReadError("SOURCE_CHANGED", source)
+    if time.monotonic() >= deadline:
+        raise VirtualReadError("VERIFICATION_PENDING", source)
+    return digest.hexdigest()
+
+
+def read_virtual_result(
+    owner: VirtualReadOwner,
+    source: str,
+    start_line: int | None = None,
+    end_line: int | None = None,
+    *,
+    heading: str | None = None,
+    start_char: int = 0,
+    max_chars: int | None = None,
+    allow_stale: bool = False,
+    expected_revision_id: str | None = None,
+    expected_sha256: str | None = None,
+    expected_render_sha256: str | None = None,
+    chunk_id_hint: str | None = None,
+    verification_timeout: float = 1.5,
+) -> ReadResult:
+    """Read a committed revision only after source and policy verification.
+
+    The caller selects a registered vault and resolves aliases before entering
+    this helper. No facade import, sync, parsing or binary UTF-8 read occurs.
+    """
+    if type(allow_stale) is not bool:
+        raise ValueError("allow_stale must be a boolean")
+    if verification_timeout <= 0 or not math.isfinite(verification_timeout):
+        raise ValueError("verification_timeout must be positive and finite")
+    source = normalize_source_path(source, owner.vault_path)
+    try:
+        ignore_path = owner.vault_path / owner.config.ignore_file
+        try:
+            ignore_path.stat()
+        except FileNotFoundError:
+            pass
+        else:
+            ignore_path.read_text(encoding="utf-8")
+        matcher = owner._ignore_matcher()
+        if matcher.is_ignored(source)[0]:
+            raise VirtualReadError("UNAVAILABLE", source)
+        store = owner._existing_document_store()
+        active = store.get_active(source, include_hidden=True) if store is not None else None
+    except VirtualReadError:
+        raise
+    except Exception as exc:
+        raise VirtualReadError("UNAVAILABLE", source) from exc
+    if store is None or active is None or active.visibility != "active" or active.revision.state != "committed":
+        raise VirtualReadError("UNAVAILABLE", source)
+    revision = active.revision
+    is_chunk = chunk_id_hint is not None or expected_revision_id is not None
+    if is_chunk and (
+        not expected_revision_id or not expected_sha256 or not expected_render_sha256
+        or expected_revision_id != revision.revision_id
+        or expected_sha256 != revision.source_sha256
+        or expected_render_sha256 != revision.render_sha256
+    ):
+        raise VirtualReadError("STALE", source)
+    deadline = time.monotonic() + verification_timeout
+    raw_sha = _original_sha256(owner.vault_path / source, source,
+                               owner.config.ingest.max_file_size_bytes, deadline)
+    changed = raw_sha != revision.source_sha256
+    if changed and (is_chunk or not allow_stale):
+        raise VirtualReadError("STALE" if is_chunk else "SOURCE_CHANGED", source)
+    if hashlib.sha256(revision.parsed_markdown.encode("utf-8")).hexdigest() != revision.render_sha256:
+        raise VirtualReadError("UNAVAILABLE", source)
+    result = slice_text_result(revision.parsed_markdown, source, revision.render_sha256,
+                               start_line, end_line, heading=heading,
+                               start_char=start_char, max_chars=max_chars)
+    try:
+        latest = store.get_active(source, include_hidden=True)
+        try:
+            ignore_path.stat()
+        except FileNotFoundError:
+            pass
+        else:
+            ignore_path.read_text(encoding="utf-8")
+        ignored = owner._ignore_matcher().is_ignored(source)[0]
+    except Exception as exc:
+        raise VirtualReadError("UNAVAILABLE", source) from exc
+    normalize_source_path(source, owner.vault_path)
+    if latest is None or latest.visibility != "active" or ignored:
+        raise VirtualReadError("UNAVAILABLE", source)
+    if latest.active_revision != revision.revision_id:
+        raise VirtualReadError("STALE" if is_chunk else "SOURCE_CHANGED", source)
+    return replace(result, source_kind="virtual", revision_id=revision.revision_id,
+                   original_sha256=revision.source_sha256, render_sha256=revision.render_sha256,
+                   line_basis="rendered_markdown", quality=revision.quality,
+                   coverage=revision.capabilities.get("coverage"), source_changed=changed)
+
+
+def resolve_virtual_source(owner: VirtualReadOwner, source: str, *,
+                           revision_id: str = "", verification_timeout: float = 1.5) -> dict[str, Any]:
+    """Verify库归属/当前revision/物理源 SHA 后返回地址事实，不返回正文（§15.1/§15.3）。
+
+    与 `read_virtual_result` 同一 fail-closed 判据：来源被 ignore/非 active/未提交/物理
+    源 SHA 与解析事实不符/复核期间 revision 变化，一律抛 `VirtualReadError`（带稳定 code）。
+    媒体读取用它对 `source + revision_id` 做发布前核验，绝不按包内签名或调用方自述采信。
+    """
+    if not isinstance(revision_id, str):
+        raise ValueError("revision_id must be a string")
+    if verification_timeout <= 0 or not math.isfinite(verification_timeout):
+        raise ValueError("verification_timeout must be positive and finite")
+    source = normalize_source_path(source, owner.vault_path)
+    try:
+        ignore_path = owner.vault_path / owner.config.ignore_file
+        try:
+            ignore_path.stat()
+        except FileNotFoundError:
+            pass
+        else:
+            ignore_path.read_text(encoding="utf-8")
+        if owner._ignore_matcher().is_ignored(source)[0]:
+            raise VirtualReadError("UNAVAILABLE", source)
+        store = owner._existing_document_store()
+        active = store.get_active(source, include_hidden=True) if store is not None else None
+    except VirtualReadError:
+        raise
+    except Exception as exc:
+        raise VirtualReadError("UNAVAILABLE", source) from exc
+    if store is None or active is None or active.visibility != "active" or active.revision.state != "committed":
+        raise VirtualReadError("UNAVAILABLE", source)
+    revision = active.revision
+    if revision_id and revision_id != revision.revision_id:
+        raise VirtualReadError("STALE", source)
+    deadline = time.monotonic() + verification_timeout
+    raw_sha = _original_sha256(owner.vault_path / source, source,
+                               owner.config.ingest.max_file_size_bytes, deadline)
+    if raw_sha != revision.source_sha256:
+        raise VirtualReadError("SOURCE_CHANGED", source)
+    if hashlib.sha256(revision.parsed_markdown.encode("utf-8")).hexdigest() != revision.render_sha256:
+        raise VirtualReadError("UNAVAILABLE", source)
+    try:
+        latest = store.get_active(source, include_hidden=True)
+        ignored = owner._ignore_matcher().is_ignored(source)[0]
+    except Exception as exc:
+        raise VirtualReadError("UNAVAILABLE", source) from exc
+    if latest is None or latest.visibility != "active" or ignored:
+        raise VirtualReadError("UNAVAILABLE", source)
+    if latest.active_revision != revision.revision_id:
+        raise VirtualReadError("STALE", source)
+    return {
+        "source": source,
+        "doc_id": active.doc_id,
+        "revision_id": revision.revision_id,
+        "source_sha256": revision.source_sha256,
+        "render_sha256": revision.render_sha256,
+        "line_basis": "rendered_markdown",
+        "quality": revision.quality,
+        "coverage": revision.capabilities.get("coverage"),
+        "total_lines": len(revision.parsed_markdown.splitlines()),
+        "markdown": revision.parsed_markdown,
+    }

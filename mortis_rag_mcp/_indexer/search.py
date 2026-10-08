@@ -275,8 +275,9 @@ def search_single_vault(
         if dedupe:
             ranked = dedupe_by_content_hash(ranked)
         if filters is None:
-            return ranked[: max(0, top_k)]
+            return owner._filter_visible_chunks(ranked)[: max(0, top_k)]
         ranked = [chunk for chunk in ranked if filters.matches(chunk)]
+        ranked = owner._filter_visible_chunks(ranked)
         start, end = filters.page_slice(top_k)
         return ranked[start:end]
 
@@ -336,7 +337,7 @@ def search_single_vault(
 
     semantic_chunks: list[Chunk] = []
     semantic_snapshot: dict[str, float] = {}
-    if owner.config.embedding.mode == "external":
+    if owner.config.embedding.mode == "external" and owner._vector_route_allowed():
         try:
             if query_vector is None:
                 query_vector = owner.embedding_provider.embed([query])[0]
@@ -400,8 +401,10 @@ def search_single_vault(
     if dedupe:
         ranked = dedupe_by_content_hash(ranked)
 
+    ranked = owner._filter_visible_chunks(ranked)
     if use_rerank and owner.reranker_provider and ranked:
         ranked = rerank_chunks(query, ranked, owner.reranker_provider, cap=owner.config.rerank_cap)
+    ranked = owner._filter_visible_chunks(ranked)
 
     if filters is None:
         return ranked[: max(0, top_k)]
