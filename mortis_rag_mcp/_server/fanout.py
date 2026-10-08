@@ -325,6 +325,8 @@ def fanout_search(
     searched: list[str] = []
     errors: dict[str, str] = {}
     indexing_vaults: dict[str, Any] = {}
+    # E04-b：与单库检索/导入同一口径的 additive 索引状态（只登记非 ready 的库）。
+    vault_index_state: dict[str, Any] = {}
 
     query = query.strip()
     query_by_space: dict[str, Any] = {}
@@ -340,11 +342,16 @@ def fanout_search(
                 and not getattr(indexer, "_chunks_cache_loaded", False)
                 and len(indexer._chunks) == 0
             )
+            state = indexer.index_state()
+            if state["index_state"] != "ready":
+                vault_index_state[entry.path] = state
             if is_cold:
                 errors[entry.path] = "indexing in progress"
                 indexing_vaults[entry.path] = {
                     "indexing_in_progress": True,
                     "indexing_progress": r_status["indexing_progress"],
+                    "index_state": state["index_state"],
+                    "next_action": state["next_action"],
                 }
                 continue
             if r_status["indexing_in_progress"] or r_status.get("refresh_error"):
@@ -495,6 +502,8 @@ def fanout_search(
         if indexing_vaults:
             res["indexing_vaults"] = indexing_vaults
             res["indexing_in_progress"] = True
+        if vault_index_state:
+            res["vault_index_state"] = vault_index_state
         if len(searched) > 1 and not target_vaults:
             names = [vault_name_map.get(s, Path(s).name) for s in searched]
             res["hint"] = (
@@ -524,6 +533,8 @@ def fanout_search(
     if indexing_vaults:
         res["indexing_vaults"] = indexing_vaults
         res["indexing_in_progress"] = True
+    if vault_index_state:
+        res["vault_index_state"] = vault_index_state
     if len(searched) > 1 and not target_vaults:
         names = [vault_name_map.get(s, Path(s).name) for s in searched]
         res["hint"] = (

@@ -1667,6 +1667,10 @@ class MarkdownIndexer:
     def refresh_status(self) -> dict[str, Any]:
         return _watch.refresh_status(self)
 
+    def index_state(self) -> dict[str, Any]:
+        """additive `index_state=empty/rebuilding/unverified/ready` + `next_action`（E04-b）。"""
+        return _watch.index_state(self)
+
     def request_ingest_scan(self) -> bool:
         return _watch.request_ingest_scan(self)
 

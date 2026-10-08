@@ -143,6 +143,46 @@ def refresh_status(owner: MarkdownIndexer) -> dict[str, Any]:
     }
 
 
+INDEX_STATES = ("empty", "rebuilding", "unverified", "ready")
+
+
+def index_state(owner: MarkdownIndexer) -> dict[str, Any]:
+    """Additive 索引状态（E04-b / Q05）：single、fanout、import 共用同一口径。
+
+    * `rebuilding`：还有可重建工作未完成（后台 sync 在跑或刷新已登记）；
+    * `unverified`：无待重建但有隔离事实（exempt/unverified/deleted 文档）；
+      `isolated_facts` 给出数量，**ready 不自动激活这些事实**；
+    * `empty`：既无可见内容也无隔离事实；
+    * `ready`：其余。
+    """
+    status = refresh_status(owner)
+    pending = bool(status.get("indexing_in_progress")) or bool(getattr(owner, "_fs_requested", False))
+    try:
+        visible = len(getattr(owner, "_chunks", {}) or {})
+    except Exception:
+        visible = 0
+    isolated = 0
+    try:
+        store = owner._existing_document_store()
+        if store is not None:
+            isolated = sum(1 for doc in store.list_documents() if str(doc.visibility) != "active")
+    except Exception:
+        isolated = 0
+    if pending:
+        state, action = "rebuilding", "wait for the background sync to finish, then retry"
+    elif isolated:
+        state, action = "unverified", (
+            "isolated parsed facts are kept but not activated; re-parse or verify them, "
+            "or import with trust_parsed_documents after checking the source SHA"
+        )
+    elif visible == 0:
+        state, action = "empty", "run kb_init and a sync to build the index from local sources"
+    else:
+        state, action = "ready", ""
+    return {"index_state": state, "isolated_facts": isolated,
+            "visible_sources": visible, "next_action": action}
+
+
 def request_ingest_scan(owner: MarkdownIndexer) -> bool:
     """Request an ingest scan for PDF/Office documents (coalesced).
 

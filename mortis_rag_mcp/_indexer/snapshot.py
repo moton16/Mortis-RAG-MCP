@@ -261,13 +261,18 @@ def _register_post_import_refresh(owner: MarkdownIndexer, result: dict[str, Any]
     会停在「空且无待办」的状态，只有下次外部触发才重建。这里只登记 pending、
     不拉起后台调度线程（避免为"登记"而启动一次后台 sync）。
     """
-    from .watch import request_refresh
+    from .watch import index_state, request_refresh
 
     try:
         accepted = bool(request_refresh(owner, immediate=True, start_scheduler=False))
     except Exception:
         accepted = False
     result["refresh_requested"] = accepted
+    try:
+        # 与单库检索/fanout 同一口径的 additive 状态（E04-b）：导入后必然需要重建。
+        result.update(index_state(owner))
+    except Exception:
+        result["index_state"] = "rebuilding"
 
 
 def _sha_file(path: Path) -> str:
