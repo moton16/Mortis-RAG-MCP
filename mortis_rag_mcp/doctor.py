@@ -13,6 +13,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import platform
@@ -473,6 +474,22 @@ def check_config(app_config: str | None) -> tuple[dict, object | None]:
                 ingest_str = f"ingest: 未启用(上限{cap_str})"
             detail += f"，{ingest_str}"
 
+        chunking = getattr(cfg, "chunking", None)
+        if chunking is not None:
+            detail += f"，chunking={_sanitize_free_text(getattr(chunking, 'mode', '?'))}"
+            if getattr(chunking, "mode", "") == "legacy_chars" and not getattr(chunking, "mode_explicit", False):
+                detail += "（保留旧分块；显式切换可能重新嵌入计费）"
+        detail += f"，adapter={_sanitize_free_text(getattr(emb, 'adapter', 'openai_text'))}"
+        detail += f"，capability_profile={_sanitize_free_text(getattr(emb, 'capability_profile', '') or 'conservative')}"
+        detail += f"，routing={_sanitize_free_text(getattr(ingest_cfg, 'routing', 'auto'))}"
+        detail += f"，storage={_sanitize_free_text(getattr(ingest_cfg, 'storage', 'legacy'))}"
+        detail += f"，audio_enabled={getattr(ingest_cfg, 'audio_enabled', False)}"
+        audio = getattr(cfg, "audio", None)
+        detail += f"，transcription={'configured (not probed)' if getattr(audio, 'transcription_endpoint', '') else 'disabled'}"
+        media = getattr(cfg, "media", None)
+        detail += f"，media.inline_max_bytes={getattr(media, 'inline_max_bytes', 8388608)}"
+        detail += f"，media.refs_limit={getattr(media, 'refs_limit', 20)}"
+
         # 两侧同名配置同时存在：resolve_config_path 新名优先，旧侧那份被静默忽略。
         # 用户继续编辑旧侧的 config.toml 时看不到任何反馈，这里显式点出来。
         try:
@@ -583,14 +600,60 @@ def check_doc_store(cfg: object | None) -> dict:
         return _section(True, f"文档库检查跳过：{_sanitize_free_text(exc)}")
 
 
+def _configure_probe_paid(provider: object, cfg: object, *, kind: str, fingerprint: str) -> bool:
+    """为 doctor 显式探活装配「仅本次探测」的付费授权（§20.7B）。
+
+    探活是用户显式请求的独立动作：它只授权这一次（guard 只放行精确 fingerprint），
+    并且仍然落一条持久发送意图（响应丢失时按 SUBMISSION_UNKNOWN 处理，不自动重发）。
+    它**不**解除任何库的 pending 重嵌审批，也不写授权表。cache 关闭时无法持久化意图，
+    于是拒绝探活并给出可操作原因（不静默少一次费用记录）。
+    """
+    configure = getattr(provider, "configure_paid_requests", None)
+    if not callable(configure):
+        return True
+    from .config import AppConfig
+    from .doc_store import resolve_storage_layout
+    from .paid_requests import PaidRequestJournal, open_paid_control
+
+    if not isinstance(cfg, AppConfig):
+        # 非 AppConfig（测试桩/自定义对象）无法证明控制面可用：交给调用方按
+        # 「无法持久化意图」处理，绝不为了跑通探测而跳过闸门。
+        return False
+
+    cache_cfg = getattr(cfg, "cache", None)
+    if not bool(getattr(cache_cfg, "enabled", False)):
+        return False
+    vault = Path(str(getattr(cfg, "vault_path", "") or Path.cwd())).expanduser()
+    try:
+        control = open_paid_control(resolve_storage_layout(cfg, vault))
+    except Exception:
+        return False
+    journal = PaidRequestJournal(control, f"doctor-probe-{kind}")
+    configure(journal, lambda profile: profile == fingerprint, fingerprint)
+    return True
+
+
 def probe_embedding(cfg: object) -> dict:
     try:
         from .providers import create_embedding_provider
+        from .embedding_capabilities import resolve_embedding_profile
         emb = getattr(cfg, "embedding", None)
         mode = getattr(emb, "mode", "static")
         if mode != "external":
             return _section(True, f"mode={mode}（非 external，跳过在线探测）")
         provider = create_embedding_provider(emb)
+        try:
+            fingerprint = resolve_embedding_profile(emb).fingerprint
+        except Exception:
+            # 未经验证的 profile（自定义 endpoint）不是探活失败：provider 自己会用空
+            # profile 标识发这一次请求，闸门仍按精确 fingerprint 放行。
+            fingerprint = ""
+        if not _configure_probe_paid(provider, cfg, kind="embed", fingerprint=fingerprint):
+            return _section(
+                False,
+                "付费探活需要可持久化发送意图的本机控制面（[cache] enabled=true）；"
+                "已跳过，未发出任何请求",
+            )
         t0 = time.monotonic()
         vecs = provider.embed(["ping"])
         ms = int((time.monotonic() - t0) * 1000)
@@ -599,7 +662,7 @@ def probe_embedding(cfg: object) -> dict:
             expected_dim = getattr(emb, "dimension", None)
             if expected_dim and actual_dim != expected_dim:
                 return _section(False, f"维度不匹配：模型返回 {actual_dim} 维，配置预期 {expected_dim} 维")
-            return _section(True, f"探活成功，dim={actual_dim}，{ms}ms")
+            return _section(True, f"探活成功，dim={actual_dim}，{ms}ms（本次探活按一次独立授权发送）")
         return _section(False, "探活返回空向量")
     except Exception as exc:
         return _section(False, f"探测失败：{_sanitize_free_text(exc)}")
@@ -612,11 +675,21 @@ def probe_reranker(cfg: object) -> dict:
         if not getattr(rr, "enabled", False):
             return _section(True, "未启用（跳过）")
         provider = create_reranker_provider(rr)
+        fingerprint = hashlib.sha256("|".join((
+            "rerank", str(getattr(rr, "adapter", "openai")), str(getattr(rr, "model", "")),
+            str(getattr(rr, "endpoint", "") or ""),
+        )).encode("utf-8")).hexdigest()
+        if not _configure_probe_paid(provider, cfg, kind="rerank", fingerprint=fingerprint):
+            return _section(
+                False,
+                "重排探活需要可持久化发送意图的本机控制面（[cache] enabled=true）；"
+                "已跳过，未发出任何请求",
+            )
         t0 = time.monotonic()
         # 修正：直接调用 provider 的标准 API rerank(query, documents)
         _ = provider.rerank("ping", ["doc"])
         ms = int((time.monotonic() - t0) * 1000)
-        return _section(True, f"重排可用，{ms}ms")
+        return _section(True, f"重排可用，{ms}ms（本次探活按一次独立授权发送）")
     except Exception as exc:
         return _section(False, f"探测失败：{_sanitize_free_text(exc)}")
 
@@ -663,14 +736,21 @@ def check_ingest(cfg: object | None) -> dict:
             pass
 
         scan_note = f"最近自动扫描: {_sanitize_free_text(last_scan_record)}（报告生成时快照）" if last_scan_record else "最近自动扫描: 无记录（报告生成时快照）"
+        # 解析落点/网络策略/音频开关必须进报告：否则「为什么库里没有 .mortis-parsed」
+        # 与「为什么云端解析被拒」只能靠猜（§20.4 / §23.4 状态合同）。
+        mode_note = "；".join((
+            f"落点 storage={_sanitize_free_text(str(getattr(ingest_cfg, 'storage', 'virtual')))}",
+            f"network_policy={_sanitize_free_text(str(getattr(ingest_cfg, 'network_policy', 'configured')))}",
+            f"audio={'on' if bool(getattr(ingest_cfg, 'audio_enabled', False)) else 'off'}",
+        ))
 
         if not enabled and auto_watch:
-            return _section(True, f"auto_watch=true 但未启用（enabled=false，不生效，上限 {cap_str}）；{scan_note}")
+            return _section(True, f"auto_watch=true 但未启用（enabled=false，不生效，上限 {cap_str}）；{mode_note}；{scan_note}")
         if enabled and auto_watch:
-            return _section(True, f"自动摄取已启用（上限 {cap_str}）；{scan_note}")
+            return _section(True, f"自动摄取已启用（上限 {cap_str}）；{mode_note}；{scan_note}")
         if enabled:
-            return _section(True, f"手动摄取模式（上限 {cap_str}）；{scan_note}")
-        return _section(True, f"未启用（上限 {cap_str}）；{scan_note}")
+            return _section(True, f"手动摄取模式（上限 {cap_str}）；{mode_note}；{scan_note}")
+        return _section(True, f"未启用（上限 {cap_str}）；{mode_note}；{scan_note}")
     except Exception as exc:
         return _section(True, f"摄取检查跳过：{_sanitize_free_text(exc)}")
 

@@ -227,6 +227,9 @@ def test_kb_stats_includes_ingest_auto_snapshot(tmp_path, monkeypatch):
     server = VaultMcpServer()
     server.config.ingest.enabled = True
     server.config.ingest.auto_watch = True
+    # ingest_auto 快照来自 legacy 账本（.ingest_state.json）；virtual 的账本在 store 里，
+    # 本用例专测 legacy 快照字段，故显式选回 legacy。
+    server.config.ingest.storage = "legacy"
     server.config.ingest.max_file_size_mb = 15
     server.config.watch_method = "poll"
     server.config.watch_fallback_interval = 25.0
@@ -291,6 +294,9 @@ def test_mock_e2e_auto_ingest_flow(tmp_path, monkeypatch):
     server = VaultMcpServer()
     server.config.ingest.enabled = True
     server.config.ingest.auto_watch = True
+    # 本用例专测 **legacy 回退路径**（物理镜像 + 旧 IngestManager 内部打桩）；
+    # v0.9.0 C96 起 ingest.storage 默认 virtual，故这里显式选回 legacy。
+    server.config.ingest.storage = "legacy"
 
     with patch("mortis_rag_mcp.ingest.worker.IngestManager._client_or_make") as mock_client_factory:
         mock_client = MagicMock()

@@ -15,6 +15,7 @@ from typing import Any
 
 from . import __version__
 from .config import load_config, resolve_config_path
+from .doc_store import ControlStore, DocumentStore, resolve_storage_layout
 from .indexer import Chunk, MarkdownIndexer, SearchFilter, path_prefix_match
 from .ingest import IngestManager, INGEST_EXTS, make_ingest_manager
 from ._server import dispatch_search as _dispatch_search, fanout_search as _fanout_search_impl
@@ -227,6 +228,9 @@ def _tool_definitions() -> list[dict[str, Any]]:
             "inputSchema": {"type": "object", "required": ["snapshot"], "properties": {
                 "snapshot": {"type": "string", "description": "必填，快照 zip 文件路径"},
                 "force": {"type": "boolean", "default": False, "description": "模型/维度不一致时强制导入（仅文本层，向量重算）"},
+                "trust_parsed_documents": {"type": "boolean", "default": False, "description": "仅明确确认可信自有备份时启用；未知来源解析文档默认隔离"},
+                "replace": {"type": "boolean", "default": False, "description": "显式替换当前文档generation，旧generation保留为备份"},
+                "confirm_replace": {"type": "boolean", "default": False, "description": "确认替换目标及损失；replace=true时必需"},
                 "vault_path": {"type": "string", "description": vault_path_hint},
             }},
         },
@@ -274,7 +278,9 @@ def _tool_definitions() -> list[dict[str, Any]]:
             "name": "kb_read",
             "description": "读取知识库原文（只读磁盘原文，不触发同步、不调用 embedding API；建议带上 start_line/end_line 限定范围避免一次拉全篇）。多库环境下建议显式传 vault_path（fan-out 结果中的 source 是库内相对路径）。",
             "inputSchema": {"type": "object", "required": [], "properties": {
-                "source": {"type": "string"},
+                "source": {"type": "string", "description": "原始相对路径，支持已提交虚拟PDF/Office/音频文档及物理文本"},
+                "allow_stale": {"type": "boolean", "default": False, "description": "仅显式true允许source读取已变更源的存档；chunk_id仍严格核版本"},
+                "media_refs_offset": {"type": "integer", "minimum": 0, "default": 0, "description": "虚拟文档媒体引用分页偏移"},
                 "chunk_id": {"type": "string", "description": "可选，命中切片 ID（由 kb_search 返回），自动展开上下文；与 start_line/end_line/heading 互斥"},
                 "expand_lines": {"type": "integer", "default": 30, "minimum": 0, "maximum": 500, "description": "可选，配合 chunk_id 使用：切片前后各展开行数（默认 30，范围 0-500）"},
                 "heading": {"type": "string", "description": "可选，按原文章节标题精确定位段落（包含子标题）；多处同名标题报错引导改用行号；若同时传入 start_line/end_line 则行区间优先"},
@@ -282,6 +288,19 @@ def _tool_definitions() -> list[dict[str, Any]]:
                 "end_line": {"type": "integer", "minimum": 1},
                 "start_char": {"type": "integer", "minimum": 0, "default": 0, "description": "可选，start_line 内 0-based Unicode 字符起始偏移量（默认 0），仅在显式指定 start_line 时有效，用于单行超过 read_max_chars 时的续读"},
                 "vault_path": {"type": "string", "description": vault_path_hint},
+            }},
+        },
+        {
+            "name": "kb_read_media",
+            "description": "读取明确库、源和revision下的媒体occurrence。默认仅metadata，不读取完整blob；inline显式返回标准MCP媒体块，遵循完整JSON字节预算。",
+            "inputSchema": {"type": "object", "required": ["vault_path", "source", "revision_id", "occurrence_id"], "properties": {
+                "vault_path": {"type": "string", "description": "必填，已注册知识库名称或绝对路径"},
+                "source": {"type": "string", "description": "必填，原始库内相对路径，不接受URL"},
+                "revision_id": {"type": "string"},
+                "occurrence_id": {"type": "string"},
+                "representation": {"type": "string", "enum": ["metadata", "inline"], "default": "metadata"},
+                "variant": {"type": "string", "enum": ["preview", "original"], "default": "preview"},
+                "budget_bytes": {"type": "integer", "minimum": 1, "maximum": 8388608, "default": 2097152},
             }},
         },
         {"name": "kb_stats", "description": "返回指定知识库的索引状态、失败文件、最后同步时间和模型信息。", "inputSchema": {"type": "object", "properties": {
@@ -972,6 +991,7 @@ class VaultMcpServer:
         "kb_search": "_kb_search",
         "kb_list_files": "_kb_list_files",
         "kb_read": "_kb_read",
+        "kb_read_media": "_kb_read_media",
         "kb_stats": "_kb_stats",
         "kb_exempt": "_kb_exempt",
     }
@@ -984,7 +1004,8 @@ class VaultMcpServer:
             handler_name = self._TOOL_ROUTE_TABLE.get(name)
             if handler_name is None:
                 raise ValueError(f"unknown tool: {name}")
-            return _text_content(getattr(self, handler_name)(arguments))
+            raw_result = getattr(self, handler_name)(arguments)
+            return raw_result if name == "kb_read_media" else _text_content(raw_result)
 
         import time
         from . import diaglog
@@ -1008,7 +1029,7 @@ class VaultMcpServer:
             )
 
             t_ser0 = time.perf_counter()
-            response = _text_content(raw_result)
+            response = raw_result if name == "kb_read_media" else _text_content(raw_result)
             ser_ms = round((time.perf_counter() - t_ser0) * 1000, 2)
             resp_bytes = len(json.dumps(response, ensure_ascii=False).encode("utf-8"))
             result_count = diaglog.extract_result_count(raw_result)
@@ -1087,6 +1108,11 @@ class VaultMcpServer:
         return indexer.export_snapshot(out)
 
     def _kb_import(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        for key in ("trust_parsed_documents", "replace", "confirm_replace"):
+            if not isinstance(arguments.get(key, False), bool):
+                raise ValueError(f"{key} must be a boolean")
+        if arguments.get("replace", False) and not arguments.get("confirm_replace", False):
+            raise ValueError("replace=true requires explicit confirm_replace=true")
         indexer = self._indexer_for(arguments)
         snapshot = str(arguments.get("snapshot", "")).strip()
         if not snapshot:
@@ -1094,7 +1120,16 @@ class VaultMcpServer:
         force = arguments.get("force", False)
         if isinstance(force, str):
             force = force.strip().lower() in {"1", "true", "yes", "on"}
-        return indexer.import_snapshot(snapshot, force=bool(force))
+        # §20.2/§20.7F：信任门禁与显式替换必须逐项透传到导入实现，不能在 schema
+        # 层校验完就丢掉——否则「未知来源快照默认隔离」和「replace 独立确认」
+        # 都只是文档承诺。
+        return indexer.import_snapshot(
+            snapshot,
+            force=bool(force),
+            trust_parsed_documents=bool(arguments.get("trust_parsed_documents", False)),
+            replace=bool(arguments.get("replace", False)),
+            confirm_replace=bool(arguments.get("confirm_replace", False)),
+        )
     def _kb_search(self, arguments: dict[str, Any]) -> dict[str, Any]:
         return _dispatch_search(self, arguments)
 
@@ -1364,7 +1399,17 @@ class VaultMcpServer:
             for p in probes_to_close:
                 self._close_probe_indexer(p)
 
+    def _kb_read_media(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        from ._server.media_dispatch import dispatch_media_read
+        return dispatch_media_read(self, arguments)
+
     def _kb_read(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        allow_stale = arguments.get("allow_stale", False)
+        if not isinstance(allow_stale, bool):
+            raise ValueError("allow_stale must be a boolean")
+        media_refs_offset = arguments.get("media_refs_offset", 0)
+        if isinstance(media_refs_offset, bool) or not isinstance(media_refs_offset, int) or media_refs_offset < 0:
+            raise ValueError("media_refs_offset must be an integer >= 0")
         raw_source = arguments.get("source")
         source = str(raw_source).strip() if raw_source is not None else ""
         raw_chunk_id = arguments.get("chunk_id")
@@ -1463,12 +1508,29 @@ class VaultMcpServer:
             attribution = located["attribution"]
 
             source = chunk.source
-            recorded_sig = indexer._signatures.get(source)
-            if not recorded_sig:
-                raise ValueError(
-                    f"chunk_id {chunk_id[:12]}… 所在源文件 {source} 缺失索引签名记录（stale）；"
-                    "请重新 kb_search 获取新 id，或改用 source + heading / 行区间读取"
-                )
+            # §20.7B：虚拟 chunk 的版本寻址必须用 chunk 自己捕获的 revision/SHA
+            # （虚拟签名是版本标识，**不是**物理 SHA，绝不能拿它当物理文件校验值）。
+            is_virtual_chunk = bool(chunk.metadata.get("revision_id"))
+            expected_revision_id: str | None = None
+            expected_render_sha256: str | None = None
+            if is_virtual_chunk:
+                expected_revision_id = str(chunk.metadata.get("revision_id") or "")
+                expected_render_sha256 = str(chunk.metadata.get("render_sha256") or "")
+                expected_sha256 = str(chunk.metadata.get("source_sha256") or "")
+                if not (expected_revision_id and expected_render_sha256 and expected_sha256):
+                    raise ValueError(
+                        f"chunk_id {chunk_id[:12]}… 所在虚拟源 {source} 缺失 revision/SHA 记录（stale）；"
+                        "请重新 kb_search 获取新 id"
+                    )
+                recorded_sig = None
+            else:
+                recorded_sig = indexer._signatures.get(source)
+                if not recorded_sig:
+                    raise ValueError(
+                        f"chunk_id {chunk_id[:12]}… 所在源文件 {source} 缺失索引签名记录（stale）；"
+                        "请重新 kb_search 获取新 id，或改用 source + heading / 行区间读取"
+                    )
+                expected_sha256 = recorded_sig
 
             c_start = chunk.metadata.get("start_line", 1)
             c_end = chunk.metadata.get("end_line", c_start)
@@ -1485,9 +1547,10 @@ class VaultMcpServer:
             is_chunk_read = True
             echo_start_line = start_line
             echo_end_line = end_line
-            expected_sha256 = recorded_sig
             chunk_id_hint = f"{chunk_id[:12]}… "
         else:
+            expected_revision_id = None
+            expected_render_sha256 = None
             indexer = self._indexer_for(arguments)
             indexer.request_refresh()
             is_chunk_read = False
@@ -1578,6 +1641,9 @@ class VaultMcpServer:
             max_chars=read_max_chars,
             expected_sha256=expected_sha256,
             chunk_id_hint=chunk_id_hint,
+            allow_stale=allow_stale,
+            expected_revision_id=expected_revision_id,
+            expected_render_sha256=expected_render_sha256,
         )
 
         if heading and req_start_line is None and req_end_line is None:
@@ -1597,16 +1663,86 @@ class VaultMcpServer:
             "next_start_line": read_res.next_start_line,
             "next_start_char": read_res.next_start_char,
         }
+        # 虚拟读取必须显式暴露版本/来源事实，并附媒体引用分页（§15.1/§15.4）：
+        # 消费方据此选择 kb_read_media，而不是猜「哪张图对应哪段」。
+        if read_res.source_kind == "virtual":
+            result["source_kind"] = "virtual"
+            result["revision_id"] = read_res.revision_id
+            result["render_sha256"] = read_res.render_sha256
+            result["line_basis"] = read_res.line_basis
+            if read_res.quality is not None:
+                result["quality"] = read_res.quality
+            if read_res.coverage is not None:
+                result["coverage"] = read_res.coverage
+            if read_res.source_changed:
+                result["source_changed"] = True
+            result.update(self._media_refs_page(indexer, source, read_res.revision_id, media_refs_offset))
         if is_chunk_read:
             result["chunk_id"] = chunk.id
             result.update(attribution)
         return result
+
+    def _media_refs_page(self, indexer: MarkdownIndexer, source: str, revision_id: str | None,
+                         offset: int) -> dict[str, Any]:
+        """虚拟源的媒体引用一页（compact 键保持，缺值不臆造）。
+
+        越权/过期/库不可用一律返回空页而不是让 kb_read 失败：正文读取本身已经
+        通过 revision/SHA 核验，媒体引用只是附加上下文。
+        """
+        empty = {"media_refs": [], "media_refs_offset": offset, "next_media_refs_offset": None}
+        if not revision_id:
+            return empty
+        limit = int(getattr(self.config.media, "refs_limit", 20))
+        limit = max(1, min(limit, 100))
+        try:
+            store = indexer.document_store()
+            rows = store.list_media(source, revision_id=revision_id, offset=offset, limit=limit + 1)
+        except Exception:
+            return empty
+        page = rows[:limit]
+        refs: list[dict[str, Any]] = []
+        for row in page:
+            entry: dict[str, Any] = {"occurrence_id": row.get("occurrence_id"), "kind": row.get("kind")}
+            for key in ("page", "t_start_ms", "t_end_ms"):
+                if row.get(key) is not None:
+                    entry[key] = row[key]
+            refs.append(entry)
+        has_more = len(rows) > limit
+        return {"media_refs": refs, "media_refs_offset": offset,
+                "next_media_refs_offset": offset + len(page) if has_more else None}
 
     def _kb_stats(self, arguments: dict[str, Any]) -> dict[str, Any]:
         indexer = self._indexer_for(arguments)
         indexer.request_refresh()
         r_status = indexer.refresh_status()
         stats = indexer.stats()
+        # 付费闸门状态必须可观测：否则「检索退回词法」看起来像向量算错，实际是
+        # 等待显式重嵌授权（§20.7B）。这里只报告事实，不做任何隐式授权动作。
+        unresolved_intents = indexer.unresolved_paid_intents()
+        if unresolved_intents:
+            # 结果未知的付费请求必须可观测，否则「嵌入静默暂停」看起来像坏了。
+            stats["pending_paid_requests"] = [
+                {"request_id": item["request_id"], "kind": item["kind"],
+                 "state": item["state"], "attempt": item["attempt"]}
+                for item in unresolved_intents
+            ]
+        if getattr(indexer, "_embedding_paused", False):
+            stats["embedding_paused"] = True
+            stats["embedding_paused_reason"] = (
+                "paid embedding is paused: an earlier paid request has an unknown outcome; "
+                "confirm or abandon those intents (see pending_paid_requests) before retrying"
+                if unresolved_intents else
+                "paid embedding requires explicit approval for the current profile "
+                "(run --approve-reembedding <profile_fingerprint>)"
+            )
+        if getattr(indexer, "_paid_profile_requires_approval", False):
+            stats["pending_reembedding_approval"] = True
+            try:
+                summary = indexer.reembedding_approval_summary()
+            except Exception:
+                summary = None
+            if summary is not None:
+                stats["reembedding_approval"] = summary
         if r_status["indexing_in_progress"]:
             stats["indexing_in_progress"] = True
             stats["indexing_progress"] = r_status["indexing_progress"]
@@ -1644,6 +1780,11 @@ class VaultMcpServer:
         stats["ingest_auto"] = {
             "configured": bool(ingest_cfg.auto_watch),
             "effective": bool(effective_auto),
+            # 解析事实落点与网络策略必须可见：否则「为什么没有 .mortis-parsed 镜像」
+            # 或「为什么云解析被拒」都要靠猜（§20.4 首次 5 分钟验）。
+            "storage": str(getattr(ingest_cfg, "storage", "virtual")),
+            "network_policy": str(getattr(ingest_cfg, "network_policy", "configured")),
+            "audio_enabled": bool(getattr(ingest_cfg, "audio_enabled", False)),
             "max_file_size_mb": ingest_cfg.max_file_size_mb,
             "watch_method": watch_method,
             "effective_interval": effective_interval,
@@ -1815,14 +1956,79 @@ def _serve_stdio(server: VaultMcpServer) -> int:
             indexer.stop_watching()
 
 
+def approve_reembedding(profile_fingerprint: str, *, config_path: str | Path | None = None,
+                        vault_path: str | Path | None = None) -> dict[str, Any]:
+    """写本机付费重嵌授权（§20.7B）。不调用任何外部 API，只记录精确 profile 授权。
+
+    授权范围只覆盖该 fingerprint：配置再次变化（模型/模板/预处理/维度/切块代际）
+    会得到新 fingerprint，旧授权自动失效，不会被沿用。
+    """
+    fingerprint = str(profile_fingerprint or "").strip()
+    if not fingerprint:
+        raise ValueError("profile_fingerprint is required")
+    config = load_config(resolve_config_path(config_path))
+    if not getattr(config.cache, "enabled", False):
+        raise ValueError("cache is disabled; paid re-embedding authorization requires [cache]")
+    target_vault = Path(vault_path or config.vault_path).expanduser()
+    layout = resolve_storage_layout(config, target_vault)
+    control = ControlStore(layout)
+    try:
+        control.open(create=True, write=True)
+        control.authorize_paid_profile(fingerprint, scope="reembedding",
+                                      cost_summary={"basis": "unknown", "reason": "estimator not calibrated"},
+                                      note=f"cli approved for {target_vault}")
+    finally:
+        control.close()
+    return {"approved": True, "profile_fingerprint": fingerprint, "vault_path": str(target_vault),
+            "requires_reembedding": True}
+
+
+def migrate_ingest(*, apply: bool = False, config_path: str | Path | None = None,
+                   vault_path: str | Path | None = None) -> dict[str, Any]:
+    """旧 `.mortis-parsed` 镜像迁移入口（§20.1）：**默认 dry-run**，`apply=True` 才写 store。
+
+    不联网、不删除旧镜像、不自动重嵌；无法证明归属/源 SHA 不符的项一律 pending_manual。
+    """
+    from .ingest.migration import migrate_legacy_mirrors
+
+    config = load_config(resolve_config_path(config_path))
+    if not getattr(config.cache, "enabled", False):
+        raise ValueError("cache is disabled; mirror migration requires [cache]")
+    target_vault = Path(vault_path or config.vault_path).expanduser()
+    layout = resolve_storage_layout(config, target_vault)
+    store = DocumentStore(layout, config)
+    store.open(write=True)
+    try:
+        return migrate_legacy_mirrors(store, apply=bool(apply))
+    finally:
+        store.close()
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = ArgumentParser(prog="mortis-rag-mcp")
     parser.add_argument("--serve-mcp-stdio", action="store_true")
     parser.add_argument("--app-config", default=None)
     parser.add_argument("--doctor", action="store_true",
                         help="全量探测本机环境（含 API 真实调用）并重写 ~/.mortis_rag_mcp/STATUS.md 与 status.json")
+    parser.add_argument("--approve-reembedding", default=None, metavar="PROFILE_FINGERPRINT",
+                        help="显式授权精确 embedding profile 的付费重嵌（只写本机授权记录，不调用 API）")
+    parser.add_argument("--migrate-ingest", action="store_true",
+                        help="迁移旧 .mortis-parsed 镜像到文档库（默认 dry-run；不联网、不删除旧镜像）")
+    parser.add_argument("--apply", action="store_true", help="--migrate-ingest 时真正写库")
+    parser.add_argument("--vault", default=None, help="--approve-reembedding / --migrate-ingest 的目标库路径（默认取配置的 vault_path）")
     parser.add_argument("--quiet", action="store_true", help="静默模式，禁止输出到 stdout")
     args = parser.parse_args(argv)
+    if args.migrate_ingest:
+        result = migrate_ingest(apply=args.apply, config_path=args.app_config, vault_path=args.vault)
+        if not args.quiet:
+            sys.stdout.write(json.dumps(result, ensure_ascii=False) + "\n")
+        return 0
+    if args.approve_reembedding is not None:
+        result = approve_reembedding(args.approve_reembedding, config_path=args.app_config,
+                                     vault_path=args.vault)
+        if not args.quiet:
+            sys.stdout.write(json.dumps(result, ensure_ascii=False) + "\n")
+        return 0
     if args.doctor:
         from . import doctor
         return doctor.run(full=True, app_config=args.app_config, quiet=args.quiet)
