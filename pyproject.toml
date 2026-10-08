@@ -20,6 +20,9 @@ vec = ["sqlite-vec>=0.1.9"]
 # (semantic_rank). Soft dependency — without numpy the code falls back to the
 # scalar loop automatically; never required for correctness.
 accel = ["numpy>=1.24"]
+# PyMuPDF has AGPL/commercial distribution terms; this extra is not all MIT.
+docs = ["pymupdf>=1.24,<2", "pypdf>=4,<7", "python-docx>=1.0,<2", "python-pptx>=1.0,<2", "openpyxl>=3.1,<4"]
+media = ["Pillow>=10,<13"]
 
 [project.scripts]
 mortis-rag-mcp = "mortis_rag_mcp.__main__:main"

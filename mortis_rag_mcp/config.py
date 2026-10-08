@@ -45,6 +45,109 @@ class EmbeddingConfig:
     batch_size: int = 32
     # Base seconds for the exponential backoff between retries.
     retry_backoff: float = 1.0
+    capability_profile: str = ""
+    adapter: str = "openai_text"
+    client_slicing: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.client_slicing, bool):
+            raise ValueError("embedding.client_slicing must be a boolean")
+        if not isinstance(self.capability_profile, str) or not isinstance(self.adapter, str) or not self.adapter:
+            raise ValueError("embedding profile and adapter must be strings; adapter must not be empty")
+
+
+def _positive_fields(config: Any, prefix: str, names: tuple[str, ...]) -> None:
+    for name in names:
+        value = getattr(config, name)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError(f"{prefix}.{name} must be an integer >= 1")
+
+
+@dataclass(slots=True)
+class ChunkingConfig:
+    mode: str = "legacy_chars"
+    target_tokens: int = 384
+    overlap_tokens: int = 64
+    hard_limit_tokens: int = 768
+    #: 估算器真实名称。`unicode-estimate-v1` 是当前实现（纯标准库 Unicode 权重估算，
+    #: **未离线校准**）；`calibrated-v1` 只是旧库缓存里遗留的别名，读旧库时原样保留、
+    #: 不触发重嵌，也不据此宣称「已校准」。
+    estimator_profile: str = "unicode-estimate-v1"
+    mode_explicit: bool = False
+    legacy_explicit: bool = False
+    #: 实际驱动 legacy 字符切块的参数（由 Facade 从 config.chunk_size/overlap 注入），
+    #: 只参与切块身份指纹，不进缓存 meta，避免既有库被判失效。
+    legacy_chunk_size: int = 0
+    legacy_chunk_overlap: int = 0
+
+    def __post_init__(self) -> None:
+        if self.mode == "legacy":
+            self.mode = "legacy_chars"
+        if self.mode not in {"legacy_chars", "estimated_tokens"}:
+            raise ValueError("chunking.mode must be legacy_chars or estimated_tokens")
+        _positive_fields(self, "chunking", ("target_tokens", "hard_limit_tokens"))
+        if isinstance(self.overlap_tokens, bool) or not isinstance(self.overlap_tokens, int):
+            raise ValueError("chunking.overlap_tokens must be an integer")
+        if not 0 <= self.overlap_tokens < self.target_tokens <= self.hard_limit_tokens:
+            raise ValueError("chunking requires 0 <= overlap_tokens < target_tokens <= hard_limit_tokens")
+        if self.estimator_profile not in {"unicode-estimate-v1", "calibrated-v1"}:
+            raise ValueError("chunking.estimator_profile must be unicode-estimate-v1")
+        if not isinstance(self.mode_explicit, bool):
+            raise ValueError("chunking.mode_explicit must be a boolean")
+        if not isinstance(self.legacy_explicit, bool):
+            raise ValueError("chunking.legacy_explicit must be a boolean")
+        for name in ("legacy_chunk_size", "legacy_chunk_overlap"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"chunking.{name} must be a non-negative integer")
+
+
+@dataclass(slots=True)
+class MediaConfig:
+    inline_max_bytes: int = 8 * 1024 * 1024
+    refs_limit: int = 20
+    preview_enabled: bool = True
+    preview_max_edge: int = 1600
+    preview_max_bytes: int = 524288
+
+    def __post_init__(self) -> None:
+        _positive_fields(self, "media", ("inline_max_bytes", "refs_limit", "preview_max_edge", "preview_max_bytes"))
+        if self.refs_limit > 100:
+            raise ValueError("media.refs_limit must be in [1, 100]")
+        if not isinstance(self.preview_enabled, bool):
+            raise ValueError("media.preview_enabled must be a boolean")
+
+
+@dataclass(slots=True)
+class AudioConfig:
+    adapter: str = ""
+    transcription_endpoint: str = ""
+    transcription_model: str = ""
+    transcription_api_key_env: str = ""
+    transcription_timeout: float = 30.0
+    decoder: str = "core_pcm"
+    max_duration_seconds: int = 3600
+    segment_seconds: int = 30
+    overlap_seconds: int = 5
+    max_segments: int = 1000
+    max_channels: int = 2
+    max_sample_rate: int = 48000
+    max_input_mb: int = 20
+    max_segment_mb: int = 8
+
+    def __post_init__(self) -> None:
+        _positive_fields(self, "audio", ("max_duration_seconds", "segment_seconds", "max_segments", "max_channels", "max_sample_rate", "max_input_mb", "max_segment_mb"))
+        if isinstance(self.overlap_seconds, bool) or not isinstance(self.overlap_seconds, int) or not 0 <= self.overlap_seconds < self.segment_seconds:
+            raise ValueError("audio requires 0 <= overlap_seconds < segment_seconds")
+        if isinstance(self.transcription_timeout, bool) or not isinstance(self.transcription_timeout, (int, float)) or not math.isfinite(self.transcription_timeout) or not 0 < self.transcription_timeout <= 300:
+            raise ValueError("audio.transcription_timeout must be finite and in (0, 300]")
+        if self.decoder not in {"core_pcm", "ffmpeg"}:
+            raise ValueError("audio.decoder must be core_pcm or ffmpeg")
+        for name in ("adapter", "transcription_endpoint", "transcription_model", "transcription_api_key_env"):
+            if not isinstance(getattr(self, name), str):
+                raise ValueError(f"audio.{name} must be a string")
+        if self.transcription_api_key_env and not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", self.transcription_api_key_env):
+            raise ValueError("audio.transcription_api_key_env must name an environment variable")
 
 
 @dataclass(slots=True)
@@ -227,10 +330,10 @@ class IngestConfig:
     auto_watch: bool = False             # 自动摄取（默认关闭：需显式授权）
     max_file_size_mb: int = 20           # 单文件尺寸上限（MiB，默认20；0表示不限）
     # --- v0.9.0 C93/C94 新增（§17.4）------------------------------------------------
-    # storage：解析事实落点。**本 Lane 默认 legacy**：物理镜像（.mortis-parsed/*.md）仍是
-    # 当前唯一可读路径——虚拟文档的读取适配器属 C96（Lane C）。在 C96 落地前把默认改成
-    # virtual 会让已摄取文档不可读，故默认沿用 legacy，virtual 需显式配置。
-    storage: str = "legacy"              # legacy | virtual
+    # storage：解析事实落点。C96 落地后默认改为 **virtual**：虚拟文档已通过
+    # server/indexer 读取适配器按 revision/SHA 可读，不再依赖物理镜像；仍保留
+    # `storage = "legacy"` 作为回退（旧物理镜像路径继续工作，不自动迁移/删除）。
+    storage: str = "virtual"             # legacy | virtual
     network_policy: str = "configured"   # configured | local_only（local_only 在入队前拒云路径）
     archive_max_mb: int = 32             # 压缩响应上限（安全配额，0 不关闭限制）
     extracted_max_mb: int = 200          # 累计解压上限
@@ -240,8 +343,17 @@ class IngestConfig:
     memory_budget_mb: int = 128          # 全局受控缓冲预算（不是 RSS 承诺）
     queue_limit: int = 1000              # 队列容量上限
     max_parse_workers: int = 1           # 同时解析数（本 Lane 只实现 1）
+    routing: str = "auto"
+    audio_enabled: bool = False
 
     def __post_init__(self) -> None:
+        if self.routing == "cloud":
+            self.routing = "mineru"
+        if self.routing not in {"auto", "mineru", "local"}:
+            raise ValueError("ingest.routing must be auto, mineru or local")
+        for name in ("enabled", "audio_enabled", "auto_watch", "is_ocr", "enable_formula", "enable_table", "pymupdf_fallback", "convert_small_tables"):
+            if not isinstance(getattr(self, name), bool):
+                raise ValueError(f"ingest.{name} must be a boolean")
         if not isinstance(self.auto_watch, bool):
             raise ValueError(f"ingest.auto_watch must be a boolean, got {self.auto_watch!r}")
         if (
@@ -323,6 +435,9 @@ class AppConfig:
     ingest: IngestConfig = field(default_factory=IngestConfig)
     index: IndexConfig = field(default_factory=IndexConfig)
     diag: DiagConfig = field(default_factory=DiagConfig)
+    chunking: ChunkingConfig = field(default_factory=ChunkingConfig)
+    media: MediaConfig = field(default_factory=MediaConfig)
+    audio: AudioConfig = field(default_factory=AudioConfig)
     # 混合检索开关：true（默认）用 FTS5 BM25 + 向量余弦 + bigram 词法三路 RRF
     # 融合；false 完整还原旧的「词法软信号 + 余弦」行为。
     use_hybrid: bool = True
@@ -580,6 +695,48 @@ def _numeric(
     return value
 
 
+def _boolean(section: Mapping[str, Any], key: str, default: bool) -> bool:
+    value = section.get(key, default)
+    if not isinstance(value, bool):
+        raise ValueError(f"config key '{key}' must be a boolean, got {value!r}")
+    return value
+
+
+def _load_chunking(data: Mapping[str, Any], index: Mapping[str, Any]) -> ChunkingConfig:
+    section = _section(data, "chunking")
+    alias_present = "legacy_chunking" in section or "legacy_chunking" in index or "legacy_chunking" in data
+    alias_data = {**data, **index, **section}
+    alias = _boolean(alias_data, "legacy_chunking", False)
+    mode = str(section.get("mode", "legacy_chars" if alias or any(key in index or key in data for key in ("chunk_size", "chunk_overlap")) else "estimated_tokens"))
+    if alias_present and "mode" in section and ((mode in {"legacy", "legacy_chars"}) != alias):
+        raise ValueError("chunking.mode conflicts with legacy_chunking")
+    return ChunkingConfig(
+        mode=mode,
+        target_tokens=_numeric(section, {}, "target_tokens", int, 384, 1),
+        overlap_tokens=_numeric(section, {}, "overlap_tokens", int, 64, 0),
+        hard_limit_tokens=_numeric(section, {}, "hard_limit_tokens", int, 768, 1),
+        estimator_profile=str(section.get("estimator_profile", "unicode-estimate-v1")),
+        mode_explicit=("mode" in section or alias_present),
+        legacy_explicit=alias_present or any(key in index or key in data for key in ("chunk_size", "chunk_overlap")),
+    )
+
+
+def _load_audio(data: Mapping[str, Any]) -> AudioConfig:
+    section = _section(data, "audio")
+    kwargs = {name: str(_env(section.get(name, default))) for name, default in (
+        ("adapter", ""), ("transcription_endpoint", ""), ("transcription_model", ""),
+        ("transcription_api_key_env", ""), ("decoder", "core_pcm"),
+    )}
+    kwargs["transcription_timeout"] = _numeric(section, {}, "transcription_timeout", float, 30.0, 0.0, 300.0)
+    for name, default, minimum in (
+        ("max_duration_seconds", 3600, 1), ("segment_seconds", 30, 1), ("overlap_seconds", 5, 0),
+        ("max_segments", 1000, 1), ("max_channels", 2, 1), ("max_sample_rate", 48000, 1),
+        ("max_input_mb", 20, 1), ("max_segment_mb", 8, 1),
+    ):
+        kwargs[name] = _numeric(section, {}, name, int, default, minimum)
+    return AudioConfig(**kwargs)
+
+
 def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
     """Load app.toml while accepting both flat and grouped configuration keys."""
     data = _read_toml(Path(path)) if path is not None else {}
@@ -603,6 +760,9 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
         max_retries=_numeric(embedding, data, "max_retries", int, 3, 0, 10),
         batch_size=_numeric(embedding, data, "batch_size", int, 32, 0),
         retry_backoff=_numeric(embedding, data, "retry_backoff", float, 1.0, 0.0, 60.0),
+        capability_profile=str(embedding.get("capability_profile", "")),
+        adapter=str(embedding.get("adapter", "openai_text")),
+        client_slicing=_boolean(embedding, "client_slicing", False),
     )
     rer = RerankerConfig(
         enabled=bool(reranker.get("enabled", False)),
@@ -628,22 +788,24 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
     if not isinstance(raw_auto_watch, bool):
         raise ValueError(f"config key 'auto_watch' must be a boolean, got {raw_auto_watch!r}")
     ing = IngestConfig(
-        enabled=bool(ingest.get("enabled", False)),
+        enabled=_boolean(ingest, "enabled", False),
+        routing=str(ingest.get("routing", "auto")),
+        audio_enabled=_boolean(ingest, "audio_enabled", False),
         api_key=str(_env(ingest.get("api_key", ""))),
         model_version=str(_env(ingest.get("model_version", "vlm"))),
         language=str(_env(ingest.get("language", "ch"))),
-        is_ocr=bool(ingest.get("is_ocr", False)),
-        enable_formula=bool(ingest.get("enable_formula", True)),
-        enable_table=bool(ingest.get("enable_table", True)),
+        is_ocr=_boolean(ingest, "is_ocr", False),
+        enable_formula=_boolean(ingest, "enable_formula", True),
+        enable_table=_boolean(ingest, "enable_table", True),
         poll_interval=_numeric(ingest, data, "poll_interval", float, 3.0, 0.1, 60.0),
         poll_timeout=_numeric(ingest, data, "poll_timeout", float, 600.0, 1.0, 7200.0),
         output_dirname=str(_env(ingest.get("output_dirname", ".mortis-parsed"))),
-        pymupdf_fallback=bool(ingest.get("pymupdf_fallback", True)),
-        convert_small_tables=bool(ingest.get("convert_small_tables", True)),
+        pymupdf_fallback=_boolean(ingest, "pymupdf_fallback", True),
+        convert_small_tables=_boolean(ingest, "convert_small_tables", True),
         table_convert_max_cells=_numeric(ingest, data, "table_convert_max_cells", int, 60, 1),
         auto_watch=raw_auto_watch,
         max_file_size_mb=_numeric(ingest, data, "max_file_size_mb", int, 20, 0),
-        storage=str(ingest.get("storage", "legacy")).strip().lower() or "legacy",
+        storage=str(ingest.get("storage", "virtual")).strip().lower() or "virtual",
         network_policy=str(ingest.get("network_policy", "configured")).strip().lower() or "configured",
         archive_max_mb=_numeric(ingest, data, "archive_max_mb", int, 32, 1),
         extracted_max_mb=_numeric(ingest, data, "extracted_max_mb", int, 200, 1),
@@ -707,6 +869,15 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
         ingest=ing,
         index=IndexConfig(read_max_chars=read_max_chars),
         diag=dg,
+        chunking=_load_chunking(data, index),
+        audio=_load_audio(data),
+        media=MediaConfig(
+            inline_max_bytes=_numeric(_section(data, "media"), {}, "inline_max_bytes", int, 8388608, 1),
+            refs_limit=_numeric(_section(data, "media"), {}, "refs_limit", int, 20, 1, 100),
+            preview_enabled=_boolean(_section(data, "media"), "preview_enabled", True),
+            preview_max_edge=_numeric(_section(data, "media"), {}, "preview_max_edge", int, 1600, 1),
+            preview_max_bytes=_numeric(_section(data, "media"), {}, "preview_max_bytes", int, 524288, 1),
+        ),
         use_hybrid=bool(index.get("use_hybrid", data.get("use_hybrid", True))),
         chunk_size=_numeric(index, data, "chunk_size", int, 1200, 1),
         chunk_overlap=_numeric(index, data, "chunk_overlap", int, 0, 0),

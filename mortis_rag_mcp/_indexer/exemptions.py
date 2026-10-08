@@ -94,32 +94,25 @@ def get_exemptions(owner: MarkdownIndexer) -> dict[str, Any]:
 
 def _prune_ignored_sources(owner: MarkdownIndexer, matcher: IgnoreMatcher) -> list[str]:
     """按豁免规则即时剪除内存态（含 0.7.1 全部时序观测状态）。"""
+    from .sync_engine import revoke_source
+
     pruned: list[str] = []
-    removed_ids: list[str] = []
     with owner._sync_lock:
-        for source in list(owner._chunks.keys()):
+        try:
+            documents = owner.document_store().list_documents()
+        except Exception:
+            documents = []
+        failed_before = dict(owner.failed_files)
+        sources = set(owner._chunks) | set(owner.failed_files) | {doc.source for doc in documents}
+        recorded = {doc.source for doc in documents}
+        for source in sorted(sources):
             if not matcher.is_ignored(source, is_dir=False)[0]:
                 continue
-            for c in owner._chunks.pop(source, []):
-                removed_ids.append(c.id)
-            owner._signatures.pop(source, None)
-            owner._stat_cache.pop(source, None)
-            owner._stat_seen_ns.pop(source, None)
-            owner._stat_confirmations.pop(source, None)
-            if hasattr(owner, "fast_path_warnings"):
-                owner.fast_path_warnings.pop(source, None)
-            owner._fts_delete(source)
-            pruned.append(source)
-        if removed_ids:
-            try:
-                owner._vector_backend.delete_vectors(removed_ids)
-                owner._disk_vectors.difference_update(removed_ids)
-            except Exception:
-                pass
-        for failed_source in list(owner.failed_files.keys()):
-            if matcher.is_ignored(failed_source, is_dir=False)[0]:
-                owner.failed_files.pop(failed_source, None)
-        if pruned or removed_ids:
+            if source in recorded:
+                owner.document_store(write=True).set_visibility(source, "exempt")
+            if revoke_source(owner, source, reason="exempt"):
+                pruned.append(source)
+        if pruned or owner.failed_files != failed_before:
             owner._save_cache()
     return pruned
 

@@ -103,9 +103,6 @@ def request_refresh(owner: MarkdownIndexer, *, immediate: bool = False) -> bool:
     if owner._watch_stop.is_set() or getattr(owner, "_stopping", False):
         return False
     if not Path(owner.vault_path).is_dir():
-        with owner._cache_lock:
-            owner._chunks = {}
-            owner._signatures = {}
         return False
     _start_fs_scheduler(owner)
     with owner._fs_debounce_lock:

@@ -331,7 +331,19 @@ def make_chunks(
     mtime: float | None = None,
     source_pdf: str | None = None,
     aliases: list[str] | None = None,
+    *,
+    chunking: Any = None,
+    source_text: str | None = None,
+    virtual_identity: dict[str, str] | None = None,
 ) -> list[Chunk]:
+    from .token_chunking import chunking_profile, make_token_chunks
+
+    if chunking_profile(chunking)["mode"] == "estimated_tokens":
+        return make_token_chunks(
+            source, title, tags, sections, profile=chunking, new_chunk_fn=new_chunk,
+            mtime=mtime, source_pdf=source_pdf, aliases=aliases,
+            source_text=source_text, virtual_identity=virtual_identity,
+        )
     result: list[Chunk] = []
     chunk_index = 0
     overlap = chunk_overlap
@@ -511,6 +523,14 @@ def make_chunks(
                 )
             )
             chunk_index += 1
+    if virtual_identity is not None:
+        from .token_chunking import chunker_fingerprint, virtual_chunk_id
+
+        fingerprint = chunker_fingerprint(chunking)
+        for chunk in result:
+            chunk.id = virtual_chunk_id(chunk, virtual_identity, fingerprint)
+            chunk.metadata.update(dict(virtual_identity))
+            chunk.metadata["chunker_fingerprint"] = fingerprint
     return result
 
 
@@ -520,6 +540,9 @@ def chunk_file(
     config: Any,
     mtime: float | None = None,
     inject_image_notes_fn: Callable[[list[str]], list[str]] | None = None,
+    *,
+    chunking_config: Any = None,
+    virtual_identity: dict[str, str] | None = None,
 ) -> list[Chunk]:
     if inject_image_notes_fn is None:
         inject_image_notes_fn = _inject_image_notes
@@ -619,6 +642,9 @@ def chunk_file(
         mtime=mtime,
         source_pdf=properties.get("source_pdf"),
         aliases=aliases if aliases else None,
+        chunking=chunking_config if chunking_config is not None else getattr(config, "chunking", None),
+        source_text=text,
+        virtual_identity=virtual_identity,
     )
 
 

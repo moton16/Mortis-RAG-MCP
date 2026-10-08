@@ -29,6 +29,10 @@ timeout = 30
 max_retries = 3
 batch_size = 32
 retry_backoff = 1.0
+# Empty profile retains conservative text-only behavior; no automatic model guessing.
+capability_profile = ""
+adapter = "openai_text"
+client_slicing = false
 
 [reranker]
 enabled = false
@@ -42,9 +46,19 @@ max_retries = 1
 retry_backoff = 1.0
 # When enabled, provider failure must fall back to base retrieval order.
 
+[chunking]
+mode = "estimated_tokens"
+target_tokens = 384
+overlap_tokens = 64
+hard_limit_tokens = 768
+estimator_profile = "unicode-estimate-v1"
+# Type: 纯标准库 Unicode 权重估算（未离线校准），不是真实 LLM tokenizer；
+# legacy 别名 "calibrated-v1" 仅为读取旧库缓存保留，不使用也不代表已校准。
+# Existing explicit chunk_size/chunk_overlap without a new mode retain legacy_chars.
+
 [index]
-chunk_size = 1200
-chunk_overlap = 0
+# chunk_size = 1200
+# chunk_overlap = 0
 debounce_seconds = 0.5
 # 0.5.0：注入图片 alt/图注使其可检索。注意这会改写 chunk content → chunk.id，
 # 开启 = 全库重新 embedding（一次付费操作）。
@@ -115,6 +129,9 @@ max_size_mb = 2048
 # 云端都失败且装了 pymupdf（pip install pymupdf）→ 本地纯文本兜底。
 [ingest]
 enabled = false
+# Routing: auto | mineru | local. local never selects the cloud parser.
+routing = "auto"
+audio_enabled = false
 # 自动监听并摄取知识库内的 PDF/Office 文档（默认关闭：必须显式配置 enabled=true 与 auto_watch=true 才生效）。
 # 开启后会自动扫描并排队摄取知识库内既有文档及后续新增/修改的文档。
 # 支持所有 INGEST_EXTS 格式（.pdf, .doc, .docx, .ppt, .pptx, .xls, .xlsx）。
@@ -129,10 +146,10 @@ max_file_size_mb = 20
 # model_version = "vlm"
 
 # ── v0.9.0 有界解析与队列（默认值即安全起点；0 不是「关闭限制」）─────────
-# storage：解析事实落点。legacy（默认）= 继续写 .mortis-parsed/*.md 物理镜像，
-# 这是当前唯一可读路径；virtual = 只写文档库（ingest_jobs/document_revisions），
-# 需要 C96 的虚拟读取适配器才能读回，故默认仍为 legacy。
-# storage = "legacy"
+# storage：解析事实落点。virtual（默认）= 只写文档库（document_revisions/媒体），
+# 由 kb_read/kb_search 按 revision 读回，不再产生 .mortis-parsed 物理镜像；
+# legacy = 保留旧物理镜像路径（旧库回退用，不自动迁移、不自动删除旧镜像）。
+# storage = "virtual"
 # network_policy：configured（默认）允许已授权的云端解析；local_only 在**入队前**
 # 拒绝一切云路径（不会先上传再报错）。
 # network_policy = "configured"
@@ -146,6 +163,30 @@ max_file_size_mb = 20
 # memory_budget_mb = 128
 # queue_limit = 1000
 # max_parse_workers = 1
+
+[media]
+inline_max_bytes = 8388608
+refs_limit = 20
+preview_enabled = true
+preview_max_edge = 1600
+preview_max_bytes = 524288
+
+[audio]
+# No endpoint means no transcription. Credentials are read from a named env var.
+adapter = ""
+transcription_endpoint = ""
+transcription_model = ""
+transcription_api_key_env = ""
+transcription_timeout = 30.0
+decoder = "core_pcm"
+max_duration_seconds = 3600
+segment_seconds = 30
+overlap_seconds = 5
+max_segments = 1000
+max_channels = 2
+max_sample_rate = 48000
+max_input_mb = 20
+max_segment_mb = 8
 
 # ── 本地诊断日志（默认关闭）────────────────────────────────
 # 开启后在本地输出结构化 jsonl 诊断日志，用于排查检索退化与阶段耗时。
