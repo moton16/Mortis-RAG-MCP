@@ -35,8 +35,14 @@ def test_mineru_channel_selection_for_free_and_paid_modes(tmp_path: Path):
     assert paid_client.channel_for(docx_path) == "v4"
 
 
-def test_mineru_free_channel_parses_document_with_images_and_anchors(tmp_path: Path):
-    """验证无 key 体验通道端到端解析带图文档，提取正文、图片与锚点。"""
+def test_free_channel_mapping_sinks_images_when_archive_provides_them(tmp_path: Path):
+    """注入式归档映射回归：归档提供图片 + 锚点时，媒体 sink 与正文锚点必须落位。
+
+    E17 更正（重要）：**真实 agent 免登通道协议只返回 markdown**——不含图片字节、
+    不含 content_list.json/page_map。因此本用例验证的是「归档 → 图片 occurrence/锚点」
+    的映射通路（可被 v4 通道或本地解析复用），**不是**免登通道的真实能力；
+    免登通道的真实能力由 `test_agent_channel_protocol_is_text_only` 固定。
+    """
     client = MineruClient(api_key="")
     doc_path = tmp_path / "paper_with_images.pdf"
     doc_path.write_bytes(b"%PDF-1.4 test document with embedded figure")
@@ -90,4 +96,46 @@ def test_mineru_free_channel_parses_document_with_images_and_anchors(tmp_path: P
     assert result.media[0].caption == "图1：系统拓扑结构图"
     assert result.media[0].anchor_start is not None
     assert "![图1：系统拓扑结构图]" in result.markdown
-    print("\n[MINERU FREE CHANNEL VERIFIED] 无 key 体验通道成功解析带图文档、提取图片 occurrence 与正文锚点！")
+    print("\n[MAPPING VERIFIED] 归档提供图片与锚点时，媒体 occurrence 与正文锚点正确落位。")
+
+
+def test_agent_channel_protocol_is_text_only(monkeypatch, tmp_path: Path):
+    """真实 agent 免登通道协议：done 分支只下载 markdown，不产生图片 occurrence / page_map。
+
+    E17 用真实端点实测确认（.runtime/beta2/E17/step5/agent-channel-evidence.json）：
+    markdown 仍带 `images/xxx.jpg` 引用，但通道**不返回**图片字节与结构化 JSON。
+    因此 `images=False / structured_json=False / media=[]` 是本仓库与上游协议一致的
+    预期行为，不得对外宣传成「免登通道可提取图片与锚点」。
+    """
+    from mortis_rag_mcp.ingest import mineru as mineru_module
+
+    client = MineruClient(api_key="")
+    doc = tmp_path / "paper.pdf"
+    doc.write_bytes(b"%PDF-1.4 agent channel contract probe")
+
+    monkeypatch.setattr(client, "_upload_payload", lambda path: (b"payload", []))
+    monkeypatch.setattr(mineru_module, "_put_upload", lambda url, payload, timeout: None)
+    monkeypatch.setattr(
+        client, "_poll_json",
+        lambda url, **kwargs: {
+            "code": 0,
+            "data": {"state": "done", "markdown_url": "https://example.invalid/full.md"},
+        },
+    )
+    monkeypatch.setattr(
+        client, "_download_bytes",
+        lambda url, recorder, request_id: b"# Title\n\n![](images/a.jpg)\n",
+    )
+
+    sink = DictMediaSink()
+    result = client.parse_structured(doc, sink=sink, poll_interval=0.01, poll_timeout=5.0)
+
+    assert result.channel == "agent"
+    assert result.model == "pipeline-light"
+    assert list(getattr(sink, "occurrences", []) or []) == []
+    assert list(result.media) == []
+    assert list(getattr(sink, "images", {}) or {}) == []
+    assert result.capabilities.get("images") is False
+    assert result.capabilities.get("structured_json") is False
+    assert result.capabilities.get("page_map") is False
+    assert "images/a.jpg" in result.markdown
