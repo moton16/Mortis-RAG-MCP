@@ -949,18 +949,61 @@ def test_mineru_anchor_advanced_formatting_and_page_mapping():
     assert m_title.anchor_start is not None
     assert markdown[m_title.anchor_start : m_title.anchor_end].startswith("![图1：标题属性](images/fig_title.png")
 
-    # 2. 验证尖括号 destination
+    # 2. 验证尖括号 destination 与 page_idx=5 -> page=6
     m_angle = next(m for m in outcome.media if m.name == "images/fig_angle.png")
+    assert m_angle.page == 6
     assert m_angle.anchor_start is not None
     assert markdown[m_angle.anchor_start : m_angle.anchor_end] == "![图2：尖括号语法](<images/fig_angle.png>)"
 
-    # 3. 验证 URL 编码文件名
+    # 3. 验证 URL 编码文件名与 page_idx=6 -> page=7
     m_space = next(m for m in outcome.media if m.name == "images/fig space.png")
+    assert m_space.page == 7
     assert m_space.anchor_start is not None
     assert markdown[m_space.anchor_start : m_space.anchor_end] == "![图3：URL编码](images/fig%20space.png)"
 
-    # 4. 验证多行 alt 文本
+    # 4. 验证多行 alt 文本与 page_idx=7 -> page=8
     m_multi = next(m for m in outcome.media if m.name == "images/fig_multi.png")
+    assert m_multi.page == 8
     assert m_multi.anchor_start is not None
     assert markdown[m_multi.anchor_start : m_multi.anchor_end] == "![图4：多行\n换行标注](images/fig_multi.png)"
+
+
+def test_mineru_media_occurrence_page_extraction_boundaries():
+    """E16：验证 mineru.py 媒体块 page_idx -> page=page_idx+1 与无页证据->None 边界。"""
+    content_list = [
+        {"type": "image", "img_path": "images/p0.png", "page_idx": 0},
+        {"type": "image", "img_path": "images/p10.png", "page_idx": 10},
+        {"type": "image", "img_path": "images/legacy_p3.png", "page": 3},
+        {"type": "image", "img_path": "images/invalid_neg.png", "page_idx": -1},
+        {"type": "image", "img_path": "images/invalid_bool.png", "page_idx": True},
+        {"type": "image", "img_path": "images/invalid_zero.png", "page": 0},
+        {"type": "image", "img_path": "images/none_page.png", "page_idx": None},
+    ]
+    zip_bytes = _make_zip({
+        "full.md": b"# Test\n",
+        "content_list.json": json.dumps(content_list).encode("utf-8"),
+        "images/p0.png": PNG_BYTES,
+        "images/p10.png": PNG_BYTES,
+        "images/legacy_p3.png": PNG_BYTES,
+        "images/invalid_neg.png": PNG_BYTES,
+        "images/invalid_bool.png": PNG_BYTES,
+        "images/invalid_zero.png": PNG_BYTES,
+        "images/none_page.png": PNG_BYTES,
+        "images/unmentioned.png": PNG_BYTES,
+    })
+
+    sink = DictMediaSink()
+    limits = ResourceLimits()
+    outcome = _safe_extract_zip(zip_bytes, limits=limits, sink=sink)
+    media_map = {m.name: m for m in outcome.media}
+
+    assert media_map["images/p0.png"].page == 1
+    assert media_map["images/p10.png"].page == 11
+    assert media_map["images/legacy_p3.png"].page == 3
+    assert media_map["images/invalid_neg.png"].page is None
+    assert media_map["images/invalid_bool.png"].page is None
+    assert media_map["images/invalid_zero.png"].page is None
+    assert media_map["images/none_page.png"].page is None
+    assert media_map["images/unmentioned.png"].page is None
+
 
