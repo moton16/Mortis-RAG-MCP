@@ -16,7 +16,7 @@ import zipfile
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 
 import pytest
 
@@ -151,6 +151,35 @@ def test_http_media_transport_request_shape_and_response_parsing():
     assert body["dimensions"] == 4
     assert len(body["input"]) == 1
     assert body["input"][0]["image"].startswith("data:image/png;base64,")
+
+
+def test_http_media_transport_error_handling():
+    transport = HttpMediaTransport(
+        endpoint="https://api.siliconflow.cn/v1/embeddings",
+        model="Qwen/Qwen3-VL-Embedding-8B",
+    )
+
+    # 1. 429 Rate limited with error json body
+    err_body = io.BytesIO(json.dumps({"error": {"message": "Rate limit reached", "type": "rate_limit_error"}}).encode("utf-8"))
+    with patch("mortis_rag_mcp.media_providers.urlopen", side_effect=HTTPError("https://api.test", 429, "Too Many Requests", {}, err_body)):
+        with pytest.raises(ProviderError, match="media embedding HTTP failure: HTTP Error 429.*Rate limit reached"):
+            transport([_input("1")])
+
+    # 2. 502 Bad Gateway with HTML error page
+    html_body = io.BytesIO(b"<html><head><title>502 Bad Gateway</title></head><body>502 Bad Gateway</body></html>")
+    with patch("mortis_rag_mcp.media_providers.urlopen", side_effect=HTTPError("https://api.test", 502, "Bad Gateway", {}, html_body)):
+        with pytest.raises(ProviderError, match="media embedding HTTP failure: HTTP Error 502: Bad Gateway"):
+            transport([_input("1")])
+
+    # 3. Network error (URLError)
+    with patch("mortis_rag_mcp.media_providers.urlopen", side_effect=URLError("Connection refused")):
+        with pytest.raises(ProviderError, match="media embedding network error"):
+            transport([_input("1")])
+
+    # 4. HTTP 200 but response has error dict
+    with patch("mortis_rag_mcp.media_providers.urlopen", return_value=io.BytesIO(json.dumps({"error": {"message": "Model not found"}}).encode("utf-8"))):
+        with pytest.raises(ProviderError, match="media embedding API error: Model not found"):
+            transport([_input("1")])
 
 
 def test_http_media_transport_enforces_limits_and_modality():
@@ -313,6 +342,78 @@ def test_create_transcription_adapter_validation():
     assert isinstance(adapter, OpenAiTranscriptionAdapter)
     assert adapter.endpoint == "https://api.test/v1/audio/transcriptions"
     assert adapter.model == "whisper-1"
+
+
+def test_transcription_adapter_error_details_and_quota_diagnostics():
+    seg = _wav_segment(1)
+    journal = _MockJournal()
+    adapter = OpenAiTranscriptionAdapter(
+        endpoint="https://api.openai.com/v1/audio/transcriptions",
+        journal=journal,
+    )
+
+    # 1. 429 insufficient quota payload preserved in TranscriptionError
+    err_body = io.BytesIO(json.dumps({
+        "error": {
+            "message": "You exceeded your current quota, please check your plan and billing details.",
+            "type": "insufficient_quota",
+            "code": "insufficient_quota",
+        }
+    }).encode("utf-8"))
+    with patch("mortis_rag_mcp.ingest.transcription.urlopen", side_effect=HTTPError("https://api.test", 429, "Too Many Requests", {}, err_body)):
+        with pytest.raises(TranscriptionError) as exc_info:
+            adapter.transcribe(seg)
+        assert "insufficient_quota" in str(exc_info.value)
+        assert "exceeded your current quota" in str(exc_info.value)
+        assert "SUBMISSION_UNKNOWN" in str(exc_info.value)
+    assert [ev[0] for ev in journal.events] == ["before_send", "mark_unknown"]
+
+    # 2. 500 HTML gateway failure preserved
+    journal.events.clear()
+    html_body = io.BytesIO(b"<html><body>500 Internal Server Error</body></html>")
+    with patch("mortis_rag_mcp.ingest.transcription.urlopen", side_effect=HTTPError("https://api.test", 500, "Internal Server Error", {}, html_body)):
+        with pytest.raises(TranscriptionError) as exc_info:
+            adapter.transcribe(seg)
+        assert "500" in str(exc_info.value)
+        assert "Internal Server Error" in str(exc_info.value)
+    assert [ev[0] for ev in journal.events] == ["before_send", "mark_unknown"]
+
+    # 3. HTTP 200 with error payload
+    journal.events.clear()
+    with patch("mortis_rag_mcp.ingest.transcription.urlopen", return_value=io.BytesIO(json.dumps({"error": {"message": "Invalid audio data"}}).encode("utf-8"))):
+        with pytest.raises(TranscriptionError) as exc_info:
+            adapter.transcribe(seg)
+        assert "Invalid audio data" in str(exc_info.value)
+
+
+def test_create_transcription_adapter_direct_keys_and_options(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("MY_WHISPER_KEY", "sk-env-key")
+    cfg = AudioConfig(
+        adapter="openai_whisper",
+        transcription_endpoint="https://api.test/v1/audio/transcriptions",
+        transcription_model="whisper-large-v3",
+        transcription_api_key_env="MY_WHISPER_KEY",
+    )
+    adapter = create_transcription_adapter(cfg)
+    assert isinstance(adapter, OpenAiTranscriptionAdapter)
+    assert adapter.api_key == "sk-env-key"
+    assert adapter.model == "whisper-large-v3"
+
+    # 兼容通过 SimpleNamespace 传入直接 api_key / language / response_format 的配置对象
+    from types import SimpleNamespace
+    duck_cfg = SimpleNamespace(
+        adapter="whisper",
+        transcription_endpoint="https://api.test/v1/audio/transcriptions",
+        transcription_model="whisper-base",
+        transcription_api_key="sk-direct-key",
+        transcription_response_format="verbose_json",
+        transcription_language="zh",
+    )
+    adapter_duck = create_transcription_adapter(duck_cfg)
+    assert adapter_duck.api_key == "sk-direct-key"
+    assert adapter_duck.response_format == "verbose_json"
+    assert adapter_duck.language == "zh"
+    assert adapter_duck.model == "whisper-base"
 
 
 def test_transcription_adapter_pipeline_with_parse_audio(tmp_path: Path):
@@ -520,3 +621,77 @@ def test_mineru_auth_failure_does_not_silently_fallback_to_agent():
         with pytest.raises(MineruError) as exc_info:
             client._parse_v4(Path("doc.pdf"), poll_interval=1, sink=DictMediaSink(), deadline=100, intent_recorder=None, request_id="r1")
         assert "unauthorized" in str(exc_info.value)
+
+
+def test_mineru_anchor_advanced_formatting_and_page_mapping():
+    markdown = (
+        "# 测试文档\n\n"
+        "![图1：标题属性](images/fig_title.png \"Figure 1 With Title\")\n\n"
+        "![图2：尖括号语法](<images/fig_angle.png>)\n\n"
+        "![图3：URL编码](images/fig%20space.png)\n\n"
+        "![图4：多行\n换行标注](images/fig_multi.png)\n\n"
+        "结尾文本。\n"
+    )
+    content_list = [
+        {
+            "type": "image",
+            "img_path": "images/fig_title.png",
+            "page": 5,  # 1-based page without page_idx
+            "caption": [{"text": "结构化嵌套 Caption"}],
+        },
+        {
+            "type": "image",
+            "img_path": "images/fig_angle.png",
+            "page_idx": 5,
+            "caption": "尖括号图",
+        },
+        {
+            "type": "image",
+            "img_path": "images/fig space.png",
+            "page_idx": 6,
+            "caption": "空格图",
+        },
+        {
+            "type": "image",
+            "img_path": "images/fig_multi.png",
+            "page_idx": 7,
+            "caption": "多行说明图",
+        },
+    ]
+
+    zip_bytes = _make_zip({
+        "full.md": markdown.encode("utf-8"),
+        "content_list.json": json.dumps(content_list).encode("utf-8"),
+        "images/fig_title.png": PNG_BYTES,
+        "images/fig_angle.png": PNG_BYTES,
+        "images/fig space.png": PNG_BYTES,
+        "images/fig_multi.png": PNG_BYTES,
+    })
+
+    sink = DictMediaSink()
+    limits = ResourceLimits()
+    outcome = _safe_extract_zip(zip_bytes, limits=limits, sink=sink)
+    assert len(outcome.media) == 4
+
+    # 1. 验证带 Title 的 Markdown 图片被准确识别为 anchor，且 page 字段生效（page=5）
+    m_title = next(m for m in outcome.media if m.name == "images/fig_title.png")
+    assert m_title.page == 5
+    assert m_title.caption == "结构化嵌套 Caption"
+    assert m_title.anchor_start is not None
+    assert markdown[m_title.anchor_start : m_title.anchor_end].startswith("![图1：标题属性](images/fig_title.png")
+
+    # 2. 验证尖括号 destination
+    m_angle = next(m for m in outcome.media if m.name == "images/fig_angle.png")
+    assert m_angle.anchor_start is not None
+    assert markdown[m_angle.anchor_start : m_angle.anchor_end] == "![图2：尖括号语法](<images/fig_angle.png>)"
+
+    # 3. 验证 URL 编码文件名
+    m_space = next(m for m in outcome.media if m.name == "images/fig space.png")
+    assert m_space.anchor_start is not None
+    assert markdown[m_space.anchor_start : m_space.anchor_end] == "![图3：URL编码](images/fig%20space.png)"
+
+    # 4. 验证多行 alt 文本
+    m_multi = next(m for m in outcome.media if m.name == "images/fig_multi.png")
+    assert m_multi.anchor_start is not None
+    assert markdown[m_multi.anchor_start : m_multi.anchor_end] == "![图4：多行\n换行标注](images/fig_multi.png)"
+

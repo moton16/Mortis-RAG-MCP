@@ -678,6 +678,20 @@ def _parse_structure_json(members: list[tuple[str, bytes]]) -> tuple[dict[str, A
     return capabilities, blocks, warnings, partial
 
 
+def _clean_markdown_dest(raw_dest: str) -> str:
+    dest = raw_dest.strip()
+    if dest.startswith("<") and ">" in dest:
+        dest = dest[1:dest.find(">")]
+    else:
+        # If title or extra space exists, e.g. "path/to/img.png "title"" or 'path/to/img.png 'title''
+        parts = dest.split(None, 1)
+        if parts:
+            dest = parts[0]
+    dest = dest.split("?")[0].split("#")[0]
+    dest = urllib.parse.unquote(dest)
+    return dest.lstrip("/").replace("\\", "/").lower()
+
+
 def _build_image_block_map(blocks: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     """建立结构 JSON 中图片/图表/表格/公式块到成员路径的索引映射。"""
     mapping: dict[str, dict[str, Any]] = {}
@@ -692,7 +706,7 @@ def _build_image_block_map(blocks: list[dict[str, Any]]) -> dict[str, dict[str, 
             elif isinstance(val, list):
                 candidates.extend(str(x).strip() for x in val if str(x).strip())
         for cand in candidates:
-            norm = cand.lstrip("/").lower()
+            norm = cand.replace("\\", "/").lstrip("/").lower()
             mapping[norm] = block
             fname = norm.rsplit("/", 1)[-1]
             if fname and fname not in mapping:
@@ -705,21 +719,21 @@ def _find_media_anchor(markdown: str, member_name: str, used_spans: set[tuple[in
 
     仅在有真实正文引用证据时记录；绝不拿图片尺寸冒充 anchor。
     """
-    norm_member = member_name.lstrip("/").lower()
+    norm_member = member_name.lstrip("/").replace("\\", "/").lower()
     fname = norm_member.rsplit("/", 1)[-1]
-    for match in re.finditer(r'!\[.*?\]\((.*?)\)', markdown):
+    for match in re.finditer(r'!\[[\s\S]*?\]\(([\s\S]*?)\)', markdown):
         span = (match.start(), match.end())
         if span in used_spans:
             continue
-        target = match.group(1).strip().split("?")[0].lstrip("/").lower()
+        target = _clean_markdown_dest(match.group(1))
         if target == norm_member or target.rsplit("/", 1)[-1] == fname:
             used_spans.add(span)
             return span[0], span[1]
-    for match in re.finditer(r'<img[^>]+src=["\'](.*?)["\']', markdown, re.IGNORECASE):
+    for match in re.finditer(r'<img\b[^>]*?\bsrc=["\'](.*?)["\']', markdown, re.IGNORECASE):
         span = (match.start(), match.end())
         if span in used_spans:
             continue
-        target = match.group(1).strip().split("?")[0].lstrip("/").lower()
+        target = _clean_markdown_dest(match.group(1))
         if target == norm_member or target.rsplit("/", 1)[-1] == fname:
             used_spans.add(span)
             return span[0], span[1]
@@ -893,14 +907,25 @@ def _safe_extract_zip(
             bbox: tuple[float, ...] | None = None
             if block is not None:
                 raw_page_idx = block.get("page_idx")
+                raw_page = block.get("page")
                 if isinstance(raw_page_idx, int) and not isinstance(raw_page_idx, bool) and raw_page_idx >= 0:
                     page = raw_page_idx + 1
+                elif isinstance(raw_page, int) and not isinstance(raw_page, bool) and raw_page >= 1:
+                    page = raw_page
                 for ckey in ("image_caption", "table_caption", "chart_caption", "caption"):
                     raw_c = block.get(ckey)
                     if isinstance(raw_c, list):
-                        c_text = "\n".join(str(c).strip() for c in raw_c if str(c).strip())
+                        c_text = "\n".join(
+                            (c.get("text", "") if isinstance(c, dict) else str(c)).strip()
+                            for c in raw_c
+                            if (c.get("text", "") if isinstance(c, dict) else str(c)).strip()
+                        )
                         if c_text:
                             caption = c_text
+                            break
+                    elif isinstance(raw_c, dict) and "text" in raw_c:
+                        caption = str(raw_c["text"]).strip()
+                        if caption:
                             break
                     elif isinstance(raw_c, str) and raw_c.strip():
                         caption = raw_c.strip()

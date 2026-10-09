@@ -7,6 +7,7 @@ import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol, Sequence
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from .embedding_capabilities import ResolvedEmbeddingProfile, validate_profile, validate_vector
@@ -119,12 +120,40 @@ class HttpMediaTransport:
             headers=headers,
             method="POST",
         )
-        with urlopen(req, timeout=self.timeout) as resp:
-            raw_body = resp.read()
+        try:
+            with urlopen(req, timeout=self.timeout) as resp:
+                raw_body = resp.read()
+        except HTTPError as exc:
+            err_text = ""
+            try:
+                err_text = exc.read(1024).decode("utf-8", errors="replace")
+            except Exception:
+                pass
+            msg = f"HTTP Error {exc.code}: {exc.reason}"
+            if err_text:
+                try:
+                    err_json = json.loads(err_text)
+                    if isinstance(err_json, dict) and "error" in err_json:
+                        e = err_json["error"]
+                        detail = e.get("message") if isinstance(e, dict) else str(e)
+                        msg += f" - {detail}"
+                    else:
+                        msg += f" - {err_text[:200]}"
+                except Exception:
+                    msg += f" - {err_text[:200]}"
+            raise ProviderError(f"media embedding HTTP failure: {msg}") from exc
+        except (URLError, OSError) as exc:
+            raise ProviderError(f"media embedding network error: {exc}") from exc
+
         try:
             result = json.loads(raw_body.decode("utf-8"))
         except Exception as exc:
             raise ProviderError(f"invalid JSON response from media embedding endpoint: {exc}") from exc
+
+        if isinstance(result, dict) and "error" in result:
+            err = result["error"]
+            err_msg = err.get("message") if isinstance(err, dict) else str(err)
+            raise ProviderError(f"media embedding API error: {err_msg}")
 
         data = result.get("data") if isinstance(result, dict) else None
         if not isinstance(data, list):

@@ -158,13 +158,40 @@ class OpenAiTranscriptionAdapter:
         try:
             with urlopen(req, timeout=timeout) as resp:
                 raw_body = resp.read()
-        except (HTTPError, URLError, OSError) as exc:
-            raise exc
+        except HTTPError as exc:
+            err_text = ""
+            try:
+                err_text = exc.read(1024).decode("utf-8", errors="replace")
+            except Exception:
+                pass
+            msg = f"HTTP Error {exc.code}: {exc.reason}"
+            if err_text:
+                try:
+                    err_json = json.loads(err_text)
+                    if isinstance(err_json, dict) and "error" in err_json:
+                        e = err_json["error"]
+                        detail = e.get("message") if isinstance(e, dict) else str(e)
+                        code = e.get("code") or e.get("type") if isinstance(e, dict) else ""
+                        msg += f" - {code}: {detail}" if code else f" - {detail}"
+                    else:
+                        msg += f" - {err_text[:200]}"
+                except Exception:
+                    msg += f" - {err_text[:200]}"
+            raise TranscriptionError(f"transcription HTTP failure: {msg}") from exc
+        except (URLError, OSError) as exc:
+            raise TranscriptionError(f"transcription network failure: {exc}") from exc
 
         try:
-            return json.loads(raw_body.decode("utf-8"))
+            result = json.loads(raw_body.decode("utf-8"))
         except Exception as exc:
             raise TranscriptionError(f"invalid JSON response from transcription endpoint: {exc}") from exc
+
+        if isinstance(result, dict) and "error" in result:
+            err = result["error"]
+            err_msg = err.get("message") if isinstance(err, dict) else str(err)
+            raise TranscriptionError(f"transcription API error: {err_msg}")
+
+        return result
 
 
 def create_transcription_adapter(
@@ -199,15 +226,21 @@ def create_transcription_adapter(
 
     key_env = str(getattr(audio_config, "transcription_api_key_env", "") or "").strip()
     api_key = os.environ.get(key_env, "") if key_env else ""
+    if not api_key:
+        api_key = str(getattr(audio_config, "transcription_api_key", "") or getattr(audio_config, "api_key", "") or "").strip()
     model = str(getattr(audio_config, "transcription_model", "") or "whisper-1").strip() or "whisper-1"
     timeout = float(getattr(audio_config, "transcription_timeout", 30.0))
     resolved_local_only = bool(getattr(audio_config, "local_only", False)) if local_only is None else bool(local_only)
+    resp_format = str(getattr(audio_config, "transcription_response_format", "") or getattr(audio_config, "response_format", "") or "verbose_json").strip() or "verbose_json"
+    lang = str(getattr(audio_config, "transcription_language", "") or getattr(audio_config, "language", "") or "").strip()
 
     return OpenAiTranscriptionAdapter(
         endpoint=endpoint,
         model=model,
         api_key=api_key,
         timeout=timeout,
+        response_format=resp_format,
+        language=lang,
         transport=transport,
         journal=journal,
         local_only=resolved_local_only,
