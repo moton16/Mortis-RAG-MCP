@@ -16,7 +16,22 @@
 - **装配面**：`server.py` 删除 `_transcription_adapter`/`_audio_decoder` 与转录 paid_guard 装配，`make_ingest_manager` 不再传 `audio_config/audio_adapter/audio_decoder`；`doctor.py` 删除 `audio_enabled`/`transcription` 报告字段；`ingest/worker.py` 删除 `AUDIO_EXTS`/`AUDIO_ROUTE_UNSUPPORTED`、音频分卷与转录 subjobs 调度、段级 audio checkpoint 与 audio 指纹。
 - **测试**：删除 `test_audio_ingest.py`、`test_audio_production_adapter.py`、`tests/fixtures/transcription_contract.json`；`test_e15_service_contracts.py` 移除转录子出口用例；`test_lane_be_config.py`/`test_route_execution_upgrade.py` 移除音频配置断言。混合文件去音频后更名为 `test_virtual_worker_queue.py`、`test_subjob_checkpoint_contract.py`（保留非音频合同用例，未降低覆盖口径）。
 - **保留（与转录无关）**：音频原生 embedding transport（`media_providers.py`）、音频 occurrence 展示（`_server/media_dispatch.py`、`_indexer/media.py::merge_audio_segments`）、`doc_store` 的 `audio_frames/audio_ms` range kind（读旧库 checkpoint 兼容）。
-- **验证**：静态探针（模块导入 + 被清除符号/签名/成员缺席）PASS；受影响靶向套件 97 passed/4 skipped 与 158 passed/2 skipped，均 exit0。全量回归与发布候选在本窗口后续登记。
+
+E17 同一窗口另外落地三项真实验收发现：
+
+- `5e37bc5` **test(e2e)**：本机 EG2 文本→图片用例硬编码端口且无载体门控，缺载体时是**失败**而非 skip（CI 必红）。改为 `MORTIS_EG2_MEDIA_ENDPOINT`（默认 `127.0.0.1:8000`）并加可达性 skip，保留载体在线时的强断言。
+- `50793f3` **test(e2e)**：新增零 mock 跨模态回归——真实 PNG → `HttpMediaTransport` → EG2 Tier2 图文向量 → native chunk → 图片查询自命中（cos>0.999）+ 文本查询召回。载体在线实测 2 passed。
+- `57caeca` **test(mineru)**：真实端点实测确认**免费 agent 通道只返回 markdown**（无图片字节 / 无 `content_list.json`/page_map），原 mock 用例名与文档暗示「免登通道可提取图片与锚点」属误导，已改名+改写说明并新增 `test_agent_channel_protocol_is_text_only` 固定该协议事实。
+- `b328dc9` **fix(config)**：宿主机首用检查复现出真实缺陷——配置文件带 UTF-8 BOM（记事本 / `Set-Content -Encoding utf8` 默认）时会**静默错解**：首个 `[section]` 头丢失、段内键泄漏到顶层，`[cache] enabled = true` 被 flat-legacy 别名读成 `reranker.enabled = True`，doctor 对合法配置误判 ❌ BROKEN。`_read_toml` 改为 `utf-8-sig` 解码，并加 BOM/非 BOM 等价回归。
+
+**验证**（本窗口，`.venv/Scripts/python.exe`，basetemp 与 TEMP/TMP/TMPDIR 全隔离）：
+
+- 音频清除静态探针 PASS（模块导入 + 被清除符号/签名/成员缺席）。
+- 受影响靶向：97 passed/4 skipped 与 158 passed/2 skipped，均 exit0。
+- 全量 run1（修复载体门控前）1128 passed/17 skipped/**1 failed**（EG2 载体未运行，记录保留不改写）；全量 run2（修复后）**1128 passed/18 skipped，exit0**；载体在线复跑 `test_text_to_image_search_e2e.py` 为 2 passed。
+- 发布候选（离线、隔离 src、setuptools 后端直调）：wheel 48 项 / sdist 166 项，归档卫生 0 项违禁；隔离导入 `ISOLATED_IMPORT_OK 0.9.0`；pyproject = 包 = `server.SERVER_INFO` = 0.9.0。
+
+**仍未闭合（精确 blocked，不降低口径）**：`sqlite-vec` 未安装（本机两套解释器均无，`.venv` 连 pip 都没有）→ 磁盘向量后端正向检查只能用 CI `extras` lane 承接；≥100 问七类真实语料不存在（仓库只有 2 问 metric fixture + 157B 演示 vault）→ 质量门禁只能记 `fixture_measured`；真实旧库升级演练缺授权旧库样本；push/PR 未经主人显式授权 → CI 未触发。
 
 ---
 
