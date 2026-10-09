@@ -159,7 +159,6 @@ max_size_mb = 2048
 enabled = false
 # Routing: auto | mineru | local. local never selects the cloud parser.
 routing = "auto"
-audio_enabled = false
 # 自动监听并摄取知识库内的 PDF/Office 文档（默认关闭：必须显式配置 enabled=true 与 auto_watch=true 才生效）。
 # 开启后会自动扫描并排队摄取知识库内既有文档及后续新增/修改的文档。
 # 支持所有 INGEST_EXTS 格式（.pdf, .doc, .docx, .ppt, .pptx, .xls, .xlsx）。
@@ -198,25 +197,6 @@ refs_limit = 20
 preview_enabled = true
 preview_max_edge = 1600
 preview_max_bytes = 524288
-
-[audio]
-# 当前配置对象尚未完整接入 server -> manager 的 adapter/解码装配；
-# 本段是配置合同，不是开箱即用的音频服务承诺。
-# No endpoint means no transcription. Credentials are read from a named env var.
-adapter = ""
-transcription_endpoint = ""
-transcription_model = ""
-transcription_api_key_env = ""
-transcription_timeout = 30.0
-decoder = "core_pcm"
-max_duration_seconds = 3600
-segment_seconds = 30
-overlap_seconds = 5
-max_segments = 1000
-max_channels = 2
-max_sample_rate = 48000
-max_input_mb = 20
-max_segment_mb = 8
 
 # ── 本地诊断日志（默认关闭）────────────────────────────────
 # 开启后在本地输出结构化 jsonl 诊断日志，用于排查检索退化与阶段耗时。

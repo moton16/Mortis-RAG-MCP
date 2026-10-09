@@ -483,9 +483,6 @@ def check_config(app_config: str | None) -> tuple[dict, object | None]:
         detail += f"，capability_profile={_sanitize_free_text(getattr(emb, 'capability_profile', '') or 'conservative')}"
         detail += f"，routing={_sanitize_free_text(getattr(ingest_cfg, 'routing', 'auto'))}"
         detail += f"，storage={_sanitize_free_text(getattr(ingest_cfg, 'storage', 'legacy'))}"
-        detail += f"，audio_enabled={getattr(ingest_cfg, 'audio_enabled', False)}"
-        audio = getattr(cfg, "audio", None)
-        detail += f"，transcription={'configured (not probed)' if getattr(audio, 'transcription_endpoint', '') else 'disabled'}"
         media = getattr(cfg, "media", None)
         detail += f"，media.inline_max_bytes={getattr(media, 'inline_max_bytes', 8388608)}"
         detail += f"，media.refs_limit={getattr(media, 'refs_limit', 20)}"
@@ -746,12 +743,11 @@ def check_ingest(cfg: object | None) -> dict:
             pass
 
         scan_note = f"最近自动扫描: {_sanitize_free_text(last_scan_record)}（报告生成时快照）" if last_scan_record else "最近自动扫描: 无记录（报告生成时快照）"
-        # 解析落点/网络策略/音频开关必须进报告：否则「为什么库里没有 .mortis-parsed」
+        # 解析落点/网络策略必须进报告：否则「为什么库里没有 .mortis-parsed」
         # 与「为什么云端解析被拒」只能靠猜（§20.4 / §23.4 状态合同）。
         mode_note = "；".join((
             f"落点 storage={_sanitize_free_text(str(getattr(ingest_cfg, 'storage', 'virtual')))}",
             f"network_policy={_sanitize_free_text(str(getattr(ingest_cfg, 'network_policy', 'configured')))}",
-            f"audio={'on' if bool(getattr(ingest_cfg, 'audio_enabled', False)) else 'off'}",
         ))
 
         if not enabled and auto_watch:

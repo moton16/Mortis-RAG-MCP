@@ -33,7 +33,8 @@ Mortis'RAG MCP 是一个**本地 Markdown 知识库 RAG 服务器**，通过 MCP
   import 最终 busy/CAS 与发布同用现有 OS mutation lock；固定 revision read/export pin 在返回前再校验。
 - `retry` 排队后唤醒 worker；cancelled 释放媒体保护后重试清段 checkpoint，failed 保有效段，unknown 不自动重新提交。
 - virtual 文档源 SHA/render SHA 也写到媒体 proxy/native；occurrences 逐页遍历固定 revision。只有成功生成 native 的 occurrence 停用 proxy 文本向量，不支持的 MIME/模态保留 proxy。
-- **仍未完成**：真实媒体 transport、server 的 AudioConfig/adapter/解码装配、独立图片摄取；不以配置声明或 PNG 冒音频 fixture 证明生产功能。
+- **已剔除**：ffmpeg 音频解码 / Whisper 转录链路在 v0.9.0（E17）物理清除——`ingest/audio.py`、`ingest/transcription.py`、`AudioConfig`/`[audio]` 段、worker 音频分卷与转录 subjobs 调度及专项测试一并移除；音频只保留原生 embedding transport 与 occurrence 展示出口。
+- **仍未完成**：真实媒体 transport 端到端、独立图片摄取、真实检索质量与宿主 Media 验收；不以配置声明或 PNG 冒音频 fixture 证明生产功能。
 - `scripts/eval_quality.py` 读取已有成对排名，计算 Recall/NDCG@10/固定 seed bootstrap；
   示例只有两问，缺 ≥100 问/七类/语料 SHA/引用定位与跨库检查时不是最终 PASS。
   `scripts/eval_resources.py` 测合成 SQLite/客户端规模、延迟与 Python 分配峰值，不称 RSS。

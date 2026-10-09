@@ -61,7 +61,7 @@ def build_server(tmp_path: Path, *, ingest_extra: str = ""):
 
 
 def _ingest_ns(**overrides):
-    base = {"enabled": True, "audio_enabled": False, "storage": "virtual",
+    base = {"enabled": True, "storage": "virtual",
             "network_policy": "configured", "routing": "auto", "auto_watch": False,
             "output_dirname": ".mortis-parsed"}
     base.update(overrides)

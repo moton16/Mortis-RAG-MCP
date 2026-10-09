@@ -541,7 +541,7 @@ class MarkdownIndexer:
     def configure_paid_provider(self, kind: str, provider: Any, profile_fingerprint: str) -> bool:
         """把持久 journal + 闸门装配到任何 `configure_paid_requests` provider 上。
 
-        媒体/转录等新 provider 必须经此装配（§20.7B 覆盖 media/transcription）：
+        媒体等新 provider 必须经此装配（§20.7B 覆盖 media）：
         返回 False 表示该 provider 不支持付费装配，调用方必须自行拒绝外部请求。
         """
         configure = getattr(provider, "configure_paid_requests", None)

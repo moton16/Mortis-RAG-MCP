@@ -171,41 +171,6 @@ class MediaConfig:
 
 
 @dataclass(slots=True)
-class AudioConfig:
-    adapter: str = ""
-    transcription_endpoint: str = ""
-    transcription_model: str = ""
-    transcription_api_key_env: str = ""
-    transcription_timeout: float = 30.0
-    decoder: str = "core_pcm"
-    max_duration_seconds: int = 3600
-    segment_seconds: int = 30
-    overlap_seconds: int = 5
-    max_segments: int = 1000
-    max_channels: int = 2
-    max_sample_rate: int = 48000
-    max_input_mb: int = 20
-    max_segment_mb: int = 8
-    #: 帧数上限（48000Hz 单声道约 1 小时）。此前只存在于不存在的 flat `audio_max_frames`，
-    #: 因此 `[audio]` 里配不了；E09 起由 AudioConfig 真正承载并被 `inspect_audio` 消费。
-    max_frames: int = 172800000
-
-    def __post_init__(self) -> None:
-        _positive_fields(self, "audio", ("max_duration_seconds", "segment_seconds", "max_segments", "max_channels", "max_sample_rate", "max_input_mb", "max_segment_mb", "max_frames"))
-        if isinstance(self.overlap_seconds, bool) or not isinstance(self.overlap_seconds, int) or not 0 <= self.overlap_seconds < self.segment_seconds:
-            raise ValueError("audio requires 0 <= overlap_seconds < segment_seconds")
-        if isinstance(self.transcription_timeout, bool) or not isinstance(self.transcription_timeout, (int, float)) or not math.isfinite(self.transcription_timeout) or not 0 < self.transcription_timeout <= 300:
-            raise ValueError("audio.transcription_timeout must be finite and in (0, 300]")
-        if self.decoder not in {"core_pcm", "ffmpeg"}:
-            raise ValueError("audio.decoder must be core_pcm or ffmpeg")
-        for name in ("adapter", "transcription_endpoint", "transcription_model", "transcription_api_key_env"):
-            if not isinstance(getattr(self, name), str):
-                raise ValueError(f"audio.{name} must be a string")
-        if self.transcription_api_key_env and not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", self.transcription_api_key_env):
-            raise ValueError("audio.transcription_api_key_env must name an environment variable")
-
-
-@dataclass(slots=True)
 class RerankerConfig:
     enabled: bool = False
     endpoint: str = ""
@@ -399,14 +364,13 @@ class IngestConfig:
     queue_limit: int = 1000              # 队列容量上限
     max_parse_workers: int = 1           # 同时解析数（本 Lane 只实现 1）
     routing: str = "auto"
-    audio_enabled: bool = False
 
     def __post_init__(self) -> None:
         if self.routing == "cloud":
             self.routing = "mineru"
         if self.routing not in {"auto", "mineru", "local"}:
             raise ValueError("ingest.routing must be auto, mineru or local")
-        for name in ("enabled", "audio_enabled", "auto_watch", "is_ocr", "enable_formula", "enable_table", "pymupdf_fallback", "convert_small_tables"):
+        for name in ("enabled", "auto_watch", "is_ocr", "enable_formula", "enable_table", "pymupdf_fallback", "convert_small_tables"):
             if not isinstance(getattr(self, name), bool):
                 raise ValueError(f"ingest.{name} must be a boolean")
         if not isinstance(self.auto_watch, bool):
@@ -492,7 +456,6 @@ class AppConfig:
     diag: DiagConfig = field(default_factory=DiagConfig)
     chunking: ChunkingConfig = field(default_factory=ChunkingConfig)
     media: MediaConfig = field(default_factory=MediaConfig)
-    audio: AudioConfig = field(default_factory=AudioConfig)
     # 混合检索开关：true（默认）用 FTS5 BM25 + 向量余弦 + bigram 词法三路 RRF
     # 融合；false 完整还原旧的「词法软信号 + 余弦」行为。
     use_hybrid: bool = True
@@ -810,22 +773,6 @@ def _load_chunking(data: Mapping[str, Any], index: Mapping[str, Any]) -> Chunkin
     )
 
 
-def _load_audio(data: Mapping[str, Any]) -> AudioConfig:
-    section = _section(data, "audio")
-    kwargs = {name: str(_env(section.get(name, default))) for name, default in (
-        ("adapter", ""), ("transcription_endpoint", ""), ("transcription_model", ""),
-        ("transcription_api_key_env", ""), ("decoder", "core_pcm"),
-    )}
-    kwargs["transcription_timeout"] = _numeric(section, {}, "transcription_timeout", float, 30.0, 0.0, 300.0)
-    for name, default, minimum in (
-        ("max_duration_seconds", 3600, 1), ("segment_seconds", 30, 1), ("overlap_seconds", 5, 0),
-        ("max_segments", 1000, 1), ("max_channels", 2, 1), ("max_sample_rate", 48000, 1),
-        ("max_input_mb", 20, 1), ("max_segment_mb", 8, 1), ("max_frames", 172800000, 1),
-    ):
-        kwargs[name] = _numeric(section, {}, name, int, default, minimum)
-    return AudioConfig(**kwargs)
-
-
 def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
     """Load app.toml while accepting both flat and grouped configuration keys."""
     data = _read_toml(Path(path)) if path is not None else {}
@@ -901,7 +848,6 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
     ing = IngestConfig(
         enabled=_boolean(ingest, "enabled", False),
         routing=str(ingest.get("routing", "auto")),
-        audio_enabled=_boolean(ingest, "audio_enabled", False),
         api_key=str(_env(ingest.get("api_key", ""))),
         model_version=str(_env(ingest.get("model_version", "vlm"))),
         language=str(_env(ingest.get("language", "ch"))),
@@ -981,7 +927,6 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
         index=IndexConfig(read_max_chars=read_max_chars),
         diag=dg,
         chunking=_load_chunking(data, index),
-        audio=_load_audio(data),
         media=MediaConfig(
             inline_max_bytes=_numeric(_section(data, "media"), {}, "inline_max_bytes", int, 8388608, 1),
             refs_limit=_numeric(_section(data, "media"), {}, "refs_limit", int, 20, 1, 100),

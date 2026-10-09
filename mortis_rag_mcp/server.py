@@ -908,42 +908,6 @@ class VaultMcpServer:
             except Exception:
                 return None
 
-    def _transcription_adapter(self, vault_path: str | Path | None = None) -> Any:
-        """转录 adapter 装配点（E09/E16）。
-
-        服务合同（请求/响应/幂等/额度）未提供时不编造实现：返回 None，由 worker 在
-        入队/执行前给出**可见**的 `AUDIO_ADAPTER_UNAVAILABLE`，而不是静默降级成
-        metadata_only。合同到达后只在这里接唯一实现。
-        """
-        from .ingest.transcription import (
-            TranscriptionContractUnverified,
-            create_transcription_adapter,
-        )
-        try:
-            adapter = create_transcription_adapter(self.config.audio)
-        except TranscriptionContractUnverified:
-            return None
-        if adapter is None:
-            return None
-
-        # E16：接通转录付费闸门
-        if vault_path is not None:
-            key = str(Path(vault_path).expanduser().resolve())
-            indexer = self._indexers.get(key)
-            fp = getattr(adapter, "fingerprint", "")
-            if indexer is not None:
-                indexer.configure_paid_provider("transcription", adapter, fp)
-            else:
-                control = self._paid_control_store_for(vault_path)
-                if control is not None:
-                    from .paid_requests import PaidRequestJournal, paid_request_guard
-                    journal = PaidRequestJournal(control, "transcription")
-                    guard = lambda profile_fp: paid_request_guard(control, profile_fp)
-                    configure = getattr(adapter, "configure_paid_requests", None)
-                    if callable(configure):
-                        configure(journal, guard, fp)
-        return adapter
-
     def _media_provider_and_error(self, vault_path: str | Path | None = None) -> tuple[Any, str | None]:
         """原生媒体 provider 装配点，返回 (provider, capability_error)（E16）。"""
         from .providers import create_media_provider
@@ -985,15 +949,6 @@ class VaultMcpServer:
         """原生媒体 provider 装配点（E16）。"""
         provider, _ = self._media_provider_and_error(vault_path)
         return provider
-
-    def _audio_decoder(self) -> Any:
-        """显式解码组件装配点（E09）。
-
-        本仓库不内置解码器、不隐式 shell 调 ffmpeg、不联网安装：非 PCM（MP3/M4A/FLAC）
-        在注入受验证组件之前由 `inspect_audio` 在入队前明确报 blocked。这里就是后续接入
-        的**唯一**位置（显式配置 + 显式注入）。
-        """
-        return None
 
     def _ingest_manager_for(self, vault_path: str) -> IngestManager:
         key = str(Path(vault_path).resolve())
@@ -1052,11 +1007,6 @@ class VaultMcpServer:
                         store_provider=_store_provider,
                         on_job_finished=_on_job_finished,
                         ignore_provider=_ignore_provider,
-                        # E09：独立 AudioConfig + 转录 adapter/解码组件 + 真实 chunker 指纹
-                        # 沿 server → factory → worker → audio 贯通（旧 flat 调用仍兼容）。
-                        audio_config=self.config.audio,
-                        audio_adapter=self._transcription_adapter(vault_path),
-                        audio_decoder=self._audio_decoder(),
                         chunker_fingerprint_provider=_chunker_fingerprint_provider,
                         media_provider=media_prov,
                         media_capability_error=media_err,
@@ -1977,7 +1927,6 @@ class VaultMcpServer:
             # 或「为什么云解析被拒」都要靠猜（§20.4 首次 5 分钟验）。
             "storage": str(getattr(ingest_cfg, "storage", "virtual")),
             "network_policy": str(getattr(ingest_cfg, "network_policy", "configured")),
-            "audio_enabled": bool(getattr(ingest_cfg, "audio_enabled", False)),
             "max_file_size_mb": ingest_cfg.max_file_size_mb,
             "watch_method": watch_method,
             "effective_interval": effective_interval,

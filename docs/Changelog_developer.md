@@ -7,6 +7,19 @@
 
 ---
 
+### [E17 架构收敛：物理清除 ffmpeg 音频解码与 Whisper 转录链路] — moton16,2026-10-09,CodeBuddy,DeepSeek-V4.1-Flash
+
+按统一入口 §16 架构收敛裁定，把音频转码 / 转录链路整体移出核心代码库（不新增业务功能，只做删除与去悬空）：
+
+- **删除模块**：`mortis_rag_mcp/ingest/audio.py`（PCM 分段/解码接缝/`parse_audio` 编排）、`mortis_rag_mcp/ingest/transcription.py`（OpenAI Whisper 转录 adapter 与付费闸门装配点）。
+- **配置面**：移除 `config.AudioConfig`、`AppConfig.audio`、`IngestConfig.audio_enabled`、`_load_audio` 与 `[audio]` 解析；`config/app.toml.example` 删除 `[audio]` 段与 `audio_enabled`。
+- **装配面**：`server.py` 删除 `_transcription_adapter`/`_audio_decoder` 与转录 paid_guard 装配，`make_ingest_manager` 不再传 `audio_config/audio_adapter/audio_decoder`；`doctor.py` 删除 `audio_enabled`/`transcription` 报告字段；`ingest/worker.py` 删除 `AUDIO_EXTS`/`AUDIO_ROUTE_UNSUPPORTED`、音频分卷与转录 subjobs 调度、段级 audio checkpoint 与 audio 指纹。
+- **测试**：删除 `test_audio_ingest.py`、`test_audio_production_adapter.py`、`tests/fixtures/transcription_contract.json`；`test_e15_service_contracts.py` 移除转录子出口用例；`test_lane_be_config.py`/`test_route_execution_upgrade.py` 移除音频配置断言。混合文件去音频后更名为 `test_virtual_worker_queue.py`、`test_subjob_checkpoint_contract.py`（保留非音频合同用例，未降低覆盖口径）。
+- **保留（与转录无关）**：音频原生 embedding transport（`media_providers.py`）、音频 occurrence 展示（`_server/media_dispatch.py`、`_indexer/media.py::merge_audio_segments`）、`doc_store` 的 `audio_frames/audio_ms` range kind（读旧库 checkpoint 兼容）。
+- **验证**：静态探针（模块导入 + 被清除符号/签名/成员缺席）PASS；受影响靶向套件 97 passed/4 skipped 与 158 passed/2 skipped，均 exit0。全量回归与发布候选在本窗口后续登记。
+
+---
+
 ### [beta2 第四批与前三批局部复核] — moton16,2026-10-08,Codex
 
 只做本地候选准备，未调用真实 API/迁移真实资产/执行远端 Git 或发布。只读增量复核由内置 gpt-6.1-sol/high 完成，主流程核实与修复。
@@ -631,7 +644,7 @@ virtual不可用错误与后台stdio等待按现行接口；estimated保尾空�
 >     - 历史任务清理（>500）仅修剪 jobs，严格保留 `auto_seen` 账本去重凭证；完整无异常扫描支持清理已确认物理删除的源；
 >     - 兼容迁移：旧版缺失 `auto_seen` 的 state 自动基于 `jobs` 最新 `submitted_at` 构建。
 > - `mortis_rag_mcp/ingest/__init__.py`：
->   - 更新设计约束文档注释，从“仅显式触发”更新为“默认手动，显式授权后可自动（auto_watch=True）”。
+>   - 更新设计约束文档注释，从"仅显式触发"更新为"默认手动，显式授权后可自动（auto_watch=True）"。
 > - `tests/test_ingest_auto.py`：
 >   - 扩展 18 个测试用例，覆盖显式提交阻断、精确边界允许、扫描过滤、auto_submit 诊断统计、force 无法绕过上限、queued 恢复与入队后变大二次拦截、混合源全批回滚、Agent 额度 PyMuPDF 兜底、动态 ignore、四种状态去重、sha 变化与 A->B->A 重新入队、500 历史修剪免重传、旧 state 迁移、删除源修剪与零副作用读状态等。
 >
@@ -809,7 +822,7 @@ virtual不可用错误与后台stdio等待按现行接口；estimated保尾空�
 > - **Part 2：用户文档、检索路由纪律与配置复核（commit `6c4361d`）**：
 >   - `skills/mortis-rag-mcp/SKILL.md`：
 >     - 递增 frontmatter 版本至 `5.3.0`，主标题同步为 0.8.1；
->     - 全面清除无样本依据的“降低 70%+ Token”量化宣传；
+>     - 全面清除无样本依据的"降低 70%+ Token"量化宣传；
 >     - 增补 C70.2 六条检索调用纪律（大候选初筛定向与预算、compact 无 chunk_id 的 source+行号回读契约、budget returned=0 恢复与 group 游标原样续页、read 实际总行数校正与同名 heading 消歧、indexing/stale 状态应对与禁擅自 rebuild、自动摄取默认关闭与用户显式授权边界）；
 >     - 给出大候选 compact 初筛、区间回读、物理章节直读与用户授权 ingest 配置四组标准调用样例；
 >   - `QUICKSTART_user.md`：
@@ -817,8 +830,8 @@ virtual不可用错误与后台stdio等待按现行接口；estimated保尾空�
 >     - 新增 §0.3 v0.8.1 检索与读取升级速查（compact 模式、heading 物理章节读取与重名消歧、只读优先、摄取 20MiB 门禁）；
 >     - 同步 §6 常用工具速查表，增加 compact、budget_bytes、group_offsets 与 heading 参数提示；
 >   - `README.md` & `README_EN.md`：
->     - 删除无样本限定的“降低 70%+”承诺，准确描述为轻量返回切片与行号、降低上下文开销；
->     - 去除固定“秒级”承诺，准确表述为后台增量同步与只读优先；
+>     - 删除无样本限定的"降低 70%+"承诺，准确描述为轻量返回切片与行号、降低上下文开销；
+>     - 去除固定"秒级"承诺，准确表述为后台增量同步与只读优先；
 >     - 补充 0.8.1 紧凑初筛与物理章节直读核心特性；
 >   - `config/app.toml.example`：
 >     - 复核 `[ingest]` 注释，明确阐述自动摄取的费用/隐私成本、扫描 cadence 绑定 index 轮询周期、初始存量文件自动入队、0 表示不限制单文件尺寸及重启生效要求。

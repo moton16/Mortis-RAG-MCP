@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 
 from mortis_rag_mcp import config
-from mortis_rag_mcp.config import AppConfig, AudioConfig, ChunkingConfig, IngestConfig, MediaConfig
+from mortis_rag_mcp.config import AppConfig, ChunkingConfig, IngestConfig, MediaConfig
 
 
 def load_text(tmp_path, text):
@@ -18,8 +18,6 @@ def test_new_install_and_programmatic_compatibility(tmp_path):
     cfg = load_text(tmp_path, "")
     assert cfg.chunking.mode == "estimated_tokens"
     assert cfg.chunking.mode_explicit is False
-    assert cfg.audio.transcription_endpoint == ""
-    assert cfg.ingest.audio_enabled is False
     assert cfg.embedding.client_slicing is False
     assert cfg.media.inline_max_bytes == 8388608
 
@@ -57,15 +55,12 @@ def test_legacy_alias_conflict(tmp_path):
 
 
 @pytest.mark.parametrize("text", [
-    '[ingest]\nenabled = "false"', '[ingest]\naudio_enabled = 1',
+    '[ingest]\nenabled = "false"',
     '[ingest]\npymupdf_fallback = "false"', '[embedding]\nclient_slicing = "false"',
     '[media]\npreview_enabled = "false"', '[chunking]\nlegacy_chunking = "false"',
     '[chunking]\ntarget_tokens = true', '[chunking]\noverlap_tokens = 384',
     '[chunking]\nhard_limit_tokens = 100', '[chunking]\nestimator_profile = "unknown"',
     '[media]\nrefs_limit = 101', '[media]\ninline_max_bytes = 0',
-    '[audio]\nsegment_seconds = 0', '[audio]\noverlap_seconds = 30',
-    '[audio]\ntranscription_timeout = nan', '[audio]\nmax_input_mb = true',
-    '[audio]\ntranscription_api_key_env = "not a variable"',
     '[embedding]\nmedia_adapter = 123',
     '[embedding]\nmedia_dimension = 0',
 ])
@@ -76,8 +71,7 @@ def test_invalid_config_is_rejected(tmp_path, text):
 
 @pytest.mark.parametrize("factory, kwargs", [
     (ChunkingConfig, {"target_tokens": True}), (MediaConfig, {"refs_limit": False}),
-    (AudioConfig, {"transcription_timeout": float("inf")}),
-    (IngestConfig, {"audio_enabled": "false"}),
+    (IngestConfig, {"routing": "bogus"}),
 ])
 def test_programmatic_validation(factory, kwargs):
     with pytest.raises(ValueError):
@@ -85,7 +79,7 @@ def test_programmatic_validation(factory, kwargs):
 
 
 def test_fallback_and_normal_parser_match(tmp_path, monkeypatch):
-    text = '[chunking]\nmode = "estimated_tokens"\ntarget_tokens = 400\n[media]\nrefs_limit = 12\n[audio]\nsegment_seconds = 40\n[ingest]\naudio_enabled = false'
+    text = '[chunking]\nmode = "estimated_tokens"\ntarget_tokens = 400\n[media]\nrefs_limit = 12'
     normal = load_text(tmp_path, text)
     monkeypatch.setattr(config, "tomllib", None)
     fallback = load_text(tmp_path, text)
@@ -101,13 +95,12 @@ def test_example_loads(monkeypatch):
 
 def test_doctor_new_fields_are_read_only(tmp_path, monkeypatch):
     from mortis_rag_mcp import doctor
-    cfg = load_text(tmp_path, '[audio]\ntranscription_endpoint = "https://example.invalid/transcribe"')
+    cfg = load_text(tmp_path, '[media]\nrefs_limit = 12')
     before = asdict(cfg)
     monkeypatch.setattr(config, "resolve_config_path", lambda _: None)
     monkeypatch.setattr(config, "load_config", lambda _: cfg)
     result, returned = doctor.check_config(None)
     assert result["ok"]
-    assert "not probed" in result["detail"]
     assert "chunking=" in result["detail"]
     assert "media_provider=" in result["detail"]
     assert returned is cfg

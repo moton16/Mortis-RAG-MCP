@@ -23,7 +23,7 @@
 2. virtual 为文档事实默认落点。`DocumentStore` 的 generation/revision 与 control/job/checkpoint/blob/occurrence 分开；refresh 保留请求，read/export pin 固定版本；import 最终 gate 重核及发布同一 OS mutation lock，沿用原补偿机制。
 3. worker retry 唤醒线程；cancelled 失去 GC 保护的段在 retry 同事务清除，failed 的有效 checkpoint 保留，unknown 不自动回 queued。
 4. sync 捕获固定 revision 的所有 occurrence（不以一页1000当全量）；proxy/native 均有源/渲染 SHA。native ID/key 含媒体 profile；重开时旧 pending 不覆盖新向量；不支持的模态/MIME保留 proxy 文本召回。磁盘派生 orphan 清理不涉及事实 blob GC。
-5. 16 工具包括 `kb_read_media`，实际 request_id 纳入完整 JSON-RPC 预算。媒体内部可注入 transport fixture 已接通；普通工厂真实 transport、server AudioConfig/adapter/解码完整装配、独立图片摄取仍有缺口，不写成完整生产能力。
+5. 16 工具包括 `kb_read_media`，实际 request_id 纳入完整 JSON-RPC 预算。媒体内部可注入 transport fixture 已接通；普通工厂真实 transport 端到端、独立图片摄取仍有缺口，不写成完整生产能力。音频转录 / ffmpeg 解码链路已在 E17 物理清除（见统一入口 §16），音频只保留原生 embedding 与 occurrence 展示出口。
 6. 可选 docs/media 正向格式已本地执行；vec 正向必须由有 sqlite_vec 的环境/新 CI lane 验收。质量脚本区分 fixture_measured/incomplete，合成资源峰值不是 RSS；真实语料、端点、跨模态质量、宿主显示/播放未验收。
 7. 极端 legacy 超长多格表格仍有历史截失；保持其旧地址兼容，本次不隐式改变 golden。estimated 完整保留超限表格并不发 embedding。
 

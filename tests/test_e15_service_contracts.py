@@ -1,9 +1,10 @@
-"""E15：真实服务合同适配器回归（媒体 embeddings / 转录 / MinerU 结构媒体）。
+"""E15：真实服务合同适配器回归（媒体 embeddings / MinerU 结构媒体）。
 
-覆盖三个子出口的 mock-transport 隔离回归：
+覆盖两个子出口的 mock-transport 隔离回归：
 1. HttpMediaTransport：请求形态、base64 dataURI 编码、响应索引对齐、429/网络异常未知停、限额与模态拒绝、普通工厂装配；
-2. OpenAiTranscriptionAdapter：multipart 请求编码、verbose_json 与 json 响应解析、细粒度分段时间戳、timeout 透传、429/网络异常未知停、缺 endpoint 显式拒绝、parse_audio 链路贯通；
-3. MinerU 结构媒体映射：content_list.json 真实字段（caption/OCR/page/bbox）映射到 MediaOccurrenceSpec、正文 Markdown 字符锚点 [start, end) 检索定位、无引用不猜、尺寸绝不冒充 anchor、StoreMediaSink 真实落库回归。
+2. MinerU 结构媒体映射：content_list.json 真实字段（caption/OCR/page/bbox）映射到 MediaOccurrenceSpec、正文 Markdown 字符锚点 [start, end) 检索定位、无引用不猜、尺寸绝不冒充 anchor、StoreMediaSink 真实落库回归。
+
+E17：Whisper 转录 adapter（原第 2 项子出口）随音频转录链路物理清除一并移除。
 """
 from __future__ import annotations
 
@@ -11,7 +12,6 @@ import hashlib
 import io
 import json
 import sqlite3
-import wave
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -20,25 +20,11 @@ from urllib.error import HTTPError, URLError
 
 import pytest
 
-from mortis_rag_mcp.config import AppConfig, AudioConfig, CacheConfig, EmbeddingConfig
+from mortis_rag_mcp.config import AppConfig, CacheConfig, EmbeddingConfig
 from mortis_rag_mcp.doc_store import DocumentStore, resolve_storage_layout
 from mortis_rag_mcp.embedding_capabilities import resolve_media_profile
-from mortis_rag_mcp.ingest.audio import (
-    AudioSegment,
-    audio_settings,
-    iter_segments,
-    parse_audio,
-)
 from mortis_rag_mcp.ingest.mineru import MineruClient, MineruError, _safe_extract_zip
 from mortis_rag_mcp.ingest.models import DictMediaSink, ResourceLimits
-from mortis_rag_mcp.ingest.transcription import (
-    AUDIO_ADAPTER_UNAVAILABLE,
-    TRANSCRIPT_CONTRACT_UNVERIFIED,
-    OpenAiTranscriptionAdapter,
-    TranscriptionContractUnverified,
-    TranscriptionError,
-    create_transcription_adapter,
-)
 from mortis_rag_mcp.ingest.worker import StoreMediaSink
 from mortis_rag_mcp.media_providers import (
     EmbeddingInput,
@@ -501,215 +487,6 @@ def test_multimodal_audio_contract_fixtures_integrity():
     assert gemma_data["audio_specifications"]["sample_rate_hz"] == 16000
     assert gemma_data["audio_specifications"]["placeholder_token"] == "<|audio|>"
 
-
-
-# =====================================================================
-# 2. 转录 Adapter 回归
-# =====================================================================
-
-
-def _wav_segment(ordinal: int = 1, frames: int = 8000) -> AudioSegment:
-    bio = io.BytesIO()
-    with wave.open(bio, "wb") as w:
-        w.setnchannels(1)
-        w.setsampwidth(2)
-        w.setframerate(8000)
-        w.writeframes(b"\x00\x01" * frames)
-    data = bio.getvalue()
-    return AudioSegment(
-        ordinal=ordinal,
-        start_frame=0,
-        end_frame=frames,
-        t_start_ms=0,
-        t_end_ms=1000,
-        input_sha256=hashlib.sha256(data).hexdigest(),
-        data=data,
-    )
-
-
-def test_transcription_adapter_multipart_request_and_verbose_json():
-    seg = _wav_segment(1)
-    captured = {}
-
-    def fake_urlopen(req, timeout=30.0):
-        captured["timeout"] = timeout
-        captured["url"] = req.full_url
-        captured["content_type"] = req.headers.get("Content-type")
-        captured["auth"] = req.headers.get("Authorization")
-        captured["body"] = req.data
-        resp = {
-            "task": "transcribe",
-            "language": "zh",
-            "duration": 1.0,
-            "text": "测试音频转录",
-            "segments": [
-                {"id": 0, "start": 0.0, "end": 1.0, "text": "测试音频转录"},
-            ],
-        }
-        return io.BytesIO(json.dumps(resp).encode("utf-8"))
-
-    journal = _MockJournal()
-    adapter = OpenAiTranscriptionAdapter(
-        endpoint="https://api.openai.com/v1/audio/transcriptions",
-        model="whisper-1",
-        api_key="sk-test",
-        timeout=15.0,
-        journal=journal,
-    )
-
-    with patch("mortis_rag_mcp.ingest.transcription.urlopen", side_effect=fake_urlopen):
-        result = adapter.transcribe(seg, timeout=12.5)
-
-    assert result["text"] == "测试音频转录"
-    assert len(result["segments"]) == 1
-    assert captured["timeout"] == 12.5
-    assert "multipart/form-data" in captured["content_type"]
-    assert captured["auth"] == "Bearer sk-test"
-    assert b"whisper-1" in captured["body"]
-    assert b"segment-1.wav" in captured["body"]
-    assert [ev[0] for ev in journal.events] == ["before_send", "mark_success"]
-
-
-def test_transcription_adapter_error_marks_unknown_and_no_retry():
-    seg = _wav_segment(1)
-    journal = _MockJournal()
-
-    def fake_urlopen(req, timeout=30.0):
-        raise HTTPError(req.full_url, 429, "Too Many Requests", {}, io.BytesIO(b'{"error": "rate_limit"}'))
-
-    adapter = OpenAiTranscriptionAdapter(
-        endpoint="https://api.openai.com/v1/audio/transcriptions",
-        journal=journal,
-    )
-
-    with patch("mortis_rag_mcp.ingest.transcription.urlopen", side_effect=fake_urlopen):
-        with pytest.raises(TranscriptionError, match="SUBMISSION_UNKNOWN"):
-            adapter.transcribe(seg)
-
-    assert [ev[0] for ev in journal.events] == ["before_send", "mark_unknown"]
-
-
-def test_create_transcription_adapter_validation():
-    # 空配置 -> None
-    assert create_transcription_adapter(AudioConfig(adapter="")) is None
-
-    # 未受支持的 adapter 标识 -> TranscriptionContractUnverified
-    with pytest.raises(TranscriptionContractUnverified, match="未受支持"):
-        create_transcription_adapter(AudioConfig(adapter="unknown_engine"))
-
-    # 声明了 adapter 但缺少 endpoint -> TranscriptionContractUnverified
-    with pytest.raises(TranscriptionContractUnverified, match="transcription_endpoint"):
-        create_transcription_adapter(AudioConfig(adapter="whisper", transcription_endpoint=""))
-
-    # 正常装配
-    cfg = AudioConfig(
-        adapter="openai_whisper",
-        transcription_endpoint="https://api.test/v1/audio/transcriptions",
-        transcription_model="whisper-1",
-    )
-    adapter = create_transcription_adapter(cfg)
-    assert isinstance(adapter, OpenAiTranscriptionAdapter)
-    assert adapter.endpoint == "https://api.test/v1/audio/transcriptions"
-    assert adapter.model == "whisper-1"
-
-
-def test_transcription_adapter_error_details_and_quota_diagnostics():
-    seg = _wav_segment(1)
-    journal = _MockJournal()
-    adapter = OpenAiTranscriptionAdapter(
-        endpoint="https://api.openai.com/v1/audio/transcriptions",
-        journal=journal,
-    )
-
-    # 1. 429 insufficient quota payload preserved in TranscriptionError
-    err_body = io.BytesIO(json.dumps({
-        "error": {
-            "message": "You exceeded your current quota, please check your plan and billing details.",
-            "type": "insufficient_quota",
-            "code": "insufficient_quota",
-        }
-    }).encode("utf-8"))
-    with patch("mortis_rag_mcp.ingest.transcription.urlopen", side_effect=HTTPError("https://api.test", 429, "Too Many Requests", {}, err_body)):
-        with pytest.raises(TranscriptionError) as exc_info:
-            adapter.transcribe(seg)
-        assert "insufficient_quota" in str(exc_info.value)
-        assert "exceeded your current quota" in str(exc_info.value)
-        assert "SUBMISSION_UNKNOWN" in str(exc_info.value)
-    assert [ev[0] for ev in journal.events] == ["before_send", "mark_unknown"]
-
-    # 2. 500 HTML gateway failure preserved
-    journal.events.clear()
-    html_body = io.BytesIO(b"<html><body>500 Internal Server Error</body></html>")
-    with patch("mortis_rag_mcp.ingest.transcription.urlopen", side_effect=HTTPError("https://api.test", 500, "Internal Server Error", {}, html_body)):
-        with pytest.raises(TranscriptionError) as exc_info:
-            adapter.transcribe(seg)
-        assert "500" in str(exc_info.value)
-        assert "Internal Server Error" in str(exc_info.value)
-    assert [ev[0] for ev in journal.events] == ["before_send", "mark_unknown"]
-
-    # 3. HTTP 200 with error payload
-    journal.events.clear()
-    with patch("mortis_rag_mcp.ingest.transcription.urlopen", return_value=io.BytesIO(json.dumps({"error": {"message": "Invalid audio data"}}).encode("utf-8"))):
-        with pytest.raises(TranscriptionError) as exc_info:
-            adapter.transcribe(seg)
-        assert "Invalid audio data" in str(exc_info.value)
-
-
-def test_create_transcription_adapter_direct_keys_and_options(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setenv("MY_WHISPER_KEY", "sk-env-key")
-    cfg = AudioConfig(
-        adapter="openai_whisper",
-        transcription_endpoint="https://api.test/v1/audio/transcriptions",
-        transcription_model="whisper-large-v3",
-        transcription_api_key_env="MY_WHISPER_KEY",
-    )
-    adapter = create_transcription_adapter(cfg)
-    assert isinstance(adapter, OpenAiTranscriptionAdapter)
-    assert adapter.api_key == "sk-env-key"
-    assert adapter.model == "whisper-large-v3"
-
-    # 兼容通过 SimpleNamespace 传入直接 api_key / language / response_format 的配置对象
-    from types import SimpleNamespace
-    duck_cfg = SimpleNamespace(
-        adapter="whisper",
-        transcription_endpoint="https://api.test/v1/audio/transcriptions",
-        transcription_model="whisper-base",
-        transcription_api_key="sk-direct-key",
-        transcription_response_format="verbose_json",
-        transcription_language="zh",
-    )
-    adapter_duck = create_transcription_adapter(duck_cfg)
-    assert adapter_duck.api_key == "sk-direct-key"
-    assert adapter_duck.response_format == "verbose_json"
-    assert adapter_duck.language == "zh"
-    assert adapter_duck.model == "whisper-base"
-
-
-def test_transcription_adapter_pipeline_with_parse_audio(tmp_path: Path):
-    path = tmp_path / "sample.wav"
-    seg = _wav_segment(1, frames=8000)
-    path.write_bytes(seg.data)
-
-    adapter = OpenAiTranscriptionAdapter(
-        endpoint="https://api.test/v1/audio/transcriptions",
-        transport=lambda segment, timeout=None: {"text": f"transcript-of-seg-{segment.ordinal}"},
-        local_only=True,
-    )
-
-    from types import SimpleNamespace
-
-    sink = DictMediaSink()
-    audio_cfg = AudioConfig(adapter="whisper", transcription_endpoint="https://api.test", segment_seconds=2, overlap_seconds=1)
-    cfg = audio_settings(SimpleNamespace(audio_enabled=True), audio_cfg)
-    result = parse_audio(path, cfg, adapter=adapter, sink=sink)
-
-
-    assert result.capabilities["transcript"] is True
-    assert "transcript-of-seg-1" in result.markdown
-    assert len(sink.occurrences) == 1
-    assert sink.occurrences[0].caption == "transcript-of-seg-1"
-
-
 # =====================================================================
 # 3. MinerU 结构媒体映射回归
 # =====================================================================
@@ -1017,10 +794,9 @@ def test_create_media_provider_gemini_adapter_rejects_loopback():
         create_media_provider(cfg)
 
 
-def test_media_and_transcription_bounded_response_limits():
-    """E16：media transport 与 transcription 响应体大小上限拦截（对齐 mineru 预算纪律）。"""
+def test_media_bounded_response_limits():
+    """E16：media transport 响应体大小上限拦截（对齐 mineru 预算纪律）。"""
     from mortis_rag_mcp.media_providers import HttpMediaTransport, GeminiMediaTransport, EmbeddingInput
-    from mortis_rag_mcp.ingest.transcription import OpenAiTranscriptionAdapter, TranscriptionError
 
     class OversizedResponse:
         def __init__(self, size: int):
@@ -1059,15 +835,5 @@ def test_media_and_transcription_bounded_response_limits():
     with patch("mortis_rag_mcp.media_providers.urlopen", return_value=OversizedResponse(15 * 1024 * 1024)):
         with pytest.raises(ProviderError, match="exceeds limit"):
             gemini_transport([EmbeddingInput(request_id="r2", modality="image", data=b"test", mime_type="image/png", media_hash="h2")])
-
-    # 3. OpenAiTranscriptionAdapter
-    trans_adapter = OpenAiTranscriptionAdapter(
-        endpoint="https://api.openai.com/v1/audio/transcriptions",
-        model="whisper-1",
-    )
-    seg = _wav_segment(1, frames=100)
-    with patch("mortis_rag_mcp.ingest.transcription.urlopen", return_value=OversizedResponse(15 * 1024 * 1024)):
-        with pytest.raises(TranscriptionError, match="exceeds limit"):
-            trans_adapter.transcribe(seg)
 
 
