@@ -15,7 +15,7 @@ from dataclasses import replace
 import re
 from typing import Any, Iterable, TYPE_CHECKING
 
-from .models import Chunk, SearchFilter, _EMB_DTYPE, dedupe_by_content_hash
+from .models import Chunk, SearchFilter, _EMB_DTYPE, dedupe_by_content_hash, dedupe_by_occurrence
 
 if TYPE_CHECKING:
     from mortis_rag_mcp.indexer import MarkdownIndexer
@@ -277,6 +277,8 @@ def search_single_vault(
             ranked = [chunk for chunk in ranked if all(term in _lexical_haystack(chunk) for term in clean_terms)]
         if dedupe:
             ranked = dedupe_by_content_hash(ranked)
+        # 空 query 路径：媒体 occurrence 也只留一条，避免同一媒体重复占位。
+        ranked = dedupe_by_occurrence(ranked)
         if filters is None:
             return owner._filter_visible_chunks(ranked)[: max(0, top_k)]
         ranked = [chunk for chunk in ranked if filters.matches(chunk)]
@@ -404,6 +406,9 @@ def search_single_vault(
 
     if dedupe:
         ranked = dedupe_by_content_hash(ranked)
+
+    # E08-d：媒体候选按 occurrence 归并去双计权（proxy 与 native 只留一条）。
+    ranked = dedupe_by_occurrence(ranked)
 
     ranked = owner._filter_visible_chunks(ranked)
     if use_rerank and owner.reranker_provider and ranked:

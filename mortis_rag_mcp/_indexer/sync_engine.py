@@ -12,6 +12,7 @@ from __future__ import annotations
 from array import array
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
+import json
 import time
 from typing import Any, Iterable, TYPE_CHECKING
 
@@ -423,12 +424,13 @@ def revoke_source(owner: MarkdownIndexer, source: str, *, reason: str) -> bool:
 
 
 def media_proxy_for_revision(owner: MarkdownIndexer, store: Any, source: str, revision_id: str,
-                             markdown: str, text_chunks: list[Chunk]) -> list[Chunk]:
+                             markdown: str, text_chunks: list[Chunk]) -> tuple[list[Chunk], list[Any]]:
     """为一条已提交 revision 生成媒体 proxy chunk，并**整代**落 profile 作用域 links。
 
     - 正文与 proxy 走同一 FTS/embed 候选：返回的 proxy 由调用方并入 `owner._chunks`；
     - links 至少按 profile/derived generation/revision/occurrence/chunk 绑定；
     - 无 occurrence 时也整代替换（清掉本代旧链），源失去媒体后不残留旧召回。
+    返回 `(proxy_chunks, occurrences)`，供同轮原生媒体向量路线复用同一 occurrence 事实。
     """
     from .media import build_media_proxy_chunks, media_chunk_links
 
@@ -451,7 +453,90 @@ def media_proxy_for_revision(owner: MarkdownIndexer, store: Any, source: str, re
     writable.replace_media_chunk_links(
         revision_id=revision_id, profile_key=profile_key,
         derived_generation_id=generation, chunker_fingerprint=fingerprint, links=links)
-    return proxy
+    return proxy, occurrences
+
+
+def media_native_route(owner: MarkdownIndexer) -> Any:
+    """返回可用的原生媒体 provider；缺能力/缺 alignment 声明时返回 None（route 不可用）。
+
+    **绝不用文本成功、同维向量或模型名冒充**：只有媒体 profile 显式声明的
+    `alignment_space_id` 与正文 profile 的声明**完全一致**时，媒体向量才允许进入
+    同一检索空间。
+    """
+    provider = getattr(owner, "media_provider", None)
+    profile = getattr(provider, "profile", None)
+    text_profile = getattr(owner, "_embedding_profile", None)
+    if provider is None or profile is None or text_profile is None:
+        return None
+    text_alignment = getattr(text_profile, "alignment_space_id", "") or ""
+    if not text_alignment or getattr(profile, "alignment_space_id", "") != text_alignment:
+        return None
+    if not any(modality in getattr(profile, "modalities", ()) for modality in ("image", "audio")):
+        return None
+    return provider
+
+
+def media_native_for_revision(owner: MarkdownIndexer, store: Any, source: str, revision_id: str,
+                              occurrences: list[Any]) -> list[Chunk]:
+    """从**已验证 blob** 读受限 bytes 并消费 E07 `embed_media`，产出原生媒体向量 chunk。
+
+    route 不可用（无 provider / 未声明 alignment / 无受限读取能力）时返回空列表——
+    明确该 route 不可用，纯词法 proxy 仍可用，但**不**把 proxy 冒充 native。
+    """
+    from ..media_providers import EmbeddingInput
+
+    provider = media_native_route(owner)
+    if provider is None or not occurrences:
+        return []
+    ability = provider.ability()
+    allowed = set(ability.get("allowed_mime_types", ()))
+    max_bytes = int(ability.get("max_input_bytes", 0) or 0)
+    batch = max(1, int(ability.get("max_batch_size", 0) or 1))
+    if not allowed or max_bytes <= 0:
+        return []
+    inputs: list[Any] = []
+    identity: dict[str, tuple[str, str, str]] = {}
+    for occurrence in occurrences:
+        occ_id = str(occurrence.get("occurrence_id") or "")
+        kind = "audio" if str(occurrence.get("kind")) == "audio" else "image"
+        if not occ_id or kind not in ability.get("modalities", ()):
+            continue
+        # MIME 以**已验证 blob**（read_media 返回值）为准，不采信列举摘要里可能缺失/自述的值。
+        try:
+            payload = store.read_media(source, revision_id=revision_id, occurrence_id=occ_id,
+                                       variant_id="original", max_bytes=max_bytes, include_data=True)
+        except Exception:
+            continue
+        mime = str(payload.get("mime_type") or "")
+        data = payload.get("data") or b""
+        if mime not in allowed or not data or len(data) > max_bytes:
+            continue
+        request_id = f"{source}\0{revision_id}\0{occ_id}"
+        blob_hash = hashlib.sha256(bytes(data)).hexdigest()
+        inputs.append(EmbeddingInput(request_id, kind, bytes(data), mime, blob_hash))
+        identity[request_id] = (occ_id, kind, blob_hash)
+    chunks: list[Chunk] = []
+    for start in range(0, len(inputs), batch):
+        batch_inputs = inputs[start:start + batch]
+        vectors = provider.embed_media(batch_inputs)
+        for item, vector in zip(batch_inputs, vectors):
+            occ_id, kind, blob_hash = identity[item.request_id]
+            chunk_id = "media-native-" + hashlib.sha256(
+                json.dumps([source, revision_id, occ_id, blob_hash], ensure_ascii=False).encode()).hexdigest()
+            metadata = {
+                "source_kind": "virtual", "revision_id": revision_id, "kind": "media_native",
+                "occurrence_id": occ_id, "media_occurrence_ids": [occ_id],
+                "media_route": "native", "blob_sha256": blob_hash,
+                "profile_key": provider.profile.fingerprint,
+                "alignment_space_id": provider.profile.alignment_space_id,
+                "line_basis": "media_alignment", "synthetic_segments": [],
+                "source_spans": [], "anchor_available": False, "anchor_confidence": "unavailable",
+            }
+            chunk = Chunk(chunk_id, f"[Media native: {source} / {revision_id} / {occ_id}]",
+                          source, occ_id, metadata)
+            chunk.embedding = _to_emb(vector)
+            chunks.append(chunk)
+    return chunks
 
 
 def run_sync(owner: MarkdownIndexer) -> list[Chunk]:
@@ -639,10 +724,18 @@ def run_sync(owner: MarkdownIndexer) -> list[Chunk]:
             # E08-b：捕获已提交 revision 的 occurrences，生成媒体 proxy 并落 links。
             # proxy 并入同一 FTS/embed 候选；失败只记该 source，不丢正文层。
             try:
-                chunks.extend(media_proxy_for_revision(
-                    owner, store, source, revision.revision_id, revision.parsed_markdown, chunks))
+                proxy_chunks, occurrences = media_proxy_for_revision(
+                    owner, store, source, revision.revision_id, revision.parsed_markdown, chunks)
+                chunks.extend(proxy_chunks)
             except Exception as exc:
+                occurrences = []
                 owner.failed_files[source] = f"media_proxy: {exc}"
+            # E08-d：原生媒体向量路线（消费 E07 embed_media）。route 不可用即空，不冒充。
+            try:
+                chunks.extend(media_native_for_revision(
+                    owner, owner.document_store(write=True), source, revision.revision_id, occurrences))
+            except Exception as exc:
+                owner.failed_files[source] = f"media_native: {exc}"
             changed.append((source, signature, chunks,
                             (int(stat.st_mtime_ns), int(stat.st_size), int(stat.st_ctime_ns)),
                             time.time_ns()))

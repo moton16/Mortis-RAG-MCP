@@ -34,7 +34,7 @@ def _layout(server, vault):
 
 
 def _commit(store: DocumentStore, vault: Path, source: str, markdown: str,
-            blobs: list[bytes]) -> str:
+            blobs: list[bytes], mimes: list[str] | None = None) -> str:
     path = vault / source
     sha = hashlib.sha256(path.read_bytes()).hexdigest()
     staged = store.stage_revision(
@@ -42,13 +42,14 @@ def _commit(store: DocumentStore, vault: Path, source: str, markdown: str,
         render_sha256=hashlib.sha256(markdown.encode("utf-8")).hexdigest(),
         parser_fingerprint="fake-1", markdown=markdown, capabilities={"coverage": "full"},
     )
+    mimes = mimes or ["image/png"] * len(blobs)
     specs = []
     for index, data in enumerate(blobs):
-        blob_id = store.put_media_blob(data=data, mime_type="image/png", width=8, height=8)
+        blob_id = store.put_media_blob(data=data, mime_type=mimes[index], width=8, height=8)
         anchor = markdown.index("media")
         specs.append(MediaOccurrenceSpec(
             occurrence_id=f"occ-{index}", blob_id=blob_id, kind="image", ordinal=index,
-            mime_type="image/png", page=index + 1, caption="same caption",
+            mime_type=mimes[index], page=index + 1, caption="same caption",
             anchor_start=anchor, anchor_end=anchor + len("media")))
     if specs:
         store.attach_occurrences(staged.revision_id, specs)
@@ -177,3 +178,126 @@ def test_revision_change_and_removal_revoke_derived_links_without_deleting_facts
             reader.close()
     finally:
         server.shutdown()
+
+
+# --------------------------------------------------------------------------- E08-d
+MEDIA_TOML = '''mode = "external"
+endpoint = "https://example.test/embed"
+model = "unknown"
+dimension = 2
+send_dimensions = false
+media_modalities = ["image"]
+media_alignment_space_id = "space-1"
+media_preprocess_version = "media-v1"
+media_endpoint_revision = "ep-1"
+media_allowed_mime_types = ["image/png"]
+media_max_input_bytes = 4096
+media_max_batch_size = 4
+media_model_reference = "model-ref"
+media_endpoint_fixture_reference = "fixture-ref"
+media_alignment_reference = "align-ref"
+media_license_reference = "license-ref"
+
+[ingest]
+enabled = false
+storage = "virtual"
+'''
+
+
+class _FakeTextProvider:
+    """dim-2 文本向量；故意不带 `.profile`，走纯文本 profile 校验路径。"""
+
+    def __init__(self, vector):
+        self.vector = list(vector)
+
+    def embed(self, texts):
+        return [list(self.vector) for _ in texts]
+
+
+def _media_indexer(tmp_path: Path, *, text_alignment: str = "space-1",
+                   media_alignment: str = "space-1", blobs=None, mimes=None):
+    from dataclasses import replace as _replace
+
+    from mortis_rag_mcp.config import load_config
+    from mortis_rag_mcp.indexer import MarkdownIndexer
+    from mortis_rag_mcp.providers import create_media_provider
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (vault / "doc.pdf").write_bytes(b"%PDF-1.4 payload")
+    config_path = tmp_path / "app.toml"
+    config_path.write_text(MEDIA_TOML, encoding="utf-8")
+    config = load_config(config_path)
+    config.cache.dir = str(tmp_path / "cache")
+    config.cache.enabled = True
+    config.cache.placement = "home"
+    config.embedding = _replace(config.embedding, media_alignment_space_id=text_alignment)
+    store = DocumentStore(resolve_storage_layout(config, vault, registered_vaults=[]), config)
+    store.open(write=True)
+    revision = _commit(store, vault, "doc.pdf", MARKDOWN, blobs or [PNG_A], mimes)
+    store.close()
+    provider_config = _replace(config.embedding, media_alignment_space_id=media_alignment)
+    media_provider = create_media_provider(
+        provider_config,
+        transport=lambda items: [{"index": i, "embedding": [3, 4]} for i, _ in enumerate(items)])
+    indexer = MarkdownIndexer(vault, config, embedding_provider=_FakeTextProvider([1.0, 0.0]),
+                              media_provider=media_provider)
+    return indexer, vault, revision
+
+
+def test_native_media_vectors_enter_aligned_query_and_dedupe_occurrence(tmp_path: Path):
+    from mortis_rag_mcp._indexer.sync_engine import media_native_route
+
+    indexer, vault, _revision = _media_indexer(tmp_path)
+    try:
+        assert media_native_route(indexer) is not None
+        indexer.sync()
+        chunks = indexer._chunks["doc.pdf"]
+        native = [c for c in chunks if c.metadata.get("kind") == "media_native"]
+        proxy = [c for c in chunks if c.metadata.get("kind") == "media_proxy"]
+        assert len(native) == 1 and native[0].embedding is not None
+        assert native[0].metadata["media_route"] == "native"
+        assert native[0].metadata["alignment_space_id"] == "space-1"
+        assert proxy, "缺少原生能力时纯词法 proxy 仍应存在（可降级）"
+
+        # 查询：同一 occurrence 的 proxy 与 native 只保留一条（去双计权）。
+        results = indexer.search("alpha", top_k=20)
+        per_occurrence = [c for c in results if c.metadata.get("occurrence_id") == "occ-0"]
+        assert len(per_occurrence) == 1
+
+        # 去掉词法 proxy 后，原生向量仍能作为独立候选被检索到（证明它真进了向量空间）。
+        indexer._chunks["doc.pdf"] = [c for c in chunks if c.metadata.get("kind") != "media_proxy"]
+        native_results = [c for c in indexer.search("alpha", top_k=20)
+                          if c.metadata.get("kind") == "media_native"]
+        assert native_results, "原生媒体向量必须进入同一对齐空间的检索候选"
+    finally:
+        indexer.close_document_store()
+
+
+def test_native_route_unavailable_without_declared_alignment(tmp_path: Path):
+    from mortis_rag_mcp._indexer.sync_engine import media_native_route
+
+    indexer, vault, _revision = _media_indexer(tmp_path, media_alignment="other-space")
+    try:
+        # 缺对齐声明（或声明不一致）→ 该 route 明确不可用，绝不用同维向量冒充。
+        assert media_native_route(indexer) is None
+        indexer.sync()
+        kinds = {c.metadata.get("kind") for c in indexer._chunks["doc.pdf"]}
+        assert "media_native" not in kinds
+        assert "media_proxy" in kinds, "纯词法降级仍必须可用"
+    finally:
+        indexer.close_document_store()
+
+
+def test_native_route_skips_unallowed_mime_without_fabrication(tmp_path: Path):
+    from mortis_rag_mcp._indexer.sync_engine import media_native_route
+
+    indexer, vault, _revision = _media_indexer(tmp_path, mimes=["image/tiff"])
+    try:
+        assert media_native_route(indexer) is not None
+        indexer.sync()
+        chunks = indexer._chunks["doc.pdf"]
+        assert not [c for c in chunks if c.metadata.get("kind") == "media_native"]
+        assert [c for c in chunks if c.metadata.get("kind") == "media_proxy"]
+    finally:
+        indexer.close_document_store()

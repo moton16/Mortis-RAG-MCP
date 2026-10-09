@@ -135,6 +135,7 @@ class MarkdownIndexer:
         config: AppConfig | None = None,
         embedding_provider: EmbeddingProvider | None = None,
         reranker_provider: RerankerProvider | None = None,
+        media_provider: Any = None,
         *,
         load_vectors: bool = True,
     ) -> None:
@@ -162,10 +163,13 @@ class MarkdownIndexer:
         # 无已声明 transport（Q09 缺协议）→ 记录「该 route 不可用」，但**不**影响文本路径。
         self.media_provider: Any = None
         self._media_capability_error: str | None = None
-        try:
-            self.media_provider = create_media_provider(self.config.embedding)
-        except Exception as exc:
-            self._media_capability_error = str(exc)
+        if media_provider is not None:
+            self.media_provider = media_provider
+        else:
+            try:
+                self.media_provider = create_media_provider(self.config.embedding)
+            except Exception as exc:
+                self._media_capability_error = str(exc)
         self.reranker_provider = reranker_provider
         if reranker_provider is None:
             try:

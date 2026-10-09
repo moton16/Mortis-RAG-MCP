@@ -231,3 +231,24 @@ def dedupe_by_content_hash(items: list[Any], chunk_of: Callable[[Any], Chunk] | 
         seen.add(digest)
         kept.append(item)
     return kept
+
+
+def dedupe_by_occurrence(items: list[Chunk]) -> list[Chunk]:
+    """媒体候选按 (source, occurrence_id) 归并去双计权（E08-d）。
+
+    同一 occurrence 可能同时以词法 proxy 与原生向量两条路线进入检索；这里保序
+    只留排名最靠前的一条，避免同一个媒体被 RRF 计两次权重。非媒体 chunk 原样
+    保留；不同 occurrence / 不同 source 绝不合并（同 caption 异图、同 blob 多页
+    仍是各自独立的候选）。
+    """
+    seen: set[tuple[str, str]] = set()
+    kept: list[Chunk] = []
+    for chunk in items:
+        occurrence_id = chunk.metadata.get("occurrence_id")
+        if occurrence_id and chunk.metadata.get("kind") in {"media_proxy", "media_native"}:
+            key = (chunk.source, str(occurrence_id))
+            if key in seen:
+                continue
+            seen.add(key)
+        kept.append(chunk)
+    return kept
