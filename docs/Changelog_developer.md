@@ -1288,3 +1288,7 @@ Codex 主流程：load/save 读状态与内存快照置于既有 RLock；直接 
 ### E20 F01/F02/F03 存储不变量出口
 
 Codex 主流程整合；施工子代理 gpt-6.1-sol/high。已有活动代数据库缺失/零长度显式失败，不创建替代空库；合法首次初始化先建库再发布指针。删除原子推进 change_seq、tombstone 与旧任务栅栏，source_seq 从已有事实生成 source-local CAS，schema/epoch 不变。generation pin 保护必要 committed revision，导出冻结 chunks staging member，并对 backup sequence、引用、最终 pin 做发布前验证，避免其他客户端换缓存后形成混包。原红 8 failed/1 passed，新增 immutable-cache 红2failed；主复核12passed，既有docstore/snapshot/recovery靶向通过。worker CAS消费者与首摄取删除sync补丁在下一批串行整合。证据 .runtime/beta2/E20/store/；不声明真实丢盘/旧用户库已验。
+
+### E20 F04/F08/F09、worker 栅栏与局部冗余
+
+Codex 主流程整合；施工子代理 gpt-6.1-sol/high。自动入队保留成功/拒绝部分结果，已有 queued 即使 new_jobs=0 仍唤醒worker；worker在claim后解析前捕获source-local CAS并原样提交。MinerU正文先去BOM/统一换行再算anchor/page坐标，回归对持久occurrence切片；旧raw legacy返回保留。图片 validate_image_source 原sha256字段改用完整流式SHA，parse实际payload另算完整SHA；主复核拒绝过一次header_sha256替名方案，纠正红绿记录保留。worker重复IngestConfig fallback清除，配置真源和导入别名同一性、完整发行包路径核验保留。恒真assert改为解析前/解析中确定性屏障两例。主复核正确性18passed、virtual10passed；兼容auto52/worker6/MinerU23/image10等离线靶向保留。已提交坏坐标/SHA不静默重写，恢复需显式新revision重摄取。

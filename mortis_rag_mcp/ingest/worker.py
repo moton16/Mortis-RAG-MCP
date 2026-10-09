@@ -18,43 +18,8 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable
 
-try:
-    from ..config import IngestConfig
-except ImportError:
-    from dataclasses import dataclass
-
-    @dataclass(slots=True)
-    class IngestConfig:
-        enabled: bool = False
-        api_key: str = ""
-        model_version: str = "vlm"
-        language: str = "ch"
-        is_ocr: bool = False
-        enable_formula: bool = True
-        enable_table: bool = True
-        poll_interval: float = 3.0
-        poll_timeout: float = 600.0
-        output_dirname: str = ".mortis-parsed"
-        pymupdf_fallback: bool = True
-        convert_small_tables: bool = True
-        table_convert_max_cells: int = 60
-        auto_watch: bool = False
-        max_file_size_mb: int = 20
-
-        def __post_init__(self) -> None:
-            if not isinstance(self.auto_watch, bool):
-                raise ValueError(f"ingest.auto_watch must be a boolean, got {self.auto_watch!r}")
-            if (
-                isinstance(self.max_file_size_mb, bool)
-                or not isinstance(self.max_file_size_mb, int)
-                or self.max_file_size_mb < 0
-            ):
-                raise ValueError(f"ingest.max_file_size_mb must be an integer >= 0, got {self.max_file_size_mb!r}")
-
-        @property
-        def max_file_size_bytes(self) -> int:
-            """Max file size in bytes (1024*1024 per MiB). 0 means unlimited."""
-            return self.max_file_size_mb * 1024 * 1024
+# 真源与历史 worker.IngestConfig 导入别名保持同一对象。
+from ..config import IngestConfig
 
 from .mineru import AGENT_EXTS, MineruClient, MineruError
 from .tables import convert_small_tables
@@ -1187,7 +1152,7 @@ class VirtualIngestWorker:
             )
             created += 1 if is_new else 0
             jobs.append(self._job_view(job))
-        if created:
+        if store.queue_depth():
             self._ensure_worker(store)
         return {
             "submitted": created,
@@ -1216,6 +1181,7 @@ class VirtualIngestWorker:
                     "skipped_too_large": 0, "skipped_ignored": 0}
         pending = self.scan_pending()
         jobs: list[dict] = []
+        rejected: list[dict] = []
         created = 0
         skipped_seen = 0
         too_large = 0
@@ -1227,10 +1193,10 @@ class VirtualIngestWorker:
                 continue
             try:
                 self._assert_network_policy(target["source"])
-            except ValueError:
-                return {"submitted": 0, "new_jobs": 0, "jobs": [], "status": "network_policy_blocked",
-                        "rescan_after_seconds": 0.0, "skipped_too_large": too_large,
-                        "skipped_ignored": 0}
+            except ValueError as exc:
+                rejected.append({"source": target["source"],
+                                 "error_code": "NETWORK_POLICY_BLOCKED", "error": str(exc)})
+                continue
             job, is_new = store.enqueue_job(
                 source=target["source"],
                 source_sha256=target["sha256"],
@@ -1238,16 +1204,18 @@ class VirtualIngestWorker:
             )
             if is_new:
                 created += 1
-                jobs.append(self._job_view(job))
             else:
                 skipped_seen += 1
-        if created:
+            jobs.append(self._job_view(job))
+        # auto_seen 已在入队时记录；没有新候选仍须唤醒上次进程留下的 queued。
+        if store.queue_depth():
             self._ensure_worker(store)
         return {
             "submitted": created,
             "new_jobs": created,
             "jobs": jobs,
-            "status": "ok",
+            "status": ("partial" if jobs else "network_policy_blocked") if rejected else "ok",
+            "rejected": rejected,
             "skipped_too_large": too_large,
             "skipped_seen": skipped_seen,
             "skipped_ignored": 0,
@@ -1531,6 +1499,8 @@ class VirtualIngestWorker:
                 except Exception:
                     pass
     def _run_job(self, store: Any, job: Any, owner: str) -> None:
+        # claim 后、源核验/解析前捕获；发布前不得重取 token，否则会吞掉并发新事实。
+        expected_source_seq = store.source_seq(job.source)
         src = _validate_safe_source(self.vault_path, job.source)
         stat_before = src.stat()
         if not self._check_file_size(stat_before.st_size):
@@ -1648,6 +1618,7 @@ class VirtualIngestWorker:
                                      job_id=job.job_id, owner_token=owner)
         store.commit_job_revision(
             job.job_id, owner, staged.revision_id, source_sha256=job.source_sha256,
+            expected_source_seq=expected_source_seq,
             source_size=stat_after.st_size, source_mtime_ns=stat_after.st_mtime_ns,
         )
         store.record_auto_seen(

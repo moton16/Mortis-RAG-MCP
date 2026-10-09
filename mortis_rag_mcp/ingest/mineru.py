@@ -836,6 +836,8 @@ def _safe_extract_zip(
         retained_budget += len(markdown_bytes) * 12
         remaining -= len(markdown_bytes)
         markdown = markdown_bytes.decode("utf-8", errors="replace")
+        # raw 仅供 legacy parse() 逐字返回；所有字符坐标共用规范化正文。
+        normalized_markdown = normalize_markdown(markdown)
 
         # 1. 先抽取结构 JSON 成员（优先解析元数据再处理媒体）
         json_members: list[tuple[str, bytes]] = []
@@ -943,7 +945,7 @@ def _safe_extract_zip(
                 if isinstance(raw_b, (list, tuple)) and len(raw_b) == 4 and all(isinstance(x, (int, float)) for x in raw_b):
                     bbox = tuple(float(x) for x in raw_b)
 
-            anchor_start, anchor_end = _find_media_anchor(markdown, key, used_anchor_spans)
+            anchor_start, anchor_end = _find_media_anchor(normalized_markdown, key, used_anchor_spans)
 
             ordinal += 1
             meta = {"archive_member": key}
@@ -984,7 +986,7 @@ def _safe_extract_zip(
                     metadata=meta,
                 )
 
-    page_map, reason = _derive_page_map(normalize_markdown(markdown), blocks)
+    page_map, reason = _derive_page_map(normalized_markdown, blocks)
     if reason:
         warnings.append(f"page_map unavailable: {reason}")
     capabilities: dict[str, Any] = {

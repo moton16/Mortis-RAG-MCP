@@ -53,7 +53,7 @@ def image_mime(path: Path) -> str:
 
 
 def validate_image_source(path: Path, limits: ResourceLimits) -> dict[str, Any]:
-    """显式图片源的准入：后缀/真实 magic、字节上限、像素上限（只读头部，不解码像素）。"""
+    """图片准入：magic/字节/像素预算；尺寸只读头，来源 SHA 流式覆盖完整文件。"""
     mime = image_mime(path)
     size = int(path.stat().st_size)
     if size <= 0:
@@ -70,8 +70,16 @@ def validate_image_source(path: Path, limits: ResourceLimits) -> dict[str, Any]:
     width, height = int(dimensions[0]), int(dimensions[1])
     if width and height and width * height > limits.max_image_pixels:
         raise ImageUnsupported("image exceeds pixel budget")
+    digest = hashlib.sha256()
+    consumed = 0
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1 << 20), b""):
+            consumed += len(block)
+            if consumed > limits.media_max_bytes:
+                raise ImageUnsupported("image source exceeds media byte budget")
+            digest.update(block)
     return {"mime_type": mime, "width": width, "height": height, "byte_size": size,
-            "sha256": hashlib.sha256(head).hexdigest()}
+            "sha256": digest.hexdigest()}
 
 
 def parse_image(path: Path, *, limits: ResourceLimits | None = None, sink: Any = None,
@@ -84,6 +92,7 @@ def parse_image(path: Path, *, limits: ResourceLimits | None = None, sink: Any =
     limits = limits or ResourceLimits()
     info = validate_image_source(path, limits)
     payload = path.read_bytes()
+    source_sha256 = hashlib.sha256(payload).hexdigest()
     name = path.name
     caption = str(description or title or path.stem).strip()
     heading = str(title or path.stem).strip() or name
@@ -102,7 +111,7 @@ def parse_image(path: Path, *, limits: ResourceLimits | None = None, sink: Any =
             name=f"source{path.suffix.lower()}", data=payload, kind="image", ordinal=ordinal,
             mime_type=info["mime_type"], caption=caption,
             width=info["width"] or None, height=info["height"] or None,
-            metadata={"source_format": info["mime_type"], "source_sha256": info["sha256"],
+            metadata={"source_format": info["mime_type"], "source_sha256": source_sha256,
                       "line_basis": "user_metadata", "ocr": False},
         )
         occurrences.append({"occurrence_id": str(occurrence_id or ""), "ordinal": int(ordinal)})
@@ -115,6 +124,6 @@ def parse_image(path: Path, *, limits: ResourceLimits | None = None, sink: Any =
         capabilities={"image": True, "ocr": False, "semantic_image": False,
                       "line_basis": "user_metadata", "anchor": False,
                       "width": info["width"] or None, "height": info["height"] or None,
-                      "image_sha256": info["sha256"], "occurrences": occurrences},
+                      "image_sha256": source_sha256, "occurrences": occurrences},
         warnings=warnings,
     )

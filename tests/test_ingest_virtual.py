@@ -6,6 +6,7 @@ ignore matcher fail-closed。
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -141,20 +142,48 @@ def test_local_only_rejects_before_enqueue(env):
     assert store.queue_depth() == 0          # 入队前拒绝，绝不先上传
 
 
-def test_source_changed_after_enqueue_discards_candidate(env, monkeypatch):
+def test_source_changed_before_claim_never_parses(env, monkeypatch):
     vault, cfg, store, worker = env
     monkeypatch.setattr("mortis_rag_mcp.ingest.worker.MineruClient", _FakeClient)
+    monkeypatch.setattr(worker, "_ensure_worker", lambda store: None)
+    monkeypatch.setattr(_FakeClient, "calls", [])
     doc = _pdf(vault)
-    worker.submit(["doc.pdf"])
-    # 在 worker 领取前改源：领取后的第一次核验必须拦截（绝不解析上传旧引用的内容）
-    worker.submit(["doc.pdf"])
+    result = worker.submit(["doc.pdf"])
     doc.write_bytes(b"%PDF-1.4 CHANGED")
-    assert _FakeClient.calls == [] or True   # 打桩调用计数只用于人工核对
-    worker._worker.join(timeout=5.0)
-    jobs = worker.status()["jobs"]
-    assert all(job["state"] in ("done", "failed") for job in jobs)
-    changed = [job for job in jobs if "SOURCE_CHANGED" in job["error"]]
-    assert changed, f"源变更必须以 SOURCE_CHANGED 失败：{jobs}"
+    job = store.claim_job("before-parse")
+    assert job.job_id == result["jobs"][0]["job_id"]
+    worker._run_job(store, job, "before-parse")
+    status = store.job_status(job.job_id)
+    assert status.state == "failed" and status.error_code == "SOURCE_CHANGED"
+    assert _FakeClient.calls == []
+    assert store.get_active("doc.pdf") is None
+    assert store.queue_depth() == 0
+
+
+def test_source_changed_during_parse_never_publishes(env, monkeypatch):
+    vault, cfg, store, worker = env
+    monkeypatch.setattr(worker, "_ensure_worker", lambda store: None)
+    monkeypatch.setattr(_FakeClient, "calls", [])
+    doc = _pdf(vault)
+    before = doc.stat()
+
+    class ChangesSource(_FakeClient):
+        def parse_structured(self, path, **kwargs):
+            result = super().parse_structured(path, **kwargs)
+            # 同大小、同 mtime：第二次全文 SHA 核验不能被 stat 快路代替。
+            path.write_bytes(b"%PDF-1.4 CHANGED")
+            os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+            return result
+
+    worker._client = ChangesSource()
+    worker.submit(["doc.pdf"])
+    job = store.claim_job("during-parse")
+    worker._run_job(store, job, "during-parse")
+    status = store.job_status(job.job_id)
+    assert status.state == "failed" and status.error_code == "SOURCE_CHANGED"
+    assert ChangesSource.calls == [job.job_id]
+    assert store.get_active("doc.pdf") is None
+    assert store.queue_depth() == 0
 
 
 def test_ignore_matcher_unavailable_fails_closed(env):
