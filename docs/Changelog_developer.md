@@ -1312,3 +1312,10 @@ Codex 主流程：真实生产export/import新增copy前另一client覆写与chu
 ### E20 bounded C01/C02 与磁盘持久化收口
 
 Codex 主流程整合；媒体施工子代理 gpt-6.1-sol/high。C01真实TOML+程序化认证并存矩阵24新增例：12先失败，统一resolve_media_auth按raw显式generic选择media专用值/环境/全局回退，文本既有global规则保持。C02本地blob/proxy重试错误先红，逐occurrence核source/revision/profile/occurrence/blob身份并携已验证prefix；memory/sqlite_vec跨重启、五身份字段负对照、revision/profile漂移不复用，共媒体outcome39pass、connection44pass。R02真实disk backend抛错/空集/吞错3红→3绿，last_write_error传递最小定位，未落盘ID留RAM、写成功/真实重开后才清诊断；vector6既有例保留。ops13pass；长basetemp触发doctor既有自由文本截断，新断言保持诊断前缀并在typed resolver校验完整路径，不放宽公有文案保护。完整所有层尚未运行，修后重新测默认再唯一全层。
+
+
+### E20 最终实测、回滚与交付收尾
+
+Codex 主流程（2026-10-09 / America_New_York）。代码候选93c39a50b09ec617a76b1a50f97cc538283cba99：最终默认层1279 passed /14 skipped /3 deselected in98.29s，唯一全层显式-o addopts=解除排除后1282 passed /14 skipped in207.77s，PYTHONHASHSEED=0，均exit0。完整节点1296，较E19新增143/移除1（原源变化一例拆两例），净+142；旧保留节点状态迁移0。默认少执行原slow与两个real_carrier，实测差109.48s（52.69%），不是slow算法加速；全链slow93.80s保留。EG2本地http://127.0.0.1:8000/v1/embeddings两个不同真实载体均passed（10.28s/2.23s）；精确HTTP请求数未埋点，不记为0；真实paid请求0。14skip为12缺docs/media依赖与2非Windows平台例；既有PATH解释器12额外格式/preview/分卷靶向证据独立，不拼接core总数或site-packages。
+
+原TST07两死定义清理case delta0，FLK原节点保持；四真实fast分页+4；worker配置fallback及媒体装配只局部收敛，兼容、watch quiet-window、恢复家族与virtual_worker_queue保留。主副本回滚剧本恢复初始186项tracked原字节，正确性回归恢复旧10failed/3passed；主分支和修改工件不回退。报告E20_EXECUTION_2026-10-09.md、统一入口仅追加§20与manifest round11/E20保留round10链，按仓库既有忽略交付，不force-add。最终收尾仅当前用户说明与追加技术记账，162项生产/测试/pyproject SHA保持本轮全层候选。真实用户旧库/其他paid端点/宿主展示/远端CI/包重建发布未执行；E17转录/ffmpeg移除保持。原bounded复核已完成；收口后第二次代理只读复核transport失败，无closure交付，不冒已完成。最终保护、工件重开与副本事务精确命令/输入/结果/exit见.runtime/beta2/E20/VERIFICATION.txt与final_validation.json。
