@@ -1007,3 +1007,67 @@ def test_mineru_media_occurrence_page_extraction_boundaries():
     assert media_map["images/unmentioned.png"].page is None
 
 
+def test_create_media_provider_gemini_adapter_rejects_loopback():
+    """E16：gemini adapter 遇到回环端点抛具名 ProviderError。"""
+    cfg = _gemini_media_config(
+        adapter="gemini",
+        endpoint="http://127.0.0.1:8080/v1/embeddings",
+    )
+    with pytest.raises(ProviderError, match="local inference server.*lacks a verified HTTP REST audio embedding schema"):
+        create_media_provider(cfg)
+
+
+def test_media_and_transcription_bounded_response_limits():
+    """E16：media transport 与 transcription 响应体大小上限拦截（对齐 mineru 预算纪律）。"""
+    from mortis_rag_mcp.media_providers import HttpMediaTransport, GeminiMediaTransport, EmbeddingInput
+    from mortis_rag_mcp.ingest.transcription import OpenAiTranscriptionAdapter, TranscriptionError
+
+    class OversizedResponse:
+        def __init__(self, size: int):
+            self.headers = {"Content-Length": str(size)}
+            self._size = size
+
+        def read(self, amt: int | None = None) -> bytes:
+            return b"X" * (amt or self._size)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    # 1. HttpMediaTransport
+    http_transport = HttpMediaTransport(
+        endpoint="https://api.siliconflow.cn/v1/embeddings",
+        model="Qwen/Qwen3-VL-Embedding-8B",
+        allowed_mime_types=("image/png",),
+        max_input_bytes=1048576,
+        max_batch_size=1,
+    )
+    with patch("mortis_rag_mcp.media_providers.urlopen", return_value=OversizedResponse(15 * 1024 * 1024)):
+        with pytest.raises(ProviderError, match="exceeds limit"):
+            http_transport([EmbeddingInput(request_id="r1", modality="image", data=b"test", mime_type="image/png", media_hash="h1")])
+
+    # 2. GeminiMediaTransport
+    gemini_transport = GeminiMediaTransport(
+        endpoint="https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-2:batchEmbedContents",
+        model="gemini-embedding-2",
+        allowed_mime_types=("image/png",),
+        max_input_bytes=1048576,
+        max_batch_size=1,
+    )
+    with patch("mortis_rag_mcp.media_providers.urlopen", return_value=OversizedResponse(15 * 1024 * 1024)):
+        with pytest.raises(ProviderError, match="exceeds limit"):
+            gemini_transport([EmbeddingInput(request_id="r2", modality="image", data=b"test", mime_type="image/png", media_hash="h2")])
+
+    # 3. OpenAiTranscriptionAdapter
+    trans_adapter = OpenAiTranscriptionAdapter(
+        endpoint="https://api.openai.com/v1/audio/transcriptions",
+        model="whisper-1",
+    )
+    seg = _wav_segment(1, frames=100)
+    with patch("mortis_rag_mcp.ingest.transcription.urlopen", return_value=OversizedResponse(15 * 1024 * 1024)):
+        with pytest.raises(TranscriptionError, match="exceeds limit"):
+            trans_adapter.transcribe(seg)
+
+

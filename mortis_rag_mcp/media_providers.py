@@ -13,7 +13,27 @@ from urllib.request import Request, urlopen
 from .embedding_capabilities import ResolvedEmbeddingProfile, validate_profile, validate_vector
 from .providers import ProviderError
 
+_MAX_RESPONSE_BYTES = 10 * 1024 * 1024  # 10 MiB response body limit
 
+
+def _read_bounded(resp: Any, limit: int = _MAX_RESPONSE_BYTES) -> bytes:
+    """受限读取响应体，防无界内存爆炸（对齐 mineru 预算纪律）。"""
+    declared = getattr(resp, "headers", None)
+    if declared is not None and hasattr(declared, "get"):
+        cl = declared.get("Content-Length")
+        if cl is not None:
+            try:
+                if int(str(cl).strip()) > limit:
+                    raise ProviderError(f"response Content-Length exceeds limit {limit} bytes")
+            except (ValueError, TypeError):
+                pass
+    try:
+        raw = resp.read(limit + 1)
+    except TypeError:
+        raw = resp.read()
+    if len(raw) > limit:
+        raise ProviderError(f"response body exceeded limit {limit} bytes")
+    return raw
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,7 +142,7 @@ class HttpMediaTransport:
         )
         try:
             with urlopen(req, timeout=self.timeout) as resp:
-                raw_body = resp.read()
+                raw_body = _read_bounded(resp)
         except HTTPError as exc:
             err_text = ""
             try:
@@ -281,7 +301,7 @@ class GeminiMediaTransport:
         )
         try:
             with urlopen(req, timeout=self.timeout) as resp:
-                raw_body = resp.read()
+                raw_body = _read_bounded(resp)
         except HTTPError as exc:
             err_text = ""
             try:

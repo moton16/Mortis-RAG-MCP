@@ -20,6 +20,29 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+_MAX_RESPONSE_BYTES = 10 * 1024 * 1024  # 10 MiB response body limit
+
+
+def _read_bounded(resp: Any, limit: int = _MAX_RESPONSE_BYTES) -> bytes:
+    """受限读取响应体，防无界内存爆炸（对齐 mineru 预算纪律）。"""
+    declared = getattr(resp, "headers", None)
+    if declared is not None and hasattr(declared, "get"):
+        cl = declared.get("Content-Length")
+        if cl is not None:
+            try:
+                if int(str(cl).strip()) > limit:
+                    raise TranscriptionError(f"response Content-Length exceeds limit {limit} bytes")
+            except (ValueError, TypeError):
+                pass
+    try:
+        raw = resp.read(limit + 1)
+    except TypeError:
+        raw = resp.read()
+    if len(raw) > limit:
+        raise TranscriptionError(f"response body exceeded limit {limit} bytes")
+    return raw
+
+
 #: 声明了转录 adapter 但没有任何可注入的已核验实现（服务合同缺）。
 AUDIO_ADAPTER_UNAVAILABLE = "AUDIO_ADAPTER_UNAVAILABLE"
 #: 合同字段缺失（请求/响应/幂等/额度），不得凭猜实现。
@@ -76,7 +99,7 @@ class OpenAiTranscriptionAdapter:
         self.local_only = bool(local_only)
         self.fingerprint = f"openai-whisper-v1:{self.model}:{self.endpoint}"
 
-    def configure_paid_requests(self, journal: Any, guard: Any = None) -> None:
+    def configure_paid_requests(self, journal: Any, guard: Any = None, *args: Any, **kwargs: Any) -> None:
         self.journal = journal
         self.paid_guard = guard
 
@@ -157,7 +180,7 @@ class OpenAiTranscriptionAdapter:
         req = Request(self.endpoint, data=body, headers=headers, method="POST")
         try:
             with urlopen(req, timeout=timeout) as resp:
-                raw_body = resp.read()
+                raw_body = _read_bounded(resp)
         except HTTPError as exc:
             err_text = ""
             try:
@@ -199,6 +222,8 @@ def create_transcription_adapter(
     *,
     transport: Any = None,
     journal: Any = None,
+    paid_guard: Any = None,
+    guard: Any = None,
     local_only: bool | None = None,
 ) -> Any:
     """按配置装配转录 adapter（唯一入口）。
@@ -233,6 +258,7 @@ def create_transcription_adapter(
     resolved_local_only = bool(getattr(audio_config, "local_only", False)) if local_only is None else bool(local_only)
     resp_format = str(getattr(audio_config, "transcription_response_format", "") or getattr(audio_config, "response_format", "") or "verbose_json").strip() or "verbose_json"
     lang = str(getattr(audio_config, "transcription_language", "") or getattr(audio_config, "language", "") or "").strip()
+    effective_guard = paid_guard if paid_guard is not None else guard
 
     return OpenAiTranscriptionAdapter(
         endpoint=endpoint,
@@ -243,5 +269,6 @@ def create_transcription_adapter(
         language=lang,
         transport=transport,
         journal=journal,
+        paid_guard=effective_guard,
         local_only=resolved_local_only,
     )
