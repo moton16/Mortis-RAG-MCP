@@ -38,7 +38,7 @@ def _run_stdio(config: Path, requests: list[dict]) -> list[dict]:
     return [json.loads(line) for line in proc.stdout.splitlines() if line]
 
 
-def test_stdio_search_and_read_chunk_id(tmp_path: Path):
+def test_stdio_search_and_read_chunk_id(tmp_path: Path, stdio_polling):
     """F1 stdio 集成：kb_search 命中后直接用 chunk_id 调用 kb_read 原地展开。"""
     vault = tmp_path / "notes"
     vault.mkdir()
@@ -50,24 +50,39 @@ def test_stdio_search_and_read_chunk_id(tmp_path: Path):
     app_toml = tmp_path / "app.toml"
     app_toml.write_text('mode = "static"\n[index]\nread_max_chars = 20000\n', encoding="utf-8")
 
-    requests = [
+    # kb_init 只承诺「后台已开始索引」；一次性喂完 stdin 的批式会话能否读到 chunks
+    # 取决于后台线程彼时推进到哪一步（CI 上随机器的负载漂移）。先轮询到就绪再读。
+    env = {"MORTIS_RAG_REGISTRY": str(tmp_path / "vaults.toml"),
+           "VAULT_MCP_REGISTRY": str(tmp_path / "vaults.toml")}
+
+    def settled(data):
+        return (
+            data.get("status") != "indexing"
+            and not data.get("indexing_in_progress", False)
+            and data.get("index_state", "ready") == "ready"
+            and bool(data.get("chunks"))
+        )
+
+    prefix = [
         {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
         {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "kb_init", "arguments": {"path": str(vault), "name": "MainVault"}}},
-        {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "kb_search", "arguments": {"query": "SpecialKeyword", "vault_path": "MainVault"}}},
     ]
-    responses = _run_stdio(app_toml, requests)
-    search_res = json.loads(responses[2]["result"]["content"][0]["text"])
-    assert len(search_res["chunks"]) > 0
-    target_chunk = search_res["chunks"][0]
+    search = {"jsonrpc": "2.0", "method": "tools/call", "params": {"name": "kb_search", "arguments": {"query": "SpecialKeyword", "vault_path": "MainVault"}}}
+
+    first = stdio_polling(app_toml, prefix, search, settled, env_overrides=env)
+    target_chunk = first["observed"][-1]["chunks"][0]
     chunk_id = target_chunk["id"]
     assert chunk_id
 
-    # 4. 用 chunk_id 原地展开，默认 expand_lines=30
-    read_req = [
-        {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "kb_read", "arguments": {"chunk_id": chunk_id, "vault_path": "MainVault"}}},
-    ]
-    read_res_list = _run_stdio(app_toml, requests[:2] + read_req)
-    read_out = json.loads(read_res_list[2]["result"]["content"][0]["text"])
+    # 4. 用 chunk_id 原地展开，默认 expand_lines=30（同一条会话内，索引此时已就绪）
+    second = stdio_polling(
+        app_toml, prefix, search, settled,
+        followup_requests=[
+            {"jsonrpc": "2.0", "method": "tools/call", "params": {"name": "kb_read", "arguments": {"chunk_id": chunk_id, "vault_path": "MainVault"}}},
+        ],
+        env_overrides=env,
+    )
+    read_out = json.loads(second["followups"][0]["result"]["content"][0]["text"])
 
     assert read_out["source"] == "doc.md"
     assert read_out["chunk_id"] == chunk_id
