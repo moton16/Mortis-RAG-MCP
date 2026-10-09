@@ -57,3 +57,4 @@ def test_skill_package_version_matches():
 
     m_fm = re.search(r'^version:\s*([0-9\.]+)', skill_text, re.MULTILINE)
     assert m_fm, "SKILL.md frontmatter 缺少 version"
+    assert m_fm.group(1) == expected_version

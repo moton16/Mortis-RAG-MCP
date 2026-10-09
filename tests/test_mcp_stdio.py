@@ -177,9 +177,9 @@ def test_stdio_survives_lone_surrogate_in_notes(tmp_path):
     assert responses[-1]["result"]["tools"]
 
 
-def test_stdio_release_smoke_v081(tmp_path):
+def test_stdio_candidate_smoke(tmp_path):
     """C60/Req 9: stdio smoke:
-    - initialize 版本 0.8.1
+    - initialize 版本与包版本一致
     - 16 工具列表与新参数可见（compact, start_char, group_offsets, heading）
     - ping 正常
     - invalid range 与 heading 歧义返回 isError
@@ -204,7 +204,8 @@ def test_stdio_release_smoke_v081(tmp_path):
     ])
 
     # 1. initialize 检查
-    assert responses[0]["result"]["serverInfo"]["version"] == "0.8.1"
+    from mortis_rag_mcp import __version__
+    assert responses[0]["result"]["serverInfo"]["version"] == __version__
     assert responses[0]["result"]["serverInfo"]["name"] == "mortis-rag-mcp"
 
     # 2. ping 检查

@@ -11,6 +11,8 @@
 
 只做本地候选准备，未调用真实 API/迁移真实资产/执行远端 Git 或发布。只读增量复核由内置 gpt-6.1-sol/high 完成，主流程核实与修复。
 
+E14 本地目标0.9.0：同步包、pyproject、SERVER_INFO衍生版本、README badges、Skill标题/frontmatter和用户候选changelog；stdio smoke从包版本取断言。未创建 tag/release，候选构建/回归证据由统一入口另记，不预写外部CI绿。
+
 - `f4577c1`：PPTX 正常 printerSettings 二进制是惰性打印元数据，不应按嵌入 OLE 拒绝；仅精确豁免此路径，真实 PDF/Office/Pillow 正向5例通过。
 - `c11f762`（E11）：必需 docs/media/vec CI lane；离线检索拒外部配置；成对质量/资源工具与合同测试。2问指标 fixture 不是七类100问验收；Python tracemalloc 不冒充 RSS。
 - `4e69b1d`：retry 启动 idle worker；cancelled 重试清失去 blob 保护的段 checkpoint；9个 management 和5个 checkpoint用例通过。
@@ -18,6 +20,7 @@
 - `d631ff9`：native 缺向量不走文本补嵌、媒体 fingerprint 进入签名、媒体chunk补 SHA、固定 revision occurrence 分页、完整同步清磁盘派生 orphan。14个媒体接线用例通过；真实 sqlite_vec 本地缺包，新增磁盘回归待必需 CI。
 - `9050ed7`：第二轮局部证伪再现重开 chunker/profile 后旧 pending 覆盖 native，以及不支持MIME误停 proxy；native ID 含媒体 profile、仅补缺向量、仅成功native停其proxy。3个靶向+7个codec+5个sync通过。
 - E12：真实16工具/配置合同、合成 legacy 缓存升级/快照恢复与源/备份hash不变；同步 virtual/import/retry/请求CLI/升级边界；取消 Agent 缺 STATUS 即自动 doctor。相应提交由统一入口登记，不伪造未产生的 SHA。
+- `8cd52ca`：真实示例未设API环境变量触发 `_env` 的缺失 sys import；最小修正+1个unset用例+33个配置用例通过。E12提交 `ccdb9d0` 的文案/升级3例、virtual配置33例、stdio5例、import6例通过。
 
 仍有实际范围缺口：真实媒体 transport、完整 AudioConfig/adapter/解码装配、独立图片摄取、真实质量/宿主验收；legacy 极端多格截失未静默改兼容语义。完整候选回归/构建结果在后续交接登记，不预写通过。
 

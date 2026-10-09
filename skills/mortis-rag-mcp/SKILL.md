@@ -1,10 +1,10 @@
 ---
 name: mortis-rag-mcp
 description: "调用 Mortis'RAG MCP 检索本地知识库。触发词：搜知识库、查笔记、kb_search、vault 检索、RAG 搜索、mortis rag。"
-version: 5.3.0
+version: 0.9.0
 ---
 
-# mortis-rag-mcp 检索路由（0.8.1）
+# mortis-rag-mcp 检索路由（0.9.0）
 
 连接即读 server 的 `instructions`（路由纪律已内嵌）。本文件只补判定表、检索纪律与反模式。
 

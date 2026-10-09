@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/moton16/Mortis-RAG-MCP/actions/workflows/ci.yml/badge.svg)](https://github.com/moton16/Mortis-RAG-MCP/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Version: 0.8.1](https://img.shields.io/badge/Version-0.8.1-blue.svg)](CHANGELOG_user.md)
+[![Version: 0.9.0](https://img.shields.io/badge/Version-0.9.0-blue.svg)](CHANGELOG_user.md)
 
 [English](README_EN.md) | 简体中文
 
