@@ -476,3 +476,85 @@ def test_same_transcript_different_audio_never_reuses_segments(tmp_path):
                 != sink_b.items[0].metadata["segment_sha256"])
     finally:
         store.close()
+
+
+def test_transcription_paid_request_lifecycle_and_gate(tmp_path: Path):
+    """E16：转录付费闸门接通。
+    - 正常请求持久化 intent 至 control store 并更新为 success；
+    - 请求失败标记为 submission_unknown 并暂停重试；
+    - 被撤销（revoked）的 profile 明确被闸门拦截。
+    """
+    from unittest.mock import patch
+    from mortis_rag_mcp.ingest.transcription import TranscriptionError
+    from mortis_rag_mcp.providers import ProviderError
+
+    server, vault = build_server(
+        tmp_path,
+        audio_toml=(
+            'adapter = "openai_whisper"\n'
+            'transcription_endpoint = "https://api.openai.com/v1/audio/transcriptions"\n'
+            'transcription_api_key = "test-key"\n'
+        ),
+        vault_name="Vault",
+    )
+    try:
+        adapter = server._transcription_adapter(str(vault))
+        assert adapter is not None
+        assert adapter.journal is not None
+        assert adapter.paid_guard is not None
+
+        control = server._paid_control_store_for(str(vault))
+        assert control is not None
+
+        path_a = tmp_path / "trans.wav"
+        wav(path_a, frames=8000)
+        seg = next(iter(iter_segments(path_a, _acfg())))
+
+        # 1. 成功请求：before_send 预落库 intent，调用成功后标记 success
+        class FakeResp:
+            def __init__(self, payload: bytes):
+                self._payload = payload
+                self.headers = {}
+            def read(self, *args):
+                return self._payload
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                return False
+
+        with patch("mortis_rag_mcp.ingest.transcription.urlopen", return_value=FakeResp(b'{"text": "transcribed speech"}')):
+            res = adapter.transcribe(seg)
+            assert res["text"] == "transcribed speech"
+
+        intents = [it for it in control.list_request_intents() if it["kind"] == "transcription"]
+        assert len(intents) == 1
+        assert intents[0]["state"] == "success"
+
+        # 2. 远端异常：标记 submission_unknown，且同一载荷禁止自动重发
+        path_b = tmp_path / "fail.wav"
+        wav(path_b, frames=8000, seed=1)
+        seg_fail = next(iter(iter_segments(path_b, _acfg())))
+
+        with patch("mortis_rag_mcp.ingest.transcription.urlopen", side_effect=RuntimeError("remote network drop")):
+            with pytest.raises(TranscriptionError, match="SUBMISSION_UNKNOWN"):
+                adapter.transcribe(seg_fail)
+
+        unknown_intents = [it for it in control.list_request_intents()
+                           if it["kind"] == "transcription" and it["state"] == "submission_unknown"]
+        assert len(unknown_intents) == 1
+
+        # 再次对相同载荷发起重发：before_send 拦截未决意图，禁止自动重试
+        with pytest.raises(ProviderError, match="PAID_REQUEST_UNRESOLVED"):
+            adapter.transcribe(seg_fail)
+
+        # 3. Profile 授权撤销后，paid_guard 拦截外部请求
+        control.revoke_paid_authorization(adapter.fingerprint)
+        path_c = tmp_path / "blocked.wav"
+        wav(path_c, frames=8000, seed=2)
+        seg_c = next(iter(iter_segments(path_c, _acfg())))
+
+        with pytest.raises(TranscriptionError, match="TRANSCRIPTION_PENDING_APPROVAL"):
+            adapter.transcribe(seg_c)
+    finally:
+        server.shutdown()
+

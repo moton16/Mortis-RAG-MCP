@@ -872,8 +872,26 @@ class VaultMcpServer:
         entry = self.registry.set_description(path, desc)
         return {"path": entry.path, "name": entry.name, "description": entry.description}
 
-    def _transcription_adapter(self) -> Any:
-        """转录 adapter 装配点（E09）。
+    def _paid_control_store_for(self, vault_path: str | Path | None = None) -> Any:
+        """获取或打开指定 vault 的 ControlStore（供付费请求持久化与闸门消费）。"""
+        if not getattr(self.config.cache, "enabled", False):
+            return None
+        if not vault_path:
+            return None
+        key = str(Path(vault_path).resolve())
+        indexer = self._indexers.get(key)
+        if indexer is not None:
+            return indexer._paid_control_store()
+        try:
+            from .doc_store import resolve_storage_layout
+            from .paid_requests import open_paid_control
+            layout = resolve_storage_layout(self.config, vault_path)
+            return open_paid_control(layout)
+        except Exception:
+            return None
+
+    def _transcription_adapter(self, vault_path: str | Path | None = None) -> Any:
+        """转录 adapter 装配点（E09/E16）。
 
         服务合同（请求/响应/幂等/额度）未提供时不编造实现：返回 None，由 worker 在
         入队/执行前给出**可见**的 `AUDIO_ADAPTER_UNAVAILABLE`，而不是静默降级成
@@ -884,9 +902,29 @@ class VaultMcpServer:
             create_transcription_adapter,
         )
         try:
-            return create_transcription_adapter(self.config.audio)
+            adapter = create_transcription_adapter(self.config.audio)
         except TranscriptionContractUnverified:
             return None
+        if adapter is None:
+            return None
+
+        # E16：接通转录付费闸门
+        if vault_path is not None:
+            key = str(Path(vault_path).resolve())
+            indexer = self._indexers.get(key)
+            fp = getattr(adapter, "fingerprint", "")
+            if indexer is not None:
+                indexer.configure_paid_provider("transcription", adapter, fp)
+            else:
+                control = self._paid_control_store_for(vault_path)
+                if control is not None:
+                    from .paid_requests import PaidRequestJournal, paid_request_guard
+                    journal = PaidRequestJournal(control, "transcription")
+                    guard = lambda profile_fp: paid_request_guard(control, profile_fp)
+                    configure = getattr(adapter, "configure_paid_requests", None)
+                    if callable(configure):
+                        configure(journal, guard, fp)
+        return adapter
 
     def _audio_decoder(self) -> Any:
         """显式解码组件装配点（E09）。
@@ -956,7 +994,7 @@ class VaultMcpServer:
                         # E09：独立 AudioConfig + 转录 adapter/解码组件 + 真实 chunker 指纹
                         # 沿 server → factory → worker → audio 贯通（旧 flat 调用仍兼容）。
                         audio_config=self.config.audio,
-                        audio_adapter=self._transcription_adapter(),
+                        audio_adapter=self._transcription_adapter(vault_path),
                         audio_decoder=self._audio_decoder(),
                         chunker_fingerprint_provider=_chunker_fingerprint_provider,
                     )
