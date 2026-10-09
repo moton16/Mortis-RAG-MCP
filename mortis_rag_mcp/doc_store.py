@@ -3669,6 +3669,24 @@ class DocumentStore:
             conn.commit()
             return int(cursor.rowcount)
 
+    def list_media_chunk_links(self, *, revision_id: str, occurrence_id: str = "") -> list[dict]:
+        """读取路径用的**跨 profile** 链接列举（E08-e）：不预设 profile/generation。
+
+        返回 `(profile_key, derived_generation_id, occurrence_id, chunk_id, relation)`，
+        供 kb_read_media 从 links 双向取 context，同时保留 revision/occurrence 归属。
+        """
+        gen = self._ensure_read_generation()
+        if not gen or not revision_id:
+            return []
+        conn = self._open_conn(gen)
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE name='media_chunk_links'").fetchone() is None:
+            return []
+        rows = conn.execute("SELECT profile_key, derived_generation_id, occurrence_id, chunk_id, relation "
+                            "FROM media_chunk_links WHERE revision_id=? AND (?='' OR occurrence_id=?)",
+                            (revision_id, occurrence_id, occurrence_id))
+        return [dict(zip(("profile_key", "derived_generation_id", "occurrence_id", "chunk_id", "relation"),
+                         row)) for row in rows]
+
     def get_media_chunk_links(self, *, revision_id: str, profile_key: str,
                              derived_generation_id: str, occurrence_id: str = "") -> list[dict]:
         gen = self._ensure_read_generation()

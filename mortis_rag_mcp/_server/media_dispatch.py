@@ -124,6 +124,26 @@ def _occurrence_detail(store: Any, source: str, revision_id: str, occurrence_id:
         offset += len(page)
 
 
+def _link_context(store: Any, revision_id: str, occurrence_id: str) -> dict[str, Any] | None:
+    """从 media_chunk_links 双向取 context（E08-e）：同一 occurrence 关联的 chunk 地址。
+
+    store 不支持（旧库/替身）时返回 None，绝不让读取因附加上下文失败。
+    """
+    lister = getattr(store, "list_media_chunk_links", None)
+    if not callable(lister):
+        return None
+    try:
+        rows = lister(revision_id=revision_id, occurrence_id=occurrence_id)
+    except Exception:
+        return None
+    if not rows:
+        return None
+    return {
+        "chunk_ids": sorted({str(row["chunk_id"]) for row in rows if row.get("chunk_id")}),
+        "relations": sorted({str(row.get("relation") or "") for row in rows if row.get("relation")}),
+    }
+
+
 def _stored_or_generated_preview(store: Any, source: str, revision_id: str, occurrence_id: str,
                                  maximum: int, config: Any, mime: str) -> tuple[bytes, str, str] | None:
     """先取已持久化 preview 变体；缺失时用原图在内存生成；两者都不可用返回 None。"""
@@ -156,8 +176,43 @@ def _stored_or_generated_preview(store: Any, source: str, revision_id: str, occu
     return generated[0], generated[1], "generated"
 
 
+def _capture_read_pin(store: Any) -> Any:
+    """捕获 E04 固定版本 handle；store 不支持时返回 None（不阻断旧/替身 store）。"""
+    capture = getattr(store, "capture_generation_pin", None)
+    if not callable(capture):
+        return None
+    return capture(lease_seconds=120)
+
+
+def _pin_still_live(store: Any, pin: Any) -> bool:
+    if pin is None:
+        return True
+    validate = getattr(store, "validate_generation_pin", None)
+    if not callable(validate):
+        return True
+    try:
+        return bool(validate(pin))
+    except Exception:
+        return False
+
+
+def _release_read_pin(store: Any, pin: Any) -> None:
+    if pin is None:
+        return
+    release = getattr(store, "release_generation_pin", None)
+    if callable(release):
+        try:
+            release(pin)
+        except Exception:
+            pass
+
+
 def dispatch_media_read(server: Any, arguments: dict[str, Any], *, request_id: Any = None) -> dict[str, Any]:
-    """核验库归属/当前 revision 后，按显式 representation 返回 metadata 或受限 inline 媒体。"""
+    """核验库归属/当前 revision 后，按显式 representation 返回 metadata 或受限 inline 媒体。
+
+    E08-e：读取期间用 E04 固定版本 handle 钉住 generation；**最终媒体包络前**再验租，
+    到期/换代一律拒绝，绝不把旧 chunk 与新 media 拼在同一个响应里。
+    """
     for key in ("vault_path", "source", "revision_id", "occurrence_id"):
         if not isinstance(arguments.get(key), str) or not arguments[key].strip():
             return _error("INVALID_ARGUMENT", f"{key} is required")
@@ -172,6 +227,8 @@ def dispatch_media_read(server: Any, arguments: dict[str, Any], *, request_id: A
     source = arguments["source"]
     revision_id = arguments["revision_id"]
     occurrence_id = arguments["occurrence_id"]
+    pin = None
+    store = None
     try:
         vault = server._resolve_vault_path(arguments["vault_path"])
         indexer = server._indexer_for({"vault_path": vault})
@@ -182,10 +239,13 @@ def dispatch_media_read(server: Any, arguments: dict[str, Any], *, request_id: A
         if not isinstance(resolved, dict) or resolved.get("revision_id") != revision_id:
             return _error("MEDIA_UNAVAILABLE", "Media revision is stale or unavailable")
         store = indexer.document_store()
+        # 固定版本：捕获失败（跨代冲突）即拒绝，不读取半新半旧的媒体。
+        pin = _capture_read_pin(store)
         blob = store.read_media(source, revision_id=revision_id, occurrence_id=occurrence_id,
                                 variant_id="original", include_data=False)
         detail = _occurrence_detail(store, source, revision_id, occurrence_id)
     except Exception as exc:
+        _release_read_pin(store, pin)
         return _media_error(exc)
 
     mime = str(blob.get("mime_type", ""))
@@ -200,8 +260,18 @@ def dispatch_media_read(server: Any, arguments: dict[str, Any], *, request_id: A
         "ocr": detail.get("ocr", ""), "t_start_ms": detail.get("t_start_ms"),
         "t_end_ms": detail.get("t_end_ms"), "host_media_verified": False,
     }
+    # 从 links 双向取 context：保留 vault/source/revision/occurrence 归属，只回 chunk 地址事实。
+    context = _link_context(store, revision_id, occurrence_id)
+    if context:
+        metadata["context_chunk_ids"] = context["chunk_ids"]
+        metadata["context_relations"] = context["relations"]
     if representation == "metadata":
-        return media_content_result(metadata, budget_bytes=budget, request_id=request_id)
+        if not _pin_still_live(store, pin):
+            _release_read_pin(store, pin)
+            return _error("MEDIA_UNAVAILABLE", "Media revision pin expired before the final envelope")
+        result = media_content_result(metadata, budget_bytes=budget, request_id=request_id)
+        _release_read_pin(store, pin)
+        return result
 
     config = server.config.media
     maximum = min(getattr(config, "inline_max_bytes", MAX_BUDGET), MAX_BUDGET)
@@ -228,8 +298,15 @@ def dispatch_media_read(server: Any, arguments: dict[str, Any], *, request_id: A
         if active is None or active.revision.revision_id != revision_id:
             return _error("MEDIA_UNAVAILABLE", "Media revision is stale")
     except Exception as exc:
+        _release_read_pin(store, pin)
         return _media_error(exc)
 
     metadata.update({"variant": variant, "variant_source": variant_source, "mime_type": mime,
                      "byte_size": len(data), "sha256": hashlib.sha256(data).hexdigest()})
-    return media_content_result(metadata, data, budget_bytes=budget, request_id=request_id)
+    # 包络最终组装前最后一次验租（E08-e）：到期/换代拒绝，不拼旧 chunk 与新 media。
+    if not _pin_still_live(store, pin):
+        _release_read_pin(store, pin)
+        return _error("MEDIA_UNAVAILABLE", "Media revision pin expired before the final envelope")
+    result = media_content_result(metadata, data, budget_bytes=budget, request_id=request_id)
+    _release_read_pin(store, pin)
+    return result

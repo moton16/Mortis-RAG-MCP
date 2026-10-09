@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 
 import pytest
@@ -301,3 +302,57 @@ def test_native_route_skips_unallowed_mime_without_fabrication(tmp_path: Path):
         assert [c for c in chunks if c.metadata.get("kind") == "media_proxy"]
     finally:
         indexer.close_document_store()
+
+
+# --------------------------------------------------------------------------- E08-e
+def test_kb_read_media_returns_link_context_and_rejects_expired_pin(tmp_path: Path, monkeypatch):
+    server, vault = _build(tmp_path)
+    setup = DocumentStore(_layout(server, vault), server.config)
+    setup.open(write=True)
+    revision = _commit(setup, vault, "doc.pdf", MARKDOWN, [PNG_A])
+    setup.close()
+    try:
+        indexer = server._indexer_for({"vault_path": "Vault"})
+        indexer.sync()
+        proxy = [c for c in indexer._chunks["doc.pdf"] if c.metadata.get("kind") == "media_proxy"]
+        args = {"vault_path": "Vault", "source": "doc.pdf", "revision_id": revision,
+                "occurrence_id": "occ-0"}
+        meta = server._kb_read_media(args)
+        assert "isError" not in meta
+        payload = json.loads(meta["content"][0]["text"])
+        assert proxy[0].id in payload["context_chunk_ids"]
+        assert "proxy" in payload["context_relations"]
+
+        # 固定版本 handle 到期 → 最终包络前拒绝，绝不返回媒体。
+        monkeypatch.setattr(DocumentStore, "validate_generation_pin", lambda self, pin: False)
+        expired = server._kb_read_media(args)
+        assert json.loads(expired["content"][0]["text"])["code"] == "MEDIA_UNAVAILABLE"
+    finally:
+        server.shutdown()
+
+
+def test_media_refs_pagination_binds_revision_without_loss_or_dupes(tmp_path: Path):
+    server, vault = _build(tmp_path)
+    setup = DocumentStore(_layout(server, vault), server.config)
+    setup.open(write=True)
+    revision = _commit(setup, vault, "doc.pdf", MARKDOWN, [PNG_A] * 25)
+    setup.close()
+    try:
+        server.config.media.refs_limit = 20
+        indexer = server._indexer_for({"vault_path": "Vault"})
+        indexer.sync()
+        seen: list[str] = []
+        offset = 0
+        for _ in range(5):
+            page = server._kb_read({"source": "doc.pdf", "vault_path": "Vault",
+                                    "media_refs_offset": offset})
+            assert page["media_refs_revision_id"] == revision
+            assert "media_refs_text_range" in page
+            seen.extend(ref["occurrence_id"] for ref in page["media_refs"])
+            nxt = page["next_media_refs_offset"]
+            if nxt is None:
+                break
+            offset = nxt
+        assert len(seen) == 25 and len(set(seen)) == 25
+    finally:
+        server.shutdown()

@@ -1687,20 +1687,29 @@ class VaultMcpServer:
                 result["coverage"] = read_res.coverage
             if read_res.source_changed:
                 result["source_changed"] = True
-            result.update(self._media_refs_page(indexer, source, read_res.revision_id, media_refs_offset))
+            result.update(self._media_refs_page(
+                indexer, source, read_res.revision_id, media_refs_offset,
+                text_range={"start_line": read_res.effective_start_line,
+                            "end_line": read_res.effective_end_line}))
         if is_chunk_read:
             result["chunk_id"] = chunk.id
             result.update(attribution)
         return result
 
     def _media_refs_page(self, indexer: MarkdownIndexer, source: str, revision_id: str | None,
-                         offset: int) -> dict[str, Any]:
+                         offset: int, text_range: dict[str, Any] | None = None) -> dict[str, Any]:
         """虚拟源的媒体引用一页（compact 键保持，缺值不臆造）。
 
         越权/过期/库不可用一律返回空页而不是让 kb_read 失败：正文读取本身已经
         通过 revision/SHA 核验，媒体引用只是附加上下文。
+
+        E08-e：分页显式绑定 **revision + 文本范围 + offset**，续页不跨 revision、
+        不丢不重；调用方据 `media_refs_revision_id` 校验续页仍在同一版本。
         """
-        empty = {"media_refs": [], "media_refs_offset": offset, "next_media_refs_offset": None}
+        empty = {"media_refs": [], "media_refs_offset": offset, "next_media_refs_offset": None,
+                 "media_refs_revision_id": revision_id}
+        if text_range is not None:
+            empty["media_refs_text_range"] = text_range
         if not revision_id:
             return empty
         limit = int(getattr(self.config.media, "refs_limit", 20))
@@ -1719,8 +1728,12 @@ class VaultMcpServer:
                     entry[key] = row[key]
             refs.append(entry)
         has_more = len(rows) > limit
-        return {"media_refs": refs, "media_refs_offset": offset,
-                "next_media_refs_offset": offset + len(page) if has_more else None}
+        result = {"media_refs": refs, "media_refs_offset": offset,
+                  "next_media_refs_offset": offset + len(page) if has_more else None,
+                  "media_refs_revision_id": revision_id}
+        if text_range is not None:
+            result["media_refs_text_range"] = text_range
+        return result
 
     def _kb_stats(self, arguments: dict[str, Any]) -> dict[str, Any]:
         indexer = self._indexer_for(arguments)
