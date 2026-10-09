@@ -60,7 +60,7 @@ from .mineru import AGENT_EXTS, MineruClient, MineruError
 from .tables import convert_small_tables
 from ..registry import _process_file_lock
 from .router import DEFAULT_PARSE_BUDGET, ParseBudget, decide_route, upgrade_route_once
-from .local import LocalUnsupported, parse_local
+from .local import LocalUnsupported, parse_local, parse_local_volumes
 from .audio import (AudioUnsupported, audio_profile_fingerprint, audio_settings,
                     inspect_audio, parse_audio)
 from .images import (IMAGE_EXTS, IMAGE_ROUTE_UNSUPPORTED, ImageUnsupported, parse_image,
@@ -1588,9 +1588,17 @@ class VirtualIngestWorker:
         return parse_image(src, limits=self._limits(), sink=sink,
                            title=self._image_captions.get(job.source, ""), ordinal=1)
 
-    def _parse_document_job(self, job: Any, src: Path, sink: Any, record: Any) -> Any:
-        """文档：E10 决定路由；本地质量复检失败时**最多一次**升级（不重定质量阈值）。"""
-        decision = decide_route(src, self.config, limits=self._limits())
+    def _parse_document_job(self, store: Any, job: Any, owner: str, src: Path, sink: Any,
+                            record: Any) -> Any:
+        """文档：E10 决定路由；本地质量复检失败时**最多一次**升级（不重定质量阈值）；
+        本地 PDF 超页数预算时有界内存分卷（不升云、不落临时文件）。"""
+        try:
+            decision = decide_route(src, self.config, limits=self._limits())
+        except LocalUnsupported as exc:
+            result = self._run_local_volumes_or_raise(store, job, owner, src, exc)
+            if result is None:
+                raise
+            return result
         if decision.route == "local":
             try:
                 result = parse_local(src, limits=self._limits(),
@@ -1598,14 +1606,82 @@ class VirtualIngestWorker:
                                      cancelled=self._stop.is_set)
             except LocalUnsupported as exc:
                 upgraded = self._upgrade_after_local_failure(decision, exc)
-                if upgraded is None:
+                if upgraded is not None:
+                    decision = upgraded
+                    result = self._cloud_parse(job, src, sink, record)
+                    result.capabilities["route_decision"] = decision.as_dict()
+                    return result
+                # 页数预算超限（decide_route 的探测会吞掉自己的预算异常，这里兜住
+                # parse_local 的 "page limit exceeded"）→ 有界分卷，不升云。
+                result = self._run_local_volumes_or_raise(store, job, owner, src, exc)
+                if result is None:
                     raise
-                decision = upgraded
-                result = self._cloud_parse(job, src, sink, record)
+                return result
         else:
             result = self._cloud_parse(job, src, sink, record)
         result.capabilities["route_decision"] = decision.as_dict()
         return result
+
+    #: 页数预算超限的稳定标记（加密 PDF 不是分卷理由）。
+    _VOLUME_SPLIT_MARKERS = ("local page budget exceeded", "page limit exceeded")
+
+    def _run_local_volumes_or_raise(self, store: Any, job: Any, owner: str, src: Path,
+                                    exc: LocalUnsupported) -> Any | None:
+        """本地 PDF 超页数预算 → 有界分卷（消费 E02 通用子记录）；否则 None 照常失败。"""
+        if not any(marker in str(exc) for marker in self._VOLUME_SPLIT_MARKERS):
+            return None
+        if src.suffix.lower() != ".pdf" or self._stop.is_set():
+            return None
+        resume = self._volume_resume(store, job)
+        result = parse_local_volumes(
+            src, limits=self._limits(),
+            max_pages=getattr(self.config, "local_max_pages", 300),
+            cancelled=self._stop.is_set, resume=resume,
+            source_sha256=str(getattr(job, "source_sha256", "") or ""),
+            checkpoint=lambda ordinal, rng, payload: self._volume_checkpoint(
+                store, job, owner, ordinal, rng, payload))
+        result.capabilities["route_decision"] = {
+            "route": "local", "initial_route": "local", "upgrade_count": 0,
+            "confidence": 0.4, "partial": True, "failed_pages": [],
+            "reasons": ("bounded in-memory volume split of local PDF",),
+            "volumes": result.capabilities.get("volumes_total", 0),
+        }
+        return result
+
+    def _volume_resume(self, store: Any, job: Any) -> dict[int, dict[str, Any]]:
+        """读回已确认卷的 checkpoint（E02 `list_subjobs`；坏记录拒绝静默续跑）。"""
+        reader = getattr(store, "list_subjobs", None)
+        if reader is None:
+            return {}
+        rows = reader(job.job_id)
+        resume: dict[int, dict[str, Any]] = {}
+        for row in rows or []:
+            ordinal = int(getattr(row, "ordinal", 0) or 0)
+            if ordinal < 1 or str(getattr(row, "state", "") or "") != "done":
+                continue
+            raw = getattr(row, "checkpoint", "") or ""
+            if not raw:
+                continue
+            try:
+                payload = json.loads(raw)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"volume checkpoint for ordinal {ordinal} is corrupt; refusing to resume "
+                    "silently (that would redo confirmed volumes)") from exc
+            if not isinstance(payload, dict) or str(payload.get("kind") or "") != "document_pages":
+                continue
+            resume[ordinal] = payload
+        return resume
+
+    @staticmethod
+    def _volume_checkpoint(store: Any, job: Any, owner: str, ordinal: int, rng: tuple[int, int],
+                           payload: dict[str, Any]) -> None:
+        """逐卷写 E02 子记录（`document_pages` 0-based 半开页范围；失败不静默）。"""
+        store.record_subjob(job.job_id, owner, ordinal=int(ordinal),
+                            input_hash=str(payload.get("sha256") or ""),
+                            range={"kind": "document_pages", "start": int(rng[0]),
+                                   "end": int(rng[1])},
+                            state="done", checkpoint=payload)
 
     def _cloud_parse(self, job: Any, src: Path, sink: Any, record: Any) -> Any:
         return self._client_or_make().parse_structured(
@@ -1681,7 +1757,7 @@ class VirtualIngestWorker:
             elif suffix in IMAGE_EXTS:
                 result = self._parse_image_job(job, src, sink)
             else:
-                result = self._parse_document_job(job, src, sink, _record)
+                result = self._parse_document_job(store, job, owner, src, sink, _record)
         self._assert_network_policy(job.source)
         matcher = self._matcher()
         if matcher is not None and matcher.is_ignored(job.source)[0]:
