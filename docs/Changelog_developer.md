@@ -28,10 +28,14 @@ E17 同一窗口另外落地三项真实验收发现：
 
 - 音频清除静态探针 PASS（模块导入 + 被清除符号/签名/成员缺席）。
 - 受影响靶向：97 passed/4 skipped 与 158 passed/2 skipped，均 exit0。
-- 全量 run1（修复载体门控前）1128 passed/17 skipped/**1 failed**（EG2 载体未运行，记录保留不改写）；全量 run2（修复后）**1128 passed/18 skipped，exit0**；载体在线复跑 `test_text_to_image_search_e2e.py` 为 2 passed。
+- 全量 run1（修复载体门控前）1128 passed/17 skipped/**1 failed**（EG2 载体未运行，记录保留不改写）；run2（修复后）1128 passed/18 skipped；run3（载体在线）1132 passed/17 skipped；**run4（终态，装入 sqlite-vec 后）1140 passed / 14 skipped，exit0**；载体在线复跑 `test_text_to_image_search_e2e.py` 为 2 passed。
 - 发布候选（离线、隔离 src、setuptools 后端直调）：wheel 48 项 / sdist 166 项，归档卫生 0 项违禁；隔离导入 `ISOLATED_IMPORT_OK 0.9.0`；pyproject = 包 = `server.SERVER_INFO` = 0.9.0。
 
-**仍未闭合（精确 blocked，不降低口径）**：`sqlite-vec` 未安装（本机两套解释器均无，`.venv` 连 pip 都没有）→ 磁盘向量后端正向检查只能用 CI `extras` lane 承接；≥100 问七类真实语料不存在（仓库只有 2 问 metric fixture + 157B 演示 vault）→ 质量门禁只能记 `fixture_measured`；真实旧库升级演练缺授权旧库样本；push/PR 未经主人显式授权 → CI 未触发。
+**sqlite-vec 后端正向检查（主人授权后闭合）**：主人授权安装后，按**本机已有离线 wheel**（`C:\tmp\sqlitevec_probe\sqlite_vec-0.1.9-py3-none-win_amd64.whl`，此前有窗口下载过但**从未装入任何解释器**）以 `--no-index --no-deps` 离线装入 PATH python 与仓库 `.venv`；`vec0` 虚拟表 KNN 实测通过（`SQLITE_VEC_POSITIVE_OK`），本地复刻 CI `extras` lane（`MORTIS_REQUIRE_EXTRAS=1`）`import pymupdf…sqlite_vec` = `EXTRAS_IMPORTS_OK` 且 `test_extra_formats.py + test_vector_backend.py` = **11 passed**，核心全量比 run3 多跑通 8 个此前被 `importorskip` 跳过的磁盘后端用例。首轮记 BLOCKED 的根因是只查了两套解释器的 `pip show`——「下载过」≠「装上了」。`pyproject.toml` 的 `vec` extra 与 CI `extras` lane 原样保留。
+
+**主人裁定（2026-10-09）**：远端 CI、≥100 问七类质量语料、真实旧库升级演练三项属**需要实际使用才能知道的结论**，按 PASS 收口、不再作为阻塞项；本窗口不为它们编造本地证据（CI 未推送故无链接、质量门禁仍只记 `fixture_measured`、旧库只有合成升级/快照恢复证据），逐项区分见 `docs/v0.9.0/E17_FINAL_ACCEPTANCE_2026-10-09.md` §9/§10 与统一入口 §17.6。
+
+**仍未闭合**：push/PR 未经主人显式授权 → 分支未推送、CI 未触发；宿主真实 image/audio 显示验收需真实 MCP 客户端；MinerU v4 带图 occurrence/正文锚点需授权商业 key。
 
 ---
 
