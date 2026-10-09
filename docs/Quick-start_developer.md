@@ -10,7 +10,7 @@
 ## 1. 30 秒版：这是什么
 
 Mortis'RAG MCP 是一个**本地 Markdown 知识库 RAG 服务器**，通过 MCP 协议（stdio +
-换行分隔 JSON-RPC，协议版本 `2025-06-18`）向 AI agent 提供 15 个 `kb_*` 工具：
+换行分隔 JSON-RPC，协议版本 `2025-06-18`）向 AI agent 提供 16 个 `kb_*` 工具：
 注册任意文件夹为知识库 → 后台增量索引（切块 + embedding + FTS）→ 三路混合检索
 （FTS5 BM25 + 向量余弦 + bigram 词法，RRF 融合）→ rerank → 返回结构化 chunks。
 
@@ -18,10 +18,31 @@ Mortis'RAG MCP 是一个**本地 Markdown 知识库 RAG 服务器**，通过 MCP
 
 1. **零第三方运行时依赖**：`pyproject.toml` 里 `dependencies = []`。HTTP 用 `urllib`，
    TOML 用 `tomllib`（3.10 有内置 fallback 解析器），向量存储自己写二进制编解码。
-   唯一的可选加速依赖是 numpy（缺失时自动回退标量余弦）和 sqlite_vec（可选磁盘向量后端）。
+   可选 accel/vec 支持加速与磁盘向量；docs/media 支持格式解析与预览，非核心必需。
 2. **不绑定任何路径**：知识库关系存用户级注册表 `~/.mortis_rag_mcp/vaults.toml`（兼容旧名 `~/.vault_mcp/vaults.toml`），仓库零个人配置。
-3. **检索永不报错**：FTS 缺失、向量后端加载失败、reranker 挂掉——全部自动降级，不抛给用户。
+3. **按实际能力降级**：FTS/reranker 等失败可降级，但配置无效、版本不符及媒体不可用应返回可见错误；不承诺所有路径永不报错。
 4. **注释解释"为什么"**：代码里大量注释记录的是"曾经踩过的坑"，删注释等于拆地雷标识。
+
+### 1.1 0.9 候选开发入口（2026-10-08）
+
+以下地图的旧行数/测试计数仅是历史概览，不能用作施工定位。当前统一状态见
+`docs/v0.9.0/beta2/UNIFIED_EXECUTION_PLAN_2026-10-08.md`（被忽略，交接需另行复制）。
+
+- 配置→文本 templates/profile→indexer sync→单库/fanout query；媒体由独立 profile/provider 提供，native ID 含媒体 fingerprint，旧 pending 向量不覆盖新计算结果。
+- `DocumentStore` 维护 generation/revision/control/job/checkpoint/blob/occurrence；
+  import 最终 busy/CAS 与发布同用现有 OS mutation lock；固定 revision read/export pin 在返回前再校验。
+- `retry` 排队后唤醒 worker；cancelled 释放媒体保护后重试清段 checkpoint，failed 保有效段，unknown 不自动重新提交。
+- virtual 文档源 SHA/render SHA 也写到媒体 proxy/native；occurrences 逐页遍历固定 revision。只有成功生成 native 的 occurrence 停用 proxy 文本向量，不支持的 MIME/模态保留 proxy。
+- **仍未完成**：真实媒体 transport、server 的 AudioConfig/adapter/解码装配、独立图片摄取；不以配置声明或 PNG 冒音频 fixture 证明生产功能。
+- `scripts/eval_quality.py` 读取已有成对排名，计算 Recall/NDCG@10/固定 seed bootstrap；
+  示例只有两问，缺 ≥100 问/七类/语料 SHA/引用定位与跨库检查时不是最终 PASS。
+  `scripts/eval_resources.py` 测合成 SQLite/客户端规模、延迟与 Python 分配峰值，不称 RSS。
+- CI 核心仍零运行时依赖；新增 Linux/Windows docs/media/vec **必需正向** lane，
+  安装/导入失败应红。本地 vec 缺包时 skip 是缺证据，不是磁盘后端通过。
+
+验证时在仓库 `.runtime/任务ID/GUID` 创建父目录，独立 TEMP/TMP/TMPDIR、pytest basetemp/cache；
+中途仅相关单文件，全量在整合末或 CI。不要写默认 `%TEMP%`，不要共用 basetemp。
+本地完成检查后只 `git add -- 明确路径` 并及时 commit，保留 hooks，不自动远端操作。
 
 ## 2. 仓库地图
 
@@ -31,7 +52,7 @@ Mortis-RAG-MCP/
 │   ├── __main__.py          # 入口：python -m mortis_rag_mcp --serve-mcp-stdio
 │   ├── config.py            # 配置加载（526 行）
 │   ├── registry.py          # 用户级知识库注册表（384 行）
-│   ├── server.py            # MCP 协议层 + 15 个公开工具路由表与轻量入口（1312 行）
+│   ├── server.py            # MCP 协议层 + 16 个公开工具路由表与轻量入口
 │   ├── _server/             # 服务端路由与跨库编排私有包
 │   │   ├── search_dispatch.py # 单库/Scoped/全局检索路由与入参规范化
 │   │   └── fanout.py          # 跨库候选聚合、权重计算、去重、rerank、全局/分组分页
@@ -73,7 +94,7 @@ AI agent (WorkBuddy/Codex/...)
 ┌─────────────────────────────────────────────┐
 │ server.py  VaultMcpServer                    │  协议层：initialize / tools/list /
 │  - _tool_definitions()  工具 schema          │  tools/call 分发、参数归一化、
-│  - call_tool()          15 个 handler        │  跨库 fan-out 合并、库级权重
+│  - call_tool()          16 个工具入口        │  跨库 fan-out 合并、库级权重
 │  - _fanout_search()     跨库检索             │
 └──────┬───────────────────┬──────────────────┘
        │                   │

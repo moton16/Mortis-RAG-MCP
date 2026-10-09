@@ -7,6 +7,20 @@
 
 ---
 
+### [beta2 第四批与前三批局部复核] — moton16,2026-10-08,Codex
+
+只做本地候选准备，未调用真实 API/迁移真实资产/执行远端 Git 或发布。只读增量复核由内置 gpt-6.1-sol/high 完成，主流程核实与修复。
+
+- `f4577c1`：PPTX 正常 printerSettings 二进制是惰性打印元数据，不应按嵌入 OLE 拒绝；仅精确豁免此路径，真实 PDF/Office/Pillow 正向5例通过。
+- `c11f762`（E11）：必需 docs/media/vec CI lane；离线检索拒外部配置；成对质量/资源工具与合同测试。2问指标 fixture 不是七类100问验收；Python tracemalloc 不冒充 RSS。
+- `4e69b1d`：retry 启动 idle worker；cancelled 重试清失去 blob 保护的段 checkpoint；9个 management 和5个 checkpoint用例通过。
+- `5f5b4c0`：import 最终忙态/gate重核和generation发布复用同一 mutation lock，保原补偿；6个 import安全用例通过。
+- `d631ff9`：native 缺向量不走文本补嵌、媒体 fingerprint 进入签名、媒体chunk补 SHA、固定 revision occurrence 分页、完整同步清磁盘派生 orphan。14个媒体接线用例通过；真实 sqlite_vec 本地缺包，新增磁盘回归待必需 CI。
+- `9050ed7`：第二轮局部证伪再现重开 chunker/profile 后旧 pending 覆盖 native，以及不支持MIME误停 proxy；native ID 含媒体 profile、仅补缺向量、仅成功native停其proxy。3个靶向+7个codec+5个sync通过。
+- E12：真实16工具/配置合同、合成 legacy 缓存升级/快照恢复与源/备份hash不变；同步 virtual/import/retry/请求CLI/升级边界；取消 Agent 缺 STATUS 即自动 doctor。相应提交由统一入口登记，不伪造未产生的 SHA。
+
+仍有实际范围缺口：真实媒体 transport、完整 AudioConfig/adapter/解码装配、独立图片摄取、真实质量/宿主验收；legacy 极端多格截失未静默改兼容语义。完整候选回归/构建结果在后续交接登记，不预写通过。
+
 ### D0 — Vodyanitsaaa,2026-9-13,WorkBuddy(工作区改动，未commit),WorkBuddy,kimi-k3-1 — docs: 开发者文档体系建立
 - **新增 `docs/Execution-plan_developer.md`**：v0.7.0 代码级执行方案。P0 检索评测 harness（scripts/eval_search.py + 金标准查询集）→ P1 定向检索路由（registry 加 description 字段 + kb_describe 工具 + MCP initialize instructions + kb_search 描述路由纪律 + fan-out hint + SKILL.md 5.0 判定表化重写）→ P2 PDF/Office 摄取层（**默认关闭**、按需异步 kb_ingest、内嵌 MinerU 双通道客户端 v4/Agent免登、产物收 `.mortis-parsed/`、HTML 表格原子块保护 + 小表转 pipe、pymupdf 兜底）→ P3 可选增强（title/alias boost、per-source 限流，eval 数据决定是否做）。每步含可直接粘贴的代码、测试清单、commit 切分与验收标准。
 - **补全 `docs/Quick-start_developer.md`**（原为空胚）：项目概况、架构分层图、索引/检索/tools-call 三条数据流、8 个模块职责与改动坑位表、缓存布局、测试约定、开发约定（文档分工/原子写/fail-closed/Breaking 流程）、常见任务食谱（加工具/改检索/加配置）、上手 checklist。

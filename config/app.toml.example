@@ -41,6 +41,8 @@ adapter = "openai_text"
 client_slicing = false
 
 # ---- 原生媒体（图像/音频）声明：E07 ----
+# 当前仅提供可注入 transport 的内部合同；普通工厂尚未装配真实媒体 HTTP adapter。
+# 填这些声明本身不代表真实端点可用或已经验证，不按模型名猜线协议。
 # 全部留空 = 不声明任何原生媒体能力；文本路径完全不受影响。
 # 媒体能力**只**由下面的显式声明决定：不按 model 名推、不按同维向量推 alignment。
 # 缺任一必需声明（modalities / alignment_space_id / preprocess / endpoint_revision /
@@ -148,8 +150,8 @@ max_size_mb = 2048
 # Those filters are implementation defaults, not configurable keys today.
 
 # ── PDF/Office 摄取层（默认关闭）────────────────────────────
-# 开启后可用 kb_ingest 把库里的 PDF/DOCX/PPTX/XLSX 解析成 Markdown 收进
-# .mortis-parsed/ 子目录并纳入索引。解析走 MinerU 云端 API：
+# 开启后可用 kb_ingest 把 PDF/DOCX/PPTX/XLSX 解析事实纳入 virtual 文档库。
+# 显式 storage="legacy" 才写 .mortis-parsed/；routing 控制本地/云端解析：
 #   - 配了 api_key → v4 精准接口（≤200MB/200页，每天 1000 页高优先级额度）
 #   - 没配 api_key → Agent 免登接口（≤10MB/20页，IP 限频，零配置试用）
 # 云端都失败且装了 pymupdf（pip install pymupdf）→ 本地纯文本兜底。
@@ -198,6 +200,8 @@ preview_max_edge = 1600
 preview_max_bytes = 524288
 
 [audio]
+# 当前配置对象尚未完整接入 server -> manager 的 adapter/解码装配；
+# 本段是配置合同，不是开箱即用的音频服务承诺。
 # No endpoint means no transcription. Credentials are read from a named env var.
 adapter = ""
 transcription_endpoint = ""

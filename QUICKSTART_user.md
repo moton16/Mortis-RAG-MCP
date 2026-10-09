@@ -45,6 +45,30 @@ v0.8.1 进一步强化了检索初筛、章节直读与后台刷新体验：
    - `[ingest] auto_watch` 默认关闭（`false`），绝不未经用户显式配置擅自向云端上传解析文件。
    - 默认单文件上限 `max_file_size_mb = 20`，超过 20MiB 的文件自动跳过，防误传超大文档。
 
+### 0.4 0.9 候选升级与恢复
+
+本候选尚未发布；本地合成升级/备份恢复已测，不代替你的实际旧库、远端 API 或宿主验收。
+
+1. 停止旧服务及摄取 writer，关闭数据库句柄；备份注册表、配置和整个库对应 cache/control，另存 `kb_export` 快照并记录 SHA256。不要让新旧 writer 同时操作同库。
+2. 在临时库/缓存副本试升级。新库默认 `[chunking] mode="estimated_tokens"`；已有字符参数/缓存保留旧模式。需要保旧地址时显式设置 `mode="legacy_chars"`。只有 profile 相容才能复用向量；换模型/模板/切块可能重嵌，不承诺任意升级零费用。
+3. virtual 是默认解析事实落点，不再新写 `.mortis-parsed/`；旧镜像仍按逐项证据兼容。旧二进制读不到 virtual-only 事实，回退应停新 writer、恢复升级前完整副本，再使用旧版；不要原地降 schema 或覆盖现代解析结果。
+4. `kb_import` 的 `index_state` 表示 `empty/rebuilding/unverified/ready`。包内正文/FTS不会自动激活；按返回的 `next_action` 校验源或重解析。只有明确相信包内解析事实时才使用现有 `trust_parsed_documents`，不把导入成功写成 ready。
+
+失败/取消任务的显式重试（工具 `kb_ingest` 参数）：
+```json
+{"action":"retry","job_id":"实际返回的job_id","vault_path":"已注册库名"}
+```
+unknown 表示请求结果不明，先查原任务，不自动重发。请求记录与 ingest job 是两回事；下列 CLI 的 `--vault` 使用**绝对路径**，不是库名：
+```powershell
+python -m mortis_rag_mcp --app-config ".\config\app.toml" --list-requests --vault "C:\YourVault"
+python -m mortis_rag_mcp --app-config ".\config\app.toml" --abandon-request REQUEST_ID --vault "C:\YourVault"
+```
+放弃只改本机意图，不取消远端任务、不上传、不自动重试；随后重新提交可能重复处理。
+
+媒体先通过 `kb_read` 返回的 `media_refs` 选 source/revision/occurrence，再调用 `kb_read_media`；分页沿返回的 revision/offset 继续。原生媒体内部 fixture 不等于真实端点成功：媒体 transport、完整音频 adapter/解码装配、独立图片摄取与宿主播放仍未闭合。文本成功或同维向量不证明跨模态对齐。
+
+`--doctor` 是显式诊断，可能访问真实端点；STATUS.md 缺失不触发 Agent 自动探活。正常查询直接用已有工具，实际报错再按错误/本地状态排查。
+
 ## 1. 安装
 
 ```powershell

@@ -180,7 +180,7 @@ def test_stdio_survives_lone_surrogate_in_notes(tmp_path):
 def test_stdio_release_smoke_v081(tmp_path):
     """C60/Req 9: stdio smoke:
     - initialize 版本 0.8.1
-    - 15 工具列表与新参数可见（compact, start_char, group_offsets, heading）
+    - 16 工具列表与新参数可见（compact, start_char, group_offsets, heading）
     - ping 正常
     - invalid range 与 heading 歧义返回 isError
     """
@@ -210,9 +210,10 @@ def test_stdio_release_smoke_v081(tmp_path):
     # 2. ping 检查
     assert responses[1]["result"] == {}
 
-    # 3. 15 工具列表与新参数检查
+    # 3. 16 工具列表与新参数检查（含 kb_read_media）
     tools = {t["name"]: t for t in responses[2]["result"]["tools"]}
-    assert len(tools) == 15
+    assert len(tools) == 16
+    assert "kb_read_media" in tools
     search_props = tools["kb_search"]["inputSchema"]["properties"]
     assert "compact" in search_props
     assert "group_offsets" in search_props
