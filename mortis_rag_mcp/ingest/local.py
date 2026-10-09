@@ -52,7 +52,13 @@ def office_admission(path: Path, limits: ResourceLimits) -> bytes:
             mode = info.external_attr >> 16
             if info.flag_bits & 1 or stat.S_ISLNK(mode) or info.compress_type not in (0, 8):
                 raise LocalUnsupported("unsafe Office archive member")
-            if name.lower().endswith((".zip", ".bin", ".vba", ".vbs", ".exe")):
+            lower = name.lower()
+            # PowerPoint's ordinary printer settings are inert binary metadata,
+            # not an embedded OLE object. The text parser never consumes them.
+            printer_settings = (path.suffix.lower() == ".pptx"
+                                and lower.startswith("ppt/printersettings/")
+                                and lower.endswith(".bin"))
+            if lower.endswith((".zip", ".bin", ".vba", ".vbs", ".exe")) and not printer_settings:
                 raise LocalUnsupported("embedded objects/macros require unsupported capability")
             if info.is_dir():
                 continue

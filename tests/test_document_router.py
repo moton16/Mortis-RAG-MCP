@@ -50,6 +50,19 @@ def test_office_xml_dtd_and_nested_archive_rejected(tmp_path):
             local.office_admission(path, local.ResourceLimits())
 
 
+def test_pptx_printer_settings_are_not_embedded_objects(tmp_path):
+    path = tmp_path / "ordinary.pptx"
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("[Content_Types].xml", "<Types/>")
+        archive.writestr("ppt/presentation.xml", "<presentation/>")
+        archive.writestr("ppt/printerSettings/printerSettings1.bin", b"inert printer metadata")
+    assert local.office_admission(path, local.ResourceLimits()) == path.read_bytes()
+    with zipfile.ZipFile(path, "a") as archive:
+        archive.writestr("ppt/embeddings/oleObject1.bin", b"embedded")
+    with pytest.raises(local.LocalUnsupported, match="embedded"):
+        local.office_admission(path, local.ResourceLimits())
+
+
 def test_shared_budget_exception_and_cancel_release():
     budget = router.ParseBudget(100)
     with pytest.raises(RuntimeError):
