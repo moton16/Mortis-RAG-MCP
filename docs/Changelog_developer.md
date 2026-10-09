@@ -1333,6 +1333,11 @@ editor:moton16，agent:codebuddy（2026-10-09）。推送 PR #8 后 CI 全矩阵
 
 本轮本地验证：受影响 13 个测试文件 189 passed / 1 skipped；全量 `.venv` = **1281 passed / 14 skipped / 3 deselected in 149.33s**（较上一轮 +2，正是两个新增回归用例）。py3.13 与非 Windows 内核行为仍只能由 CI 判定：本机只有 py3.10，不替 CI 下结论。
 
+**第二轮 CI（4a14269）**：py3.10/3.12/3.13 转绿，py3.11 与 windows 仍红。① py3.11 `test_read_stale::test_foreground_search_returns_immediately_while_sync_blocked` 断言 `indexing_in_progress is True` 拿到 None —— 深挖后是**第三个真实产品缺陷**：`try_sync_with_guard()` 直接调 `_sync_locked()`，而「索引在飞」的 `_indexing` 只在监听线程的 `_run_sync_quietly` 包装里置位，于是从守护式入口进入的同步对 `kb_search`/`kb_stats` 完全不可见，客户端会把同步期间的部分结果当成终态（C66 读优先契约的静默漏洞）。改为在 `_sync_locked()`（所有真同步的共同内层）置位并保存/恢复旧值；新增 `test_read_stale.py::test_guarded_sync_is_visible_as_indexing` 钉住该入口。同时该用例原先卡的是 `_sync_locked` 本身，等于先掐掉进度标记再断言能看见它，改为卡内层 `_sync_locked_impl`。② windows 仍红的 eval CLI 是上一处改了一半：`GOLDEN.read_bytes() == before` 的收尾比较还留在原始字节上（autocrlf 检出是 CRLF），统一走 `_golden_bytes()` 换行折算 helper。
+**第三轮 CI（262bb94）**：py3.10/3.11/3.13/windows 转绿，py3.12 剩 `test_kb_read_chunkid::test_stdio_search_and_read_chunk_id`（`assert 0 > 0`：批式 stdio 在冷启动阶段读到 0 chunks），与第 5 条同源，改为轮询到就绪后再在同一条会话里做 chunk_id 精读，断言一条未减（本地连跑三遍 21 passed）。
+**第四轮 CI（65ba598，测试-only）= 全矩阵 7/7 全绿**：ubuntu 3.10/3.11/3.12/3.13、windows-3.12、extras ubuntu/windows 全部 pass。本地全量 1282 passed / 14 skipped / 3 deselected。
+**遗留风险（不在本次声称已修）**：仓库还有若干「批式 stdio 一次性喂完 stdin」的老用例（`test_scoped_search` 的其余三条、`test_registry_server`、`test_subvaults` 等）共享同一类冷启动时序依赖，本次只修了实际报红的三个；它们此前长期绿，但理论上仍会随机器的负载漂移。若要彻底收敛需单开一卡批量改造，不在发版收尾范围内。
+
 ### v0.9.0 发版收尾：许可证转 Apache-2.0、候选包重建、隔离安装与 MCP 冒烟
 
 editor:moton16，agent:codebuddy（2026-10-09）。基线 HEAD `4fcde07`（E20 收尾提交，分支 feat/v0.9.0-lane-ab）。
@@ -1340,6 +1345,7 @@ editor:moton16，agent:codebuddy（2026-10-09）。基线 HEAD `4fcde07`（E20 �
 **许可证 MIT → Apache-2.0**：`LICENSE` 整篇替换为 Apache License 2.0 全文（201 行，含 END OF TERMS AND CONDITIONS 与附录 Copyright 2026 Moton）；新增 `NOTICE` 披露可选 extras 的第三方许可（pymupdf AGPL-3.0/商业、pypdf BSD-3、python-docx/pptx/openpyxl MIT、Pillow HPND、sqlite-vec MIT、numpy BSD-3），并声明组合分发责任自负。`pyproject.toml` 改 PEP 639 `license = "Apache-2.0"`、`license-files = ["LICENSE", "NOTICE"]`，`[docs]` extra 注释同步改为「非 Apache-2.0 授权范围，见 NOTICE」。`README.md` / `README_EN.md` 徽章与 License 段改写，`CHANGELOG_user.md` 0.9.0 条目日期改 2026-10-09、去掉「尚未正式发布」口径并新增 Changed：许可证变更（v0.8.1 及更早仍为 MIT，已发布版本授权不变）。`docs/Changelog_developer.md` 既有历史条目按纪律未回改。
 
 **候选包重建**：清掉 E17 遗留 `build/` 与 `mortis_rag_mcp.egg-info`；PATH 解释器（python 3.10.11）无 `venv` 模块，PEP 517 隔离不可用，改用 `python -m build --no-isolation --outdir dist`（本机 setuptools 82.0.1 / wheel 0.46.3 满足 build-system requires setuptools>=77）。产物 wheel 49 项（42 个 py 模块）、sdist 176 项（含 LICENSE/NOTICE/README.md/pyproject.toml/tests）。METADATA 为 Metadata-Version 2.4，`License-Expression: Apache-2.0`，两条 `License-File`；wheel `dist-info/licenses/LICENSE` 实测 201 行且含 END OF TERMS。SHA256：wheel `1C80CE51905B40DA5F8E3144B94BDEFB0B6AE72F4E5FF661E3E28182549008AC`、sdist `3CD65F86788231D77A35C757D663A961CBD7F05182DF3DC666C2789F33D82FC9`。
+**该候选包已被后续 CI 修复（`indexer._sync_locked` 置位）作废**：下面三轮修完后按 HEAD `262bb94` 重建，最终候选包 SHA256 为 wheel `2C5EDCF89462BEC9646561C3B01D0AD22F81912971BBBB78D04C7018D9E0A0AC`、sdist `A2C734EB88F8CAA5CF403F7092AB86793A13AAAFB017BECD1914110AF9EC4D93`；最后一笔 `65ba598` 只改测试，包内 42 个 `.py` 与 `262bb94` 逐字节一致，故候选包仍对应最终 HEAD。最终候选包重新隔离安装并重跑两场景冒烟（static 384 维 + EG2 768 维），rc=0、stderr 空、16 工具、kb_init/kb_search/kb_read/kb_list 全通。
 
 **隔离安装**：同一原因无法建 venv（`.venv` 亦无 pip/ensurepip），改为 `pip install --no-deps --target .runtime/ship/site <wheel>`，以 PYTHONPATH 指向该 site、cwd 置于 `.runtime/ship`，`import mortis_rag_mcp` 落在安装副本且 `__version__=0.9.0`、`importlib.metadata` 的 License-Expression=Apache-2.0、License-File=['LICENSE','NOTICE']，证明源码树零参与与零运行时依赖。sdist 另以 `--no-build-isolation --target .runtime/ship/site-sdist` 安装并导入通过。
 
