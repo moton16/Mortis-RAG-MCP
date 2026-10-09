@@ -1304,3 +1304,7 @@ Codex 主流程整合；施工子代理 gpt-6.1-sol/high。媒体成功必须在
 ### E20 测试分层、薄弱断言与当前说明
 
 Codex 主流程整合；施工子代理 gpt-6.1-sol/high。真实存储分页3/999/1000/1001新增4参数例（16边界断言）；原1001 sync/proxy/links全链保留slow；两不同真实载体合同保留real_carrier。默认快层只排除上述3节点，完整验收显式-o addopts=；未修改远端CI。GAP03 SourcePathError/错误码/零store访问，GAP04 import失败后vectors/FTS/generation/epoch/失败账本与重开恢复，原node保留；薄断言负注入先放过、增厚后失败日志保留。GAPOPS01独立CLI完整source HIT与目录expect MISS两新例，冻结golden不改，当前开发说明订正。主流程修正新增CLI evidence路径误限recovery子目录（红2failed→绿2passed）以支持完整E20 runner。snapshot6、virtual_read24、fast-pagination4passed，exit0；默认节省及完整层成本留最终实测，未把deselect当成算法加速。
+
+### E20 bounded 复核 R01 转正与导出补足
+
+Codex 主流程：真实生产export/import新增copy前另一client覆写与chunks ENOSPC两回归，均先失败。导出vectors只按固定captured chunk ID选择；chunks持久化失败明确拒绝发布，保留此前输出与RAM搜索，不把旧磁盘cache冒充当前snapshot。两例green，snapshot14与store integrity12既有靶向通过。此项合并F03/ADD-09-OPS-3，不另造重复工单；schema/哈希/pin/引用护栏保持。证据 integration/export-durability-red/green及family。

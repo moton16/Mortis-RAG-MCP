@@ -83,6 +83,9 @@ def _export_snapshot_locked(owner: MarkdownIndexer, out_path: str | Path) -> dic
 
     # 把当前内存态刷进缓存文件再打包，保证快照 = 此刻的索引。
     owner._save_cache()
+    if getattr(owner, "persistence_status", {}).get("errors", {}).get("chunks"):
+        from ..doc_store import StoreConflict
+        raise StoreConflict("snapshot chunks persistence failed; restore storage before exporting")
     return _export_v2(owner, out_path)
 
 
@@ -346,7 +349,8 @@ def _export_v2(owner: MarkdownIndexer, out_path: str | Path) -> dict[str, Any]:
             captured_files = captured[1]
             vectors_meta = owner._vectors_meta()
             payloads = {"chunks.bin": chunks_path}
-            vectors = owner._vector_backend.get_vectors(chunk.id for chunk in owner.all_chunks())
+            captured_ids = {chunk.id for _, chunks in captured_files.values() for chunk in chunks}
+            vectors = owner._vector_backend.get_vectors(captured_ids)
             if vectors:
                 transport = root / "vectors.bin"
                 _VectorsCodec.dump(transport, vectors_meta, vectors)
