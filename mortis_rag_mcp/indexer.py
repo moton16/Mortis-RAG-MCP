@@ -676,8 +676,8 @@ class MarkdownIndexer:
     def _attach_pending_vectors(self) -> None:
         """把初始化时无处可挂的向量按 chunk.id 补挂到重建出来的 chunk 上。
 
-        命中与否只看 chunk.id，与文本层是否重建无关：内容没变的 chunk id 一定
-        不变，向量也就一定是有效的。
+        文本以稳定 chunk.id 复用；native ID 还含媒体 profile。
+        新一轮已经生成的向量优先，旧缓存不得覆盖它。
         """
         if not self._pending_vectors:
             return
@@ -686,7 +686,7 @@ class MarkdownIndexer:
         for chunks in self._chunks.values():
             for chunk in chunks:
                 vector = pending.get(chunk.id)
-                if vector is not None:
+                if vector is not None and chunk.embedding is None:
                     chunk.embedding = vector
 
     def _load_failed_files(self) -> None:

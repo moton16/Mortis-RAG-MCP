@@ -448,9 +448,6 @@ def media_proxy_for_revision(owner: MarkdownIndexer, store: Any, source: str, re
         markdown, occurrences, source=source, revision_id=revision_id,
         profile_key=profile_key, chunker_fingerprint=fingerprint,
         derived_generation_id=generation, chunking=owner._chunking_config)
-    if media_native_route(owner) is not None:
-        for chunk in proxy:
-            chunk.metadata["embedding_disabled"] = True
     links = media_chunk_links(
         [*text_chunks, *proxy], occurrences, revision_id=revision_id,
         profile_key=profile_key, chunker_fingerprint=fingerprint,
@@ -527,7 +524,8 @@ def media_native_for_revision(owner: MarkdownIndexer, store: Any, source: str, r
         for item, vector in zip(batch_inputs, vectors):
             occ_id, kind, blob_hash = identity[item.request_id]
             chunk_id = "media-native-" + hashlib.sha256(
-                json.dumps([source, revision_id, occ_id, blob_hash], ensure_ascii=False).encode()).hexdigest()
+                json.dumps([source, revision_id, occ_id, blob_hash, provider.profile.fingerprint],
+                           ensure_ascii=False).encode()).hexdigest()
             metadata = {
                 "source_kind": "virtual", "revision_id": revision_id, "kind": "media_native",
                 "occurrence_id": occ_id, "media_occurrence_ids": [occ_id],
@@ -744,8 +742,15 @@ def run_sync(owner: MarkdownIndexer) -> list[Chunk]:
                 owner.failed_files[source] = f"media_proxy: {exc}"
             # E08-d：原生媒体向量路线（消费 E07 embed_media）。route 不可用即空，不冒充。
             try:
-                chunks.extend(media_native_for_revision(
-                    owner, owner.document_store(write=True), source, revision.revision_id, occurrences))
+                native_chunks = media_native_for_revision(
+                    owner, owner.document_store(write=True), source, revision.revision_id, occurrences)
+                chunks.extend(native_chunks)
+                native_occurrences = {c.metadata["occurrence_id"] for c in native_chunks}
+                # 只停用确实已有 native 向量的 proxy；不支持的 MIME/模态仍保留文本召回。
+                for chunk in chunks:
+                    if (chunk.metadata.get("kind") == "media_proxy"
+                            and chunk.metadata.get("occurrence_id") in native_occurrences):
+                        chunk.metadata["embedding_disabled"] = True
             except Exception as exc:
                 owner.failed_files[source] = f"media_native: {exc}"
             for chunk in chunks:

@@ -343,9 +343,38 @@ def test_native_route_skips_unallowed_mime_without_fabrication(tmp_path: Path):
         indexer.sync()
         chunks = indexer._chunks["doc.pdf"]
         assert not [c for c in chunks if c.metadata.get("kind") == "media_native"]
-        assert [c for c in chunks if c.metadata.get("kind") == "media_proxy"]
+        proxy = [c for c in chunks if c.metadata.get("kind") == "media_proxy"]
+        assert proxy
+        assert all(c.embedding is not None for c in proxy)
     finally:
         indexer.close_document_store()
+
+
+def test_reopen_chunker_and_media_profile_change_preserves_new_native(tmp_path):
+    from dataclasses import replace
+    from mortis_rag_mcp.indexer import MarkdownIndexer
+    from mortis_rag_mcp.providers import create_media_provider
+
+    first, vault, _ = _media_indexer(tmp_path)
+    first.sync()
+    old = next(c for c in first._chunks["doc.pdf"] if c.metadata.get("kind") == "media_native")
+    config = replace(first.config, chunking=replace(first.config.chunking, mode="estimated_tokens",
+                     mode_explicit=True, target_tokens=211),
+                     embedding=replace(first.config.embedding, media_endpoint_revision="ep-2"))
+    first.close_document_store()
+    provider = create_media_provider(config.embedding, transport=lambda items: [
+        {"index": i, "embedding": [0, 1]} for i, _ in enumerate(items)])
+    reopened = MarkdownIndexer(vault, config, embedding_provider=_FakeTextProvider([1, 0]),
+                               media_provider=provider)
+    try:
+        assert reopened._pending_vectors, "exercise disk-cache pending reattachment"
+        reopened.sync()
+        native = next(c for c in reopened._chunks["doc.pdf"] if c.metadata.get("kind") == "media_native")
+        assert list(native.embedding) == pytest.approx([0, 1])
+        assert native.id != old.id
+        assert native.metadata["profile_key"] == provider.profile.fingerprint
+    finally:
+        reopened.close_document_store()
 
 
 # --------------------------------------------------------------------------- E08-e
