@@ -643,10 +643,15 @@ def _fallback_toml(text: str) -> dict[str, Any]:
 
 
 def _read_toml(path: Path) -> dict[str, Any]:
-    data = path.read_bytes()
+    # Windows 编辑器（记事本 / PowerShell `Set-Content -Encoding utf8`）默认写 UTF-8 BOM。
+    # 带 BOM 时首个 `[section]` 头不再被识别为段：该段整体丢失，段内键泄漏到顶层，随后
+    # 被 flat-legacy 别名读成**另一套配置**（实测：`[cache] enabled = true` 的顶层 `enabled`
+    # 被当成 `reranker.enabled`，doctor 直接判 ❌ BROKEN）。这是静默错误配置，比解析失败更危险，
+    # 因此统一按 `utf-8-sig` 解码剥掉 BOM。
+    text = path.read_bytes().decode("utf-8-sig")
     if tomllib is not None:
-        return tomllib.loads(data.decode("utf-8"))
-    return _fallback_toml(data.decode("utf-8"))
+        return tomllib.loads(text)
+    return _fallback_toml(text)
 
 
 def read_toml_file(path: str | os.PathLike[str]) -> dict[str, Any]:

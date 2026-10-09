@@ -141,3 +141,29 @@ def test_media_provider_config_keys_and_validation(tmp_path, monkeypatch):
     assert "gemini" in res["detail"]
     assert "dim=768" in res["detail"]
     assert "GEMINI_API_KEY" in res["detail"]
+
+
+def test_utf8_bom_config_is_not_silently_misparsed(tmp_path):
+    """E17 首用修复：带 UTF-8 BOM 的 app.toml 必须与非 BOM 版本解析一致。
+
+    回归场景（宿主机首用实测）：BOM 会让首个 `[section]` 头丢失、段内键泄漏到顶层，
+    顶层的 `enabled = true`（来自 `[cache]`）随即被 flat-legacy 别名读成
+    `reranker.enabled = True`，doctor 因此误判 ❌ BROKEN。静默错解比解析失败更危险。
+    """
+    text = (
+        '[cache]\ndir = "isolated-cache"\nenabled = true\n\n'
+        '[ingest]\nenabled = false\n\n'
+        '[embedding]\nmode = "static"\ndimension = 8\n'
+    )
+    plain = tmp_path / "plain.toml"
+    plain.write_text(text, encoding="utf-8", newline="\n")
+    bom = tmp_path / "bom.toml"
+    bom.write_bytes(b"\xef\xbb\xbf" + text.encode("utf-8"))
+
+    assert sorted(config._read_toml(bom)) == ["cache", "embedding", "ingest"]
+
+    cfg_plain = config.load_config(plain)
+    cfg_bom = config.load_config(bom)
+    assert asdict(cfg_bom) == asdict(cfg_plain)
+    assert cfg_bom.ingest.enabled is False
+    assert cfg_bom.reranker.enabled is False
