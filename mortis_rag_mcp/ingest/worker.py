@@ -994,6 +994,7 @@ class VirtualIngestWorker:
         audio_config: Any = None,
         audio_decoder: Any = None,
         media_provider: Any = None,
+        media_capability_error: str | None = None,
     ) -> None:
         self.vault_path = Path(vault_path).expanduser().resolve()
         self.config = config
@@ -1007,6 +1008,7 @@ class VirtualIngestWorker:
         self.audio_config = audio_config
         self.audio_decoder = audio_decoder
         self.media_provider = media_provider
+        self.media_capability_error = media_capability_error
         # 显式提交的图片标题/说明（`kb_ingest submit` 的可选事实）。发布后该说明已写进
         # occurrence/revision，是持久事实；进程重启发生在发布前则退回文件名（见 `_image_caption`）。
         self._image_captions: dict[str, str] = {}
@@ -1790,8 +1792,9 @@ class VirtualIngestWorker:
         media_items = [it for it in sink.items if getattr(it, "kind", "") in ("image", "audio")]
         if media_items:
             if self.media_provider is None:
+                reason = self.media_capability_error or "media_provider not configured"
                 capabilities["warnings"].append(
-                    "native media capability unavailable: media_provider not configured (falling back to proxy / text recall)"
+                    f"native media capability unavailable: {reason} (falling back to proxy / text recall)"
                 )
                 capabilities["media_route"] = "proxy"
             else:
@@ -1801,13 +1804,18 @@ class VirtualIngestWorker:
                     modalities = set(ability.get("modalities", ()))
 
                     unsupported: list[str] = []
+                    seen_errs: set[str] = set()
                     for it in media_items:
                         kind = getattr(it, "kind", "")
                         mime = getattr(it, "mime_type", "")
+                        err_msg = ""
                         if kind not in modalities:
-                            unsupported.append(f"{kind} modality not supported by media_provider")
+                            err_msg = f"{kind} modality not supported by media_provider"
                         elif mime not in allowed_mimes:
-                            unsupported.append(f"{mime} not in media_provider allowed_mime_types")
+                            err_msg = f"{mime} not in media_provider allowed_mime_types"
+                        if err_msg and err_msg not in seen_errs:
+                            seen_errs.add(err_msg)
+                            unsupported.append(err_msg)
                     if unsupported:
                         for err in unsupported:
                             capabilities["warnings"].append(

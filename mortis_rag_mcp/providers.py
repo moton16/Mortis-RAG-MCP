@@ -282,15 +282,25 @@ def create_media_provider(config: EmbeddingConfig, *, transport: Any = None) -> 
     if not all(references):
         raise ProviderError("native media capability unavailable: endpoint evidence references are incomplete")
     if transport is None:
-        adapter_name = str(getattr(config, "adapter", "") or "").strip().lower()
+        adapter_name = str(
+            getattr(config, "media_adapter", "")
+            or getattr(config, "media_provider", "")
+            or getattr(config, "adapter", "")
+            or ""
+        ).strip().lower()
         if adapter_name in {"openai_vl", "siliconflow_vl", "openai_multimodal", "vl_multimodal", "media_http"}:
             from .media_providers import HttpMediaTransport
-            dim = getattr(config, "dimension", None)
+            dim = getattr(config, "media_dimension", None) or getattr(config, "dimension", None)
             send_dim = bool(getattr(config, "send_dimensions", False))
+            media_ep = getattr(config, "media_endpoint", "") or config.endpoint
+            media_mod = getattr(config, "media_model", "") or config.model
+            media_key = getattr(config, "media_api_key", "") or getattr(config, "api_key", "")
+            if not media_key and getattr(config, "media_api_key_env", ""):
+                media_key = os.environ.get(config.media_api_key_env, "")
             transport = HttpMediaTransport(
-                endpoint=config.endpoint,
-                model=config.model,
-                api_key=getattr(config, "api_key", ""),
+                endpoint=media_ep,
+                model=media_mod,
+                api_key=media_key,
                 timeout=getattr(config, "timeout", 30.0),
                 dimension=dim,
                 send_dimensions=send_dim,

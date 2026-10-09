@@ -413,8 +413,10 @@ class VaultMcpServer:
         self.registry = VaultRegistry()
         self._indexers: dict[str, MarkdownIndexer] = {}
         self._ingest_managers: dict[str, IngestManager] = {}
+        self._paid_controls: dict[str, Any] = {}
         self._indexers_lock = threading.Lock()
         self._ingest_managers_lock = threading.Lock()
+        self._paid_controls_lock = threading.Lock()
         self._startup_lock = threading.Lock()
         self._started = False
         self._migrate_legacy()
@@ -447,6 +449,15 @@ class VaultMcpServer:
                 indexer.close_document_store()
             except Exception:
                 pass
+        with self._paid_controls_lock:
+            for control in list(self._paid_controls.values()):
+                try:
+                    close = getattr(control, "close", None)
+                    if callable(close):
+                        close()
+                except Exception:
+                    pass
+            self._paid_controls.clear()
 
     def _migrate_legacy(self) -> None:
         """First run after upgrading: import the legacy [vault].path into the
@@ -878,17 +889,24 @@ class VaultMcpServer:
             return None
         if not vault_path:
             return None
-        key = str(Path(vault_path).resolve())
+        key = str(Path(vault_path).expanduser().resolve())
         indexer = self._indexers.get(key)
         if indexer is not None:
             return indexer._paid_control_store()
-        try:
-            from .doc_store import resolve_storage_layout
-            from .paid_requests import open_paid_control
-            layout = resolve_storage_layout(self.config, vault_path)
-            return open_paid_control(layout)
-        except Exception:
-            return None
+        with self._paid_controls_lock:
+            cached = self._paid_controls.get(key)
+            if cached is not None:
+                return cached
+            try:
+                from .doc_store import resolve_storage_layout
+                from .paid_requests import open_paid_control
+                layout = resolve_storage_layout(self.config, vault_path)
+                store = open_paid_control(layout)
+                if store is not None:
+                    self._paid_controls[key] = store
+                return store
+            except Exception:
+                return None
 
     def _transcription_adapter(self, vault_path: str | Path | None = None) -> Any:
         """转录 adapter 装配点（E09/E16）。
@@ -910,7 +928,7 @@ class VaultMcpServer:
 
         # E16：接通转录付费闸门
         if vault_path is not None:
-            key = str(Path(vault_path).resolve())
+            key = str(Path(vault_path).expanduser().resolve())
             indexer = self._indexers.get(key)
             fp = getattr(adapter, "fingerprint", "")
             if indexer is not None:
@@ -926,23 +944,28 @@ class VaultMcpServer:
                         configure(journal, guard, fp)
         return adapter
 
-    def _media_provider(self, vault_path: str | Path | None = None) -> Any:
-        """原生媒体 provider 装配点（E16）。"""
+    def _media_provider_and_error(self, vault_path: str | Path | None = None) -> tuple[Any, str | None]:
+        """原生媒体 provider 装配点，返回 (provider, capability_error)（E16）。"""
         from .providers import create_media_provider
         if vault_path is not None:
-            key = str(Path(vault_path).resolve())
+            key = str(Path(vault_path).expanduser().resolve())
             indexer = self._indexers.get(key)
-            if indexer is not None and getattr(indexer, "media_provider", None) is not None:
-                return indexer.media_provider
+            if indexer is not None:
+                if getattr(indexer, "media_provider", None) is not None:
+                    return indexer.media_provider, None
+                if getattr(indexer, "_media_capability_error", None):
+                    return None, str(indexer._media_capability_error)
+        err: str | None = None
         try:
             provider = create_media_provider(self.config.embedding)
-        except Exception:
-            return None
+        except Exception as exc:
+            err = str(exc)
+            provider = None
         if provider is None:
-            return None
+            return None, err
 
         if vault_path is not None:
-            key = str(Path(vault_path).resolve())
+            key = str(Path(vault_path).expanduser().resolve())
             indexer = self._indexers.get(key)
             fp = getattr(getattr(provider, "profile", None), "fingerprint", "")
             if indexer is not None:
@@ -956,6 +979,11 @@ class VaultMcpServer:
                     configure = getattr(provider, "configure_paid_requests", None)
                     if callable(configure):
                         configure(journal, guard, fp)
+        return provider, None
+
+    def _media_provider(self, vault_path: str | Path | None = None) -> Any:
+        """原生媒体 provider 装配点（E16）。"""
+        provider, _ = self._media_provider_and_error(vault_path)
         return provider
 
     def _audio_decoder(self) -> Any:
@@ -1017,6 +1045,7 @@ class VaultMcpServer:
                         except Exception:
                             return ""
 
+                    media_prov, media_err = self._media_provider_and_error(vault_path)
                     manager = make_ingest_manager(
                         vault_path,
                         self.config.ingest,
@@ -1029,7 +1058,8 @@ class VaultMcpServer:
                         audio_adapter=self._transcription_adapter(vault_path),
                         audio_decoder=self._audio_decoder(),
                         chunker_fingerprint_provider=_chunker_fingerprint_provider,
-                        media_provider=self._media_provider(vault_path),
+                        media_provider=media_prov,
+                        media_capability_error=media_err,
                     )
                     self._ingest_managers[key] = manager
         return manager
