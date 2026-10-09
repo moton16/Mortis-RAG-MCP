@@ -89,7 +89,7 @@ def test_docstore_import_requires_explicit_replace_and_retains_backup(tmp_path):
     assert original
 
     # 默认拒绝：本机已有 committed 事实，未知包不得静默替换。
-    with pytest.raises(StoreConflict):
+    with pytest.raises(StoreConflict, match="IMPORT_CONFLICT"):
         snapshot_mod.import_snapshot(indexer_b, snap)
     assert store_b.generation_id == original
 
@@ -148,7 +148,7 @@ def test_active_ingest_blocks_import_with_import_busy(tmp_path):
         parser_fingerprint="fixture",
     )
 
-    with pytest.raises(StoreBusy):
+    with pytest.raises(StoreBusy, match="IMPORT_BUSY"):
         indexer.import_snapshot(snap)
 
 
@@ -176,14 +176,33 @@ def test_import_failure_rolls_back_live_derived_files(tmp_path, monkeypatch):
     """发布阶段任一步失败必须把活派生文件与内存态恢复到导入前（§20.2/§20.5）。"""
     vault = tmp_path / "vault"
     _write_notes(vault)
-    indexer = MarkdownIndexer(vault, _config(tmp_path), embedding_provider=CountingProvider())
+    (vault / "a.md").write_text("# Recovery\n\nrollbackneedle original text.\n", encoding="utf-8")
+    cfg = _config(tmp_path)
+    indexer = MarkdownIndexer(vault, cfg, embedding_provider=CountingProvider())
     indexer.sync()
+    _commit_fact(indexer, "a.md", (vault / "a.md").read_bytes(), "parsed-A")
+    indexer.failed_files["failed.pdf"] = "fixture parser unavailable"
+    indexer._save_failed_files()
     snap = tmp_path / "snap.zip"
     indexer.export_snapshot(snap)
 
     before_bytes = indexer._chunks_cache_path.read_bytes()
     before_ids = {chunk.id for chunk in indexer.all_chunks()}
     assert before_ids
+    before_vectors = indexer._vectors_cache_path.read_bytes()
+    before_values = {key: list(value) for key, value in
+                     indexer._vector_backend.get_vectors(before_ids).items()}
+    assert before_values, "vector recovery needs a nonempty baseline, not vacuous equality"
+    before_backend_ids = indexer._vector_backend.list_ids()
+    assert indexer._fts is not None and indexer._fts.available
+    before_fts = indexer._fts.search('"rollbackneedle"', 10)
+    assert before_fts
+    before_failed = dict(indexer.failed_files)
+    store = indexer.document_store()
+    before_generation = store.generation_id
+    with ControlStore(store.layout) as control:
+        control.open(create=False)
+        before_epoch = control.state().epoch
 
     real_stage = snapshot_mod._stage_derived_layers
 
@@ -192,8 +211,38 @@ def test_import_failure_rolls_back_live_derived_files(tmp_path, monkeypatch):
         raise RuntimeError("boom after derived install")
 
     monkeypatch.setattr(snapshot_mod, "_stage_derived_layers", failing_stage)
-    with pytest.raises(RuntimeError):
-        indexer.import_snapshot(snap)
+    with pytest.raises(RuntimeError, match="^boom after derived install$"):
+        indexer.import_snapshot(snap, replace=True, confirm_replace=True)
 
     assert indexer._chunks_cache_path.read_bytes() == before_bytes
     assert {chunk.id for chunk in indexer.all_chunks()} == before_ids
+    assert indexer._vectors_cache_path.read_bytes() == before_vectors
+    assert indexer._vector_backend.list_ids() == before_backend_ids
+    assert {key: list(value) for key, value in
+            indexer._vector_backend.get_vectors(before_ids).items()} == before_values
+    assert indexer._fts.search('"rollbackneedle"', 10) == before_fts
+    assert indexer.failed_files == before_failed
+    assert store.generation_id == before_generation
+    with ControlStore(store.layout) as control:
+        control.open(create=False)
+        assert control.state().epoch == before_epoch
+
+    # A second session must observe the restored disk state, not just old RAM.
+    indexer.close_document_store()
+    indexer._fts.close()
+    reopened = MarkdownIndexer(vault, cfg, embedding_provider=CountingProvider())
+    try:
+        assert {chunk.id for chunk in reopened.all_chunks()} == before_ids
+        assert reopened._vectors_cache_path.read_bytes() == before_vectors
+        assert reopened._vector_backend.list_ids() == before_backend_ids
+        assert {key: list(value) for key, value in
+                reopened._vector_backend.get_vectors(before_ids).items()} == before_values
+        assert reopened._fts.search('"rollbackneedle"', 10) == before_fts
+        assert reopened.failed_files == before_failed
+        assert reopened.document_store().generation_id == before_generation
+        with ControlStore(store.layout) as control:
+            control.open(create=False)
+            assert control.state().epoch == before_epoch
+    finally:
+        reopened.close_document_store()
+        reopened._fts.close()

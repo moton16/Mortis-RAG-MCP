@@ -1300,3 +1300,7 @@ Codex 主流程整合；施工子代理 gpt-6.1-sol/high。stdio复用run_stdio_
 ### E20 F07 阶段失败与 F02 生产删除接缝
 
 Codex 主流程整合；施工子代理 gpt-6.1-sol/high。媒体成功必须在数量/映射/向量合同验证后journal成功CAS；明确响应失败复用既有abandoned终态与原因，网络/5xx/429等受理未知保持submission_unknown并禁止自动重传。正文及成功native批次保留，持久媒体失败可跨重启恢复，重试复用正文向量，既有工具/schema未增。主流程串行应用watch诊断与first-ingest pending-job删除栅栏；完整扫描中真正缺源才推进删除，ignore/incomplete/permission均保留。补4对照，红1failed3passed→绿4passed。两次整合偏差（nonmedia source-changed误置failed、无活worker的unverified误置deleted）均修实现保留原stale/unverified断言，不改旧预期。媒体outcome26、virtual_sync25、transport13、paid journal10 passed，exit0。旧错误ready/无native派生数据可显式rebuild重建；unknown必须先人工核实并走既有请求解决入口，不自动补发。
+
+### E20 测试分层、薄弱断言与当前说明
+
+Codex 主流程整合；施工子代理 gpt-6.1-sol/high。真实存储分页3/999/1000/1001新增4参数例（16边界断言）；原1001 sync/proxy/links全链保留slow；两不同真实载体合同保留real_carrier。默认快层只排除上述3节点，完整验收显式-o addopts=；未修改远端CI。GAP03 SourcePathError/错误码/零store访问，GAP04 import失败后vectors/FTS/generation/epoch/失败账本与重开恢复，原node保留；薄断言负注入先放过、增厚后失败日志保留。GAPOPS01独立CLI完整source HIT与目录expect MISS两新例，冻结golden不改，当前开发说明订正。主流程修正新增CLI evidence路径误限recovery子目录（红2failed→绿2passed）以支持完整E20 runner。snapshot6、virtual_read24、fast-pagination4passed，exit0；默认节省及完整层成本留最终实测，未把deselect当成算法加速。

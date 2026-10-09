@@ -223,10 +223,18 @@ stdin 一行 JSON → handle() → method=="tools/call"
 # 设置 UTF-8 编码环境后运行靶向测试
 $env:PYTHONUTF8='1'; $env:PYTHONIOENCODING='utf-8'
 .\.venv\Scripts\python.exe -m pytest tests/test_compact_search.py tests/test_read_heading.py -q
+# 默认快层；只排除显式 slow / real_carrier 节点
+.\.venv\Scripts\python.exe -m pytest -q
+# 解除默认选择，完整验收所有执行层（缺依赖/载体仍会 skip）
+.\.venv\Scripts\python.exe -m pytest -q -o addopts=
+# 独立慢层 / 真实载体层
+.\.venv\Scripts\python.exe -m pytest -q -o addopts= -m slow
+.\.venv\Scripts\python.exe -m pytest -q -o addopts= -m real_carrier
 ```
 
-- 106 个测试文件（单机推荐按模块靶向运行；CI 全量矩阵覆盖 Ubuntu 3.10–3.13 与 Windows 3.12）：切块/缓存/多库/紧凑投影/预算/物理读取/章节定位/自动摄取/防抖监听/宿主隔离/快照/文档库与虚拟摄取/媒体与跨模态等。
-- **约定**：不碰真实网络（embedding 用 `static` 模式或注入 FakeProvider）；临时库一律 `tmp_path`；测试注册表与配置经 `MORTIS_RAG_CONFIG` / `MORTIS_RAG_REGISTRY` 严格隔离，绝不污染宿主真实环境。
+- 测试覆盖切块/缓存/多库/紧凑投影/预算/物理读取/章节定位/自动摄取/防抖监听/宿主隔离/快照/文档库与虚拟摄取/媒体与跨模态等；文件数以当前 collection 为准。
+- **约定**：默认快层不访问真实端点（embedding 用 `static` 或边界注入）；`real_carrier` 两例保留各自真实文本/真实图片载体合同，载体缺席时明确 skip，不用 mock 冒绿。临时库一律隔离；配置、注册表、cache、home、TEMP/TMP/TMPDIR 和 basetemp 都指向本轮证据目录。
+- `slow` 保留原 1001 occurrence 的 sync/proxy/links 全链断言；四个 fast 存储分页边界不是该全链合同的替代。passed、skip、deselected 分开记账，默认少选工作量不代表慢例算法已加速。完整验收须显式 `-o addopts=`；远端 CI 若仍使用默认命令，只覆盖快层，不能称作所有层已验收。
 - 已知 Windows 平台坑：`kb_rebuild` 删 FTS 缓存走系统回收站，trash 失败会
   `SAFE_DELETE_FAIL_CLOSED`（`test_subvaults.py::test_stdio_kb_rebuild_returns_stats`
   在部分 Windows 环境因此红）——修它是件独立任务，别顺手带在别的 commit 里。
@@ -259,8 +267,12 @@ $env:PYTHONUTF8='1'; $env:PYTHONIOENCODING='utf-8'
 5. skill 的工具清单加一行；CHANGELOG_user 在下次 release 补一句
 
 ### 改检索行为（切块/打分/过滤）
-1. **先跑 eval**：`python scripts/eval_search.py --golden tests/eval/golden_queries.json`
-   记录基线 Hit@K
+1. **先跑精确 source 评测**：`python scripts/eval_search.py --golden 自己的精确source查询集.json`
+   `expect` 必须是完整库内相对 source，如 `数电/ttl.md`；目录约束另用
+   `"path_prefix": "数电/"`。匹配不接受 `expect="数电/"` 作为子串。
+   冻结 `tests/eval/golden_queries.json` 的旧目录示例会按现行合同 MISS（exit1），
+   该事实保持，不改冻结夹具、不放宽匹配。独立正反向 CLI 回归见
+   `tests/test_e20_eval_cli.py`，记录实际 Hit@K。
 2. 改代码；若影响切块结果 → `_cache_meta()` 加代际键（让旧缓存自动重建）
 3. 再跑 eval 对比；无提升就 revert
 4. `tests/test_hybrid.py` / `test_search_filters.py` 补用例

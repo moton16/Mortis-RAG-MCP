@@ -15,6 +15,8 @@ from mortis_rag_mcp.media_providers import EmbeddingInput, HttpMediaTransport
 from mortis_rag_mcp.providers import ExternalEmbeddingProvider, create_media_provider
 from mortis_rag_mcp.embedding_capabilities import resolve_embedding_profile
 
+pytestmark = pytest.mark.real_carrier
+
 #: 本机 EG2（LiteRT-LM 三阶路由）多模态 embeddings 端点。可用环境变量指向其它载体。
 EG2_ENDPOINT = os.environ.get("MORTIS_EG2_MEDIA_ENDPOINT", "http://127.0.0.1:8000/v1/embeddings")
 

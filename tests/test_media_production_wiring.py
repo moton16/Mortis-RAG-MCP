@@ -406,6 +406,55 @@ def test_kb_read_media_returns_link_context_and_rejects_expired_pin(tmp_path: Pa
         server.shutdown()
 
 
+@pytest.mark.parametrize("count", [3, 999, 1000, 1001])
+def test_real_store_iter_media_pagination_boundaries(tmp_path, monkeypatch, count):
+    """真实存储迭代边界；不替代 slow 的 sync → proxy → links 全链。"""
+    server, vault = _build(tmp_path)
+    store = DocumentStore(_layout(server, vault), server.config)
+    store.open(write=True)
+    try:
+        staged = store.stage_revision(
+            source="doc.pdf",
+            source_sha256=hashlib.sha256((vault / "doc.pdf").read_bytes()).hexdigest(),
+            render_sha256=hashlib.sha256(MARKDOWN.encode("utf-8")).hexdigest(),
+            parser_fingerprint="pagination-boundary-v1", markdown=MARKDOWN,
+            capabilities={"coverage": "full"},
+        )
+        blob_id = store.put_media_blob(data=PNG_A, mime_type="image/png", width=8, height=8)
+        anchor = MARKDOWN.index("media")
+        store.attach_occurrences(staged.revision_id, [
+            MediaOccurrenceSpec(
+                occurrence_id=f"occ-{i}", blob_id=blob_id, kind="image",
+                ordinal=i, mime_type="image/png", caption="same caption",
+                anchor_start=anchor, anchor_end=anchor + len("media"),
+            ) for i in range(count)
+        ])
+        store.commit_revision(staged.revision_id)
+        calls = []
+        real_list_media = store.list_media
+
+        def trace_page(source, *, revision_id="", offset=0, limit=100):
+            # Spy 原样调用真实 SQL 分页，不合成返回数据。
+            page = real_list_media(source, revision_id=revision_id, offset=offset, limit=limit)
+            calls.append((source, revision_id, offset, limit, len(page)))
+            return page
+
+        monkeypatch.setattr(store, "list_media", trace_page)
+        rows = list(store.iter_media("doc.pdf", revision_id=staged.revision_id))
+        ids = [row["occurrence_id"] for row in rows]
+        assert len(rows) == count
+        assert len(set(ids)) == count
+        assert ids[-1] == f"occ-{count - 1}"
+        expected = [("doc.pdf", staged.revision_id, 0, 1000, min(count, 1000))]
+        if count >= 1000:
+            expected.append(("doc.pdf", staged.revision_id, 1000, 1000, count - 1000))
+        assert calls == expected
+    finally:
+        store.close()
+        server.shutdown()
+
+
+@pytest.mark.slow
 def test_sync_indexes_occurrences_after_first_thousand(tmp_path):
     server, vault = _build(tmp_path)
     setup = DocumentStore(_layout(server, vault), server.config)

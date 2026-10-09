@@ -31,6 +31,11 @@ vault-mcp = "mortis_rag_mcp.__main__:main"  # legacy alias kept for existing con
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+addopts = '-m "not slow and not real_carrier"'
+markers = [
+    "slow: full production sync/proxy/link integration; select with -o addopts= -m slow",
+    "real_carrier: distinct real embedding-carrier contracts; select with -o addopts= -m real_carrier",
+]
 
 [tool.setuptools.packages.find]
 include = ["mortis_rag_mcp*"]

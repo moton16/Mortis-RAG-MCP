@@ -795,7 +795,7 @@ MCP 工具的参数可能被提示注入的 LLM 操控，项目按「零信任�
 ## 十一、测试体系
 
 ```
-tests/（106 个测试文件；python -m pytest -q 全量回归由 CI 承接，本地按靶向文件单跑，需指定 UTF-8 编码环境）
+tests/（文件数以 collection 为准；默认快层，完整所有层须 -o addopts=；需指定 UTF-8 编码环境）
 ├── conftest.py               # pytest 全局钩子：session 级真实配置隔离 + function 级独立缓存根 + 禁用外部状态写入
 ├── test_doctor.py            # doctor 模块探活、离线容错、状态防假、静默生成单测
 ├── test_path_migration.py    # 路径与配置无损原子迁移（~/.vault_mcp* -> ~/.mortis_rag_mcp*）
@@ -817,13 +817,13 @@ tests/（106 个测试文件；python -m pytest -q 全量回归由 CI 承接，�
 ├── test_facade_freeze.py    # Facade 导出面冻结与子模块反向导入防御
 ├── test_cache_codec_roundtrip.py # 二进制协议 VMCPC/VMCPV 往返兼容性
 ├── test_version_sync.py     # 单一版本真源同步校验
-└── ...（更多包含 test_search_filters, test_dedup, test_failed_files, test_fsnotify, test_snapshot 等，全目录共 106 个测试文件）
+└── ...（更多包含 test_search_filters, test_dedup, test_failed_files, test_fsnotify, test_snapshot 和 E20 正确性回归）
 ```
 
 约定与技巧：
 
 * 测试经 `VAULT_MCP_REGISTRY` 环境变量把注册表重定向到 pytest 临时目录，绝不碰用户真实注册表；缓存目录用 `tmp_path`。
-* embedding 一律用 `static` 模式或注入 FakeProvider，**测试永不打真实 API**（历史事故：假 key 打到真端点 401）。
+* 默认快层使用 `static` 或显式离线 transport 边界；独立 `real_carrier` 层保留两个不同的真实载体合同，载体缺席记 skip，不用 fake 代替。普通回归不访问付费 API。
 * 退避序列断言靠 monkeypatch `providers._sleep`。
 * 可选依赖缺失或非 Windows 平台的用例会自动 skip（sqlite-vec / docs / media 三类）。E17 终态 `.venv` 全量为 **1140 passed / 14 skipped**，这 14 个 skip **全部**属于上面两类原因——skip 不是通过，不能当成对应后端或格式已验证。
 
@@ -841,7 +841,10 @@ python -m pip install --upgrade pip
 python -m pip install -e .                # 报 setuptools 错先 pip install -U pip setuptools wheel
 python -m pip install numpy               # 可选：批量余弦加速
 python -m pip install "mortis-rag-mcp[vec]"  # 可选：磁盘向量后端
-python -m pytest -q                       # 应全绿
+python -m pytest -q                       # 默认快层，排除 slow / real_carrier
+python -m pytest -q -o addopts=           # 完整所有执行层
+python -m pytest -q -o addopts= -m slow
+python -m pytest -q -o addopts= -m real_carrier
 ```
 
 支持 Python 3.10–3.13（3.10 走 fallback TOML 解析器）。本仓库开发机实测：Python 3.10.11 全绿。
@@ -850,7 +853,7 @@ python -m pytest -q                       # 应全绿
 
 * **零运行时依赖是铁律**：新功能必须先用标准库实现；引入第三方依赖需要非常充分的理由，且必须做成"缺失自动回退"的软依赖（参考 numpy / sqlite-vec 的做法）。
 * **注释语言**：中文注释为主（项目惯例），注释写"为什么"（约束、坑、历史 bug），不写"做了什么"。
-* **错误处理哲学**：派生数据（缓存/FTS/监听）的失败一律吞掉降级，绝不拖垮主流程；权威数据的失败要记入 `failed_files` 可观测；对外报错用人类可读的 `ValueError`。
+* **错误处理哲学**：派生失败尽量保留已成功的正文与内存检索，同时明确失败阶段及持久化状态；缓存写失败通过既有 `next_action` 披露 layer/path/errno，不能把内存 ready 冒充写盘成功。权威事实失败仍须显式失败；registry 读状态未知时禁止覆盖写；公共协议/schema 与 revision/epoch 不变量保持。
 * **原子写**：任何落盘文件用 `tmp + replace`。
 * **提交信息**：Conventional Commits（`feat:` / `fix:` / `docs:` / `chore:`），版本变更走 PR。
 

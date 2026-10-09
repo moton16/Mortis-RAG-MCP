@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from mortis_rag_mcp.config import AppConfig, EmbeddingConfig
-from mortis_rag_mcp.doc_store import resolve_storage_layout
+from mortis_rag_mcp.doc_store import SourcePathError, resolve_storage_layout
 from mortis_rag_mcp.indexer import MarkdownIndexer
 from mortis_rag_mcp._indexer import reading
 
@@ -132,9 +132,19 @@ def test_deadline_no_stale_bypass(indexer, monkeypatch):
 
 
 @pytest.mark.parametrize("source", ["../a.pdf", "/a.pdf", "C:/a.pdf", "a/../b.pdf"])
-def test_source_path_rejected(indexer, source):
-    with pytest.raises(Exception):
+def test_source_path_rejected(indexer, source, monkeypatch):
+    store_accesses = []
+    existing_store = indexer._existing_document_store
+
+    def spy_existing_store():
+        store_accesses.append("existing_document_store")
+        return existing_store()
+
+    monkeypatch.setattr(indexer, "_existing_document_store", spy_existing_store)
+    with pytest.raises(SourcePathError) as caught:
         reading.read_virtual_result(indexer, source)
+    assert caught.value.code == "SOURCE_PATH_INVALID"
+    assert store_accesses == [], "非法 source 必须在访问任何 store 前拒绝"
 
 
 def test_unreadable_ignore_fails_closed(indexer, monkeypatch):
