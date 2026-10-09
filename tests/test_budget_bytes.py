@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import json
+import time
 
 import pytest
 
@@ -30,7 +31,15 @@ def _kb_init_ready(server: VaultMcpServer, path, name: str) -> None:
     要断言完整索引的测试必须显式同步。
     """
     server.call_tool("kb_init", {"path": str(path), "name": name})
-    server._indexer_for({"vault_path": name}).sync()
+    indexer = server._indexer_for({"vault_path": name})
+    indexer.sync()
+    # 后台首建线程与前台 sync 并存时，单次 sync 也可能读到空索引（同族用例在 Linux
+    # CI 上实测拿到 0 chunks）：等到切片真的可见再返回。
+    deadline = time.monotonic() + 10.0
+    while not indexer.all_chunks() and time.monotonic() < deadline:
+        time.sleep(0.1)
+        indexer.sync()
+    return indexer
 
 
 def _is_search_settled(data: dict) -> bool:
