@@ -1338,6 +1338,9 @@ editor:moton16，agent:codebuddy（2026-10-09）。推送 PR #8 后 CI 全矩阵
 **第四轮 CI（65ba598，测试-only）= 全矩阵 7/7 全绿**：ubuntu 3.10/3.11/3.12/3.13、windows-3.12、extras ubuntu/windows 全部 pass。本地全量 1282 passed / 14 skipped / 3 deselected。
 **遗留风险（不在本次声称已修）**：仓库还有若干「批式 stdio 一次性喂完 stdin」的老用例（`test_scoped_search` 的其余三条、`test_registry_server`、`test_subvaults` 等）共享同一类冷启动时序依赖，本次只修了实际报红的三个；它们此前长期绿，但理论上仍会随机器的负载漂移。若要彻底收敛需单开一卡批量改造，不在发版收尾范围内。
 
+**第五、六轮（52fbd75 / d33a9f2）：同类残余 flakes 收口**。第五轮是**只改文档**的提交（被测代码与第四轮全绿时完全相同），py3.13 仍红在 `test_exact_terms::test_exact_terms_combined_with_budget_bytes`（0 chunks）——证明这不是我改出来的，而是「kb_init 只把首建丢进后台线程、随后一次 `sync()` 也可能读到空索引」的既有竞态。据此把三个文件里重复的 `_kb_init_ready`（`test_exact_terms` / `test_compact_search` / `test_budget_bytes`，共 19 处调用）统一改为「重试 sync 直到切片可见，上限 10s」，第六轮又按同一判据修掉 `test_search_oracle::test_server_search_dispatch_delegation`（它连 sync 都没做，纯靠后台首建抢跑）。
+**第七轮 CI（d33a9f2）= 全矩阵 7/7 全绿**（ubuntu 3.10/3.11/3.12/3.13、windows-3.12、extras ×2）。本地最终全量 1282 passed / 14 skipped / 3 deselected in 152.84s。**仍未消除的残余风险**：同类「依赖后台首建抢跑」的用例在仓库里还有（上面列出的批式 stdio 几处），本轮只在**实际报红**的地方加固；如需彻底收敛应单开一卡做全仓改造，不在发版收尾范围。
+
 ### v0.9.0 发版收尾：许可证转 Apache-2.0、候选包重建、隔离安装与 MCP 冒烟
 
 editor:moton16，agent:codebuddy（2026-10-09）。基线 HEAD `4fcde07`（E20 收尾提交，分支 feat/v0.9.0-lane-ab）。
