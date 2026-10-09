@@ -294,6 +294,46 @@ def test_native_route_unavailable_without_declared_alignment(tmp_path: Path):
         indexer.close_document_store()
 
 
+def test_missing_native_vector_never_falls_back_to_text_embedding(tmp_path, monkeypatch):
+    indexer, _, _ = _media_indexer(tmp_path)
+    try:
+        indexer.sync()
+        native = next(c for c in indexer._chunks["doc.pdf"] if c.metadata.get("kind") == "media_native")
+        expected = list(native.embedding)
+        native.embedding = None
+        seen = []
+        embed = indexer.embedding_provider.embed
+        def spy(texts):
+            seen.extend(texts)
+            return embed(texts)
+        monkeypatch.setattr(indexer.embedding_provider, "embed", spy)
+        indexer.sync()
+        current = next(c for c in indexer._chunks["doc.pdf"] if c.metadata.get("kind") == "media_native")
+        assert list(current.embedding) == pytest.approx(expected)
+        assert not any("[Media native:" in text for text in seen)
+    finally:
+        indexer.close_document_store()
+
+
+def test_media_revision_change_invalidates_native_cache(tmp_path):
+    from dataclasses import replace
+    from mortis_rag_mcp.providers import create_media_provider
+    indexer, _, _ = _media_indexer(tmp_path)
+    try:
+        indexer.sync()
+        config = replace(indexer.config.embedding, media_endpoint_revision="ep-2")
+        provider = create_media_provider(config, transport=lambda items: [
+            {"index": i, "embedding": [0, 1]} for i, _ in enumerate(items)])
+        indexer.media_provider = provider
+        indexer.configure_paid_provider("media", provider, provider.profile.fingerprint)
+        indexer.sync()
+        current = next(c for c in indexer._chunks["doc.pdf"] if c.metadata.get("kind") == "media_native")
+        assert current.metadata["profile_key"] == provider.profile.fingerprint
+        assert list(current.embedding) == pytest.approx([0, 1])
+    finally:
+        indexer.close_document_store()
+
+
 def test_native_route_skips_unallowed_mime_without_fabrication(tmp_path: Path):
     from mortis_rag_mcp._indexer.sync_engine import media_native_route
 
@@ -326,11 +366,34 @@ def test_kb_read_media_returns_link_context_and_rejects_expired_pin(tmp_path: Pa
         payload = json.loads(meta["content"][0]["text"])
         assert proxy[0].id in payload["context_chunk_ids"]
         assert "proxy" in payload["context_relations"]
+        read = server._kb_read({"vault_path": "Vault", "chunk_id": proxy[0].id})
+        assert read["revision_id"] == revision
 
         # 固定版本 handle 到期 → 最终包络前拒绝，绝不返回媒体。
         monkeypatch.setattr(DocumentStore, "validate_generation_pin", lambda self, pin: False)
         expired = server._kb_read_media(args)
         assert json.loads(expired["content"][0]["text"])["code"] == "MEDIA_UNAVAILABLE"
+    finally:
+        server.shutdown()
+
+
+def test_sync_indexes_occurrences_after_first_thousand(tmp_path):
+    server, vault = _build(tmp_path)
+    setup = DocumentStore(_layout(server, vault), server.config)
+    setup.open(write=True)
+    revision = _commit(setup, vault, "doc.pdf", MARKDOWN, [PNG_A] * 1001)
+    setup.close()
+    try:
+        indexer = server._indexer_for({"vault_path": "Vault"})
+        indexer.sync()
+        proxies = [c for c in indexer._chunks["doc.pdf"] if c.metadata.get("kind") == "media_proxy"]
+        assert len(proxies) == 1001
+        assert "occ-1000" in {c.metadata["occurrence_id"] for c in proxies}
+        store = indexer.document_store(write=True)
+        assert any(row["occurrence_id"] == "occ-1000" for row in
+                   store.get_media_chunk_links(revision_id=revision,
+                     profile_key=indexer._embedding_profile.fingerprint,
+                     derived_generation_id=indexer._derived_profile_key()))
     finally:
         server.shutdown()
 

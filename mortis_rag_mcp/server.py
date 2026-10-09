@@ -1746,7 +1746,7 @@ class VaultMcpServer:
         if any(str(row.get("kind")) == "audio" for row in rows):
             try:
                 from ._indexer.media import merge_audio_segments
-                all_rows = store.list_media(source, revision_id=revision_id, offset=0, limit=1000)
+                all_rows = list(store.iter_media(source, revision_id=revision_id))
                 result["media_audio_segments"] = merge_audio_segments(all_rows)
             except Exception:
                 pass

@@ -175,7 +175,7 @@ def _stamp_embedding_keys(owner: MarkdownIndexer) -> None:
     template = getattr(profile, "preprocess_version", "") or "text-v1"
     for chunks in owner._chunks.values():
         for chunk in chunks:
-            if chunk.metadata.get("embedding_disabled"):
+            if chunk.metadata.get("embedding_disabled") or chunk.metadata.get("kind") == "media_native":
                 continue
             media_hashes = chunk.metadata.get("media_hashes")
             if not media_hashes:
@@ -313,7 +313,9 @@ def embed_missing(owner: MarkdownIndexer) -> bool:
     pending: dict[str, list[Chunk]] = {}
     for source, chunks in owner._chunks.items():
         missing = [chunk for chunk in chunks
-                   if not chunk.metadata.get("embedding_disabled") and not owner._chunk_has_vector(chunk)]
+                   if not chunk.metadata.get("embedding_disabled")
+                   and chunk.metadata.get("kind") != "media_native"
+                   and not owner._chunk_has_vector(chunk)]
         if missing:
             pending[source] = missing
     if not pending:
@@ -441,11 +443,14 @@ def media_proxy_for_revision(owner: MarkdownIndexer, store: Any, source: str, re
     # 切代撤销：先按 source+profile 清掉该源**所有历史 revision** 的派生召回，再写当前代。
     # 这样「revision 更新后旧代 links 不复活」，而其它 profile 的作用域完全不受影响。
     writable.delete_media_chunk_links(source=source, profile_key=profile_key)
-    occurrences = writable.list_media(source, revision_id=revision_id, limit=1000)
+    occurrences = list(writable.iter_media(source, revision_id=revision_id))
     proxy = build_media_proxy_chunks(
         markdown, occurrences, source=source, revision_id=revision_id,
         profile_key=profile_key, chunker_fingerprint=fingerprint,
         derived_generation_id=generation, chunking=owner._chunking_config)
+    if media_native_route(owner) is not None:
+        for chunk in proxy:
+            chunk.metadata["embedding_disabled"] = True
     links = media_chunk_links(
         [*text_chunks, *proxy], occurrences, revision_id=revision_id,
         profile_key=profile_key, chunker_fingerprint=fingerprint,
@@ -532,6 +537,9 @@ def media_native_for_revision(owner: MarkdownIndexer, store: Any, source: str, r
                 "line_basis": "media_alignment", "synthetic_segments": [],
                 "source_spans": [], "anchor_available": False, "anchor_confidence": "unavailable",
             }
+            from .token_chunking import embedding_key
+            metadata["embedding_key"] = embedding_key(
+                blob_hash, provider.profile.fingerprint, provider.profile.preprocess_version, (blob_hash,))
             chunk = Chunk(chunk_id, f"[Media native: {source} / {revision_id} / {occ_id}]",
                           source, occ_id, metadata)
             chunk.embedding = _to_emb(vector)
@@ -704,8 +712,12 @@ def run_sync(owner: MarkdownIndexer) -> list[Chunk]:
             revision = active.revision
             if raw_sha != revision.source_sha256:
                 raise ValueError("source SHA differs from committed revision")
-            signature = f"virtual:{revision.revision_id}:{raw_sha}:{revision.render_sha256}"
-            if owner._signatures.get(source) == signature:
+            media_route = media_native_route(owner)
+            media_fingerprint = media_route.profile.fingerprint if media_route is not None else ""
+            signature = f"virtual:{revision.revision_id}:{raw_sha}:{revision.render_sha256}:media:{media_fingerprint}"
+            missing_native = any(c.metadata.get("kind") == "media_native" and not chunk_has_vector(owner, c)
+                                 for c in owner._chunks.get(source, ()))
+            if owner._signatures.get(source) == signature and not missing_native:
                 continue
             store_uuid = store.store_meta().store_uuid
             # §20.7B：虚拟 chunk ID 由 store_uuid/doc_id/revision_id/chunker 指纹/
@@ -736,6 +748,8 @@ def run_sync(owner: MarkdownIndexer) -> list[Chunk]:
                     owner, owner.document_store(write=True), source, revision.revision_id, occurrences))
             except Exception as exc:
                 owner.failed_files[source] = f"media_native: {exc}"
+            for chunk in chunks:
+                chunk.metadata.update(source_sha256=raw_sha, render_sha256=revision.render_sha256)
             changed.append((source, signature, chunks,
                             (int(stat.st_mtime_ns), int(stat.st_size), int(stat.st_ctime_ns)),
                             time.time_ns()))
@@ -810,6 +824,12 @@ def run_sync(owner: MarkdownIndexer) -> list[Chunk]:
     embed_did_work = owner._embed_missing()
     # Disk-backed mode: persist newly embedded vectors and release RAM.
     owner._flush_vectors_to_disk()
+    if scan.complete and owner._vectors_on_disk and not owner._embedding_paused:
+        current_ids = {c.id for chunks in owner._chunks.values() for c in chunks}
+        stale_ids = set(owner._vector_backend.list_ids()) - current_ids
+        if stale_ids:
+            owner._vector_backend.delete_vectors(stale_ids)
+            owner._disk_vectors.difference_update(stale_ids)
 
     try:
         latest_documents = store.list_documents() if store is not None else []

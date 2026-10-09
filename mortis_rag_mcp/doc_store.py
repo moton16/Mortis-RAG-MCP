@@ -3514,6 +3514,16 @@ class DocumentStore:
         finally:
             ctrl.close()
 
+    def iter_media(self, source: str, *, revision_id: str):
+        """Walk one captured revision, rather than mistaking a page for all media."""
+        offset = 0
+        while True:
+            page = self.list_media(source, revision_id=revision_id, offset=offset, limit=1000)
+            yield from page
+            if len(page) < 1000:
+                break
+            offset += len(page)
+
     def list_media(self, source: str, *, revision_id: str = "", offset: int = 0,
                    limit: int = 100) -> list[dict]:
         active = self.get_active(source)

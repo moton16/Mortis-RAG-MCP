@@ -57,6 +57,20 @@ def test_disk_backend_keeps_vectors_off_ram(tmp_path):
     assert any("目标" in chunk.content for chunk in results)
 
 
+def test_complete_scan_removes_orphans_after_cache_rebuild(tmp_path):
+    (tmp_path / "a.md").write_text("# A\n目标 current", encoding="utf-8")
+    indexer = MarkdownIndexer(tmp_path, _disk_config(tmp_path), embedding_provider=TargetProvider())
+    try:
+        indexer.sync()
+        current = {c.id for c in indexer.all_chunks()}
+        indexer._vector_backend.upsert_vectors({"orphan-old-chunker": TARGET})
+        indexer._disk_vectors.add("orphan-old-chunker")
+        indexer.sync()
+        assert set(indexer._vector_backend.list_ids()) == current
+    finally:
+        indexer.close_document_store()
+
+
 def test_disk_backend_migrates_from_bin_without_reembed(tmp_path):
     (tmp_path / "a.md").write_text("# A\n目标 内容", encoding="utf-8")
     (tmp_path / "b.md").write_text("# B\n其他内容", encoding="utf-8")
