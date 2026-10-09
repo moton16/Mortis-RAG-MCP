@@ -32,7 +32,7 @@ def test_media_content_is_not_double_wrapped():
     server = bare_server()
     result = {"content": [{"type": "text", "text": "metadata"},
                           {"type": "image", "data": "YWJj", "mimeType": "image/png"}]}
-    server._kb_read_media = lambda arguments: result
+    server._kb_read_media = lambda arguments, **kwargs: result
     assert server.call_tool("kb_read_media", {}) is result
     server._kb_list = lambda arguments: {"vaults": []}
     assert server.call_tool("kb_list", {})["content"][0]["type"] == "text"
@@ -43,7 +43,7 @@ def test_media_content_diagnostic_path_is_not_double_wrapped(monkeypatch):
     server = bare_server()
     server.config.diag = SimpleNamespace(enabled=True)
     result = {"content": [{"type": "image", "data": "YWJj", "mimeType": "image/png"}]}
-    server._kb_read_media = lambda arguments: result
+    server._kb_read_media = lambda arguments, **kwargs: result
     monkeypatch.setattr(diaglog, "instrument_call", lambda **kwargs: kwargs["handler"](kwargs["arguments"]))
     monkeypatch.setattr(diaglog, "record", lambda **kwargs: None)
     assert server.call_tool("kb_read_media", {}) is result

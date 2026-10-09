@@ -356,3 +356,39 @@ def test_media_refs_pagination_binds_revision_without_loss_or_dupes(tmp_path: Pa
         assert len(seen) == 25 and len(set(seen)) == 25
     finally:
         server.shutdown()
+
+
+# --------------------------------------------------------------------------- E08-f
+def test_rpc_budget_uses_real_request_id_and_stdio_serialization(tmp_path: Path):
+    server, vault = _build(tmp_path)
+    setup = DocumentStore(_layout(server, vault), server.config)
+    setup.open(write=True)
+    revision = _commit(setup, vault, "doc.pdf", MARKDOWN, [PNG_A])
+    setup.close()
+    try:
+        server._indexer_for({"vault_path": "Vault"}).sync()
+        request_id = "req-\u4e2d\u6587-1"  # 非 ASCII id：序列化参数与线上一致才有意义
+        base_args = {"vault_path": "Vault", "source": "doc.pdf", "revision_id": revision,
+                     "occurrence_id": "occ-0", "representation": "inline", "variant": "original"}
+
+        def call(args):
+            return server.handle({"jsonrpc": "2.0", "id": request_id, "method": "tools/call",
+                                  "params": {"name": "kb_read_media", "arguments": args}})
+
+        ok = call({**base_args, "budget_bytes": 8 * 1024 * 1024})
+        assert ok["id"] == request_id and "result" in ok
+        success_result = ok["result"]
+        assert success_result["content"][1]["type"] == "image"
+
+        rejected = call({**base_args, "budget_bytes": 64})
+        payload = json.loads(rejected["result"]["content"][0]["text"])
+        assert payload["code"] == "MEDIA_TOO_LARGE"
+        assert payload["next_action"]
+        # required_bytes 必须等于**线上同参数**序列化的完整 JSON-RPC 包络（含真实 id）。
+        expected = len(json.dumps({"jsonrpc": "2.0", "id": request_id, "result": success_result},
+                                  ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+        assert payload["required_bytes"] == expected
+        # 只裁完整 item：失败时绝不留下半截 base64。
+        assert "data" not in rejected["result"]["content"][0]
+    finally:
+        server.shutdown()

@@ -18,8 +18,9 @@ ORIGINAL_READ_CAP = 20 * 1024 * 1024
 
 
 def _json_size(value: Any) -> int:
-    # Match stdio's default json.dumps envelope, not a shorter compact estimate.
-    return len(json.dumps(value, ensure_ascii=False).encode("utf-8"))
+    # E08-f：与实际 stdio 写出**完全一致**的序列化参数（ensure_ascii=False + 紧凑分隔符），
+    # 否则预算与线上包络对不上：用默认分隔符会多算空格，把本该放得下的媒体误判为超限。
+    return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
 
 
 def _error(code: str, message: str, **details: Any) -> dict[str, Any]:
@@ -105,8 +106,10 @@ def media_content_result(metadata: dict[str, Any], data: bytes | None = None, *,
         result["content"].append({"type": kind, "data": base64.b64encode(data).decode("ascii"), "mimeType": mime})
     required = _json_size({"jsonrpc": "2.0", "id": request_id, "result": result})
     if required > budget_bytes:
+        # 只做**整包拒绝**：绝不截断 base64，也绝不只裁掉半条 content item。
         return _error("MEDIA_TOO_LARGE", "Complete media envelope exceeds budget; use metadata or preview",
                       required_bytes=required, budget_bytes=budget_bytes,
+                      next_action="请求 representation=metadata，或改用 variant=preview，或显式提高 budget_bytes",
                       available_variants=metadata.get("available_variants", []))
     return result
 

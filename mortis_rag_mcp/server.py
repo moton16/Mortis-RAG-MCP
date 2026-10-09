@@ -1007,7 +1007,8 @@ class VaultMcpServer:
         "kb_exempt": "_kb_exempt",
     }
 
-    def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    def call_tool(self, name: str, arguments: dict[str, Any], *,
+                  request_id: Any = None) -> dict[str, Any]:
         diag_cfg = getattr(self.config, "diag", None)
         if not diag_cfg or not diag_cfg.enabled:
             # 默认未开启诊断日志时走纯净路径，零额外开销与零副作用
@@ -1015,8 +1016,12 @@ class VaultMcpServer:
             handler_name = self._TOOL_ROUTE_TABLE.get(name)
             if handler_name is None:
                 raise ValueError(f"unknown tool: {name}")
+            if name == "kb_read_media":
+                # E08-f：把真实 JSON-RPC id 传进媒体 handler，预算按线上同一包络计量。
+                raw_result = self._kb_read_media(arguments, request_id=request_id)
+                return raw_result
             raw_result = getattr(self, handler_name)(arguments)
-            return raw_result if name == "kb_read_media" else _text_content(raw_result)
+            return _text_content(raw_result)
 
         import time
         from . import diaglog
@@ -1029,6 +1034,9 @@ class VaultMcpServer:
             if handler_name is None:
                 raise ValueError(f"unknown tool: {name}")
             handler = getattr(self, handler_name)
+            if name == "kb_read_media":
+                _base = handler
+                handler = lambda args, _base=_base: _base(args, request_id=request_id)
 
             raw_result = diaglog.instrument_call(
                 server=self,
@@ -1410,9 +1418,9 @@ class VaultMcpServer:
             for p in probes_to_close:
                 self._close_probe_indexer(p)
 
-    def _kb_read_media(self, arguments: dict[str, Any]) -> dict[str, Any]:
+    def _kb_read_media(self, arguments: dict[str, Any], *, request_id: Any = None) -> dict[str, Any]:
         from ._server.media_dispatch import dispatch_media_read
-        return dispatch_media_read(self, arguments)
+        return dispatch_media_read(self, arguments, request_id=request_id)
 
     def _kb_read(self, arguments: dict[str, Any]) -> dict[str, Any]:
         allow_stale = arguments.get("allow_stale", False)
@@ -1889,7 +1897,7 @@ class VaultMcpServer:
                 flat = {k: v for k, v in params.items() if k != "name"}
                 raw_args = flat if flat else {}
             try:
-                return _json_result(request_id, self.call_tool(tool_name, raw_args))
+                return _json_result(request_id, self.call_tool(tool_name, raw_args, request_id=request_id))
             except (ValueError, TypeError, OSError) as exc:
                 # MCP 规范：工具执行失败应以 CallToolResult{isError:true} 返回，
                 # 模型看到错误内容可以自我纠正（比如先 kb_init 再重试）。此前
