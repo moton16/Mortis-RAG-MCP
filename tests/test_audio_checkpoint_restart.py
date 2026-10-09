@@ -298,3 +298,20 @@ def test_retry_job_only_for_failed_or_cancelled(tmp_path: Path):
         assert claimed.job_id == job.job_id
     finally:
         store.close()
+
+
+def test_cancel_gc_retry_does_not_reuse_released_checkpoint(tmp_path):
+    store = _store(tmp_path, "cancel-gc")
+    try:
+        job, _ = store.enqueue_job(source="a.wav", source_sha256="s" * 64, parser_fingerprint="pcm-v1")
+        store.claim_job("A")
+        blob = store.put_media_blob(data=b"segment", mime_type="audio/wav")
+        store.record_subjob(job.job_id, "A", ordinal=1, input_hash="s" * 64,
+                            range={"kind": "audio_ms", "start": 0, "end": 1000},
+                            state="done", checkpoint={"blob_id": blob, "ordinal": 1})
+        store.cancel_job(job.job_id)
+        assert store.gc_unreferenced() == 1
+        store.retry_job(job.job_id)
+        assert store.list_subjobs(job.job_id) == [], "cancelled retry reused released media references"
+    finally:
+        store.close()

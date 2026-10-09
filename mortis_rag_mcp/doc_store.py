@@ -3052,6 +3052,10 @@ class DocumentStore:
                     or job.phase in {"send_intent", "submitted", "polling", "downloaded", "submission_unknown"}):
                 raise StoreConflict("SUBMISSION_UNKNOWN: retry requires a bound manual confirmation",
                                     fix="当前窗口未实现费用确认入口；不得把显式 retry 当确认。")
+            if job.state == "cancelled":
+                # Cancel releases checkpoint blob protection. A deliberate retry
+                # must regenerate segments, not reuse possibly collected media.
+                conn.execute("DELETE FROM ingest_subjobs WHERE job_id=? AND ordinal>=1", (job_id,))
             stamp = time.time()
             self._write(
                 conn,

@@ -1279,6 +1279,7 @@ class VirtualIngestWorker:
         view = self._job_view(updated)
         view.update(retried=True, retryable=True, reason="",
                     next_action="queued: the worker will pick it up on the next claim")
+        self._ensure_worker(store)
         return view
 
     def status(self, job_id: str | None = None) -> dict:

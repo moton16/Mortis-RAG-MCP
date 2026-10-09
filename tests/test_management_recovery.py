@@ -150,7 +150,7 @@ def test_abandon_moves_only_the_target_record(tmp_path: Path, capsys):
     assert second["abandoned"] is False and second["state"] == "success"
 
 
-def test_worker_retry_only_for_failed_or_cancelled(tmp_path: Path):
+def test_worker_retry_only_for_failed_or_cancelled(tmp_path: Path, monkeypatch):
     vault = _vault(tmp_path, "retry")
     cfg = _app_config(tmp_path, "retry")
     layout = resolve_storage_layout(cfg, vault)
@@ -162,6 +162,7 @@ def test_worker_retry_only_for_failed_or_cancelled(tmp_path: Path):
         store.claim_job("A")
         store.fail_job(job.job_id, "A", error_code="PARSE_FAILED")
         worker = VirtualIngestWorker(vault, cfg, store_provider=lambda: store)
+        monkeypatch.setattr(worker, "_ensure_worker", lambda store: None)
         retried = worker.retry(job.job_id)
         assert retried["retried"] is True and retried["state"] == "queued"
         assert store.job_status(job.job_id).state == "queued"
@@ -182,6 +183,32 @@ def test_worker_retry_only_for_failed_or_cancelled(tmp_path: Path):
         assert unknown["remote_task_id"] == "remote-42"
         assert unknown["reason"] == "SUBMISSION_UNKNOWN"
         assert "do not resend" in unknown["next_action"]
+    finally:
+        store.close()
+
+
+def test_retry_starts_idle_worker_and_claims_job(tmp_path):
+    import threading
+    vault = _vault(tmp_path, "wake")
+    cfg = _app_config(tmp_path, "wake")
+    store = DocumentStore(resolve_storage_layout(cfg, vault), cfg)
+    store.open(write=True)
+    job, _ = store.enqueue_job(source="a.wav", source_sha256="s" * 64, parser_fingerprint="pcm")
+    store.claim_job("initial")
+    store.fail_job(job.job_id, "initial", error_code="PARSE_FAILED")
+    worker = VirtualIngestWorker(vault, cfg, store_provider=lambda: store)
+    claimed = threading.Event()
+    def loop():
+        try:
+            if store.claim_job("background") is not None:
+                claimed.set()
+        finally:
+            store.close()
+    worker._loop = loop
+    try:
+        assert worker.retry(job.job_id)["retried"] is True
+        assert claimed.wait(3), "retry queued work but never started the worker"
+        worker._worker.join(3)
     finally:
         store.close()
 
