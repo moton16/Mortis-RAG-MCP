@@ -84,15 +84,19 @@ class ResolvedEmbeddingProfile:
         return {**asdict(self), "fingerprint": self.fingerprint}
 
 
-# Only exact, established fixed-text contracts are built in. No EG2 candidate.
+# Only exact, established fixed-text contracts are built in.
 EXACT_MODEL_REGISTRY = MappingProxyType({
     "BAAI/bge-m3": (1024, 8192),
     "bge-m3": (1024, 8192),
     "text-embedding-ada-002": (1536, 8192),
     "sentence-transformers/all-MiniLM-L6-v2": (384, 256),
+    "embeddinggemma2": (768, 8192),
+    "embeddinggemma-2": (768, 8192),
+    "google/embeddinggemma-2": (768, 8192),
 })
 CAPABILITY_PROFILES = MappingProxyType({
     "bge-m3": ("BAAI/bge-m3", 1024, 8192),
+    "embeddinggemma2": ("embeddinggemma2", 768, 8192),
 })
 
 
@@ -139,7 +143,12 @@ def resolve_embedding_profile(config: Any) -> ResolvedEmbeddingProfile:
         if name not in CAPABILITY_PROFILES:
             raise EmbeddingContractError("unsupported capability_profile; provide verified endpoint evidence")
         exact, native, context = CAPABILITY_PROFILES[name]
-        if model not in (exact, "bge-m3"):
+        valid_models = {exact, name}
+        if name == "bge-m3":
+            valid_models.add("bge-m3")
+        elif name == "embeddinggemma2":
+            valid_models.update({"embeddinggemma-2", "google/embeddinggemma-2"})
+        if model not in valid_models:
             raise EmbeddingContractError("capability_profile does not match exact model")
     if model in EXACT_MODEL_REGISTRY:
         native, context = EXACT_MODEL_REGISTRY[model]

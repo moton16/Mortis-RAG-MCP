@@ -76,6 +76,25 @@ def _retry_after_seconds(headers: Any) -> float | None:
     return min(seconds, _MAX_BACKOFF)
 
 
+def _is_loopback_endpoint(endpoint: str) -> bool:
+    if not endpoint:
+        return False
+    try:
+        from urllib.parse import urlsplit
+        import ipaddress
+        host = (urlsplit(endpoint).hostname or "").strip().lower()
+        if not host:
+            return False
+        if host in {"127.0.0.1", "localhost", "::1"}:
+            return True
+        try:
+            return ipaddress.ip_address(host).is_loopback
+        except ValueError:
+            return False
+    except Exception:
+        return False
+
+
 class _JsonHttpProvider:
     def __init__(self, endpoint: str, api_key: str = "", timeout: float = 30.0, max_retries: int = 3, retry_backoff: float = 1.0) -> None:
         if not endpoint:
@@ -88,6 +107,10 @@ class _JsonHttpProvider:
         self.request_journal: Any = None
         self.paid_guard: Any = None
         self.request_profile = ""
+
+    @property
+    def is_local_free(self) -> bool:
+        return not bool(self.api_key and self.api_key.strip()) and _is_loopback_endpoint(self.endpoint)
 
     def configure_paid_requests(self, journal: Any, guard: Any, profile_fingerprint: str) -> None:
         self.request_journal = journal
@@ -106,19 +129,30 @@ class _JsonHttpProvider:
             method="POST",
         )
         journal = self.request_journal
-        if journal is None or self.paid_guard is None or not self.paid_guard(self.request_profile):
+        if journal is None or self.paid_guard is None:
+            if not self.is_local_free:
+                raise ProviderError("PAID_REQUEST_CONTROL_UNAVAILABLE: durable journal required; profile may be revoked")
+        elif not self.paid_guard(self.request_profile):
             raise ProviderError("PAID_REQUEST_CONTROL_UNAVAILABLE: durable journal required; profile may be revoked")
-        payload_hash = hashlib.sha256(request.data).hexdigest()
-        request_id = journal.before_send(payload_hash, self.endpoint, self.request_profile)
-        try:
-            # Non-idempotent POST: even 429/5xx may already have incurred cost.
-            with urlopen(request, timeout=self.timeout) as response:
-                result = json.loads(response.read().decode("utf-8"))
-            journal.mark_success(request_id)
-            return result
-        except (HTTPError, URLError, OSError, ValueError, json.JSONDecodeError) as exc:
-            journal.mark_unknown(request_id, "response_unconfirmed")
-            raise ProviderError("SUBMISSION_UNKNOWN: request outcome unknown; automatic retry disabled") from exc
+
+        if journal is not None:
+            payload_hash = hashlib.sha256(request.data).hexdigest()
+            request_id = journal.before_send(payload_hash, self.endpoint, self.request_profile)
+            try:
+                # Non-idempotent POST: even 429/5xx may already have incurred cost.
+                with urlopen(request, timeout=self.timeout) as response:
+                    result = json.loads(response.read().decode("utf-8"))
+                journal.mark_success(request_id)
+                return result
+            except (HTTPError, URLError, OSError, ValueError, json.JSONDecodeError) as exc:
+                journal.mark_unknown(request_id, "response_unconfirmed")
+                raise ProviderError("SUBMISSION_UNKNOWN: request outcome unknown; automatic retry disabled") from exc
+        else:
+            try:
+                with urlopen(request, timeout=self.timeout) as response:
+                    return json.loads(response.read().decode("utf-8"))
+            except (HTTPError, URLError, OSError, ValueError, json.JSONDecodeError) as exc:
+                raise ProviderError(f"LOCAL_REQUEST_FAILED: request to local endpoint failed: {exc}") from exc
 
     def _backoff_seconds(self, attempt: int, exc: BaseException) -> float | None:
         """返回本次失败应等待的秒数；None 表示不可重试，立即失败。"""

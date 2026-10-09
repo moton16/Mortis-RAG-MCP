@@ -540,3 +540,21 @@ def test_config_numeric_accepts_legitimate_values(tmp_path):
     assert config.embedding.max_retries == 0
     assert config.rrf_per_route == 40
     assert config.max_top_k == 500
+
+
+def test_local_free_endpoint_bypasses_paid_guard(monkeypatch):
+    captured = {}
+    def fake_urlopen(request, timeout):
+        captured["url"] = request.full_url
+        return _JsonResponse({"data": [{"index": 0, "embedding": [1.0, 0.0]}]})
+    monkeypatch.setattr("mortis_rag_mcp.providers.urlopen", fake_urlopen)
+    provider = ExternalEmbeddingProvider(
+        endpoint="http://127.0.0.1:8080/v1/embeddings",
+        model="embeddinggemma2",
+        dimension=2,
+    )
+    provider.request_journal = None
+    provider.paid_guard = None
+    vecs = provider.embed(["test local bypass"])
+    assert vecs == [[1.0, 0.0]]
+    assert captured["url"] == "http://127.0.0.1:8080/v1/embeddings"

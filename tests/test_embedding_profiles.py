@@ -139,3 +139,15 @@ def test_native_media_evidence_and_request_id_mapping():
         NativeMediaProvider(p, replace(evidence, alignment_reference=""), lambda items: [])
     with pytest.raises(ProviderError):
         native.embed_media([replace(media, media_hash="wrong")])
+
+
+def test_embeddinggemma2_profile_resolution():
+    eg2 = resolve_embedding_profile(config(model="embeddinggemma2", dimension=768, capability_profile="embeddinggemma2"))
+    assert eg2.native_dim == 768
+    assert eg2.max_context == 8192
+    assert eg2.effective_dim == 768
+    assert eg2.evidence_reference == "exact-fixed-text-contract"
+    eg2_alias = resolve_embedding_profile(config(model="google/embeddinggemma-2", dimension=768, capability_profile="embeddinggemma2"))
+    assert eg2_alias.native_dim == 768
+    with pytest.raises(EmbeddingContractError):
+        resolve_embedding_profile(config(model="embeddinggemma2", dimension=1024, capability_profile="embeddinggemma2"))
