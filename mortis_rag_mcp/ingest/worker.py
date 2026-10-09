@@ -59,9 +59,13 @@ except ImportError:
 from .mineru import AGENT_EXTS, MineruClient, MineruError
 from .tables import convert_small_tables
 from ..registry import _process_file_lock
-from .router import DEFAULT_PARSE_BUDGET, ParseBudget, decide_route
+from .router import DEFAULT_PARSE_BUDGET, ParseBudget, decide_route, upgrade_route_once
 from .local import LocalUnsupported, parse_local
-from .audio import AudioUnsupported, parse_audio
+from .audio import (AudioUnsupported, audio_profile_fingerprint, audio_settings,
+                    inspect_audio, parse_audio)
+from .images import (IMAGE_EXTS, IMAGE_ROUTE_UNSUPPORTED, ImageUnsupported, parse_image,
+                     validate_image_source)
+from .transcription import AUDIO_ADAPTER_UNAVAILABLE
 
 INGEST_EXTS = {".pdf", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx"}
 AUDIO_EXTS = {".wav", ".mp3", ".m4a", ".flac"}
@@ -73,6 +77,11 @@ AUDIO_ROUTE_UNSUPPORTED = "AUDIO_ROUTE_UNSUPPORTED"
 
 
 def _ingest_exts(config: Any) -> set[str]:
+    """**扫描面**的后缀集合：显式提交面（`_validate_safe_source`）比它宽。
+
+    图片（`IMAGE_EXTS`）刻意**不在**扫描面里：E09 只做「用户显式提交的图片源」，
+    不因为支持图片就打开后台全库图片扫描（那会改变既有 auto_watch 语义）。
+    """
     return INGEST_EXTS | AUDIO_EXTS if getattr(config, "audio_enabled", False) else INGEST_EXTS
 _STATE_NAME = ".ingest_state.json"
 # review R3：扫描后仍有判稳中的文件或扫描不完整时，扫描循环延时重扫的间隔。
@@ -105,6 +114,8 @@ def _atomic_write_json(path: Path, payload: dict) -> None:
 def _validate_safe_source(vault_path: Path, rel_path_str: str) -> Path:
     """严格沙箱路径校验 (D1, D12)：
     拒绝绝对路径、.. 穿越；确保解析后位于 vault 内且为存在的文件。
+
+    后缀白名单是**显式提交面**（文档/音频/图片）；扫描面另有 `_ingest_exts`，两者独立。
     """
     rel = Path(rel_path_str)
     if rel.is_absolute() or ".." in rel.parts:
@@ -116,7 +127,7 @@ def _validate_safe_source(vault_path: Path, rel_path_str: str) -> Path:
         raise ValueError(f"source path resolves outside vault: {rel_path_str}")
     if not resolved.is_file():
         raise ValueError(f"not an ingestible document: {rel_path_str}")
-    if resolved.suffix.lower() not in INGEST_EXTS | AUDIO_EXTS:
+    if resolved.suffix.lower() not in INGEST_EXTS | AUDIO_EXTS | IMAGE_EXTS:
         raise ValueError(f"not an ingestible document ({resolved.suffix}): {rel_path_str}")
     return resolved
 
@@ -335,9 +346,13 @@ class IngestManager:
     def _validate_safe_source(self, rel: str) -> Path:
         return _validate_safe_source(self.vault_path, rel)
 
-    def submit(self, sources: list[str] | None = None, force: bool = False) -> dict:
+    def submit(self, sources: list[str] | None = None, force: bool = False,
+               caption: str = "") -> dict:
         """提交摄取任务（异步）。sources 为库内相对路径列表；None → scan_pending() 全量。
         支持 force 强制重解析 (D7)；去重 (D11)；参数严格校验 (D1, D12)；尺寸上限统一闸门。
+
+        `caption` 与 virtual 路径同签名（供 `kb_ingest` 统一调用）：legacy 没有 store，
+        图片源在这里就被明确拒绝，因此该参数不参与 legacy 行为。
         """
         if not self.config.enabled:
             raise ValueError(
@@ -370,6 +385,12 @@ class IngestManager:
                     raise ValueError(
                         f"{AUDIO_ROUTE_UNSUPPORTED}: legacy 摄取路径不得把音频送 MinerU（{rel}）；"
                         "请在完成本地格式解析并接入 virtual worker 音频路由后再启用。"
+                    )
+                if path.suffix.lower() in IMAGE_EXTS:
+                    # legacy 路径没有 store 媒体出口：明确拒绝，绝不把图片送 MinerU 猜 OCR。
+                    raise ValueError(
+                        f"{IMAGE_ROUTE_UNSUPPORTED}: legacy 摄取路径不发布独立图片源（{rel}）；"
+                        "图片显式摄取需要 ingest.storage=virtual 的 store 媒体出口。"
                     )
                 st = path.stat()
                 if not self._check_file_size(st.st_size):
@@ -767,6 +788,15 @@ class IngestManager:
             )
             job["finished_at"] = time.time()
             return
+        if src.suffix.lower() in IMAGE_EXTS:
+            job["state"] = "failed"
+            job["error_code"] = IMAGE_ROUTE_UNSUPPORTED
+            job["error"] = (
+                f"{IMAGE_ROUTE_UNSUPPORTED}: legacy 摄取路径不发布独立图片源"
+                f"（{job['source']}）；请切换到 ingest.storage=virtual。"
+            )
+            job["finished_at"] = time.time()
+            return
         st = src.stat()
         if not self._check_file_size(st.st_size):
             limit = self._size_limit_bytes()
@@ -961,6 +991,8 @@ class VirtualIngestWorker:
         parse_budget: ParseBudget | None = None,
         audio_adapter: Any = None,
         chunker_fingerprint_provider: Callable[[], str] | None = None,
+        audio_config: Any = None,
+        audio_decoder: Any = None,
     ) -> None:
         self.vault_path = Path(vault_path).expanduser().resolve()
         self.config = config
@@ -969,6 +1001,13 @@ class VirtualIngestWorker:
         # 不是 native 库 RSS 硬保证，也不是跨进程统一限额。
         self.parse_budget = parse_budget or DEFAULT_PARSE_BUDGET
         self.audio_adapter = audio_adapter
+        # E09：独立 `AudioConfig`（`AppConfig.audio`）与显式解码组件。未注入时保留旧
+        # flat（`audio_segment_seconds` …）读取路径；注入后 `audio.*` 参数才真正生效。
+        self.audio_config = audio_config
+        self.audio_decoder = audio_decoder
+        # 显式提交的图片标题/说明（`kb_ingest submit` 的可选事实）。发布后该说明已写进
+        # occurrence/revision，是持久事实；进程重启发生在发布前则退回文件名（见 `_image_caption`）。
+        self._image_captions: dict[str, str] = {}
         # C99 接缝：队列 fingerprint 需纳入真实 chunker/profile 指纹。`IngestConfig`
         # 本身不含 chunking 段，故由上层（server/indexer）注入 provider；未注入时退回
         # 常量占位并在报告中记为待接线。
@@ -1029,11 +1068,35 @@ class VirtualIngestWorker:
     def mark_settling(self, rel: str) -> None:
         self._settling_files.add(Path(rel).as_posix())
 
+    # ------------------------------------------------------------ audio (E09)
+
+    def _audio_settings(self) -> Any:
+        """把独立 `AudioConfig` 与 ingest 字段合成 audio 读取视图（旧 flat 兼容）。"""
+        return audio_settings(self.config, self.audio_config)
+
+    def _audio_adapter(self) -> Any:
+        """声明了转录 adapter 就必须有可验证实现：不静默降级成 metadata_only。"""
+        declared = str(getattr(self.audio_config, "adapter", "")
+                       or getattr(self.config, "audio_adapter", "") or "").strip()
+        if declared and self.audio_adapter is None:
+            raise AudioUnsupported(
+                f"{AUDIO_ADAPTER_UNAVAILABLE}: audio.adapter={declared!r} 没有可注入的已核验实现"
+                "（请求/响应/幂等/额度合同缺失）；拒绝以 metadata_only 静默降级"
+            )
+        return self.audio_adapter
+
     def _assert_network_policy(self, source: str) -> None:
         path = _validate_safe_source(self.vault_path, source)
-        if path.suffix.lower() in AUDIO_EXTS:
-            from .audio import inspect_wav
-            inspect_wav(path, self.config)
+        suffix = path.suffix.lower()
+        if suffix in AUDIO_EXTS:
+            # 入队前就按**实际格式**分流：非 PCM 缺解码能力时明确拒绝，绝不先按 WAV 猜，
+            # 也绝不送 MinerU 文档通道冒音频支持。
+            self._audio_adapter()
+            inspect_audio(path, self._audio_settings(), decoder=self.audio_decoder)
+            return
+        if suffix in IMAGE_EXTS:
+            # 显式提交的图片源是本地输入适配，不触发云路由；准入在入队前完成。
+            validate_image_source(path, self._limits())
             return
         with self.parse_budget.reserve(min(self._limits().memory_budget_bytes, path.stat().st_size * 4), self._stop.is_set):
             decide_route(path, self.config, limits=self._limits())
@@ -1109,8 +1172,14 @@ class VirtualIngestWorker:
                 continue
         return pending
 
-    def submit(self, sources: list[str] | None = None, force: bool = False) -> dict:
-        """提交虚拟摄取任务（异步）。校验→入队（store）→ 起 worker。"""
+    def submit(self, sources: list[str] | None = None, force: bool = False,
+               caption: str = "") -> dict:
+        """提交虚拟摄取任务（异步）。校验→入队（store）→ 起 worker。
+
+        `caption`：**显式提交**图片源时的用户标题/说明（仅对 `IMAGE_EXTS` 生效；其他后缀
+        忽略）。发布后该说明写进 occurrence/revision，是持久事实；进程在发布前重启则退回
+        文件名（不猜内容，也不做 OCR/caption 推断）。
+        """
         if not self.config.enabled:
             raise ValueError(
                 "ingest disabled: PDF 摄取层默认关闭。请在 config/app.toml 设置 "
@@ -1151,8 +1220,11 @@ class VirtualIngestWorker:
                     raise ValueError(
                         f"file size {stat.st_size} bytes exceeds limit {limit} bytes: {rel}"
                     )
+                rel_posix = Path(rel).as_posix()
+                if caption and path.suffix.lower() in IMAGE_EXTS:
+                    self._image_captions[rel_posix] = str(caption).strip()
                 targets.append({
-                    "source": Path(rel).as_posix(),
+                    "source": rel_posix,
                     "sha256": _sha256(path),
                     "mtime": stat.st_mtime,
                     "size": stat.st_size,
@@ -1165,7 +1237,7 @@ class VirtualIngestWorker:
             job, is_new = store.enqueue_job(
                 source=target["source"],
                 source_sha256=target["sha256"],
-                parser_fingerprint=self._parser_fingerprint(),
+                parser_fingerprint=self._parser_fingerprint(target["source"]),
                 force=force,
             )
             created += 1 if is_new else 0
@@ -1217,7 +1289,7 @@ class VirtualIngestWorker:
             job, is_new = store.enqueue_job(
                 source=target["source"],
                 source_sha256=target["sha256"],
-                parser_fingerprint=self._parser_fingerprint(),
+                parser_fingerprint=self._parser_fingerprint(target["source"]),
             )
             if is_new:
                 created += 1
@@ -1322,13 +1394,17 @@ class VirtualIngestWorker:
         # 未注入时用显式占位，而不是空串：接入真实 chunker 指纹后自然区分代际。
         return value or "chunker-fingerprint-unwired"
 
-    def _parser_fingerprint(self) -> str:
+    def _parser_fingerprint(self, source: str = "") -> str:
         """入队时的 job 指纹（用于「同源同 SHA 同 parser/profile 合并」，§12.2）。
 
         通道在领取时才判定，故 `channel="auto"`。**必须**纳入 routing/network_policy
         与 chunker/profile 指纹：否则同内容不同 profile 会被 `enqueue_job` 误合并成
         同一 job。真正的解析事实指纹仍由 `parse_structured()`/`parse_local()` 产出并
         写进 `document_revisions.parser_fingerprint`（本函数不是它）。
+
+        E09：音频任务必须额外纳入**音频处理 profile**（分段/重叠/解码器/转录 adapter）。
+        只对音频源追加，文档源的指纹值保持不变——否则已入库文档会被判成「新 profile」
+        而在下次 submit 时重复入队（可能真实计费）。
         """
         from .mineru import ADAPTER_VERSION
 
@@ -1346,6 +1422,12 @@ class VirtualIngestWorker:
             "network=" + str(getattr(cfg, "network_policy", "configured")),
             "chunker=" + self._chunker_fingerprint(),
         ]
+        suffix = Path(source).suffix.lower() if source else ""
+        if suffix in AUDIO_EXTS:
+            parts.append("audio=" + audio_profile_fingerprint(
+                self._audio_settings(), adapter=self.audio_adapter, decoder=self.audio_decoder))
+        elif suffix in IMAGE_EXTS:
+            parts.append("image=image-source-v1")
         return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:32]
 
     # ------------------------------------------------------------- audio (C104)
@@ -1482,6 +1564,70 @@ class VirtualIngestWorker:
                                             name="ingest-virtual-worker")
             self._worker.start()
 
+    # ------------------------------------------------------ parse 编排 (E09)
+
+    def _parse_audio_job(self, store: Any, job: Any, owner: str, src: Path, sink: Any) -> Any:
+        """音频：resume 只补缺失片段，checkpoint 逐片段持久化（partial coverage 事实）。
+
+        真实 `AudioConfig`/解码组件沿 `_audio_settings()` 贯通到 `parse_audio`：不同分段/
+        重叠/解码 profile 会产生不同片段 SHA 与 parser 指纹，因此不会误复用旧片段或旧任务。
+        """
+        resume_state = self._audio_resume(store, job)
+        result = parse_audio(
+            src, self._audio_settings(), sink=sink, adapter=self._audio_adapter(),
+            cancelled=self._stop.is_set, resume=resume_state, decoder=self.audio_decoder,
+            checkpoint=lambda segment, transcript, media=None: self._audio_checkpoint(
+                store, job, owner, segment, transcript, media))
+        # 已确认片段的媒体必须重新挂回本次 revision（不重新 sink）。
+        if resume_state:
+            sink.items.extend(self._resumed_occurrences(resume_state, sink))
+        return result
+
+    def _parse_image_job(self, job: Any, src: Path, sink: Any) -> Any:
+        """显式提交的图片源：单项有界 occurrence + 只有用户事实的代理正文（不做 OCR）。"""
+        return parse_image(src, limits=self._limits(), sink=sink,
+                           title=self._image_captions.get(job.source, ""), ordinal=1)
+
+    def _parse_document_job(self, job: Any, src: Path, sink: Any, record: Any) -> Any:
+        """文档：E10 决定路由；本地质量复检失败时**最多一次**升级（不重定质量阈值）。"""
+        decision = decide_route(src, self.config, limits=self._limits())
+        if decision.route == "local":
+            try:
+                result = parse_local(src, limits=self._limits(),
+                                     max_pages=getattr(self.config, "local_max_pages", 300),
+                                     cancelled=self._stop.is_set)
+            except LocalUnsupported as exc:
+                upgraded = self._upgrade_after_local_failure(decision, exc)
+                if upgraded is None:
+                    raise
+                decision = upgraded
+                result = self._cloud_parse(job, src, sink, record)
+        else:
+            result = self._cloud_parse(job, src, sink, record)
+        result.capabilities["route_decision"] = decision.as_dict()
+        return result
+
+    def _cloud_parse(self, job: Any, src: Path, sink: Any, record: Any) -> Any:
+        return self._client_or_make().parse_structured(
+            src, poll_interval=float(getattr(self.config, "poll_interval", 3.0)),
+            poll_timeout=float(getattr(self.config, "poll_timeout", 600.0)),
+            sink=sink, intent_recorder=record, request_id=job.job_id)
+
+    #: 本地解析**质量复检**失败 → E10 允许升级的唯一理由标记。取消/预算/加密/依赖缺失
+    #: 不是质量理由：这些必须如实失败，不能被 cloud fallback 掩盖（也不重复上传）。
+    _LOCAL_QUALITY_MARKERS = ("local quality revalidation failed",)
+
+    def _upgrade_after_local_failure(self, decision: Any, exc: Exception) -> Any:
+        """消费 E10 `upgrade_route_once` 的「最多一次」升级；不允许时返回 None。"""
+        if not any(marker in str(exc) for marker in self._LOCAL_QUALITY_MARKERS):
+            return None
+        try:
+            return upgrade_route_once(decision, self.config,
+                                      quality_reasons=("empty_or_garbled",),
+                                      failed_pages=tuple(getattr(decision, "failed_pages", ()) or ()))
+        except LocalUnsupported:
+            return None
+
     def _loop(self) -> None:
         while not self._stop.is_set():
             store = self._store()
@@ -1529,29 +1675,13 @@ class VirtualIngestWorker:
                                checkpoint=str(payload.get("payload_hash") or ""))
 
         with self.parse_budget.reserve(self._limits().memory_budget_bytes, self._stop.is_set):
-            if src.suffix.lower() in AUDIO_EXTS:
-                # C104：resume 只补缺失片段；checkpoint 逐片段持久化（partial coverage 事实）。
-                resume_state = self._audio_resume(store, job)
-                result = parse_audio(
-                    src, self.config, sink=sink, adapter=self.audio_adapter,
-                    cancelled=self._stop.is_set, resume=resume_state,
-                    checkpoint=lambda segment, transcript, media=None: self._audio_checkpoint(
-                        store, job, owner, segment, transcript, media))
-                # 已确认片段的媒体必须重新挂回本次 revision（不重新 sink）。
-                if resume_state:
-                    sink.items.extend(self._resumed_occurrences(resume_state, sink))
+            suffix = src.suffix.lower()
+            if suffix in AUDIO_EXTS:
+                result = self._parse_audio_job(store, job, owner, src, sink)
+            elif suffix in IMAGE_EXTS:
+                result = self._parse_image_job(job, src, sink)
             else:
-                decision = decide_route(src, self.config, limits=self._limits())
-                if decision.route == "local":
-                    result = parse_local(src, limits=self._limits(),
-                                         max_pages=getattr(self.config, "local_max_pages", 300),
-                                         cancelled=self._stop.is_set)
-                else:
-                    result = self._client_or_make().parse_structured(
-                        src, poll_interval=float(getattr(self.config, "poll_interval", 3.0)),
-                        poll_timeout=float(getattr(self.config, "poll_timeout", 600.0)),
-                        sink=sink, intent_recorder=_record, request_id=job.job_id)
-                result.capabilities["route_decision"] = decision.as_dict()
+                result = self._parse_document_job(job, src, sink, _record)
         self._assert_network_policy(job.source)
         matcher = self._matcher()
         if matcher is not None and matcher.is_ignored(job.source)[0]:
@@ -1623,12 +1753,18 @@ def make_ingest_manager(
     parse_budget: ParseBudget | None = None,
     audio_adapter: Any = None,
     chunker_fingerprint_provider: Callable[[], str] | None = None,
+    audio_config: Any = None,
+    audio_decoder: Any = None,
 ) -> Any:
     """按 `ingest.storage` 选择摄取实现（唯一的路径分派点）。
 
     `virtual` 需要 store 可用（门禁在 `DocumentStore.open(write=True)` 与
     `layout.writable`）；拿不到 store 时**回落 legacy** 并保持可诊断，
     绝不「半虚拟」地写盘。
+
+    E09：`audio_config`/`audio_adapter`/`audio_decoder`/`chunker_fingerprint_provider`
+    只在 virtual 路径消费（legacy 路径不落 store，音频/图片明确拒绝）。legacy 分支不接
+    这几个参数也不静默丢弃——它本来就不具备音频/图片出口。
     """
     storage = str(getattr(config, "storage", "legacy") or "legacy")
     if storage == "virtual" and store_provider is not None:
@@ -1637,6 +1773,7 @@ def make_ingest_manager(
             on_job_finished=on_job_finished, ignore_provider=ignore_provider,
             parse_budget=parse_budget, audio_adapter=audio_adapter,
             chunker_fingerprint_provider=chunker_fingerprint_provider,
+            audio_config=audio_config, audio_decoder=audio_decoder,
         )
     return IngestManager(
         vault_path, config, on_job_finished=on_job_finished, ignore_provider=ignore_provider

@@ -343,12 +343,14 @@ def _tool_definitions() -> list[dict[str, Any]]:
         },
         {
             "name": "kb_ingest",
-            "description": "PDF/Office 文档摄取（默认关闭，需 [ingest] enabled=true）。action=submit：解析指定文档（sources 为库内相对路径列表；省略则扫描全库未解析/已变更文档），后台异步执行并立即返回任务列表；action=status：查进度（可带 job_id）；action=pending：只列待解析文档不启动；action=retry：对 failed/cancelled 的既有任务显式重试（结果未知的远端任务不会被重试）。虚拟存储（ingest.storage=virtual）下产物进文档库并由 kb_read 虚拟读取，legacy 下写入库内 .mortis-parsed/ 子目录；完成后都会自动进索引。",
+            "description": "PDF/Office 文档摄取（默认关闭，需 [ingest] enabled=true）；显式提交的独立图片源（PNG/JPEG/WebP，仅 virtual 存储）同样走这里。action=submit：解析指定文档（sources 为库内相对路径列表；省略则扫描全库未解析/已变更文档），后台异步执行并立即返回任务列表；action=status：查进度（可带 job_id）；action=pending：只列待解析文档不启动；action=retry：对 failed/cancelled 的既有任务显式重试（结果未知的远端任务不会被重试）。虚拟存储（ingest.storage=virtual）下产物进文档库并由 kb_read 虚拟读取，legacy 下写入库内 .mortis-parsed/ 子目录；完成后都会自动进索引。图片只按用户显式提交摄取，不做 OCR/自动 caption，也不会因此开启后台全库图片扫描。",
             "inputSchema": {"type": "object", "required": ["action"], "properties": {
                 "action": {"type": "string", "enum": ["submit", "status", "pending", "retry"],
                            "description": "submit=启动解析（异步）；status=查进度；pending=只列待解析；retry=重试失败/已取消的既有任务"},
                 "sources": {"type": "array", "items": {"type": "string"},
                             "description": "可选，库内相对路径列表（如 ['教材/数电.pdf']）；仅 submit 有效，省略=扫描全库待解析"},
+                "caption": {"type": "string",
+                            "description": "可选，仅显式提交图片时生效：用户给出的标题/说明，写入图片 occurrence 与其代理正文；不做 OCR/自动 caption"},
                 "job_id": {"type": "string", "description": "可选，status 查单个任务；retry 必填（要重试的任务 id）"},
                 "vault_path": {"type": "string", "description": "可选，已注册知识库的绝对路径；仅注册了一个库时可省略"},
             }},
@@ -870,6 +872,31 @@ class VaultMcpServer:
         entry = self.registry.set_description(path, desc)
         return {"path": entry.path, "name": entry.name, "description": entry.description}
 
+    def _transcription_adapter(self) -> Any:
+        """转录 adapter 装配点（E09）。
+
+        服务合同（请求/响应/幂等/额度）未提供时不编造实现：返回 None，由 worker 在
+        入队/执行前给出**可见**的 `AUDIO_ADAPTER_UNAVAILABLE`，而不是静默降级成
+        metadata_only。合同到达后只在这里接唯一实现。
+        """
+        from .ingest.transcription import (
+            TranscriptionContractUnverified,
+            create_transcription_adapter,
+        )
+        try:
+            return create_transcription_adapter(self.config.audio)
+        except TranscriptionContractUnverified:
+            return None
+
+    def _audio_decoder(self) -> Any:
+        """显式解码组件装配点（E09）。
+
+        本仓库不内置解码器、不隐式 shell 调 ffmpeg、不联网安装：非 PCM（MP3/M4A/FLAC）
+        在注入受验证组件之前由 `inspect_audio` 在入队前明确报 blocked。这里就是后续接入
+        的**唯一**位置（显式配置 + 显式注入）。
+        """
+        return None
+
     def _ingest_manager_for(self, vault_path: str) -> IngestManager:
         key = str(Path(vault_path).resolve())
         manager = self._ingest_managers.get(key)
@@ -909,12 +936,29 @@ class VaultMcpServer:
                             )
                         return idx.document_store(write=True)
 
+                    def _chunker_fingerprint_provider() -> str:
+                        # C99/E09：队列指纹必须纳入**真实** chunker/profile 指纹。
+                        # indexer 未就绪时返回空串，由 worker 记为未接线占位。
+                        idx = self._indexers.get(key)
+                        if idx is None:
+                            return ""
+                        try:
+                            return str(idx._chunker_fingerprint())
+                        except Exception:
+                            return ""
+
                     manager = make_ingest_manager(
                         vault_path,
                         self.config.ingest,
                         store_provider=_store_provider,
                         on_job_finished=_on_job_finished,
                         ignore_provider=_ignore_provider,
+                        # E09：独立 AudioConfig + 转录 adapter/解码组件 + 真实 chunker 指纹
+                        # 沿 server → factory → worker → audio 贯通（旧 flat 调用仍兼容）。
+                        audio_config=self.config.audio,
+                        audio_adapter=self._transcription_adapter(),
+                        audio_decoder=self._audio_decoder(),
+                        chunker_fingerprint_provider=_chunker_fingerprint_provider,
                     )
                     self._ingest_managers[key] = manager
         return manager
@@ -946,7 +990,8 @@ class VaultMcpServer:
                 res["warning"] = "ingest.auto_watch=true 但 enabled=false，自动摄取未生效"
             return res
         force = bool(arguments.get("force", False))
-        result = manager.submit(arguments.get("sources") or None, force=force)
+        result = manager.submit(arguments.get("sources") or None, force=force,
+                               caption=str(arguments.get("caption", "") or ""))
         result["hint"] = (
             "解析在后台进行，用 kb_ingest(action='status') 查进度；"
             "done 的文档在 ingest.storage=virtual 时进入文档库（kb_read 走虚拟读取），"

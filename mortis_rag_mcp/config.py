@@ -174,9 +174,12 @@ class AudioConfig:
     max_sample_rate: int = 48000
     max_input_mb: int = 20
     max_segment_mb: int = 8
+    #: 帧数上限（48000Hz 单声道约 1 小时）。此前只存在于不存在的 flat `audio_max_frames`，
+    #: 因此 `[audio]` 里配不了；E09 起由 AudioConfig 真正承载并被 `inspect_audio` 消费。
+    max_frames: int = 172800000
 
     def __post_init__(self) -> None:
-        _positive_fields(self, "audio", ("max_duration_seconds", "segment_seconds", "max_segments", "max_channels", "max_sample_rate", "max_input_mb", "max_segment_mb"))
+        _positive_fields(self, "audio", ("max_duration_seconds", "segment_seconds", "max_segments", "max_channels", "max_sample_rate", "max_input_mb", "max_segment_mb", "max_frames"))
         if isinstance(self.overlap_seconds, bool) or not isinstance(self.overlap_seconds, int) or not 0 <= self.overlap_seconds < self.segment_seconds:
             raise ValueError("audio requires 0 <= overlap_seconds < segment_seconds")
         if isinstance(self.transcription_timeout, bool) or not isinstance(self.transcription_timeout, (int, float)) or not math.isfinite(self.transcription_timeout) or not 0 < self.transcription_timeout <= 300:
@@ -805,7 +808,7 @@ def _load_audio(data: Mapping[str, Any]) -> AudioConfig:
     for name, default, minimum in (
         ("max_duration_seconds", 3600, 1), ("segment_seconds", 30, 1), ("overlap_seconds", 5, 0),
         ("max_segments", 1000, 1), ("max_channels", 2, 1), ("max_sample_rate", 48000, 1),
-        ("max_input_mb", 20, 1), ("max_segment_mb", 8, 1),
+        ("max_input_mb", 20, 1), ("max_segment_mb", 8, 1), ("max_frames", 172800000, 1),
     ):
         kwargs[name] = _numeric(section, {}, name, int, default, minimum)
     return AudioConfig(**kwargs)
