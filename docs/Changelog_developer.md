@@ -1276,3 +1276,7 @@ Codex（本地施工；模型底模未由系统明确标注）。开工 `e35ec03
 - E20-C：doctor 仅对现有 provider 谓词已证明 loopback 且无 key 的 local_free 显式动作豁免 cache=false；付费/带 key 对照仍拒绝且零请求。
 - 隔离证据 `.runtime/beta2/E20/ops/`：正确红回归 9 failed/3 passed；修后 13 passed；registry 20、doctor 35、lane-config 30、missing-env 1、management 9、path-migration 10 passed，均 exit0。初次 fixture 导入名错误及不存在的 test_config.py exit4 原始日志保留，不作缺陷证据。
 - 本批不联网、不安装、不操作真实库/用户配置；后续媒体、摄取、存储和测试施工由主流程继续整合。
+
+### E20 F05/F06 媒体连接与认证收敛
+
+Codex 主流程整合；施工子代理 gpt-6.1-sol/high。resolved media connection 统一 adapter/endpoint/model/dimension 与认证解析；transport/profile/journal 共享真实媒体身份，凭据不纳入 fingerprint，保持既有显式 media key、通用 key、专用 env 与新旧通用 env 优先级。三个 adapter env-only 回归、单字段身份变化及重启缓存对照落地。红回归 15 failed/5 passed，绿回归 20 passed；既有 transport/profile 靶向保留。证据 .runtime/beta2/E20/media/；全部离线 HTTP 边界，不声明真实端点通过。

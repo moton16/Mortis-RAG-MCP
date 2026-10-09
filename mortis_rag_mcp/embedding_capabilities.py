@@ -4,10 +4,11 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 from string import Formatter
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from struct import pack, unpack
-from types import MappingProxyType
+from types import MappingProxyType, SimpleNamespace
 from typing import Any, Iterable
 from urllib.parse import urlsplit, urlunsplit
 
@@ -170,14 +171,63 @@ def resolve_embedding_profile(config: Any) -> ResolvedEmbeddingProfile:
     )
 
 
-def resolve_media_profile(config: Any) -> ResolvedEmbeddingProfile:
+@dataclass(frozen=True, slots=True)
+class ResolvedMediaConnection:
+    """Media wire and profile share one connection; credentials are not identity."""
+    adapter: str
+    endpoint: str
+    model: str
+    dimension: int
+    send_dimensions: bool
+    api_key: str = field(repr=False, compare=False)
+
+
+def resolve_media_connection(config: Any) -> ResolvedMediaConnection:
+    adapter = str(getattr(config, "media_adapter", "") or getattr(config, "media_provider", "")
+                  or getattr(config, "adapter", "") or "").strip().lower()
+    if adapter in {"siliconflow_vl", "openai_multimodal", "vl_multimodal", "media_http"}:
+        adapter = "openai_vl"
+    elif adapter in {"gemini_multimodal", "gemini_embedding", "google_gemini", "gemini-embedding-2"}:
+        adapter = "gemini"
+    elif adapter in {"embeddinggemma", "embeddinggemma_2", "embedding-gemma"}:
+        adapter = "embeddinggemma2"
+    model = getattr(config, "media_model", "") or config.model
+    if not model and adapter in {"gemini", "embeddinggemma2"}:
+        model = "gemini-embedding-2"
+    dimension = getattr(config, "media_dimension", None)
+    if dimension is None:
+        dimension = config.dimension
+    key = getattr(config, "media_api_key", "") or getattr(config, "api_key", "")
+    if not key:
+        key = os.environ.get(getattr(config, "media_api_key_env", ""), "")
+    if not key:
+        from .config import resolve_api_key
+        key = resolve_api_key()
+    return ResolvedMediaConnection(
+        adapter, normalize_endpoint(getattr(config, "media_endpoint", "") or config.endpoint),
+        model, dimension, bool(config.send_dimensions), key)
+
+
+def resolve_media_profile(config: Any, *,
+                          connection: ResolvedMediaConnection | None = None) -> ResolvedEmbeddingProfile:
     """装配原生媒体 profile（E07）：只消费**显式**声明，绝不按模型名/维度推断。
 
     缺任一必需声明（modality / alignment_space_id / media preprocess_version /
     media endpoint_revision）即拒绝——调用方据此判定「该 route 不可用」，不得
     用文本成功、同维向量或模型名冒充媒体能力/对齐。
     """
-    base = resolve_embedding_profile(config)
+    # Text and media fixed-model contracts are independent.
+    resolve_embedding_profile(config)
+    connection = connection or resolve_media_connection(config)
+    media_config = SimpleNamespace(
+        mode=config.mode, adapter=connection.adapter, endpoint=connection.endpoint,
+        model=connection.model, dimension=connection.dimension, send_dimensions=connection.send_dimensions,
+        capability_profile="", client_slicing=getattr(config, "client_slicing", False),
+        query_template=getattr(config, "query_template", "{text}"),
+        document_template=getattr(config, "document_template", "{text}"),
+        model_revision=getattr(config, "model_revision", ""),
+    )
+    base = resolve_embedding_profile(media_config)
     declared = tuple(getattr(config, "media_modalities", ()) or ())
     modalities = validate_media_modalities(("text", *declared))
     if not any(item in MEDIA_MODALITIES for item in modalities):

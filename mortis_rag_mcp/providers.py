@@ -292,15 +292,16 @@ def create_media_provider(config: EmbeddingConfig, *, transport: Any = None) -> 
     - 声明不完整（modality / alignment_space_id / media preprocess / endpoint revision /
       MIME / 限额 / 证据引用）→ 抛 `ProviderError`：明确「该 route 不可用」，绝不用
       文本成功、同维向量或模型名冒充，也绝不自动试端点。
-    - `transport` 必须由调用方显式注入；真实 HTTP 边界（Q09 合同）缺失时该能力同样不可用。
+    - 已声明 adapter 使用合同 transport；注入的 transport 也使用同一 resolved 身份。
     """
     declared = tuple(getattr(config, "media_modalities", ()) or ())
     if not declared:
         return None
-    from .embedding_capabilities import EmbeddingContractError, resolve_media_profile
+    from .embedding_capabilities import EmbeddingContractError, resolve_media_connection, resolve_media_profile
     from .media_providers import NativeMediaEvidence, NativeMediaProvider
     try:
-        profile = resolve_media_profile(config)
+        connection = resolve_media_connection(config)
+        profile = resolve_media_profile(config, connection=connection)
     except EmbeddingContractError as exc:
         raise ProviderError(f"native media capability unavailable: {exc}") from exc
     mime = tuple(getattr(config, "media_allowed_mime_types", ()) or ())
@@ -316,41 +317,16 @@ def create_media_provider(config: EmbeddingConfig, *, transport: Any = None) -> 
     if not all(references):
         raise ProviderError("native media capability unavailable: endpoint evidence references are incomplete")
     if transport is None:
-        adapter_name = str(
-            getattr(config, "media_adapter", "")
-            or getattr(config, "media_provider", "")
-            or getattr(config, "adapter", "")
-            or ""
-        ).strip().lower()
-        if adapter_name in {"openai_vl", "siliconflow_vl", "openai_multimodal", "vl_multimodal", "media_http"}:
+        adapter_name = connection.adapter
+        if adapter_name == "openai_vl":
             from .media_providers import HttpMediaTransport
-            dim = getattr(config, "media_dimension", None) or getattr(config, "dimension", None)
-            send_dim = bool(getattr(config, "send_dimensions", False))
-            media_ep = getattr(config, "media_endpoint", "") or config.endpoint
-            media_mod = getattr(config, "media_model", "") or config.model
-            media_key = getattr(config, "media_api_key", "") or getattr(config, "api_key", "")
-            if not media_key and getattr(config, "media_api_key_env", ""):
-                media_key = os.environ.get(config.media_api_key_env, "")
-            transport = HttpMediaTransport(
-                endpoint=media_ep,
-                model=media_mod,
-                api_key=media_key,
-                timeout=getattr(config, "timeout", 30.0),
-                dimension=dim,
-                send_dimensions=send_dim,
-                allowed_mime_types=mime,
-                max_input_bytes=max_bytes,
-                max_batch_size=max_batch,
-            )
-        elif adapter_name in {
-            "gemini",
-            "gemini_multimodal",
-            "gemini_embedding",
-            "google_gemini",
-            "gemini-embedding-2",
-        }:
-            ep = str(getattr(config, "media_endpoint", "") or getattr(config, "endpoint", "") or "").lower()
-            if any(h in ep for h in ("127.0.0.1", "localhost", "::1")):
+            transport_type = HttpMediaTransport
+        elif adapter_name in {"gemini", "embeddinggemma2"}:
+            ep = connection.endpoint.lower()
+            local = any(h in ep for h in ("127.0.0.1", "localhost", "::1"))
+            gemma_unverified = (adapter_name == "embeddinggemma2"
+                               and not any(dom in ep for dom in ("googleapis.com", "google", "aiplatform", "gemini")))
+            if local or gemma_unverified:
                 raise ProviderError(
                     "native media capability unavailable: local inference server (e.g. llama.cpp / Ollama) "
                     "lacks a verified HTTP REST audio embedding schema on /v1/embeddings. "
@@ -359,55 +335,14 @@ def create_media_provider(config: EmbeddingConfig, *, transport: Any = None) -> 
                     "with adapter='gemini'."
                 )
             from .media_providers import GeminiMediaTransport
-            dim = getattr(config, "media_dimension", None) or getattr(config, "dimension", None)
-            send_dim = bool(getattr(config, "send_dimensions", False))
-            media_ep = getattr(config, "media_endpoint", "") or config.endpoint
-            media_mod = getattr(config, "media_model", "") or config.model
-            media_key = getattr(config, "media_api_key", "") or getattr(config, "api_key", "")
-            if not media_key and getattr(config, "media_api_key_env", ""):
-                media_key = os.environ.get(config.media_api_key_env, "")
-            transport = GeminiMediaTransport(
-                endpoint=media_ep,
-                model=media_mod,
-                api_key=media_key,
-                timeout=getattr(config, "timeout", 30.0),
-                dimension=dim,
-                send_dimensions=send_dim,
-                allowed_mime_types=mime,
-                max_input_bytes=max_bytes,
-                max_batch_size=max_batch,
-            )
-        elif adapter_name in {"embeddinggemma", "embeddinggemma2", "embeddinggemma_2", "embedding-gemma"}:
-            ep = str(getattr(config, "media_endpoint", "") or getattr(config, "endpoint", "") or "").lower()
-            if any(h in ep for h in ("127.0.0.1", "localhost", "::1")) or not any(dom in ep for dom in ("googleapis.com", "google", "aiplatform", "gemini")):
-                raise ProviderError(
-                    "native media capability unavailable: local inference server (e.g. llama.cpp / Ollama) "
-                    "lacks a verified HTTP REST audio embedding schema on /v1/embeddings. "
-                    "For local EmbeddingGemma 2, run in-process via sentence-transformers/LiteRT; "
-                    "for HTTP REST audio embeddings, route to Google Gemini cloud service 'gemini-embedding-2' "
-                    "with adapter='gemini'."
-                )
-            from .media_providers import GeminiMediaTransport
-            dim = getattr(config, "media_dimension", None) or getattr(config, "dimension", None)
-            send_dim = bool(getattr(config, "send_dimensions", False))
-            media_ep = getattr(config, "media_endpoint", "") or config.endpoint
-            media_mod = getattr(config, "media_model", "") or config.model or "gemini-embedding-2"
-            media_key = getattr(config, "media_api_key", "") or getattr(config, "api_key", "")
-            if not media_key and getattr(config, "media_api_key_env", ""):
-                media_key = os.environ.get(config.media_api_key_env, "")
-            transport = GeminiMediaTransport(
-                endpoint=media_ep,
-                model=media_mod,
-                api_key=media_key,
-                timeout=getattr(config, "timeout", 30.0),
-                dimension=dim,
-                send_dimensions=send_dim,
-                allowed_mime_types=mime,
-                max_input_bytes=max_bytes,
-                max_batch_size=max_batch,
-            )
+            transport_type = GeminiMediaTransport
         else:
             raise ProviderError("native media capability unavailable: no declared transport (Q09 protocol missing)")
+        transport = transport_type(
+            endpoint=profile.endpoint, model=profile.model, api_key=connection.api_key,
+            timeout=getattr(config, "timeout", 30.0), dimension=profile.effective_dim,
+            send_dimensions=profile.request_dim is not None, allowed_mime_types=mime,
+            max_input_bytes=max_bytes, max_batch_size=max_batch)
 
     evidence = NativeMediaEvidence(
         references[0], references[1], references[2], references[3],
