@@ -1154,7 +1154,7 @@ class VaultMcpServer:
 
     def _kb_list_files(self, arguments: dict[str, Any]) -> dict[str, Any]:
         indexer = self._indexer_for(arguments)
-        indexer.request_refresh()
+        indexer.request_refresh(for_read=True)
         r_status = indexer.refresh_status()
         files = indexer.list_files()
         # path_prefix 与 kb_search 同口径（共用 path_prefix_match），空值不过滤；
@@ -1754,7 +1754,7 @@ class VaultMcpServer:
 
     def _kb_stats(self, arguments: dict[str, Any]) -> dict[str, Any]:
         indexer = self._indexer_for(arguments)
-        indexer.request_refresh()
+        indexer.request_refresh(for_read=True)
         r_status = indexer.refresh_status()
         stats = indexer.stats()
         # E04-b：与检索/导入同一口径的 additive 索引状态（ready 不激活隔离事实）。

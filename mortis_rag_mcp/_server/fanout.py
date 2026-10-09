@@ -335,7 +335,7 @@ def fanout_search(
     for entry in entries:
         try:
             indexer = server._indexer_for({"vault_path": entry.path})
-            indexer.request_refresh()
+            indexer.request_refresh(for_read=True)
             r_status = indexer.refresh_status()
             is_cold = (
                 indexer.last_sync is None

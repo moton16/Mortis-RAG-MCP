@@ -96,7 +96,7 @@ def _search_single_vault(
                 preview=preview,
             )
         return res_empty
-    indexer.request_refresh()
+    indexer.request_refresh(for_read=True)
     r_status = indexer.refresh_status()
     is_cold = (
         indexer.last_sync is None

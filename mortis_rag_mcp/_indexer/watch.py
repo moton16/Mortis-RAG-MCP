@@ -100,7 +100,7 @@ def start_watching(
 
 
 def request_refresh(owner: MarkdownIndexer, *, immediate: bool = False,
-                    start_scheduler: bool = True) -> bool:
+                    start_scheduler: bool = True, for_read: bool = False) -> bool:
     """登记一次刷新请求；返回 True 即**确实**保留了 pending（E04-a）。
 
     `start_scheduler=False` 只登记标志、不拉起调度线程：导入等已持有 mutation
@@ -114,6 +114,15 @@ def request_refresh(owner: MarkdownIndexer, *, immediate: bool = False,
         _start_fs_scheduler(owner)
     with owner._fs_debounce_lock:
         now = time.monotonic()
+        # 查询只是机会性刷新：刚完成的索引无需因每次轮询再排一轮。
+        # 文件事件/import/显式请求不走此分支，接受仍等于真实保留 pending。
+        if (for_read and not immediate and not owner._fs_requested
+                and not getattr(owner, "_indexing", False)
+                and getattr(owner, "_sync_state", "idle") == "idle"
+                and not getattr(owner, "_refresh_error", None)
+                and owner.last_sync is not None
+                and time.time() - owner.last_sync < owner._READ_REFRESH_MIN_INTERVAL_SECONDS):
+            return False
         owner._refresh_requested_at = now
         if immediate:
             owner._fs_refresh_immediate = True

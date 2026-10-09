@@ -1677,8 +1677,8 @@ class MarkdownIndexer:
     def stop_watching(self) -> None:
         return _watch.stop_watching(self)
 
-    def request_refresh(self, *, immediate: bool = False) -> bool:
-        return _watch.request_refresh(self, immediate=immediate)
+    def request_refresh(self, *, immediate: bool = False, for_read: bool = False) -> bool:
+        return _watch.request_refresh(self, immediate=immediate, for_read=for_read)
 
     def refresh_status(self) -> dict[str, Any]:
         return _watch.refresh_status(self)

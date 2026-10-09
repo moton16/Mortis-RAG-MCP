@@ -59,6 +59,18 @@ def test_stopped_or_missing_vault_does_not_fake_acceptance(tmp_path: Path):
         indexer.stop_watching()
 
 
+def test_recent_read_is_ready_but_explicit_change_still_schedules(tmp_path):
+    indexer = _indexer(tmp_path, "read")
+    try:
+        indexer.sync()
+        assert watch.request_refresh(indexer, for_read=True, start_scheduler=False) is False
+        assert indexer.index_state()["index_state"] == "ready"
+        assert watch.request_refresh(indexer, start_scheduler=False) is True
+        assert indexer.refresh_status()["refresh_pending"] is True
+    finally:
+        indexer.stop_watching()
+
+
 def test_request_arriving_during_sync_schedules_another_round(tmp_path: Path):
     """调度器清 flag 后进入 sync；sync 期间的新请求必须安排下一轮（Event，不 sleep 猜时序）。"""
     indexer = _indexer(tmp_path, "C")
