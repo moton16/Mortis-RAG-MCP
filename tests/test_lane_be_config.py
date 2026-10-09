@@ -66,6 +66,8 @@ def test_legacy_alias_conflict(tmp_path):
     '[audio]\nsegment_seconds = 0', '[audio]\noverlap_seconds = 30',
     '[audio]\ntranscription_timeout = nan', '[audio]\nmax_input_mb = true',
     '[audio]\ntranscription_api_key_env = "not a variable"',
+    '[embedding]\nmedia_adapter = 123',
+    '[embedding]\nmedia_dimension = 0',
 ])
 def test_invalid_config_is_rejected(tmp_path, text):
     with pytest.raises(ValueError):
@@ -107,5 +109,42 @@ def test_doctor_new_fields_are_read_only(tmp_path, monkeypatch):
     assert result["ok"]
     assert "not probed" in result["detail"]
     assert "chunking=" in result["detail"]
+    assert "media_provider=" in result["detail"]
     assert returned is cfg
     assert asdict(cfg) == before
+
+
+def test_media_provider_config_keys_and_validation(tmp_path, monkeypatch):
+    from mortis_rag_mcp import doctor
+    text = (
+        '[embedding]\n'
+        'media_adapter = "gemini"\n'
+        'media_endpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-2:batchEmbedContents"\n'
+        'media_model = "gemini-embedding-2"\n'
+        'media_dimension = 768\n'
+        'media_api_key_env = "GEMINI_API_KEY"\n'
+    )
+    cfg = load_text(tmp_path, text)
+    assert cfg.embedding.media_adapter == "gemini"
+    assert cfg.embedding.media_endpoint == "https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-2:batchEmbedContents"
+    assert cfg.embedding.media_model == "gemini-embedding-2"
+    assert cfg.embedding.media_dimension == 768
+    assert cfg.embedding.media_api_key_env == "GEMINI_API_KEY"
+
+    # Also verify media_provider alias works
+    text_alias = (
+        '[embedding]\n'
+        'media_provider = "siliconflow_vl"\n'
+        'media_endpoint = "https://api.siliconflow.cn/v1/embeddings"\n'
+    )
+    cfg_alias = load_text(tmp_path, text_alias)
+    assert cfg_alias.embedding.media_adapter == "siliconflow_vl"
+
+    # Verify doctor check_config shows media_provider details
+    monkeypatch.setattr(config, "resolve_config_path", lambda _: None)
+    monkeypatch.setattr(config, "load_config", lambda _: cfg)
+    res, _ = doctor.check_config(None)
+    assert "media_provider=" in res["detail"]
+    assert "gemini" in res["detail"]
+    assert "dim=768" in res["detail"]
+    assert "GEMINI_API_KEY" in res["detail"]

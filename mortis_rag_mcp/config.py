@@ -67,6 +67,13 @@ class EmbeddingConfig:
     media_endpoint_fixture_reference: str = ""
     media_alignment_reference: str = ""
     media_license_reference: str = ""
+    # ---- Media provider connection keys (E16)
+    media_adapter: str = ""
+    media_endpoint: str = ""
+    media_model: str = ""
+    media_dimension: int | None = None
+    media_api_key_env: str = ""
+    media_api_key: str = ""
 
     def __post_init__(self) -> None:
         from .embedding_capabilities import validate_media_modalities, validate_text_template
@@ -75,9 +82,14 @@ class EmbeddingConfig:
         for name in ("model_revision", "endpoint_revision", "preprocess_version",
                      "media_alignment_space_id", "media_preprocess_version", "media_endpoint_revision",
                      "media_model_reference", "media_endpoint_fixture_reference",
-                     "media_alignment_reference", "media_license_reference"):
+                     "media_alignment_reference", "media_license_reference",
+                     "media_adapter", "media_endpoint", "media_model",
+                     "media_api_key_env", "media_api_key"):
             if not isinstance(getattr(self, name), str):
                 raise ValueError(f"embedding.{name} must be a string")
+        if self.media_dimension is not None:
+            if isinstance(self.media_dimension, bool) or not isinstance(self.media_dimension, int) or self.media_dimension < 1:
+                raise ValueError("embedding.media_dimension must be an integer >= 1 or None")
         for name in ("media_modalities", "media_allowed_mime_types"):
             value = getattr(self, name)
             if isinstance(value, str) or not isinstance(value, tuple):
@@ -856,6 +868,12 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
         media_endpoint_fixture_reference=_string(embedding, "media_endpoint_fixture_reference"),
         media_alignment_reference=_string(embedding, "media_alignment_reference"),
         media_license_reference=_string(embedding, "media_license_reference"),
+        media_adapter=_string(embedding, "media_adapter") if "media_adapter" in embedding else _string(embedding, "media_provider"),
+        media_endpoint=str(_env(embedding.get("media_endpoint", ""))),
+        media_model=str(_env(embedding.get("media_model", ""))),
+        media_dimension=_numeric(embedding, data, "media_dimension", int, 0, 1) if ("media_dimension" in embedding and embedding["media_dimension"] is not None) else None,
+        media_api_key_env=_string(embedding, "media_api_key_env"),
+        media_api_key=resolve_api_key(str(_env(embedding.get("media_api_key", "")))),
     )
     rer = RerankerConfig(
         enabled=bool(reranker.get("enabled", False)),

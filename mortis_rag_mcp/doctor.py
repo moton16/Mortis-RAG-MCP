@@ -489,6 +489,16 @@ def check_config(app_config: str | None) -> tuple[dict, object | None]:
         media = getattr(cfg, "media", None)
         detail += f"，media.inline_max_bytes={getattr(media, 'inline_max_bytes', 8388608)}"
         detail += f"，media.refs_limit={getattr(media, 'refs_limit', 20)}"
+        media_adapter = str(getattr(emb, "media_adapter", "") or getattr(emb, "media_provider", "") or "")
+        if media_adapter:
+            media_ep = str(getattr(emb, "media_endpoint", "") or "default")
+            media_mod = str(getattr(emb, "media_model", "") or "default")
+            media_dim = getattr(emb, "media_dimension", None)
+            media_dim_str = str(media_dim) if media_dim is not None else "auto"
+            media_key_env = str(getattr(emb, "media_api_key_env", "") or "none")
+            detail += f"，media_provider={_sanitize_free_text(media_adapter)}(endpoint={_sanitize_free_text(media_ep)}, model={_sanitize_free_text(media_mod)}, dim={media_dim_str}, key_env={_sanitize_free_text(media_key_env)})"
+        else:
+            detail += "，media_provider=none"
 
         # 两侧同名配置同时存在：resolve_config_path 新名优先，旧侧那份被静默忽略。
         # 用户继续编辑旧侧的 config.toml 时看不到任何反馈，这里显式点出来。
