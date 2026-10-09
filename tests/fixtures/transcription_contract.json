@@ -1,0 +1,85 @@
+{
+  "contract_name": "audio_transcription_v1",
+  "provider": "openai_compatible_transcription",
+  "sample_endpoint": "https://api.openai.com/v1/audio/transcriptions",
+  "auth_header": "Authorization: Bearer <REDACTED_API_KEY>",
+  "content_type": "multipart/form-data; boundary=<BOUNDARY>",
+  "supported_formats": ["audio/wav", "audio/mp3", "audio/m4a", "audio/flac"],
+  "field_mapping": {
+    "request": {
+      "file": "binary audio payload with filename (e.g. segment-1.wav)",
+      "model": "model identifier (e.g. whisper-1)",
+      "response_format": "json | verbose_json",
+      "language": "optional ISO-639-1 code (e.g. zh, en)",
+      "temperature": "optional float in [0.0, 1.0]"
+    },
+    "response": {
+      "text": "transcription full text",
+      "segments": "array of segment objects: [{start: float (seconds), end: float (seconds), text: str}] in verbose_json"
+    }
+  },
+  "sample_request_form_fields": {
+    "model": "whisper-1",
+    "response_format": "verbose_json",
+    "file_filename": "segment-1.wav",
+    "file_content_type": "audio/wav"
+  },
+  "sample_response_json": {
+    "text": "Hello world, this is a transcribed segment."
+  },
+  "sample_response_verbose_json": {
+    "task": "transcribe",
+    "language": "english",
+    "duration": 2.5,
+    "text": "Hello world, this is a transcribed segment.",
+    "segments": [
+      {
+        "id": 0,
+        "seek": 0,
+        "start": 0.0,
+        "end": 2.5,
+        "text": "Hello world, this is a transcribed segment.",
+        "tokens": [50364, 2425, 1002, 11, 341, 374, 264, 49540, 7772, 13, 50489],
+        "temperature": 0.0,
+        "avg_logprob": -0.15,
+        "compression_ratio": 1.1,
+        "no_speech_prob": 0.005
+      }
+    ]
+  },
+  "error_samples": {
+    "rate_limited_429": {
+      "http_status": 429,
+      "headers": {
+        "Retry-After": "5"
+      },
+      "body": {
+        "error": {
+          "message": "Rate limit reached for model whisper-1",
+          "type": "requests",
+          "code": "rate_limit_exceeded"
+        }
+      }
+    },
+    "quota_exceeded_429": {
+      "http_status": 429,
+      "body": {
+        "error": {
+          "message": "You exceeded your current quota, please check your plan and billing details.",
+          "type": "insufficient_quota",
+          "code": "insufficient_quota"
+        }
+      }
+    },
+    "invalid_request_400": {
+      "http_status": 400,
+      "body": {
+        "error": {
+          "message": "Invalid file format",
+          "type": "invalid_request_error",
+          "code": "invalid_audio"
+        }
+      }
+    }
+  }
+}

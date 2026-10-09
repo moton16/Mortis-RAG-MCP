@@ -1,13 +1,18 @@
 """Evidence-gated native media adapter framework, with no built-in endpoint."""
 from __future__ import annotations
 
+import base64
 import hashlib
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol, Sequence
+from urllib.request import Request, urlopen
 
 from .embedding_capabilities import ResolvedEmbeddingProfile, validate_profile, validate_vector
 from .providers import ProviderError
+
+
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,6 +43,94 @@ class NativeMediaEvidence:
 
 class MediaTransport(Protocol):
     def __call__(self, inputs: Sequence[EmbeddingInput]) -> Sequence[dict[str, Any]]: ...
+
+
+class HttpMediaTransport:
+    """真实 HTTP 媒体 embeddings transport（E15）。
+
+    遵循 OpenAI-compatible / VL 多模态 Embeddings 协议（如 SiliconFlow / Jina CLIP）。
+    - 仅支持图像模态（image/png, image/jpeg, image/webp）；音频模态无依据直接拒绝；
+    - 请求体使用 base64 data URI 数组；
+    - 响应提取 data[].index / data[].embedding；
+    - 网络或 HTTP 错误抛出异常，由上层 NativeMediaProvider.embed_media 捕获并落 journal mark_unknown。
+    """
+
+    def __init__(
+        self,
+        endpoint: str,
+        model: str = "",
+        api_key: str = "",
+        timeout: float = 30.0,
+        *,
+        dimension: int | None = None,
+        send_dimensions: bool = False,
+        allowed_mime_types: tuple[str, ...] = ("image/png", "image/jpeg", "image/webp"),
+        max_input_bytes: int = 10 * 1024 * 1024,
+        max_batch_size: int = 16,
+    ) -> None:
+        if not endpoint:
+            raise ValueError("media transport endpoint is required")
+        self.endpoint = endpoint
+        self.model = model
+        self.api_key = api_key
+        self.timeout = timeout
+        self.dimension = dimension
+        self.send_dimensions = send_dimensions
+        self.allowed_mime_types = tuple(allowed_mime_types)
+        self.max_input_bytes = max_input_bytes
+        self.max_batch_size = max_batch_size
+
+    def __call__(self, inputs: Sequence[EmbeddingInput]) -> Sequence[dict[str, Any]]:
+        items = list(inputs)
+        if not items:
+            return []
+        if len(items) > self.max_batch_size:
+            raise ProviderError(f"media batch size {len(items)} exceeds limit {self.max_batch_size}")
+        input_payloads: list[dict[str, Any]] = []
+        for item in items:
+            if item.modality != "image":
+                raise ProviderError(f"media modality {item.modality!r} unsupported by VL embedding transport (only 'image' supported)")
+            if item.mime_type not in self.allowed_mime_types:
+                raise ProviderError(f"media mime type {item.mime_type!r} not in allowed types {self.allowed_mime_types}")
+            if len(item.data) > self.max_input_bytes:
+                raise ProviderError(f"media data size {len(item.data)} exceeds limit {self.max_input_bytes}")
+            b64_data = base64.b64encode(item.data).decode("ascii")
+            data_uri = f"data:{item.mime_type};base64,{b64_data}"
+            input_payloads.append({"image": data_uri})
+
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "input": input_payloads,
+            "encoding_format": "float",
+        }
+        if self.dimension is not None and self.send_dimensions:
+            payload["dimensions"] = self.dimension
+
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
+        req = Request(
+            self.endpoint,
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        with urlopen(req, timeout=self.timeout) as resp:
+            raw_body = resp.read()
+        try:
+            result = json.loads(raw_body.decode("utf-8"))
+        except Exception as exc:
+            raise ProviderError(f"invalid JSON response from media embedding endpoint: {exc}") from exc
+
+        data = result.get("data") if isinstance(result, dict) else None
+        if not isinstance(data, list):
+            raise ProviderError("media embedding response must contain a data list")
+        return data
+
 
 
 def map_media_response(response: Sequence[Any], ids: Sequence[str]) -> dict[str, Any]:

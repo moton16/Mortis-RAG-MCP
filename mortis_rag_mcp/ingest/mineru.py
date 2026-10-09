@@ -29,8 +29,10 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import re
 import threading
 import time
+
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -676,6 +678,54 @@ def _parse_structure_json(members: list[tuple[str, bytes]]) -> tuple[dict[str, A
     return capabilities, blocks, warnings, partial
 
 
+def _build_image_block_map(blocks: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """建立结构 JSON 中图片/图表/表格/公式块到成员路径的索引映射。"""
+    mapping: dict[str, dict[str, Any]] = {}
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        candidates: list[str] = []
+        for field in ("img_path", "image_path", "path"):
+            val = block.get(field)
+            if isinstance(val, str) and val.strip():
+                candidates.append(val.strip())
+            elif isinstance(val, list):
+                candidates.extend(str(x).strip() for x in val if str(x).strip())
+        for cand in candidates:
+            norm = cand.lstrip("/").lower()
+            mapping[norm] = block
+            fname = norm.rsplit("/", 1)[-1]
+            if fname and fname not in mapping:
+                mapping[fname] = block
+    return mapping
+
+
+def _find_media_anchor(markdown: str, member_name: str, used_spans: set[tuple[int, int]]) -> tuple[int | None, int | None]:
+    """在 Markdown 正文中检索图片引用的字符半开区间 [start, end)（E08-a / E15）。
+
+    仅在有真实正文引用证据时记录；绝不拿图片尺寸冒充 anchor。
+    """
+    norm_member = member_name.lstrip("/").lower()
+    fname = norm_member.rsplit("/", 1)[-1]
+    for match in re.finditer(r'!\[.*?\]\((.*?)\)', markdown):
+        span = (match.start(), match.end())
+        if span in used_spans:
+            continue
+        target = match.group(1).strip().split("?")[0].lstrip("/").lower()
+        if target == norm_member or target.rsplit("/", 1)[-1] == fname:
+            used_spans.add(span)
+            return span[0], span[1]
+    for match in re.finditer(r'<img[^>]+src=["\'](.*?)["\']', markdown, re.IGNORECASE):
+        span = (match.start(), match.end())
+        if span in used_spans:
+            continue
+        target = match.group(1).strip().split("?")[0].lstrip("/").lower()
+        if target == norm_member or target.rsplit("/", 1)[-1] == fname:
+            used_spans.add(span)
+            return span[0], span[1]
+    return None, None
+
+
 def _safe_extract_zip(
     zip_bytes: bytes,
     *,
@@ -773,10 +823,8 @@ def _safe_extract_zip(
         remaining -= len(markdown_bytes)
         markdown = markdown_bytes.decode("utf-8", errors="replace")
 
-        media_occurrences: list[MediaOccurrence] = []
-        media_bytes_total = 0
+        # 1. 先抽取结构 JSON 成员（优先解析元数据再处理媒体）
         json_members: list[tuple[str, bytes]] = []
-        ordinal = 0
         for key in sorted(normalized):
             info = normalized[key]
             if info is md_info or info.is_dir():
@@ -792,10 +840,22 @@ def _safe_extract_zip(
                 remaining -= len(payload)
                 retained_budget += len(payload) * 64
                 json_members.append((key, payload))
+
+        structure_caps, blocks, json_warnings, partial = _parse_structure_json(json_members)
+        warnings.extend(json_warnings)
+        image_meta_map = _build_image_block_map(blocks)
+        used_anchor_spans: set[tuple[int, int]] = set()
+
+        # 2. 逐成员处理图片媒体并注入结构元数据（caption/OCR/page/anchor）
+        media_occurrences: list[MediaOccurrence] = []
+        media_bytes_total = 0
+        ordinal = 0
+        for key in sorted(normalized):
+            info = normalized[key]
+            if info is md_info or info.is_dir():
                 continue
+            suffix = ("." + key.rsplit(".", 1)[-1]) if "." in key.rsplit("/", 1)[-1] else ""
             if suffix not in _IMAGE_EXTS or "/" not in key:
-                # 与历史契约一致：只收「归档子目录内 + 图片后缀」的成员；
-                # 其余（result.json / 顶层散图 / 未知类型）不进媒体层，但也不静默当作正文。
                 continue
             if len(media_occurrences) >= limits.max_media:
                 raise MineruError(
@@ -821,7 +881,47 @@ def _safe_extract_zip(
             if suffix != ".svg" and pixels is None:
                 warnings.append(f"image header not recognized, pixel budget unverified: {key}")
             width, height = pixels if pixels else (None, None)
+
+            # 从结构 JSON 块映射元数据
+            norm_key = key.lstrip("/").lower()
+            fname_key = norm_key.rsplit("/", 1)[-1]
+            block = image_meta_map.get(norm_key) or image_meta_map.get(fname_key)
+
+            page: int | None = None
+            caption: str = ""
+            ocr: str = ""
+            bbox: tuple[float, ...] | None = None
+            if block is not None:
+                raw_page_idx = block.get("page_idx")
+                if isinstance(raw_page_idx, int) and not isinstance(raw_page_idx, bool) and raw_page_idx >= 0:
+                    page = raw_page_idx + 1
+                for ckey in ("image_caption", "table_caption", "chart_caption", "caption"):
+                    raw_c = block.get(ckey)
+                    if isinstance(raw_c, list):
+                        c_text = "\n".join(str(c).strip() for c in raw_c if str(c).strip())
+                        if c_text:
+                            caption = c_text
+                            break
+                    elif isinstance(raw_c, str) and raw_c.strip():
+                        caption = raw_c.strip()
+                        break
+                for okey in ("ocr", "ocr_result"):
+                    raw_o = block.get(okey)
+                    if isinstance(raw_o, str) and raw_o.strip():
+                        ocr = raw_o.strip()
+                        break
+                if not ocr and block.get("type") in ("text", "equation"):
+                    raw_t = block.get("text")
+                    if isinstance(raw_t, str) and raw_t.strip():
+                        ocr = raw_t.strip()
+                raw_b = block.get("bbox")
+                if isinstance(raw_b, (list, tuple)) and len(raw_b) == 4 and all(isinstance(x, (int, float)) for x in raw_b):
+                    bbox = tuple(float(x) for x in raw_b)
+
+            anchor_start, anchor_end = _find_media_anchor(markdown, key, used_anchor_spans)
+
             ordinal += 1
+            meta = {"archive_member": key}
             occurrence = MediaOccurrence(
                 occurrence_id=f"occ-{ordinal:05d}",
                 kind="image",
@@ -829,9 +929,15 @@ def _safe_extract_zip(
                 name=key,
                 mime_type=extension_mime(key),
                 byte_size=len(payload),
+                page=page,
+                bbox=bbox,
+                caption=caption,
+                ocr=ocr,
                 width=width,
                 height=height,
-                metadata={"archive_member": key},
+                anchor_start=anchor_start,
+                anchor_end=anchor_end,
+                metadata=meta,
             )
             media_occurrences.append(occurrence)
             media_bytes_total += len(payload)
@@ -842,13 +948,17 @@ def _safe_extract_zip(
                     kind="image",
                     ordinal=ordinal,
                     mime_type=occurrence.mime_type,
+                    page=page,
+                    bbox=bbox,
+                    caption=caption,
+                    ocr=ocr,
                     width=width,
                     height=height,
-                    metadata={"archive_member": key},
+                    anchor_start=anchor_start,
+                    anchor_end=anchor_end,
+                    metadata=meta,
                 )
 
-    structure_caps, blocks, json_warnings, partial = _parse_structure_json(json_members)
-    warnings.extend(json_warnings)
     page_map, reason = _derive_page_map(normalize_markdown(markdown), blocks)
     if reason:
         warnings.append(f"page_map unavailable: {reason}")
@@ -870,6 +980,7 @@ def _safe_extract_zip(
         media_bytes=media_bytes_total,
         partial=partial,
     )
+
 
 
 # --------------------------------------------------------------------- 客户端

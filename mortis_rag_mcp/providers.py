@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import hashlib
 import json
@@ -282,7 +282,25 @@ def create_media_provider(config: EmbeddingConfig, *, transport: Any = None) -> 
     if not all(references):
         raise ProviderError("native media capability unavailable: endpoint evidence references are incomplete")
     if transport is None:
-        raise ProviderError("native media capability unavailable: no declared transport (Q09 protocol missing)")
+        adapter_name = str(getattr(config, "adapter", "") or "").strip().lower()
+        if adapter_name in {"openai_vl", "siliconflow_vl", "openai_multimodal", "vl_multimodal", "media_http"}:
+            from .media_providers import HttpMediaTransport
+            dim = getattr(config, "dimension", None)
+            send_dim = bool(getattr(config, "send_dimensions", False))
+            transport = HttpMediaTransport(
+                endpoint=config.endpoint,
+                model=config.model,
+                api_key=getattr(config, "api_key", ""),
+                timeout=getattr(config, "timeout", 30.0),
+                dimension=dim,
+                send_dimensions=send_dim,
+                allowed_mime_types=mime,
+                max_input_bytes=max_bytes,
+                max_batch_size=max_batch,
+            )
+        else:
+            raise ProviderError("native media capability unavailable: no declared transport (Q09 protocol missing)")
+
     evidence = NativeMediaEvidence(
         references[0], references[1], references[2], references[3],
         profile.fingerprint, profile.alignment_space_id, max_bytes, max_batch, mime,

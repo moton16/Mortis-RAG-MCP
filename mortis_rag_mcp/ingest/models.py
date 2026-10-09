@@ -258,6 +258,10 @@ class MediaSink(Protocol):
         ocr: str = "",
         width: int | None = None,
         height: int | None = None,
+        anchor_start: int | None = None,
+        anchor_end: int | None = None,
+        t_start_ms: int | None = None,
+        t_end_ms: int | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> str:
         """写入一项媒体并返回 occurrence_id。"""
@@ -288,6 +292,10 @@ class DictMediaSink:
         ocr: str = "",
         width: int | None = None,
         height: int | None = None,
+        anchor_start: int | None = None,
+        anchor_end: int | None = None,
+        t_start_ms: int | None = None,
+        t_end_ms: int | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> str:
         occurrence_id = f"occ-{ordinal:05d}"
@@ -305,11 +313,16 @@ class DictMediaSink:
                 caption=caption,
                 width=width,
                 height=height,
+                anchor_start=anchor_start,
+                anchor_end=anchor_end,
+                t_start_ms=t_start_ms,
+                t_end_ms=t_end_ms,
                 metadata=dict(metadata or {}),
                 ocr=ocr,
             )
         )
         return occurrence_id
+
 
 
 # --------------------------------------------------------------------- 纯函数

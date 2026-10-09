@@ -1,0 +1,81 @@
+{
+  "contract_name": "multimodal_media_embeddings_v1",
+  "provider": "openai_compatible_vl",
+  "sample_endpoint": "https://api.siliconflow.cn/v1/embeddings",
+  "auth_header": "Authorization: Bearer <REDACTED_API_KEY>",
+  "supported_modalities": ["image"],
+  "allowed_mime_types": ["image/png", "image/jpeg", "image/webp"],
+  "max_input_bytes": 10485760,
+  "max_batch_size": 16,
+  "field_mapping": {
+    "request": {
+      "model": "model identifier (e.g. Qwen/Qwen3-VL-Embedding-8B)",
+      "input": "array of objects: {\"image\": \"data:<mime>;base64,<data>\"}",
+      "encoding_format": "float",
+      "dimensions": "optional int"
+    },
+    "response": {
+      "index": "data[i].index -> maps to input sequence order (0-based)",
+      "embedding": "data[i].embedding -> list of float vectors",
+      "error": "error.message / error.code on 4xx/5xx"
+    }
+  },
+  "sample_request": {
+    "model": "Qwen/Qwen3-VL-Embedding-8B",
+    "input": [
+      {
+        "image": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAAAAAA6fptVAAAACklEQVR4nGNiAAAABgADNjd8qAAAAABJRU5ErkJggg=="
+      }
+    ],
+    "encoding_format": "float"
+  },
+  "sample_response": {
+    "object": "list",
+    "data": [
+      {
+        "object": "embedding",
+        "index": 0,
+        "embedding": [
+          0.0245,
+          -0.0381,
+          0.0119,
+          0.0572,
+          -0.0821,
+          0.0433,
+          -0.0156,
+          0.0612
+        ]
+      }
+    ],
+    "model": "Qwen/Qwen3-VL-Embedding-8B",
+    "usage": {
+      "prompt_tokens": 128,
+      "total_tokens": 128
+    }
+  },
+  "error_samples": {
+    "rate_limited_429": {
+      "http_status": 429,
+      "headers": {
+        "Retry-After": "3"
+      },
+      "body": {
+        "error": {
+          "message": "Rate limit reached for requests",
+          "type": "rate_limit_error",
+          "code": "rate_limit_exceeded"
+        }
+      }
+    },
+    "unauthorized_401": {
+      "http_status": 401,
+      "body": {
+        "error": {
+          "message": "Invalid API key provided",
+          "type": "invalid_request_error",
+          "code": "invalid_api_key"
+        }
+      }
+    }
+  }
+}
