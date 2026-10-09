@@ -153,7 +153,8 @@ max_size_mb = 2048
 # 开启后可用 kb_ingest 把 PDF/DOCX/PPTX/XLSX 解析事实纳入 virtual 文档库。
 # 显式 storage="legacy" 才写 .mortis-parsed/；routing 控制本地/云端解析：
 #   - 配了 api_key → v4 精准接口（≤200MB/200页，每天 1000 页高优先级额度）
-#   - 没配 api_key → Agent 免登接口（≤10MB/20页，IP 限频，零配置试用）
+#   - 没配 api_key → Agent 免登接口（≤10MB/20页，IP 限频，零配置试用）；
+#     该通道上游协议**只返回正文 markdown**，不返回文档内图片素材（图片需 v4 授权或本地解析）
 # 云端都失败且装了 pymupdf（pip install pymupdf）→ 本地纯文本兜底。
 [ingest]
 enabled = false

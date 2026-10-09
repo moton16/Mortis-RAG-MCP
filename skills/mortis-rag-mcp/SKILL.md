@@ -23,7 +23,8 @@ version: 0.9.0
 - `kb_ingest(action="retry", job_id="实际ID", vault_path="库名")` 只对 failed/cancelled 重试，unknown 先查询原任务。取消后的重试重做失去 blob 保护的段，不伪称断点都可保留。
 - `--list-requests --vault "绝对路径"` 只读记录；`--abandon-request REQUEST_ID --vault "绝对路径"` 仅放弃本机意图，不取消远端任务、不重发。现有配置启用的远端能力不增设审批系统。
 - compact 仍按 source/行号回读；媒体沿 `kb_read` 的 `media_refs` 及固定 revision/offset 翻页，再用 `kb_read_media(source, revision_id, occurrence_id, vault_path)` 请求 metadata/inline。不要猜媒体地址或把 caption 当原生向量。
-- 内部原生媒体 provider/index/read fixture 已接通；真实 embeddings 媒体 transport、完整音频 adapter/解码装配、独立图片摄取与宿主播放尚未验收。proxy 不替代 native。升级/回退见仓库 `QUICKSTART_user.md` §0.4。
+- 原生媒体 provider/index/read 内部路径已接通，且「输入文字直接命中库中图片」已在本机载体上验证；真实媒体端点的通用装配、单独一张图片直接入库、以及宿主客户端里的图片显示尚未验收。proxy 不替代 native。升级/回退见仓库 `QUICKSTART_user.md` §0.4。
+- 音频转录 / 音频转码链路已在 0.9.0 物理移除（含 `[audio]` 段与 `audio_enabled`）；工具面与检索纪律不受影响。
 
 ## 检索路由判定表（按序匹配，命中即执行）
 

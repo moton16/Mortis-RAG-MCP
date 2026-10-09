@@ -53,6 +53,7 @@ v0.8.1 进一步强化了检索初筛、章节直读与后台刷新体验：
 2. 在临时库/缓存副本试升级。新库默认 `[chunking] mode="estimated_tokens"`；已有字符参数/缓存保留旧模式。需要保旧地址时显式设置 `mode="legacy_chars"`。只有 profile 相容才能复用向量；换模型/模板/切块可能重嵌，不承诺任意升级零费用。
 3. virtual 是默认解析事实落点，不再新写 `.mortis-parsed/`；旧镜像仍按逐项证据兼容。旧二进制读不到 virtual-only 事实，回退应停新 writer、恢复升级前完整副本，再使用旧版；不要原地降 schema 或覆盖现代解析结果。
 4. `kb_import` 的 `index_state` 表示 `empty/rebuilding/unverified/ready`。包内正文/FTS不会自动激活；按返回的 `next_action` 校验源或重解析。只有明确相信包内解析事实时才使用现有 `trust_parsed_documents`，不把导入成功写成 ready。
+5. 音频转录与音频转码能力已从本版本移除，配置里的 `[audio]` 段与 `audio_enabled` 开关不再存在。旧配置里若还留着这些键会被忽略（不报错、不影响其它配置），建议删除以免误以为仍生效。
 
 失败/取消任务的显式重试（工具 `kb_ingest` 参数）：
 ```json
@@ -65,7 +66,7 @@ python -m mortis_rag_mcp --app-config ".\config\app.toml" --abandon-request REQU
 ```
 放弃只改本机意图，不取消远端任务、不上传、不自动重试；随后重新提交可能重复处理。
 
-媒体先通过 `kb_read` 返回的 `media_refs` 选 source/revision/occurrence，再调用 `kb_read_media`；分页沿返回的 revision/offset 继续。原生媒体内部 fixture 不等于真实端点成功：媒体 transport、完整音频 adapter/解码装配、独立图片摄取与宿主播放仍未闭合。文本成功或同维向量不证明跨模态对齐。
+媒体先通过 `kb_read` 返回的 `media_refs` 选 source/revision/occurrence，再调用 `kb_read_media`；分页沿返回的 revision/offset 继续。**用文字检索到库里的图片**已在本机验证跑通；但真实媒体端点的通用装配、单独放一张图片直接入库、以及在真实客户端里显示图片仍未闭合。文本成功或同维向量不证明跨模态对齐。
 
 `--doctor` 是显式诊断，可能访问真实端点；STATUS.md 缺失不触发 Agent 自动探活。正常查询直接用已有工具，实际报错再按错误/本地状态排查。
 
@@ -120,8 +121,8 @@ Copy-Item .\config\app.toml.example .\config\app.toml
    - 如需检索 PDF/Office 文档，在 `config/app.toml` 中将 `[ingest] enabled = true`。
    - **配置 MinerU Token**：
      - **推荐（v4 高精度通道）**：前往 [mineru.net](https://mineru.net) 免费获取 API Token，设置系统环境变量 `MINERU_API_TOKEN=<你的Token>`（或在 `[ingest]` 中填写 `api_key = "你的Token"`），享受每日 1000 页额度与大文件支持。
-     - **免登测试**：不填 `api_key` 自动走轻量免登通道（适合单次 20 页内的小文件体验）。
-   - 解析产物自动存放于 `.mortis-parsed/` 独立目录，不会修改或污染原笔记。
+     - **免登测试**：不填 `api_key` 自动走轻量免登通道（适合单次 20 页内的小文件体验）；该通道**只取回解析出的文字**，不带文档里的图片。
+   - 解析结果默认存进本机文档库，不在笔记库里另生成镜像文件，也不会改动或污染原笔记。只有显式选择旧的库内镜像模式，才会在笔记库的 `.mortis-parsed/` 里写出解析出的 Markdown。
 
 ## 3. 接入 MCP 客户端
 

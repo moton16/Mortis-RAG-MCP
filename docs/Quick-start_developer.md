@@ -49,15 +49,15 @@ Mortis'RAG MCP 是一个**本地 Markdown 知识库 RAG 服务器**，通过 MCP
 
 ```
 Mortis-RAG-MCP/
-├── mortis_rag_mcp/          # 包本体（~10850 行，v0.8.0 模块化拆分架构）
+├── mortis_rag_mcp/          # 包本体（~25260 行 / 42 个 .py，v0.8.0 模块化拆分架构）
 │   ├── __main__.py          # 入口：python -m mortis_rag_mcp --serve-mcp-stdio
-│   ├── config.py            # 配置加载（526 行）
+│   ├── config.py            # 配置加载（956 行）
 │   ├── registry.py          # 用户级知识库注册表（384 行）
 │   ├── server.py            # MCP 协议层 + 16 个公开工具路由表与轻量入口
 │   ├── _server/             # 服务端路由与跨库编排私有包
 │   │   ├── search_dispatch.py # 单库/Scoped/全局检索路由与入参规范化
 │   │   └── fanout.py          # 跨库候选聚合、权重计算、去重、rerank、全局/分组分页
-│   ├── indexer.py           # MarkdownIndexer Facade、向后兼容 re-export 与生命周期（1253 行）
+│   ├── indexer.py           # MarkdownIndexer Facade、向后兼容 re-export 与生命周期（1695 行）
 │   ├── _indexer/            # 索引器核心实现私有包
 │   │   ├── models.py        # Chunk、SearchFilter 数据模型与纯去重逻辑
 │   │   ├── cache_codec.py   # _CacheCodec、_VectorsCodec 二进制编解码持久化
@@ -68,14 +68,17 @@ Mortis-RAG-MCP/
 │   │   ├── snapshot.py      # 快照打包导出、校验导入恢复与 Zip Slip 安全防护
 │   │   ├── exemptions.py    # 豁免规则维护与八项状态级联清理
 │   │   └── watch.py         # 文件系统 watcher 监听与防抖生命周期调度
-│   ├── ingest/              # PDF/Office 异步摄取与表格处理（worker, mineru, tables）
-│   ├── providers.py         # embedding / reranker HTTP 封装（230 行）
+│   ├── ingest/              # PDF/Office 异步摄取与表格处理（worker, mineru, tables, router, local, images, models, migration）
+│   ├── doc_store.py         # 版本化文档库：generation/revision/control/job/checkpoint/blob/occurrence（4099 行）
+│   ├── media_providers.py   # 原生媒体 embedding transport（图像/音频声明式 route）
+│   ├── paid_requests.py     # 付费请求意图 journal（提交前持久化，unknown 不自动重发）
+│   ├── providers.py         # embedding / reranker / media provider HTTP 封装（426 行）
 │   ├── fts.py               # FTS5 SQLite 封装（152 行）
-│   ├── vector.py            # 向量后端：memory / sqlite_vec（367 行）
+│   ├── vector.py            # 向量后端：memory / sqlite_vec（398 行）
 │   └── fsnotify.py          # Windows ReadDirectoryChangesW 原生监听（557 行）
 ├── config/app.toml.example  # 配置模板（app.toml 本体被 gitignore）
 ├── skills/mortis-rag-mcp/   # 配套 agent skill（教 AI 怎么用这套工具）
-├── tests/                   # pytest，49 个测试文件 / 416 个用例
+├── tests/                   # pytest，106 个测试文件（本地按靶向单跑，全量回归交 CI）
 ├── docs/
 │   ├── Quick-start_developer.md       # 本文件
 │   ├── Changelog_developer.md         # 每次 commit 的技术变更流水
@@ -185,7 +188,9 @@ stdin 一行 JSON → handle() → method=="tools/call"
 | `config.py` | TOML 加载、`${ENV_VAR}` 插值、配置链 `--app-config` > `MORTIS_RAG_CONFIG` > `VAULT_MCP_CONFIG` > `~/.mortis_rag_mcp/config.toml` > `~/.vault_mcp/config.toml` > 默认 | `load_config()` | 新配置项必须给默认值 + example 文件同步加注释；`AppConfig.vault_path` 会被 `__post_init__` 特殊处理 |
 | `registry.py` | vaults.toml 读写（**原子写 tmp+replace**，跨进程排他锁 Windows `msvcrt.locking`/POSIX `fcntl.flock`） | `VaultRegistry.add/remove/set_weight/set_solo` | 字符串字段序列化必须 `json.dumps`（曾有 LLM 传入的引号毁掉整个注册表的 bug）；新字段要在 `load()` 里给老文件回退值 |
 | `doctor.py` | 环境自检与 Agent 信任锚（`STATUS.md` / `status.json`）生成器 | `doctor.run()` | 零第三方依赖，探活复用 `providers.py`；核心项门禁防假 VALID；Windows 冲突 4 次退避原子写 |
-| `server.py` | 协议层 + 15 个公开工具路由表与轻量入口 | `call_tool()` / `main()` | 15 个工具显式映射表路由；所有入参统一走 `_normalize_call_arguments()` 归一化；检索分发委托至 `_server/` |
+| `server.py` | 协议层 + 16 个公开工具路由表与轻量入口 | `call_tool()` / `main()` | 16 个工具显式映射表路由；所有入参统一走 `_normalize_call_arguments()` 归一化；检索分发委托至 `_server/` |
+| `doc_store.py` | 版本化文档库：generation/revision/control/job/checkpoint/blob/occurrence；virtual 解析事实的唯一落点 | `DocumentStore` / `document_store_for()` | 事实层不是派生缓存，普通清缓存/`kb_rebuild` 不得碰它，只有显式 purge 才清理；revision/epoch 不得降级 |
+| `media_providers.py` / `providers.py` | 原生媒体 embedding transport 与 embedding/reranker/media provider HTTP 封装 | `create_media_provider()` / `create_*_provider()` | 媒体能力**只**由显式 `media_*` 声明决定，不按 model 名猜协议、不按同维向量推 alignment；本地回环端点缺 journal/guard 时走 `is_local_free` bypass，显式撤销仍生效 |
 | `_server/` | 服务端跨库编排与检索分发私有包 | `dispatch_search()` / `fanout_search()` | 活实例契约（直读 `_indexers`，禁快照化）；跨库 embedding 全局仅计算一次；库级权重在 rerank 完成后乘回 |
 | `indexer.py` | MarkdownIndexer Facade 稳定入口、声明周期入口与向后兼容 re-export | `sync()` / `search()` | 保留向后兼容薄委托与历史测试打桩点；`__init__.__all__` 严格维持 7 项；锁获取时序固定为 `_sync_lock -> _cache_lock` |
 | `_indexer/` | 索引与检索引擎核心实现私有包 | 各子模块独立导出 | 仅自底向上依赖，严禁运行时反向导入 Facade；数据模型 `Chunk` 字段顺序与 `VMCPC/VMCPV` 二进制协议严格锁定；常驻 Chunk 禁止原地修改 score |
@@ -220,7 +225,7 @@ $env:PYTHONUTF8='1'; $env:PYTHONIOENCODING='utf-8'
 .\.venv\Scripts\python.exe -m pytest tests/test_compact_search.py tests/test_read_heading.py -q
 ```
 
-- 56 个测试文件（单机推荐按模块靶向运行；CI 全量矩阵覆盖 Ubuntu 3.10–3.13 与 Windows 3.12）：切块/缓存/多库/紧凑投影/预算/物理读取/章节定位/自动摄取/防抖监听/宿主隔离/快照等。
+- 106 个测试文件（单机推荐按模块靶向运行；CI 全量矩阵覆盖 Ubuntu 3.10–3.13 与 Windows 3.12）：切块/缓存/多库/紧凑投影/预算/物理读取/章节定位/自动摄取/防抖监听/宿主隔离/快照/文档库与虚拟摄取/媒体与跨模态等。
 - **约定**：不碰真实网络（embedding 用 `static` 模式或注入 FakeProvider）；临时库一律 `tmp_path`；测试注册表与配置经 `MORTIS_RAG_CONFIG` / `MORTIS_RAG_REGISTRY` 严格隔离，绝不污染宿主真实环境。
 - 已知 Windows 平台坑：`kb_rebuild` 删 FTS 缓存走系统回收站，trash 失败会
   `SAFE_DELETE_FAIL_CLOSED`（`test_subvaults.py::test_stdio_kb_rebuild_returns_stats`
@@ -285,7 +290,7 @@ $env:PYTHONUTF8='1'; $env:PYTHONIOENCODING='utf-8'
 
 ## 10. 上手 checklist
 
-- [ ] `pip install -e .` + `pytest tests/ -q` 全绿（Windows 上 rebuild 那个已知红除外）
+- [ ] `pip install -e .` + 靶向 `pytest` 全绿（全量回归交 CI；Windows 上 rebuild 那个已知红除外）
 - [ ] 读完本文件 §3-§5，能不看代码讲清索引/检索两条管线
 - [ ] 跑过一次 eval（哪怕只有占位查询）
 - [ ] 知道四条文档分工和 commit 记账规则

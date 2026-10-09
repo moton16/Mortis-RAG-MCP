@@ -7,6 +7,34 @@
 
 ---
 
+### [E18 文档整合、收尾与内容差异报告] — moton16,2026-10-09,CodeBuddy,DeepSeek-V4.1-Flash
+
+按用户侧 / 开发者侧分工对 v0.9.0 文档做一致性整合与发布前收尾，**不改代码逻辑、不改测试断言、不做任何发布动作**（无 push / PR / tag / release / publish）。本批只动文档，合并为一个提交（同任务连续提交按本文档开头约定合并整理）。逐项盘点、两个对比基准的原始 git 证据与全部结论见本地忽略目录 `docs/v0.9.0/V0.9.0_CHANGE_DIFF_2026-10-09.md`（本机交付，不在本提交内）。
+
+**用户侧文档（只讲功能增减与体验，无技术细节）**
+
+- `README.md` / `README_EN.md`：候选节新增「音频转录与音频转码能力已移除」——`[audio]` 段与 `audio_enabled` 开关一并消失，旧配置留着会被忽略（不报错、不影响其它配置），建议删除；删去已不存在的「完整音频 adapter/解码装配」待验收表述；媒体待验收边界改写为「文字检索图片已在本机跑通 / 真实客户端显示与付费端点通用装配未验收」；MinerU 免登通道补注「只取回解析出的文字，不带文档里的图片」；核心特性表去掉「完整音频生产链」。
+- `QUICKSTART_user.md`：§0.4 新增第 5 条（音频能力移除与旧配置键处理）；媒体段落按实际验证边界改写；MinerU 节补注免登只回文字；**修正「解析产物自动存放于 `.mortis-parsed/`」**——0.9 起默认落本机文档库（virtual），只有显式旧镜像模式才在库内写 Markdown。
+- `CHANGELOG_user.md`：0.9.0 条目新增 `### Removed`（音频转录/转码移除 + 用户侧迁移影响），`### Upgrade` 补一条「旧键可安全删除」；顶部候选说明去掉「完整音频接入」。
+
+**开发者侧文档（技术流水与实现细节）**
+
+- `docs/PROJECT_GUIDE.md`：§0.9 候选增量更新两条现状（真实载体跨模态「文字检索图片」已跑通；sqlite-vec 已装入本机两套解释器并跑通 `vec0` KNN 与 `extras` lane，远端 CI 仍未 push 故无链接）；§一项目定位把 `.mortis-parsed/` 镜像口径改为 virtual 文档库（`cache.dir/<namespace>/doc_store/`）；§3.1 与 §六工具面 15→16 并补 `kb_read_media` 行（必填 vault_path/source/revision_id/occurrence_id，`metadata`/`inline`、`preview`/`original`、`budget_bytes` 默认 2097152 上限 8388608）、修正 `kb_ingest` action 枚举为 `submit/status/pending/retry` 并写明 retry 语义；§4.3/4.4/4.5/4.8/4.10/4.11 行数按实测更新（426/398/1695/2307/937/4842），§4.11 改写任务生命周期与 `storage` 落点、新增免登通道「只返回 markdown」的协议事实（并说明原 mock 断言为何误导）；新增 §4.12 `doc_store.py`（4099 行，版本化文档库：事实与派生索引分离、OS mutation lock、revision pin、purge 边界）；§七配置参考补 `[chunking]`/`[doc_store]`/`[media]`/`[diag]` 四节与 `[ingest]` 0.9 键、`[embedding]` 模板/media 声明组；§八磁盘布局区分 virtual/legacy 并补 doc_store；§十一测试体系 56→106 个文件、skip 归类改写；§14.2 版本历史速览补齐 0.7.0–0.9.0；§14.3 新增文档库与媒体声明两条不变量。
+- `docs/Quick-start_developer.md`：仓库地图行数与模块清单按实测更新（新增 `doc_store.py` / `media_providers.py` / `paid_requests.py` / ingest 子模块，包体 ~25260 行 / 42 个 .py）；§5 模块表 15→16 并补 doc_store 与 media/provider 两行；§7 测试文件数 56→106；§10 checklist 改为「靶向 pytest 全绿，全量回归交 CI」。
+- `docs/Docs_Folder-descriptions.md`：**删除错误口径**「`docs/v0.8.1/` 是 `.gitignore` 版本目录特例、随版本入库」——用 `git check-ignore -v` 与 `git ls-files docs` 核实：实际规则是 `docs/*` 加四行白名单，`docs/v0.8.1/**` 与 `docs/v0.9.0/**` 均未被跟踪（该例外由 `21722ef` 撤销，文件仍在磁盘但已解除跟踪、仍被忽略）；补文档分工说明。
+- `skills/mortis-rag-mcp/SKILL.md`：候选增量去掉「完整音频 adapter/解码装配」并补「音频转录/转码链路已物理移除」；媒体待验收边界改为「文字检索图片已本机验证 / 真实端点通用装配与宿主显示未验收」。
+
+**未改动（有意保留）**：代码逻辑与测试断言（含 `tests/test_version_sync.py`、`tests/test_beta2_docs_contract.py` 断言的版本徽章、Skill frontmatter/标题、用户 changelog 标题与 CLI 文案）；`Changelog_developer.md`、`PROJECT_GUIDE.md`、`Quick-start_developer.md` 的历史条目按纪律不改写——例如历史批次里「仍有缺口：完整 AudioConfig/adapter/解码装配」记录的是当日状态，已被 E17 物理移除取代，新结论写在本条与 E17 条，不回改历史。
+
+**验证**（`.venv/Scripts/python.exe`；`--basetemp` 钉仓库 `.runtime`，TEMP/TMP/TMPDIR 全隔离）：
+
+- 配置与版本只读探针：`load_config(config/app.toml.example)` 正常加载、10 个段全部被识别、示例中无被拒键；`hasattr(AppConfig,'audio')=False`、`AudioConfig` 类不存在、`IngestConfig.audio_enabled` 不存在；仍带 `[audio]`/`audio_enabled` 的旧配置可正常加载（被静默忽略）；带 UTF-8 BOM 的配置 `cache.enabled=true`、`reranker.enabled=false`（`b328dc9` 回归）。版本单一真源 pyproject = 包 `__version__` = `SERVER_INFO["version"]` = `0.9.0`，`_tool_definitions()` 实测 16 个工具。
+- 文档契约靶向：`pytest -q tests/test_version_sync.py tests/test_beta2_docs_contract.py` = **9 passed**，exit0。
+- 核心全量（本窗口唯一一次）：**1140 passed / 14 skipped / exit0**（收集 1154；14 个 skip = `.venv` 缺 docs/media 可选依赖 12 个（pymupdf/docx/pptx/openpyxl/PIL/fitz）+ 非 Windows 平台用例 2 个），与 E17 终态计数完全一致，文档改动未影响用例数与结果。
+- 边界与授权：`.gitignore` 未改、未 `git add -f`、`docs/v0.9.0/**` 与 `.runtime/**` 未入库；真实计费 API 调用 0、真实知识库/用户配置写操作 0、安装包 0、push/PR/tag/release 均未执行。待授权项与开放项清单见统一入口 §18 与差异报告 §9。
+
+---
+
 ### [E17 架构收敛：物理清除 ffmpeg 音频解码与 Whisper 转录链路] — moton16,2026-10-09,CodeBuddy,DeepSeek-V4.1-Flash
 
 按统一入口 §16 架构收敛裁定，把音频转码 / 转录链路整体移出核心代码库（不新增业务功能，只做删除与去悬空）：

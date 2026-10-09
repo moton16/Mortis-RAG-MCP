@@ -17,7 +17,8 @@
 - PDF/DOCX/PPTX/XLSX 可按配置走本地可选解析器；virtual 为默认解析存储，原文件不改写、不新建镜像；旧镜像仅在逐项来源证据匹配时排除。缺依赖不等于该格式验证成功。
 - `kb_import` 返回 `index_state=empty/rebuilding/unverified/ready`；导入成功不等于索引 ready。`kb_ingest(action="retry", job_id=..., vault_path=...)` 重试 failed/cancelled，unknown 不自动重发。
 - CLI：`--list-requests --vault "库的绝对路径"` 查看未决记录；`--abandon-request REQUEST_ID --vault "库的绝对路径"` 仅放弃本机意图，不取消服务端任务、不重发。
-- 16 个工具包含 `kb_read_media`，可按 source/revision/occurrence 获取引用和受预算约束的媒体。原生媒体 provider/index/read 内部 fixture 已接通，**真实 embeddings 媒体 transport、完整音频 adapter/解码装配和宿主播放尚未验收**；proxy 不是原生媒体的替代。
+- **已移除**：音频转录与音频转码能力从本版本整体移除，配置里的 `[audio]` 段与 `audio_enabled` 开关一并消失。旧配置里若还留着这些键会被直接忽略（不报错、不影响其它配置），建议顺手删掉。
+- 16 个工具包含 `kb_read_media`，可按 source/revision/occurrence 获取引用和受预算约束的媒体。**用文字直接检索到知识库里的图片**已在本机验证跑通；**在真实客户端里显示图片，以及付费媒体端点的通用装配尚未验收**；代理图注不是原生媒体的替代。
 - 升级/恢复和可复制操作见 [快速开始 §0.4](QUICKSTART_user.md#04-09-候选升级与恢复)。显式 `--doctor` 可能请求真实端点，Agent 不以缺失 STATUS.md 为由自动运行它。
 
 ## 🌟 核心特性
@@ -31,7 +32,7 @@
 - 🔍 **轻量预览与二段式精读（0.7.2）**：支持 `preview=true` 快速返回高光切片与行号，正文配合 `kb_read` 按需精准精读，有效降低上下文冗余。
 - 📄 **纯文本 .txt 原生收录（0.7.2）**：纯文本 `.txt`（小说/分卷/资料）与 Markdown 享有同等索引地位，支持小说章节标题自动识别。
 - 🔍 **Agent 信任锚，免预检开箱即搜（0.7.1）**：一条 `python -m mortis_rag_mcp --doctor` 生成本机环境凭证（`STATUS.md`）。AI 助手读到 ✅ 即**不再做任何环境/依赖/key 预检**，首次提问就直接检索，省掉每次调用前的反复试探；真出问题才提示你跑那一条命令，且失败不会陷入重试死循环。
-- 📄 **文档解析与摄取**：按配置将 PDF/Office 解析结果纳入搜索，原文件不改写；独立图片摄取与完整音频生产链仍未闭合，参见上述候选状态。
+- 📄 **文档解析与摄取**：按配置将 PDF/Office 解析结果纳入搜索，原文件不改写；单独放一张图片直接入库摄取仍未闭合，参见上述候选状态。
 - 🎯 **智能定向路由（0.7.0）**：支持为知识库添加一句话自然语言描述，AI 检索时按意图精准选库，大幅减少无关库干扰，回答更快更准。
 - 📊 **表格排版**：estimated 模式保留超限 HTML 表格并跳过其向量请求；legacy 极端超长多格行仍有旧版截失问题，为保持旧地址不在升级时静默改写。
 - 🔒 **私密独立库（solo）**：支持注册独立私密库（`kb_init_solo`），默认不参与跨库全局搜索，仅在明确指定时查询，妥善保护个人隐私。
@@ -73,7 +74,7 @@ Copy-Item .\config\app.toml.example .\config\app.toml
 1. 打开 `config/app.toml`，在 `[ingest]` 小节将 `enabled = true`。
 2. 配置 MinerU Token（两种方式）：
    - **高精度通道（推荐）**：前往 [mineru.net](https://mineru.net) 免费获取 API Token，设置系统环境变量 `MINERU_API_TOKEN=你的Token`（或在 `config/app.toml` 的 `[ingest]` 中填写 `api_key = "你的Token"`），享受每日 1000 页额度与大文件支持。
-   - **免登试用通道**：留空 `api_key` 即可直接使用（适合 20 页以内的日常小文档体验）。
+   - **免登试用通道**：留空 `api_key` 即可直接使用（适合 20 页以内的日常小文档体验）；该通道**只取回解析出的文字**，不带文档里的图片。
 
 ### 3. 接入 AI 客户端
 
@@ -105,11 +106,11 @@ enabled = true
 
 连接成功后，在对话中对 AI 助手说：
 
-> “帮我用 `kb_init` 注册知识库：`D:\我的笔记`”
+> "帮我用 `kb_init` 注册知识库：`D:\我的笔记`"
 
 知识库即可在后台自动建立索引。之后只需自然提问：
-> “搜一下数电笔记里关于触发器的内容”
-> “查一下知识库里关于项目架构的说明”
+> "搜一下数电笔记里关于触发器的内容"
+> "查一下知识库里关于项目架构的说明"
 
 ---
 
