@@ -995,6 +995,12 @@ class MarkdownIndexer:
         return False
 
     def _sync_locked(self) -> list[Chunk]:
+        # 「索引在飞」必须在这里置位：这是所有真同步的共同内层。修复前只有监听线程
+        # 的包装（_run_sync_quietly）会置 _indexing，于是经 try_sync_with_guard 进入
+        # 的同步对 kb_search / kb_stats 完全不可见——客户端会把同步期间返回的部分
+        # 结果当成终态，C66 读优先契约出现静默漏洞。保存/恢复旧值以支持嵌套调用。
+        previous_indexing = self._indexing
+        self._indexing = True
         self._sync_state = "scanning"
         self._sync_progress = {
             "phase": "scanning",
@@ -1008,6 +1014,7 @@ class MarkdownIndexer:
         finally:
             self._sync_state = "idle"
             self._sync_progress["phase"] = "idle"
+            self._indexing = previous_indexing
 
     def _sync_locked_impl(self) -> list[Chunk]:
         return _sync_engine.run_sync(self)
