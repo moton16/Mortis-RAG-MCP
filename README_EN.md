@@ -1,7 +1,7 @@
 # Mortis'RAG MCP
 
 [![CI](https://github.com/moton16/Mortis-RAG-MCP/actions/workflows/ci.yml/badge.svg)](https://github.com/moton16/Mortis-RAG-MCP/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Version: 0.9.0](https://img.shields.io/badge/Version-0.9.0-blue.svg)](CHANGELOG_user.md)
 
 English | [简体中文](README.md)
@@ -143,4 +143,6 @@ The knowledge base is indexed in the background. You can now search conversation
 
 ## 📄 License
 
-Distributed under the [MIT License](LICENSE).
+Distributed under the [Apache License 2.0](LICENSE) since v0.9.0 (releases up to and including v0.8.1 remain MIT; the grant on already-published versions is unaffected).
+
+Optional parser dependencies (e.g. PyMuPDF) are installed by the user on demand and are outside the Apache-2.0 grant on this project; see [NOTICE](NOTICE) for their own licenses.

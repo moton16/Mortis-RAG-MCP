@@ -3,9 +3,15 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 与
 [Semantic Versioning](https://semver.org/lang/zh-CN/)。提交信息为 Conventional Commits。
 
-## [0.9.0] - 2026-10-08
+## [0.9.0] - 2026-10-09
 
-> 本地候选准备，**尚未正式发布**。真实媒体端的通用装配、真实客户端里的图片显示和代表性质量验收尚未完成。
+> **首个正式发布版本。** 仍**未在真实环境完成**的验证：真实媒体端的通用装配、真实客户端里的图片显示、以及代表性语料的质量验收（需具备对应端点与宿主后确认）。
+
+### Changed
+
+- **开源许可证由 MIT 变更为 Apache-2.0**（`LICENSE` 与新增 `NOTICE`）。
+  - v0.8.1 及更早版本仍按 MIT 授权，已发布版本的既有授权不受影响；升级到 0.9.0 起按 Apache-2.0 使用。
+  - 可选解析依赖（如 PyMuPDF）仍由用户自行安装，不在本项目的 Apache-2.0 授权范围内，见 `NOTICE`。
 
 ### Added
 

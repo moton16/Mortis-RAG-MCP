@@ -1,7 +1,7 @@
 # Mortis'RAG MCP
 
 [![CI](https://github.com/moton16/Mortis-RAG-MCP/actions/workflows/ci.yml/badge.svg)](https://github.com/moton16/Mortis-RAG-MCP/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Version: 0.9.0](https://img.shields.io/badge/Version-0.9.0-blue.svg)](CHANGELOG_user.md)
 
 [English](README_EN.md) | 简体中文
@@ -141,4 +141,6 @@ enabled = true
 
 ## 📄 License
 
-本项目采用 [MIT License](LICENSE) 开源许可。
+本项目自 v0.9.0 起采用 [Apache License 2.0](LICENSE) 开源许可（v0.8.1 及更早版本仍为 MIT，已发布版本的历史授权不受影响）。
+
+可选解析依赖（如 PyMuPDF）由用户自行安装，不在本项目的 Apache-2.0 授权范围内，各自的许可证见 [NOTICE](NOTICE)。
