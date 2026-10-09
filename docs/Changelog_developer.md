@@ -13,6 +13,13 @@
 
 E14 本地目标0.9.0：同步包、pyproject、SERVER_INFO衍生版本、README badges、Skill标题/frontmatter和用户候选changelog；stdio smoke从包版本取断言。未创建 tag/release，候选构建/回归证据由统一入口另记，不预写外部CI绿。
 
+整合末 `8866bb5` 一次全量实际为1084passed/20failed/13skipped（286.09s、exit1），保留原记录。
+`d88b234` 修复读轮询自己不断enqueue而永远rebuilding：`for_read=True`仅机会性读刷新在刚完成时返回False；显式请求/import/文件事件仍保pending，原E04接受承诺不变。import5/read_stale7/txt3/multivault9/compact7通过。
+后续靶向合同对齐：legacy字符上限/dedup/v073 golden显式mode，golden原数据不改且只剥新增embedding_key；
+scanning spy改实际扫描入口；迁移测试在临时home去掉隔离override；旧fake checkpoint换真实SQLite record_subjob(done)；
+virtual不可用错误与后台stdio等待按现行接口；estimated保尾空白/可变metadata预算按实际包络，短块预览不承诺固定压缩比（长正文压缩unit仍锁比例）。
+涉及12个失败文件分别靶向112passed/1skip，另txt3passed，关闭原20个失败点；未重复跑全量，不能将旧候选全量记录改为最终候选全绿。
+
 - `f4577c1`：PPTX 正常 printerSettings 二进制是惰性打印元数据，不应按嵌入 OLE 拒绝；仅精确豁免此路径，真实 PDF/Office/Pillow 正向5例通过。
 - `c11f762`（E11）：必需 docs/media/vec CI lane；离线检索拒外部配置；成对质量/资源工具与合同测试。2问指标 fixture 不是七类100问验收；Python tracemalloc 不冒充 RSS。
 - `4e69b1d`：retry 启动 idle worker；cancelled 重试清失去 blob 保护的段 checkpoint；9个 management 和5个 checkpoint用例通过。

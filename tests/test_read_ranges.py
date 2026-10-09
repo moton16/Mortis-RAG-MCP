@@ -250,8 +250,8 @@ def test_read_sandbox_and_security(tmp_path: Path):
     with pytest.raises(ValueError, match="source must stay inside the vault"):
         server._kb_read({"source": "../outside.md", "vault_path": "SVault"})
 
-    # 2. 非白名单格式
-    with pytest.raises(ValueError, match="source must be a Markdown or plain-text file"):
+    # 2. 非文本现在可走virtual，但没有committed事实仍明确拒绝。
+    with pytest.raises(ValueError, match="UNAVAILABLE: virtual source 'photo.png'"):
         server._kb_read({"source": "photo.png", "vault_path": "SVault"})
 
 

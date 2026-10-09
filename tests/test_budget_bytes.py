@@ -415,14 +415,16 @@ def test_budget_bytes_fanout_flat(tmp_path, monkeypatch):
     _kb_init_ready(server, v1, "VFlat1")
     _kb_init_ready(server, v2, "VFlat2")
 
-    # 预算 2500 字节仅够容纳 1 条（每条 ~1600 字节 + 元数据），第 2 条被截断
-    budget = 2500
+    # 新metadata/绝对vault路径有可变开销；按真实首条包络设预算，仍严格只放1条。
+    unbounded = json.loads(server.call_tool("kb_search", {"query": "平铺", "top_k": 2})["content"][0]["text"])
+    assert len(unbounded["chunks"]) == 2
+    budget = _measure_payload_bytes({**unbounded, "chunks": unbounded["chunks"][:1]}) + 300
     res = server.call_tool("kb_search", {"query": "平铺", "budget_bytes": budget})
     data = json.loads(res["content"][0]["text"])
     assert "chunks" in data
     assert data["truncated"] is True
     assert data["returned"] == 1
-    assert data["chunks"][0]["content"] == doc1_content.rstrip()
+    assert data["chunks"][0]["content"] == unbounded["chunks"][0]["content"] == doc1_content
     assert _measure_payload_bytes(data) <= budget
 
 
@@ -606,7 +608,7 @@ def test_budget_bytes_cold_status(tmp_path, monkeypatch):
 def test_budget_bytes_cjk_emoji_escaping(tmp_path, monkeypatch):
     """断言包含复杂中文、四字节 Emoji、CRLF 与转义引号的内容在包装度量下能正确合法 loads 且不超预算。"""
     config_path = tmp_path / "app.toml"
-    config_path.write_text('mode = "static"\n', encoding="utf-8")
+    config_path.write_text('mode = "static"\n[chunking]\nmode="legacy_chars"\n', encoding="utf-8")
     reg_path = tmp_path / "vaults.toml"
     monkeypatch.setenv("MORTIS_RAG_REGISTRY", str(reg_path))
     monkeypatch.setenv("VAULT_MCP_REGISTRY", str(reg_path))

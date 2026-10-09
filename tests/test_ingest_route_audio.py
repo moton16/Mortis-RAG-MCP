@@ -115,36 +115,29 @@ def test_job_fingerprint_includes_chunker_fingerprint():
 
 # ------------------------------------------------------------- 音频 checkpoint/resume
 
-class _FakeStore:
-    def __init__(self) -> None:
-        self.phases: list[dict] = []
-        self.rows: list = []
-
-    def report_phase(self, job_id, owner, *, phase, remote_task_id="", checkpoint="", error=""):
-        self.phases.append({"phase": phase, "checkpoint": checkpoint})
-
-    def list_subjobs(self, job_id):
-        return self.rows
-
-
-def test_audio_checkpoint_persist_and_resume_roundtrip():
-    """逐片段 checkpoint 用现成 report_phase 持久化；有读回接口时 resume 可还原。"""
+def test_audio_checkpoint_persist_and_resume_roundtrip(tmp_path):
+    """真实SQLite的段级done checkpoint，不再用旧fake聚合report_phase冒持久化。"""
+    from mortis_rag_mcp.config import AppConfig, CacheConfig
+    from mortis_rag_mcp.doc_store import DocumentStore, resolve_storage_layout
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    config = AppConfig(cache=CacheConfig(dir=str(tmp_path / "cache"), enabled=True))
+    store = DocumentStore(resolve_storage_layout(config, vault), config)
+    store.open(write=True)
     worker = _virtual_worker()
-    store = _FakeStore()
-    job = SimpleNamespace(job_id="j1", phase="prepared", source="a.wav")
+    store.enqueue_job(source="a.wav", source_sha256="source-sha", parser_fingerprint="fixture")
+    job = store.claim_job("owner")
     segment = AudioSegment(1, 0, 16000, 0, 2000, "sha-1", b"data")
-
-    worker._audio_checkpoint(store, job, "owner", segment, "hello")
-
-    assert store.phases and store.phases[-1]["phase"] == "prepared"
-    payload = json.loads(store.phases[-1]["checkpoint"])
-    assert payload["completed"][0]["ordinal"] == 1
-    assert payload["completed"][0]["text"] == "hello"
-
-    store.rows = [SimpleNamespace(checkpoint=store.phases[-1]["checkpoint"])]
-    resumed = worker._audio_resume(store, job)
-    assert resumed[1]["text"] == "hello"
-    assert resumed[1]["sha256"] == "sha-1"
+    try:
+        worker._audio_checkpoint(store, job, "owner", segment, "hello")
+        rows = [r for r in store.list_subjobs(job.job_id) if r.ordinal == 1]
+        assert rows[0].state == "done"
+        payload = json.loads(rows[0].checkpoint)
+        assert payload["ordinal"] == 1 and payload["text"] == "hello"
+        resumed = worker._audio_resume(store, job)
+        assert resumed[1]["text"] == "hello" and resumed[1]["sha256"] == "sha-1"
+    finally:
+        store.close()
 
 
 def test_audio_resume_without_reader_is_empty():

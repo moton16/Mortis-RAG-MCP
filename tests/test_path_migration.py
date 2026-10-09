@@ -192,6 +192,9 @@ def test_resolve_default_cache_dir_rename_race_fallback_to_new_if_exists(tmp_pat
 
 
 def test_registry_path_migrates_old_file_when_new_dir_already_exists(tmp_path, monkeypatch):
+    # 此例验证临时home默认路径，显式移除conftest的宿主隔离覆盖。
+    monkeypatch.delenv("MORTIS_RAG_REGISTRY", raising=False)
+    monkeypatch.delenv("VAULT_MCP_REGISTRY", raising=False)
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     old_dir = tmp_path / ".vault_mcp"
     new_dir = tmp_path / ".mortis_rag_mcp"
@@ -208,6 +211,8 @@ def test_registry_path_migrates_old_file_when_new_dir_already_exists(tmp_path, m
 
 
 def test_registry_path_rename_error_fallback_to_old_file(tmp_path, monkeypatch):
+    monkeypatch.delenv("MORTIS_RAG_REGISTRY", raising=False)
+    monkeypatch.delenv("VAULT_MCP_REGISTRY", raising=False)
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     old_dir = tmp_path / ".vault_mcp"
     new_dir = tmp_path / ".mortis_rag_mcp"

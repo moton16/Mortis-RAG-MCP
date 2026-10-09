@@ -251,7 +251,7 @@ def test_prune_ignored_sources_clears_all_layers(tmp_path):
     assert "doc2.md" in indexer._chunks
 
 
-def test_sync_progress_state_machine(tmp_path):
+def test_sync_progress_state_machine(tmp_path, monkeypatch):
     """验证 P3-2: _sync_progress 状态机 phase 与 counts 在 scanning/fts/embedding/idle 间正确流转。"""
     vault = tmp_path / "vault_progress"
     vault.mkdir(parents=True)
@@ -267,13 +267,14 @@ def test_sync_progress_state_machine(tmp_path):
     assert indexer._sync_progress["files_total"] == 0
 
     phases_seen = []
-    original_markdown_files = indexer._markdown_files
+    from mortis_rag_mcp._indexer import sync_engine
+    original_scan = sync_engine.scan_indexable_files
 
-    def _spy_markdown_files():
+    def _spy_scan(*args, **kwargs):
         phases_seen.append((indexer._sync_state, dict(indexer._sync_progress)))
-        return original_markdown_files()
+        return original_scan(*args, **kwargs)
 
-    indexer._markdown_files = _spy_markdown_files
+    monkeypatch.setattr(sync_engine, "scan_indexable_files", _spy_scan)
 
     indexer.sync()
 
@@ -290,5 +291,4 @@ def test_sync_progress_state_machine(tmp_path):
     assert indexer._sync_progress["phase"] == "idle"
     assert indexer._sync_progress["files_total"] == 5
     assert indexer._sync_progress["files_done"] == 5
-
 

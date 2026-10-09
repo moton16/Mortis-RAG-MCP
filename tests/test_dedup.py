@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from mortis_rag_mcp.config import AppConfig, CacheConfig, EmbeddingConfig, VectorConfig
+from mortis_rag_mcp.config import AppConfig, CacheConfig, EmbeddingConfig, VectorConfig, ChunkingConfig
 from mortis_rag_mcp.indexer import MarkdownIndexer
 
 # 两段正文都带这个 token，保证一次查询能命中全部 chunk。
@@ -50,6 +50,7 @@ def _config(tmp_path: Path, disk: bool = False, workers: int = 1) -> AppConfig:
         embedding=EmbeddingConfig(mode="external", dimension=8),
         vector=VectorConfig(backend="sqlite_vec" if disk else "memory"),
         cache=CacheConfig(dir=str(tmp_path / "cache"), enabled=True, embedding_max_workers=workers),
+        chunking=ChunkingConfig(mode="legacy_chars", mode_explicit=True),
     )
 
 
