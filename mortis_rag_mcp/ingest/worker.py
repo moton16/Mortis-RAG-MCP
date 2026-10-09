@@ -1879,6 +1879,7 @@ def make_ingest_manager(
     audio_config: Any = None,
     audio_decoder: Any = None,
     media_provider: Any = None,
+    media_capability_error: str | None = None,
 ) -> Any:
     """按 `ingest.storage` 选择摄取实现（唯一的路径分派点）。
 
@@ -1899,6 +1900,7 @@ def make_ingest_manager(
             chunker_fingerprint_provider=chunker_fingerprint_provider,
             audio_config=audio_config, audio_decoder=audio_decoder,
             media_provider=media_provider,
+            media_capability_error=media_capability_error,
         )
     return IngestManager(
         vault_path, config, on_job_finished=on_job_finished, ignore_provider=ignore_provider
