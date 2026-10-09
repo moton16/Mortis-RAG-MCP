@@ -333,11 +333,23 @@ def _export_v2(owner: MarkdownIndexer, out_path: str | Path) -> dict[str, Any]:
     try:
         with tempfile.TemporaryDirectory(prefix="snapshot-", dir=out.parent) as temporary:
             root = Path(temporary)
-            payloads = {"chunks.bin": owner._chunks_cache_path}
+            # _sync_lock is per client, not per cache file. Another client may
+            # atomically replace the live cache even after validation/hashing.
+            # Pin the bytes locally once; validation, hashing and ZIP writing
+            # must all consume this same immutable staging member.
+            chunks_path = root / "chunks.bin"
+            shutil.copyfile(owner._chunks_cache_path, chunks_path)
+            captured = _CacheCodec.load(chunks_path)
+            if captured is None:
+                raise StoreConflict("snapshot chunks cache is unreadable; re-run sync")
+            chunks_meta = captured[0]
+            captured_files = captured[1]
+            vectors_meta = owner._vectors_meta()
+            payloads = {"chunks.bin": chunks_path}
             vectors = owner._vector_backend.get_vectors(chunk.id for chunk in owner.all_chunks())
             if vectors:
                 transport = root / "vectors.bin"
-                _VectorsCodec.dump(transport, owner._vectors_meta(), vectors)
+                _VectorsCodec.dump(transport, vectors_meta, vectors)
                 payloads["vectors.bin"] = transport
             store = owner._existing_document_store()
             store_manifest = None
@@ -361,6 +373,9 @@ def _export_v2(owner: MarkdownIndexer, out_path: str | Path) -> dict[str, Any]:
                 # Portable backups contain facts, never live task credentials.
                 conn = sqlite3.connect(str(document))
                 try:
+                    if not _backup_matches_pin(conn, pin):
+                        raise StoreConflict("snapshot revision/sequence changed during backup")
+                    _require_export_revisions(chunks_path, conn)
                     conn.execute("DELETE FROM ingest_jobs")
                     conn.execute("DELETE FROM ingest_subjobs")
                     conn.commit()
@@ -369,6 +384,9 @@ def _export_v2(owner: MarkdownIndexer, out_path: str | Path) -> dict[str, Any]:
                 finally:
                     conn.close()
                 payloads["docstore.sqlite"] = document
+            elif any(chunk.metadata.get("revision_id")
+                     for _, chunks in captured_files.values() for chunk in chunks):
+                raise StoreConflict("snapshot revision references have no document store")
             members = {}
             for name, path in payloads.items():
                 size = path.stat().st_size
@@ -378,13 +396,15 @@ def _export_v2(owner: MarkdownIndexer, out_path: str | Path) -> dict[str, Any]:
             if sum(info["size"] for info in members.values()) > _SNAPSHOT_TOTAL_LIMIT:
                 raise ValueError("snapshot exceeds total export budget")
             manifest = {"format": _SNAPSHOT_FORMAT, "format_version": 2,
-                        "chunks_meta": owner._chunks_meta(), "vectors_meta": owner._vectors_meta(),
+                        "chunks_meta": chunks_meta, "vectors_meta": vectors_meta,
                         "members": members, "docstore": store_manifest,
                         "total_budget_bytes": _SNAPSHOT_TOTAL_LIMIT,
                         "budget_version": _SNAPSHOT_BUDGET_VERSION,
                         "derived_status": "requires_local_source_verification",
                         "data_classification": ["parsed_text", "media_originals_and_audio"],
-                        "stats": {"files": len(owner._chunks), "chunks": len(owner.all_chunks()), "vectors": len(vectors)}}
+                        "stats": {"files": len(captured_files),
+                                  "chunks": sum(len(chunks) for _, chunks in captured_files.values()),
+                                  "vectors": len(vectors)}}
             staged = root / "archive.zip"
             with zipfile.ZipFile(staged, "w", zipfile.ZIP_DEFLATED) as archive:
                 archive.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False))
@@ -406,6 +426,31 @@ def _export_v2(owner: MarkdownIndexer, out_path: str | Path) -> dict[str, Any]:
                 pass
     return {"exported": True, "path": str(out), "format_version": 2,
             "contains_media": store_manifest is not None, **manifest["stats"]}
+
+
+def _backup_matches_pin(conn: sqlite3.Connection, pin: Any) -> bool:
+    row = conn.execute("SELECT change_seq FROM store_meta WHERE id=1").fetchone()
+    return row is not None and int(row[0]) == pin.change_seq
+
+
+def _require_export_revisions(chunks_path: Path, conn: sqlite3.Connection) -> None:
+    """Every exported virtual chunk must resolve in the captured facts backup."""
+    from ..doc_store import StoreConflict
+
+    # Validate the exact staged bytes, not all_chunks()'s filtered live view.
+    loaded = _CacheCodec.load(chunks_path)
+    if loaded is None:
+        raise StoreConflict("snapshot chunks cache is unreadable; re-run sync")
+    for chunk in (chunk for _, chunks in loaded[1].values() for chunk in chunks):
+        revision = chunk.metadata.get("revision_id")
+        if not revision:
+            continue
+        row = conn.execute(
+            "SELECT 1 FROM document_revisions r JOIN documents d ON d.doc_id=r.doc_id "
+            "WHERE r.revision_id=? AND r.state='committed' AND d.source=?",
+            (revision, chunk.source)).fetchone()
+        if row is None:
+            raise StoreConflict(f"snapshot chunk references absent revision {revision!r}; re-run sync")
 
 
 #: 活跃摄取任务：存在即默认拒绝导入（§20.7F），避免覆盖未完成资产。

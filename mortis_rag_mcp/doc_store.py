@@ -1594,6 +1594,9 @@ CREATE TABLE IF NOT EXISTS derived_generations (
 """
 
 _VISIBILITIES = ("active", "exempt", "deleted", "unverified")
+# Opaque source-local CAS token, derived exclusively from existing persisted
+# facts. Stage-only writes do not change it; unrelated sources cannot fence it.
+SourceSequence = tuple[str, str, int, str, bool, int]
 
 
 class DocumentStore:
@@ -1627,7 +1630,7 @@ class DocumentStore:
     def _conn(self) -> sqlite3.Connection | None:
         return getattr(self._tls, "conn", None)
 
-    def _open_conn(self, gen_id: str) -> sqlite3.Connection:
+    def _open_conn(self, gen_id: str, *, create: bool = False) -> sqlite3.Connection:
         conn = self._conn()
         if conn is not None and getattr(self._tls, "gen", "") == gen_id:
             return conn
@@ -1639,11 +1642,26 @@ class DocumentStore:
             self._tls.conn = None
             self._tls.gen = ""
         path = self._store_path(gen_id)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(str(path), check_same_thread=False)
+        # Only allocation may create facts. An active/retained generation is not
+        # a disposable cache: never turn a missing or truncated database into an
+        # initialized replacement, even when the caller requested write=True.
+        if create:
+            path.parent.mkdir(parents=True, exist_ok=True)
+        else:
+            try:
+                if not path.is_file() or path.stat().st_size == 0:
+                    raise StoreCorrupt(f"活动文档库缺失或零长度：{path}")
+            except OSError as exc:
+                raise StoreCorrupt(f"活动文档库不可读：{path}: {exc}") from exc
+        try:
+            conn = sqlite3.connect(
+                str(path) if create else path.resolve().as_uri() + "?mode=rw",
+                uri=not create, check_same_thread=False)
+        except sqlite3.DatabaseError as exc:
+            raise StoreCorrupt(f"文档库打开失败：{path}: {exc}") from exc
         try:
             _configure_conn(conn)
-            self._ensure_schema(conn, path)
+            self._ensure_schema(conn, path, create=create)
         except DocStoreError:
             conn.close()
             raise
@@ -1660,12 +1678,14 @@ class DocumentStore:
         self._tls.gen = gen_id
         return conn
 
-    def _ensure_schema(self, conn: sqlite3.Connection, path: Path) -> None:
+    def _ensure_schema(self, conn: sqlite3.Connection, path: Path, *, create: bool = False) -> None:
         try:
             size = path.stat().st_size
         except OSError:
             size = 0
         if size == 0:
+            if not create:
+                raise StoreCorrupt(f"活动文档库缺失或零长度：{path}")
             self._create_schema(conn)
             return
         try:
@@ -1748,14 +1768,21 @@ class DocumentStore:
             ctrl.close()
 
     def _allocate_generation(self) -> str:
-        ctrl = ControlStore(self.layout)
-        try:
-            ctrl.open(create=True, write=True)
-            gen_id = ctrl.allocate_generation()
-            ctrl.set_active_document_generation(gen_id)
-            return gen_id
-        finally:
-            ctrl.close()
+        with _mutation_lock(self.layout):
+            ctrl = ControlStore(self.layout)
+            try:
+                ctrl.open(create=True, write=True)
+                active = ctrl.state().active_document_generation
+                if active:
+                    return active
+                gen_id = ctrl.allocate_generation()
+                # Initialize before publishing the active pointer; readers must
+                # never observe a half-initialized first generation.
+                self._open_conn(gen_id, create=True)
+                ctrl.set_active_document_generation(gen_id)
+                return gen_id
+            finally:
+                ctrl.close()
 
     def _resolve_generation(self, write: bool) -> str:
         if self._requested_generation:
@@ -1814,7 +1841,7 @@ class DocumentStore:
         """打开文档库；generation 为空时从 control 的 active_document_generation 取。"""
         if write:
             self._enforce_writable()
-        gen = self._resolve_generation(write=write)
+        gen = self._resolve_generation(write=write and create)
         if not gen:
             self._generation_id = ""
             return
@@ -1858,9 +1885,9 @@ class DocumentStore:
                 raise StoreConflict("An inactive retained generation is read-only")
             path = self._store_path(self._generation_id)
             path.parent.mkdir(parents=True, exist_ok=True)
+            conn = self._open_conn(self._generation_id)
             depth = int(getattr(self._tls, "mutation_depth", 0))
             self._tls.mutation_depth = depth + 1
-            conn = self._open_conn(self._generation_id)
             try:
                 yield conn
             except BaseException:
@@ -1970,6 +1997,30 @@ class DocumentStore:
         conn = self._open_conn(gen)
         row = self._query_one(conn, "SELECT change_seq FROM store_meta WHERE id = 1", what="change_seq")
         return int(row[0]) if row is not None else 0
+
+    def _source_seq_locked(self, conn: sqlite3.Connection, source: str) -> SourceSequence:
+        row = self._query_one(conn,
+            "SELECT active_revision, visibility FROM documents WHERE source=?",
+            (source,), what="source sequence document")
+        job = self._query_one(conn,
+            "SELECT COALESCE(MAX(request_seq), 0) FROM ingest_jobs WHERE source=?",
+            (source,), what="source sequence jobs")
+        return (source, self._generation_id, self._current_epoch(),
+                str(row[0] or "") if row else "", bool(row and row[1] == "deleted"),
+                int(job[0]) if job else 0)
+
+    def source_seq(self, source: str) -> SourceSequence:
+        """Capture after claim, before parsing/source checks; pass unchanged to commit.
+
+        The token includes tombstone/request fencing but not global change_seq.
+        It survives close/reopen and needs neither a new schema nor a sidecar.
+        """
+        rel = normalize_source_path(source, self.layout.vault_path)
+        with _mutation_lock(self.layout):
+            gen = self._ensure_read_generation()
+            if not gen:
+                return (rel, "", self._current_epoch(), "", False, 0)
+            return self._source_seq_locked(self._open_conn(gen), rel)
 
     def integrity_check(self) -> None:
         gen = self._ensure_read_generation()
@@ -2405,6 +2456,7 @@ class DocumentStore:
         revision_id: str,
         *,
         expected_change_seq: int | None = None,
+        expected_source_seq: SourceSequence | None = None,
         source_sha256: str | None = None,
         source_size: int | None = None,
         source_mtime_ns: int | None = None,
@@ -2416,6 +2468,7 @@ class DocumentStore:
                 conn,
                 revision_id,
                 expected_change_seq=expected_change_seq,
+                expected_source_seq=expected_source_seq,
                 source_sha256=source_sha256,
                 source_size=source_size,
                 source_mtime_ns=source_mtime_ns,
@@ -2431,6 +2484,7 @@ class DocumentStore:
         revision_id: str,
         *,
         expected_change_seq: int | None = None,
+        expected_source_seq: SourceSequence | None = None,
         source_sha256: str | None = None,
         source_size: int | None = None,
         source_mtime_ns: int | None = None,
@@ -2460,6 +2514,7 @@ class DocumentStore:
                 conn,
                 revision_id,
                 expected_change_seq=expected_change_seq,
+                expected_source_seq=expected_source_seq,
                 source_sha256=source_sha256,
                 source_size=source_size,
                 source_mtime_ns=source_mtime_ns,
@@ -2498,6 +2553,7 @@ class DocumentStore:
         revision_id: str,
         *,
         expected_change_seq: int | None = None,
+        expected_source_seq: SourceSequence | None = None,
         source_sha256: str | None = None,
         source_size: int | None = None,
         source_mtime_ns: int | None = None,
@@ -2527,6 +2583,10 @@ class DocumentStore:
                 "只能提交 staged revision", fix="committed 版本不可重复提交。"
             )
 
+        if expected_source_seq is not None:
+            source = conn.execute("SELECT source FROM documents WHERE doc_id=?", (doc_id,)).fetchone()[0]
+            if expected_source_seq != self._source_seq_locked(conn, str(source)):
+                raise StoreConflict("expected_source_seq changed (publication/deletion/request fencing)")
         cur_seq = int(conn.execute("SELECT change_seq FROM store_meta WHERE id = 1").fetchone()[0])
         if expected_change_seq is not None and int(expected_change_seq) != cur_seq:
             raise StoreConflict(
@@ -2559,6 +2619,8 @@ class DocumentStore:
         ).fetchone()
         visibility = str(doc[0])
         prev_active = str(doc[1]) if doc[1] else ""
+        if visibility == "deleted" and expected_source_seq is None:
+            raise StoreConflict("deleted source requires a fresh expected_source_seq")
         effective_policy = policy_version if policy_version is not None else rev_policy
         now = time.time()
         new_seq = cur_seq + 1
@@ -2595,6 +2657,16 @@ class DocumentStore:
         return new_seq
 
     def _prune_committed(self, conn: sqlite3.Connection, doc_id: str, keep: Sequence[str]) -> None:
+        # A generation lease protects revisions too, not only its directory.
+        # Conservatively retain committed facts while any lease is live; the
+        # next publication after release/expiry resumes active+previous pruning.
+        ctrl = ControlStore(self.layout)
+        try:
+            ctrl.open(create=False)
+            if ctrl.generation_is_pinned(self._generation_id):
+                return
+        finally:
+            ctrl.close()
         kept = {k for k in keep if k}
         rows = conn.execute(
             "SELECT revision_id FROM document_revisions WHERE doc_id = ? AND state = 'committed' "
@@ -3407,19 +3479,37 @@ class DocumentStore:
             )
             conn.commit()
 
-    def mark_deleted(self, source: str) -> None:
-        """visibility='deleted' 且清空 active_revision；解析事实保留待显式 purge（§12.6）。"""
+    def mark_deleted(self, source: str) -> int:
+        """原子删除 tombstone + change_seq/CAS + 旧任务 fencing；保留 committed 事实。"""
         rel = normalize_source_path(source, self.layout.vault_path)
         with self.mutation() as conn:
-            cur = conn.execute("SELECT doc_id FROM documents WHERE source = ?", (rel,)).fetchone()
+            cur = conn.execute("SELECT doc_id, visibility FROM documents WHERE source = ?", (rel,)).fetchone()
+            live = conn.execute(
+                "SELECT 1 FROM ingest_jobs WHERE source = ? "
+                "AND state NOT IN (" + ",".join("?" for _ in JOB_TERMINAL_STATES) + ") LIMIT 1",
+                (rel, *JOB_TERMINAL_STATES)).fetchone()
+            seq = int(conn.execute("SELECT change_seq FROM store_meta WHERE id=1").fetchone()[0])
+            if (cur is None and live is None) or (cur is not None and cur[1] == "deleted" and live is None):
+                return seq
+            now = time.time()
             if cur is None:
-                return
+                conn.execute(
+                    "INSERT INTO documents (doc_id, source, visibility, updated_at) VALUES (?, ?, 'deleted', ?)",
+                    (uuid.uuid4().hex, rel, now))
             conn.execute(
                 "UPDATE documents SET visibility = 'deleted', active_revision = NULL, updated_at = ? "
                 "WHERE source = ?",
-                (time.time(), rel),
+                (now, rel),
             )
+            conn.execute(
+                "UPDATE ingest_jobs SET state='superseded', phase='source_deleted', "
+                "lease_until=0, updated_at=? WHERE source=? AND state NOT IN ("
+                + ",".join("?" for _ in JOB_TERMINAL_STATES) + ")",
+                (now, rel, *JOB_TERMINAL_STATES))
+            conn.execute("UPDATE store_meta SET change_seq=? WHERE id=1", (seq + 1,))
+            conn.execute("UPDATE derived_generations SET status='stale'")
             conn.commit()
+            return seq + 1
 
     # ------------------------------------------------------------------ 维护/恢复
 
@@ -3822,6 +3912,11 @@ class DocumentStore:
                     "change_seq": self.change_seq(), "retained": True}
 
     def capture_generation_pin(self, *, lease_seconds: float = 300) -> GenerationPin:
+        # Serialize lease + epoch + sequence capture with all fact publications.
+        with _mutation_lock(self.layout):
+            return self._capture_generation_pin_locked(lease_seconds=lease_seconds)
+
+    def _capture_generation_pin_locked(self, *, lease_seconds: float) -> GenerationPin:
         """捕获固定版本 handle（E04-c）：控制面 active generation + change_seq + epoch。
 
         捕获与当前读代不一致立即释放并报冲突——不允许跨代读取。
@@ -3869,7 +3964,12 @@ class DocumentStore:
             ctrl.close()
         if str(state.active_document_generation or "") != pin.generation_id:
             return False
-        return int(state.epoch) == pin.epoch
+        if int(state.epoch) != pin.epoch:
+            return False
+        try:
+            return self.change_seq() == pin.change_seq
+        except DocStoreError:
+            return False
 
     def renew_generation_pin(self, pin: GenerationPin, *, lease_seconds: float = 300) -> bool:
         """未到期同 owner 续租；过期返回 False（不复活）。"""
@@ -3904,6 +4004,17 @@ class DocumentStore:
             what="活跃摄取任务计数",
         )
         return bool(row and int(row[0]) > 0)
+
+    def pending_ingest_sources(self) -> list[str]:
+        """All nonterminal queue sources, including not-yet-staged first ingest."""
+        gen = self._ensure_read_generation()
+        if not gen:
+            return []
+        rows = self._query_all(self._open_conn(gen),
+            "SELECT DISTINCT source FROM ingest_jobs WHERE COALESCE(source, '') <> '' "
+            "AND state NOT IN (" + ",".join("?" for _ in JOB_TERMINAL_STATES) + ")",
+            tuple(JOB_TERMINAL_STATES), what="pending ingest sources")
+        return sorted(str(row[0]) for row in rows)
 
     def backup_to(self, path: str | Path, *, pages: int = -1, progress: Any = None) -> Path:
         """`sqlite3.Connection.backup` 一致性备份（不是 copy 主文件，§20.2）。

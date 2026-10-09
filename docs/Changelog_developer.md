@@ -1284,3 +1284,7 @@ Codex 主流程整合；施工子代理 gpt-6.1-sol/high。resolved media connec
 ### E20 registry 并发状态复核补足
 
 Codex 主流程：load/save 读状态与内存快照置于既有 RLock；直接 save 复用既有进程文件锁，保持原锁序/重入策略，避免并发 load 把 unknown 状态改写后放过覆盖写。registry 20 passed、E20 ops 13 passed，exit0；证据 ops/registry-serialized 与 ops/green-serialized。
+
+### E20 F01/F02/F03 存储不变量出口
+
+Codex 主流程整合；施工子代理 gpt-6.1-sol/high。已有活动代数据库缺失/零长度显式失败，不创建替代空库；合法首次初始化先建库再发布指针。删除原子推进 change_seq、tombstone 与旧任务栅栏，source_seq 从已有事实生成 source-local CAS，schema/epoch 不变。generation pin 保护必要 committed revision，导出冻结 chunks staging member，并对 backup sequence、引用、最终 pin 做发布前验证，避免其他客户端换缓存后形成混包。原红 8 failed/1 passed，新增 immutable-cache 红2failed；主复核12passed，既有docstore/snapshot/recovery靶向通过。worker CAS消费者与首摄取删除sync补丁在下一批串行整合。证据 .runtime/beta2/E20/store/；不声明真实丢盘/旧用户库已验。
