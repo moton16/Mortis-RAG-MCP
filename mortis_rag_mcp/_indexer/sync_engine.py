@@ -164,6 +164,9 @@ def _stamp_embedding_keys(owner: MarkdownIndexer) -> None:
 
     key 只描述「同一输入 + 同一 profile」，不参与版本寻址（§20.7B），所以可以
     跨 revision 复用；oversize / embedding_disabled 的 chunk 不留 key。
+
+    E08-c：媒体 proxy 的 key 必须把**媒体 blob 身份**算进去 —— 否则「同 caption
+    异图」会得到同一个 key，复用阶段就会把两张不同图的向量互相冒充。
     """
     from .token_chunking import embedding_key as _embedding_key
     profile = getattr(owner, "_embedding_profile", None)
@@ -173,9 +176,12 @@ def _stamp_embedding_keys(owner: MarkdownIndexer) -> None:
         for chunk in chunks:
             if chunk.metadata.get("embedding_disabled"):
                 continue
+            media_hashes = chunk.metadata.get("media_hashes")
+            if not media_hashes:
+                blob = chunk.metadata.get("blob_sha256")
+                media_hashes = (blob,) if blob else ()
             chunk.metadata["embedding_key"] = _embedding_key(
-                _document_input(owner, chunk.content), space, template,
-                chunk.metadata.get("media_hashes", ()))
+                _document_input(owner, chunk.content), space, template, media_hashes)
 
 
 def reuse_vectors_by_content_hash(owner: MarkdownIndexer) -> int:
@@ -400,7 +406,52 @@ def revoke_source(owner: MarkdownIndexer, source: str, *, reason: str) -> bool:
         except Exception as exc:
             owner.failed_files[source] = f"{reason}: vector revocation failed: {exc}"
         owner._disk_vectors.difference_update(ids)
+    # E08-c：撤销派生媒体召回。更新/删除/豁免/导入切代都不复活旧 links；只删
+    # 派生映射，**不**触碰解析事实（revision/markdown）与媒体 blob。
+    if any(chunk.metadata.get("revision_id") or chunk.metadata.get("kind") == "media_proxy"
+           for chunk in chunks):
+        try:
+            store = owner._existing_document_store()
+        except Exception:
+            store = None
+        if store is not None:
+            try:
+                store.delete_media_chunk_links(source=source)
+            except Exception as exc:
+                owner.failed_files[source] = f"{reason}: media link revocation failed: {exc}"
     return bool(chunks)
+
+
+def media_proxy_for_revision(owner: MarkdownIndexer, store: Any, source: str, revision_id: str,
+                             markdown: str, text_chunks: list[Chunk]) -> list[Chunk]:
+    """为一条已提交 revision 生成媒体 proxy chunk，并**整代**落 profile 作用域 links。
+
+    - 正文与 proxy 走同一 FTS/embed 候选：返回的 proxy 由调用方并入 `owner._chunks`；
+    - links 至少按 profile/derived generation/revision/occurrence/chunk 绑定；
+    - 无 occurrence 时也整代替换（清掉本代旧链），源失去媒体后不残留旧召回。
+    """
+    from .media import build_media_proxy_chunks, media_chunk_links
+
+    profile_key = owner._embedding_profile.fingerprint
+    fingerprint = owner._chunker_fingerprint()
+    generation = owner._derived_profile_key()
+    writable = owner.document_store(write=True)
+    # 切代撤销：先按 source+profile 清掉该源**所有历史 revision** 的派生召回，再写当前代。
+    # 这样「revision 更新后旧代 links 不复活」，而其它 profile 的作用域完全不受影响。
+    writable.delete_media_chunk_links(source=source, profile_key=profile_key)
+    occurrences = writable.list_media(source, revision_id=revision_id, limit=1000)
+    proxy = build_media_proxy_chunks(
+        markdown, occurrences, source=source, revision_id=revision_id,
+        profile_key=profile_key, chunker_fingerprint=fingerprint,
+        derived_generation_id=generation, chunking=owner._chunking_config)
+    links = media_chunk_links(
+        [*text_chunks, *proxy], occurrences, revision_id=revision_id,
+        profile_key=profile_key, chunker_fingerprint=fingerprint,
+        derived_generation_id=generation, markdown=markdown)
+    writable.replace_media_chunk_links(
+        revision_id=revision_id, profile_key=profile_key,
+        derived_generation_id=generation, chunker_fingerprint=fingerprint, links=links)
+    return proxy
 
 
 def run_sync(owner: MarkdownIndexer) -> list[Chunk]:
@@ -585,6 +636,13 @@ def run_sync(owner: MarkdownIndexer) -> list[Chunk]:
                                        "source_sha256": raw_sha,
                                        "render_sha256": revision.render_sha256,
                                        "line_basis": "rendered_markdown"})
+            # E08-b：捕获已提交 revision 的 occurrences，生成媒体 proxy 并落 links。
+            # proxy 并入同一 FTS/embed 候选；失败只记该 source，不丢正文层。
+            try:
+                chunks.extend(media_proxy_for_revision(
+                    owner, store, source, revision.revision_id, revision.parsed_markdown, chunks))
+            except Exception as exc:
+                owner.failed_files[source] = f"media_proxy: {exc}"
             changed.append((source, signature, chunks,
                             (int(stat.st_mtime_ns), int(stat.st_size), int(stat.st_ctime_ns)),
                             time.time_ns()))

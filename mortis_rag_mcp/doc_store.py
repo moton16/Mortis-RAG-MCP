@@ -3619,6 +3619,56 @@ class DocumentStore:
                               derived_generation_id, str(link["chunk_id"]), str(link["relation"])))
             conn.commit()
 
+    def replace_media_chunk_links(self, *, revision_id: str, profile_key: str,
+                                  derived_generation_id: str,
+                                  links: Sequence[Mapping[str, str]],
+                                  chunker_fingerprint: str = "") -> int:
+        """按 (revision, profile, generation) **整代替换** links（E08-b）。
+
+        整代替换是撤销语义的关键：同一代里被移除的 occurrence/chunk 不会残留旧链，
+        而其它代（其它 profile/generation）完全不受影响。返回写入的链接条数。
+        """
+        with self.mutation() as conn:
+            self._ensure_media_links(conn)
+            conn.execute("DELETE FROM media_chunk_links WHERE revision_id=? AND profile_key=? "
+                         "AND derived_generation_id=?",
+                         (revision_id, profile_key, derived_generation_id))
+            written = 0
+            for link in links:
+                conn.execute("INSERT OR IGNORE INTO media_chunk_links VALUES (?, ?, ?, ?, ?, ?, ?)",
+                             (revision_id, str(link["occurrence_id"]), profile_key,
+                              str(link.get("chunker_fingerprint") or chunker_fingerprint),
+                              derived_generation_id, str(link["chunk_id"]), str(link["relation"])))
+                written += 1
+            conn.commit()
+            return written
+
+    def delete_media_chunk_links(self, *, source: str = "", revision_id: str = "",
+                                 profile_key: str = "") -> int:
+        """撤销派生召回（E08-c）：按 source/revision/profile 删除 links，**不动**解析事实与 blob。
+
+        返回删除条数；三个条件都为空时拒绝（避免误清全表）。
+        """
+        if not (source or revision_id or profile_key):
+            raise StoreContractError("delete_media_chunk_links requires a bounded scope")
+        with self.mutation() as conn:
+            self._ensure_media_links(conn)
+            conditions: list[str] = []
+            params: list[Any] = []
+            if revision_id:
+                conditions.append("revision_id=?")
+                params.append(revision_id)
+            if profile_key:
+                conditions.append("profile_key=?")
+                params.append(profile_key)
+            if source:
+                conditions.append("revision_id IN (SELECT r.revision_id FROM document_revisions r "
+                                  "JOIN documents d ON d.doc_id=r.doc_id WHERE d.source=?)")
+                params.append(source)
+            cursor = conn.execute("DELETE FROM media_chunk_links WHERE " + " AND ".join(conditions), params)
+            conn.commit()
+            return int(cursor.rowcount)
+
     def get_media_chunk_links(self, *, revision_id: str, profile_key: str,
                              derived_generation_id: str, occurrence_id: str = "") -> list[dict]:
         gen = self._ensure_read_generation()
