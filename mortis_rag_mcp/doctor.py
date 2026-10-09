@@ -53,6 +53,13 @@ _LINE_BREAK_RE = re.compile("\r\n|[" + "".join(_UNICODE_LINE_BREAKS) + "\r\n]")
 # 自由文本（库名、路径、异常消息）在表格里的长度上限：超出即截断。
 _FREE_TEXT_LIMIT = 160
 
+# **路径**单独给一个更宽的上限：路径的判别信息在**尾部**（`.mortis_rag_mcp/`
+# 还是 `.vault_mcp/`、`cache` 根在哪一侧），按 160 从尾部截会把最难复现、也最需要
+# 分辨的那一段丢掉——深家目录（CI 容器、长用户名、挂到深层的项目目录）实测超过
+# 160 字符，信任锚就又变成"分不清生效的是哪一份"。仍设上限，只是给到足以容纳
+# 合法绝对路径的量级，避免异常超长值把表格撑爆。
+_PATH_TEXT_LIMIT = 1024
+
 # 主机名白名单：RFC1123 的 hostname 字符集（字母/数字/`.`/`-`），额外允许 `_`
 # （Windows 域内主机名常见）。其余字符一律替换为 `?`。
 _HOSTNAME_INVALID_RE = re.compile(r"[^A-Za-z0-9._-]")
@@ -443,7 +450,7 @@ def check_config(app_config: str | None) -> tuple[dict, object | None]:
         # 一直是完整路径，口径也不一致）。PROJECT_GUIDE 让用户「依据 config.toml
         # 在哪一侧判断」，该信息必须出现在用户/agent 真正会读的文件里。
         detail = (
-            f"{_sanitize_free_text(path) if path else '内置默认'}"
+            f"{_sanitize_free_text(path, _PATH_TEXT_LIMIT) if path else '内置默认'}"
             f"：embedding={_sanitize_free_text(mode)}/{_sanitize_free_text(model)}"
             f"，api_key {status_text}{missing_str}{rr_detail}"
         )
@@ -517,7 +524,7 @@ def check_registry() -> dict:
         reg = VaultRegistry(registry_path())
         vaults = reg.load()
         if reg.read_status == "unknown":
-            return _section(False, f"注册表加载失败：{_sanitize_free_text(reg.path)}：{_sanitize_free_text(reg.read_error)}")
+            return _section(False, f"注册表加载失败：{_sanitize_free_text(reg.path, _PATH_TEXT_LIMIT)}：{_sanitize_free_text(reg.read_error)}")
         names, missing = [], []
         for v in vaults:
             name = str(getattr(v, "name", getattr(v, "path", "?")))
@@ -548,7 +555,7 @@ def check_cache_dir(cfg: object | None) -> dict:
         d = Path(str(d))
         return _section(
             True,
-            f"{_sanitize_free_text(d)}（{'存在' if d.exists() else '初次索引时自动创建'}）",
+            f"{_sanitize_free_text(d, _PATH_TEXT_LIMIT)}（{'存在' if d.exists() else '初次索引时自动创建'}）",
         )
     except Exception as exc:
         return _section(True, f"缓存目录检查跳过：{_sanitize_free_text(exc)}")
@@ -597,7 +604,7 @@ def check_doc_store(cfg: object | None) -> dict:
         if len(roots) == 1:
             root = next(iter(roots))
             exists = "存在" if Path(root).exists() else "首次虚拟摄取时创建"
-            detail += f"，根 {_sanitize_free_text(root)}（{exists}）"
+            detail += f"，根 {_sanitize_free_text(root, _PATH_TEXT_LIMIT)}（{exists}）"
         elif roots:
             detail += f"，{len(roots)} 个库缓存根"
         if blocked:

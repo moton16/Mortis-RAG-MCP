@@ -28,6 +28,20 @@ def isolate_registry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("VAULT_MCP_REGISTRY", reg_file)
 
 
+@pytest.fixture(autouse=True)
+def no_background_watch(monkeypatch: pytest.MonkeyPatch):
+    """本文件钉的是「读取时的版本/陈旧判定」，不让后台监听线程插进来。
+
+    `_indexer_for` 建库时会顺带 `start_watching()`；而这里的用例直接改写物理源文件
+    来制造 STALE 场景，监听线程可在两次断言之间并发重签源文件、改动文档库的可见
+    性，于是同一份 allow_stale 读取在快/慢机器上给出不同结果（CI 上 py3.13 这一档
+    实测踩到）。合同本身与监听无关，这里把监听惰性化，让判定保持确定性。
+    """
+    from mortis_rag_mcp.indexer import MarkdownIndexer
+
+    monkeypatch.setattr(MarkdownIndexer, "start_watching", lambda self, *args, **kwargs: None)
+
+
 def _commit_document(store: DocumentStore, vault: Path, source: str, markdown: str,
                      *, occurrences: int = 0, parser: str = "fake-1") -> str:
     path = vault / source

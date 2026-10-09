@@ -507,6 +507,34 @@ def test_doctor_check_config_reports_full_path_and_flags_shadowed_old_config(tmp
     assert "已被忽略" in res["detail"] and "vault_mcp/config.toml" in res["detail"]
 
 
+def test_doctor_check_config_keeps_full_path_when_home_root_is_deep(tmp_path, monkeypatch):
+    """家目录很深时也必须输出**完整**路径：路径的判别信息在尾部。
+
+    按自由文本 160 字符上限截断会把正好需要区分的那一段（`.mortis_rag_mcp` 还是
+    `.vault_mcp`）丢掉，而 CI/容器/挂载到深层的项目目录实测会超过这个长度。这里
+    构造一条确定超过 160 字符的家目录，pin「路径不受自由文本上限影响」。
+    """
+    deep = tmp_path
+    for segment in ("deep-home-segment-one", "deep-home-segment-two", "deep-home-segment-three"):
+        deep = deep / segment
+    (deep / ".mortis_rag_mcp").mkdir(parents=True)
+    (deep / ".mortis_rag_mcp" / "config.toml").write_text('[embedding]\nmode = "static"\n', encoding="utf-8")
+
+    _stub_home(deep, monkeypatch)
+    mock_cfg = MagicMock()
+    mock_cfg.embedding.mode = "static"
+    mock_cfg.embedding.model = ""
+    mock_cfg.embedding.endpoint = ""
+    mock_cfg.embedding.api_key = ""
+    mock_cfg.reranker.enabled = False
+    with patch("mortis_rag_mcp.config.load_config", return_value=mock_cfg):
+        res, _ = doctor.check_config(None)
+
+    target = str(deep / ".mortis_rag_mcp" / "config.toml")
+    assert len(target) > doctor._FREE_TEXT_LIMIT, f"用例前提：路径必须超过自由文本上限（实际 {len(target)}）"
+    assert f"`{target}`" in res["detail"], "深路径也必须原样给出完整值"
+
+
 def test_doctor_check_config_omits_shadow_notice_when_only_one_side_exists(tmp_path, monkeypatch):
     _stub_home(tmp_path, monkeypatch)
     old_dir = tmp_path / ".vault_mcp"

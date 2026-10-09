@@ -29,7 +29,10 @@ BODY = (
     ],
 )
 def test_eval_cli_exact_source_contract(tmp_path, expect, expected_exit, mark, hit, mrr):
-    before = GOLDEN.read_bytes()
+    # 换行符不参与"未被改写"判定：同一个 golden 在 autocrlf=true 的检出里是 CRLF，
+    # 在默认检出里是 LF（Windows CI 与本地/Ubuntu CI 实测字节不同），按原始字节哈希
+    # 会让它自己成为唯一的平台相关性来源。统一折算成 LF 再哈希，冻结值仍等于 LF 形态。
+    before = GOLDEN.read_text(encoding="utf-8").encode("utf-8")
     assert hashlib.sha256(before).hexdigest() == FROZEN_SHA256
     assert json.loads(before)["queries"][0]["expect"] == "数电/"
     vault = tmp_path / "synthetic-vault"

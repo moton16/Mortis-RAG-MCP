@@ -565,6 +565,22 @@ def _quick_signatures(owner: MarkdownIndexer) -> dict[str, tuple[int, int]]:
     return out
 
 
+def _join_started_thread(thread: threading.Thread | None, timeout: float = 2.0) -> bool:
+    """join 一个可能「已构造但从未 start」的线程，返回是否已 join 且仍然存活。
+
+    `Thread.join()` 对未 start 的线程抛 `RuntimeError: cannot join thread before
+    it is started`（py3.13 每次退栈都会触发一次）。而 `start_watching` 存在多条
+    提前返回路径（watch_method 不支持、注册表不可用、已 _stopping），线程属性可能
+    刚被构造出来就被 `stop_watching` 收尾；那时 join 会让整个进程以非零码退出，
+    并把 traceback 打到 stderr（stdio 会话断言 "stderr 必须为空" 直接挂）。
+    因此先判 `ident`：只有真正 start 过的线程才 join。
+    """
+    if thread is None or thread.ident is None:
+        return False
+    thread.join(timeout=timeout)
+    return thread.is_alive()
+
+
 def stop_watching(owner: MarkdownIndexer) -> None:
     owner._watch_stop.set()
     # 停止 ingest 扫描 worker
@@ -572,30 +588,29 @@ def stop_watching(owner: MarkdownIndexer) -> None:
     with owner._ingest_lock:
         owner._ingest_dirty = False
         owner._ingest_cv.notify_all()
-    if owner._ingest_worker_thread is not None:
-        owner._ingest_worker_thread.join(timeout=2)
-        if owner._ingest_worker_thread.is_alive():
-            owner._stopping = True
-        else:
-            owner._ingest_worker_thread = None
+    if _join_started_thread(owner._ingest_worker_thread):
+        owner._stopping = True
+    else:
+        owner._ingest_worker_thread = None
 
     with owner._fs_debounce_lock:
         owner._fs_requested = False
         owner._fs_refresh_immediate = False
         owner._fs_pending_since = None
         owner._fs_debounce_cv.notify_all()
-    if owner._fs_scheduler_thread is not None:
-        owner._fs_scheduler_thread.join(timeout=2)
-        if owner._fs_scheduler_thread.is_alive():
-            owner._stopping = True
-        else:
-            owner._fs_scheduler_thread = None
+    if _join_started_thread(owner._fs_scheduler_thread):
+        owner._stopping = True
+    else:
+        owner._fs_scheduler_thread = None
     watcher, owner._fs_watcher = owner._fs_watcher, None
     if watcher is not None:
         watcher.stop()
     if owner._watch_thread is not None:
-        owner._watch_thread.join(timeout=2)
-        if owner._watch_thread.is_alive():
+        if not _join_started_thread(owner._watch_thread):
+            owner._watch_thread = None
+            if owner._fs_scheduler_thread is None and owner._ingest_worker_thread is None:
+                owner._stopping = False
+        elif owner._watch_thread.is_alive():
             # 线程没停就别把引用丢掉：持引用才能让下一次 stop_watching
             # 继续 join，也让 is_alive() 对外如实反映"还在跑"。
             # 丢掉引用会导致 kb_remove→kb_init 同一目录时新旧两个

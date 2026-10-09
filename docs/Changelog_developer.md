@@ -1320,6 +1320,19 @@ Codex 主流程（2026-10-09 / America_New_York）。代码候选93c39a50b09ec61
 
 原TST07两死定义清理case delta0，FLK原节点保持；四真实fast分页+4；worker配置fallback及媒体装配只局部收敛，兼容、watch quiet-window、恢复家族与virtual_worker_queue保留。主副本回滚剧本恢复初始186项tracked原字节，正确性回归恢复旧10failed/3passed；主分支和修改工件不回退。报告E20_EXECUTION_2026-10-09.md、统一入口仅追加§20与manifest round11/E20保留round10链，按仓库既有忽略交付，不force-add。最终收尾仅当前用户说明与追加技术记账，162项生产/测试/pyproject SHA保持本轮全层候选。真实用户旧库/其他paid端点/宿主展示/远端CI/包重建发布未执行；E17转录/ffmpeg移除保持。原bounded复核已完成；收口后第二次代理只读复核transport失败，无closure交付，不冒已完成。最终保护、工件重开与副本事务精确命令/输入/结果/exit见.runtime/beta2/E20/VERIFICATION.txt与final_validation.json。
 
+### v0.9.0 CI 全矩阵修复（PR #8 首轮 CI 反馈）
+
+editor:moton16，agent:codebuddy（2026-10-09）。推送 PR #8 后 CI 全矩阵报红（ubuntu 3.10/3.11/3.12/3.13 + windows-3.12 五档全 fail，仅 extras 两档 pass），本地 Windows 全量当时是全绿的——本地通过不是 CI 通过的证据。按 job 日志逐条定位，六类失败里**两类是真实产品缺陷**：
+
+1. **py3.13 `stop_watching` 退栈崩溃（真实产品缺陷）**：`_indexer/watch.py` 对三个线程直接 `join(timeout=2)`，而 `start_watching` 存在多条提前返回路径会让线程停在「已构造但未 start」；`Thread.join()` 对未启动线程抛 `RuntimeError: cannot join thread before it is started`，导致 stdio 会话以非零码退出并把 traceback 写进 stderr。改为 `_join_started_thread()`（先判 `ident` 再 join，未启动即视为已结束），三处引用同步；新增 `test_watch_integration.py::test_stop_watching_tolerates_threads_that_never_started`（SimpleNamespace 替身 + 三个未启动线程）作为确定性回归。
+2. **doctor 路径被 160 字符自由文本上限截断（真实产品缺陷）**：路径的判别信息在**尾部**（`.mortis_rag_mcp` 还是 `.vault_mcp`、缓存根在哪一侧），深家目录（CI 容器、长用户名、深层挂载）实测超过 `_FREE_TEXT_LIMIT=160`，截断后「依据 config.toml 在哪一侧判断」的信息又取不到。新增 `_PATH_TEXT_LIMIT=1024`，配置路径/注册表路径/缓存目录/文档库根四处改按该上限输出，异常消息等仍走 160；新增 `test_doctor.py::test_doctor_check_config_keeps_full_path_when_home_root_is_deep`（构造确定 >160 字符的家目录）回归。
+3. **`sqlite_vec` 参数缺依赖时误报「实现回退」**：E20 媒体用例的 `make_indexer(backend="sqlite_vec")` 在核心 lane（不装 extras）会静默回退 memory 后端并被 `assert idx._vector_backend.name == backend` 判失败。补 `pytest.importorskip("sqlite_vec")`，与 `test_vector_backend.py` 既有惯例一致。
+4. **`test_eval_cli_exact_source_contract` 冻结哈希依赖换行形态**：`golden_queries.json` 在 autocrlf=true 的检出（Windows CI）与默认检出里字节不同，`read_bytes()` 哈希把它自己变成唯一的平台相关性来源。改为 `read_text(encoding="utf-8").encode("utf-8")`（通用换行折算成 LF），冻结值不变（等于 LF 形态）。
+5. **`test_issue2_minimal_reproduction` 批式 stdio 依赖后台时序**：一次性喂完 stdin 的会话读到的 `files`/`chunks` 取决于后台线程推进到哪一步（C66 读优先之后尤甚），py3.12 那一档读到 `files=0`。改为 conftest 的 `stdio_polling`：轮询到 `index_state=ready` 且命中非空后，再在同一条会话里做定向统计与检索；用例对人的合同（不得误抛 multiple vaults、不得降级盲搜、solo 不进 excluded_solo）一条未减。
+6. **`test_virtual_read_server` 允许后台监听插进 STALE 判定（py3.13 踩到）**：`_indexer_for` 建库时顺带 `start_watching()`，用例改写物理源文件制造 STALE 后，监听线程可在两次断言之间并发重签源文件、改动文档库可见性，同一份 `allow_stale` 读取在快/慢机器上给出不同结果。该模块的合同是读取判定本身，新增 autouse `no_background_watch` 把监听惰性化；**未改产品读取语义**——若把该竞争当作产品行为来修订，需另行开卡。
+
+本轮本地验证：受影响 13 个测试文件 189 passed / 1 skipped；全量 `.venv` = **1281 passed / 14 skipped / 3 deselected in 149.33s**（较上一轮 +2，正是两个新增回归用例）。py3.13 与非 Windows 内核行为仍只能由 CI 判定：本机只有 py3.10，不替 CI 下结论。
+
 ### v0.9.0 发版收尾：许可证转 Apache-2.0、候选包重建、隔离安装与 MCP 冒烟
 
 editor:moton16，agent:codebuddy（2026-10-09）。基线 HEAD `4fcde07`（E20 收尾提交，分支 feat/v0.9.0-lane-ab）。

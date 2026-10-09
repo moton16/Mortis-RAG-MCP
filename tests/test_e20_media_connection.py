@@ -52,6 +52,11 @@ class FakeText:
 
 def make_indexer(folder, cfg, transport=None, *, backend="memory"):
     from mortis_rag_mcp.config import VectorConfig
+    if backend == "sqlite_vec":
+        # 可选 extra 未安装时 indexer 会静默回退到 memory 后端，下面那条"必须用真实后端"
+        # 的断言就会把「没装依赖」误报成「实现回退」。按既有惯例（test_vector_backend.py）
+        # 显式跳过：CI 核心 lane 不装 extras，只有 extras lane 真正覆盖磁盘后端。
+        pytest.importorskip("sqlite_vec", reason="pip install sqlite-vec to exercise the disk backend")
     folder.mkdir(exist_ok=True)
     vault = folder / "vault"
     vault.mkdir(exist_ok=True)
