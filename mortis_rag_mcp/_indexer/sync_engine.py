@@ -78,13 +78,22 @@ def flush_vectors_to_disk(owner: MarkdownIndexer) -> None:
         return
     try:
         persisted = owner._vector_backend.upsert_vectors(vectors)
-    except Exception:
+    except Exception as exc:
         # 落盘失败就保留在 RAM 里，让下一轮还能重试（不能假装已落盘）。
+        owner._record_persistence_error("disk_vectors", owner._vectors_db_path, exc)
         return
     # 后端返回 None = 未实现成功计数，沿用旧的乐观语义；否则只认真正
     # 落盘的 id。此前无条件 update(vectors)：upsert 内部吞掉异常后照样
     # 记账，导致 chunk 被认为"已有向量"而永不重嵌。
     stored = set(vectors) if persisted is None else {str(item) for item in persisted}
+    stored.intersection_update(vectors)
+    if set(vectors) - stored:
+        error = getattr(owner._vector_backend, "last_write_error", None)
+        if not isinstance(error, Exception):
+            error = RuntimeError("INCOMPLETE_VECTOR_WRITE")
+        owner._record_persistence_error("disk_vectors", owner._vectors_db_path, error)
+    else:
+        owner._clear_persistence_error("disk_vectors")
     if not stored:
         return
     owner._disk_vectors.update(stored)
@@ -481,7 +490,7 @@ def media_native_route(owner: MarkdownIndexer) -> Any:
 
 
 def media_native_for_revision(owner: MarkdownIndexer, store: Any, source: str, revision_id: str,
-                              occurrences: list[Any]) -> list[Chunk]:
+                              occurrences: list[Any], *, reuse_only: bool = False) -> list[Chunk]:
     """从**已验证 blob** 读受限 bytes 并消费 E07 `embed_media`，产出原生媒体向量 chunk。
 
     route 不可用（无 provider / 未声明 alignment / 无受限读取能力）时返回空列表——
@@ -503,8 +512,16 @@ def media_native_for_revision(owner: MarkdownIndexer, store: Any, source: str, r
     batch = max(1, int(ability.get("max_batch_size", 0) or 1))
     if not allowed or max_bytes <= 0:
         return []
-    inputs: list[Any] = []
-    identity: dict[str, tuple[str, str, str]] = {}
+    from .token_chunking import embedding_key
+    # Match only facts verified for this source/revision/profile. Occurrence/blob
+    # identity is checked after each actual blob read, before any prefix is retained.
+    old = {c.id: c for c in owner._chunks.get(source, ())
+           if c.source == source and c.metadata.get("kind") == "media_native"
+           and c.metadata.get("revision_id") == revision_id
+           and c.metadata.get("profile_key") == provider.profile.fingerprint}
+    candidates: dict[str, Chunk] = {}
+    chunks: list[Chunk] = []
+    pending: list[Any] = []
     for occurrence in occurrences:
         occ_id = str(occurrence.get("occurrence_id") or "")
         kind = "audio" if str(occurrence.get("kind")) == "audio" else "image"
@@ -515,19 +532,14 @@ def media_native_for_revision(owner: MarkdownIndexer, store: Any, source: str, r
             payload = store.read_media(source, revision_id=revision_id, occurrence_id=occ_id,
                                        variant_id="original", max_bytes=max_bytes, include_data=True)
         except Exception as exc:
-            raise ProviderError(f"native media blob read failed: {exc}") from exc
+            raise MediaStageError(f"native media blob read failed: {exc}", chunks) from exc
         mime = str(payload.get("mime_type") or "")
         data = payload.get("data") or b""
         if mime not in allowed or not data or len(data) > max_bytes:
             continue
         request_id = f"{source}\0{revision_id}\0{occ_id}"
         blob_hash = hashlib.sha256(bytes(data)).hexdigest()
-        inputs.append(EmbeddingInput(request_id, kind, bytes(data), mime, blob_hash))
-        identity[request_id] = (occ_id, kind, blob_hash)
-    from .token_chunking import embedding_key
-    candidates: dict[str, Chunk] = {}
-    for item in inputs:
-        occ_id, kind, blob_hash = identity[item.request_id]
+        item = EmbeddingInput(request_id, kind, bytes(data), mime, blob_hash)
         chunk_id = "media-native-" + hashlib.sha256(
             json.dumps([source, revision_id, occ_id, blob_hash, provider.profile.fingerprint],
                        ensure_ascii=False).encode()).hexdigest()
@@ -544,13 +556,12 @@ def media_native_for_revision(owner: MarkdownIndexer, store: Any, source: str, r
         }
         candidates[item.request_id] = Chunk(
             chunk_id, f"[Media native: {source} / {revision_id} / {occ_id}]", source, occ_id, metadata)
-    # A failed later batch must not discard/recharge its successful prefix.
-    old = {c.id: c for c in owner._chunks.get(source, ()) if c.metadata.get("kind") == "media_native"}
-    chunks: list[Chunk] = []
-    pending: list[Any] = []
-    for item in inputs:
         chunk = candidates[item.request_id]
         prior = old.get(chunk.id)
+        if prior is not None and (
+                prior.metadata.get("occurrence_id") != occ_id
+                or prior.metadata.get("blob_sha256") != blob_hash):
+            prior = None
         vector = prior.embedding if prior is not None else None
         if prior is not None and vector is None and owner._vectors_on_disk:
             vector = owner._vector_backend.get_vectors([chunk.id]).get(chunk.id)
@@ -559,7 +570,7 @@ def media_native_for_revision(owner: MarkdownIndexer, store: Any, source: str, r
             chunks.append(chunk)
         else:
             pending.append(item)
-    if not pending:
+    if not pending or reuse_only:
         return chunks
     control = owner._paid_control_store()
     if control is not None and owner.has_unresolved_paid_intents(control, "media", provider.profile.fingerprint):
@@ -812,17 +823,26 @@ def run_sync(owner: MarkdownIndexer) -> list[Chunk]:
                                        "line_basis": "rendered_markdown"})
             # E08-b：捕获已提交 revision 的 occurrences，生成媒体 proxy 并落 links。
             # proxy 并入同一 FTS/embed 候选；失败只记该 source，不丢正文层。
+            proxy_failed = False
             try:
                 proxy_chunks, occurrences = media_proxy_for_revision(
                     owner, store, source, revision.revision_id, revision.parsed_markdown, chunks)
                 chunks.extend(proxy_chunks)
             except Exception as exc:
-                occurrences = []
+                proxy_failed = True
+                # A proxy construction failure must not revoke independently
+                # verified native facts. Read current occurrences, then only reuse
+                # native vectors whose full identities and blobs still verify.
+                try:
+                    occurrences = list(store.iter_media(source, revision_id=revision.revision_id))
+                except Exception:
+                    occurrences = []
                 media_failures[source] = f"media_proxy: {exc}"
             # E08-d：原生媒体向量路线（消费 E07 embed_media）。route 不可用即空，不冒充。
             try:
                 native_chunks = media_native_for_revision(
-                    owner, owner.document_store(write=True), source, revision.revision_id, occurrences)
+                    owner, owner.document_store(write=True), source, revision.revision_id, occurrences,
+                    reuse_only=proxy_failed)
                 chunks.extend(native_chunks)
             except Exception as exc:
                 chunks.extend(getattr(exc, "chunks", ()))

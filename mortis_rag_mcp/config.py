@@ -27,6 +27,16 @@ def resolve_api_key(explicit: str = "") -> str:
     return ""
 
 
+def resolve_media_auth(explicit_media: str = "", explicit_generic: str = "", env_name: str = "") -> str:
+    """Media precedence shared by the TOML loader and programmatic factory.
+
+    Text keeps its historical global fallback; media must compare the raw explicit
+    generic value before choosing the dedicated environment or global fallback.
+    """
+    return (explicit_media or explicit_generic or os.environ.get(env_name, "")
+            or resolve_api_key())
+
+
 @dataclass(slots=True)
 class EmbeddingConfig:
     mode: str = "static"
@@ -811,11 +821,14 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
     index = _section(data, "index")
 
     vault_path = _env(data.get("vault_path", vault.get("path", "")))
+    explicit_api_key = str(_env(embedding.get("api_key", "")))
+    explicit_media_api_key = str(_env(embedding.get("media_api_key", "")))
+    media_api_key_env = _string(embedding, "media_api_key_env")
     emb = EmbeddingConfig(
         mode=str(embedding.get("mode", "static")).lower(),
         endpoint=str(_env(embedding.get("endpoint", ""))),
         model=str(_env(embedding.get("model", ""))),
-        api_key=resolve_api_key(str(_env(embedding.get("api_key", "")))),
+        api_key=resolve_api_key(explicit_api_key),
         timeout=_numeric(embedding, data, "timeout", float, 30.0, 0.0, 300.0),
         dimension=_numeric(embedding, data, "dimension", int, 384, 1),
         send_dimensions=bool(embedding.get("send_dimensions", True)),
@@ -845,8 +858,8 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
         media_endpoint=str(_env(embedding.get("media_endpoint", ""))),
         media_model=str(_env(embedding.get("media_model", ""))),
         media_dimension=_numeric(embedding, data, "media_dimension", int, 0, 1) if ("media_dimension" in embedding and embedding["media_dimension"] is not None) else None,
-        media_api_key_env=_string(embedding, "media_api_key_env"),
-        media_api_key=resolve_api_key(str(_env(embedding.get("media_api_key", "")))),
+        media_api_key_env=media_api_key_env,
+        media_api_key=resolve_media_auth(explicit_media_api_key, explicit_api_key, media_api_key_env),
     )
     rer = RerankerConfig(
         enabled=bool(reranker.get("enabled", False)),

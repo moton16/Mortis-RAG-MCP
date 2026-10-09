@@ -155,6 +155,7 @@ class SqliteVecBackend:
     def __init__(self, indexer: Any, db_path: Any) -> None:
         self._indexer = indexer
         self._db_path = db_path
+        self.last_write_error: Exception | None = None
         self._conn: sqlite3.Connection | None = None
         self._serialize = None
         self.available = False
@@ -241,6 +242,7 @@ class SqliteVecBackend:
 
     @_serialized
     def upsert_vectors(self, vectors: dict[str, Any]) -> set[str] | None:
+        self.last_write_error = None
         if not self.available or self._conn is None or not vectors:
             return set()
         try:
@@ -277,9 +279,10 @@ class SqliteVecBackend:
                     )
                     persisted.update(chunk_id for chunk_id, _ in batch if chunk_id in id_map)
             return persisted
-        except Exception:
+        except Exception as exc:
             # 失败时返回已成功落盘的部分（可能为空集），绝不返回 None ——
             # None 会被调用方当成"全部成功"。
+            self.last_write_error = exc
             return set()
 
     @_serialized

@@ -4,7 +4,6 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-import os
 from string import Formatter
 from dataclasses import asdict, dataclass, field, replace
 from struct import pack, unpack
@@ -197,12 +196,9 @@ def resolve_media_connection(config: Any) -> ResolvedMediaConnection:
     dimension = getattr(config, "media_dimension", None)
     if dimension is None:
         dimension = config.dimension
-    key = getattr(config, "media_api_key", "") or getattr(config, "api_key", "")
-    if not key:
-        key = os.environ.get(getattr(config, "media_api_key_env", ""), "")
-    if not key:
-        from .config import resolve_api_key
-        key = resolve_api_key()
+    from .config import resolve_media_auth
+    key = resolve_media_auth(getattr(config, "media_api_key", ""), getattr(config, "api_key", ""),
+                             getattr(config, "media_api_key_env", ""))
     return ResolvedMediaConnection(
         adapter, normalize_endpoint(getattr(config, "media_endpoint", "") or config.endpoint),
         model, dimension, bool(config.send_dimensions), key)

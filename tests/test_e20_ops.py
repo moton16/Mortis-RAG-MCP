@@ -14,9 +14,12 @@ def test_explicit_missing_config_is_not_healthy_default(tmp_path):
     section, cfg = doctor.check_config(str(missing))
     assert section["ok"] is False
     assert cfg is None
-    assert str(missing) in section["detail"]
-    with pytest.raises(FileNotFoundError, match="typo.toml"):
+    # Doctor deliberately bounds free-text diagnostics; a long basetemp may
+    # truncate the tail. The typed resolver still retains the exact full path.
+    assert "Explicit configuration file not found:" in section["detail"]
+    with pytest.raises(FileNotFoundError, match="typo.toml") as error:
         config.resolve_config_path(missing)
+    assert str(missing) in str(error.value)
 
 
 def test_missing_env_config_does_not_read_default(tmp_path, monkeypatch):

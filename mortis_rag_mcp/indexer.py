@@ -743,14 +743,17 @@ class MarkdownIndexer:
                 "ready" if self._chunks_cache_path is not None else "disabled"
             )
 
-    def _record_persistence_error(self, layer: str, path: Path, exc: OSError) -> None:
+    def _record_persistence_error(self, layer: str, path: Path, exc: Exception) -> None:
         self.persistence_status["errors"][layer] = {
-            "path": str(path), "errno": exc.errno, "error": type(exc).__name__,
+            "path": str(path), "errno": getattr(exc, "errno", None), "error": type(exc).__name__,
+            "detail": str(exc)[:160],
         }
         self.persistence_status["state"] = "failed"
 
     def _clear_persistence_error(self, layer: str) -> None:
         self.persistence_status["errors"].pop(layer, None)
+        if not self.persistence_status["errors"]:
+            self.persistence_status["state"] = "ready" if self._chunks_cache_path is not None else "disabled"
 
     def _save_chunks_cache(self) -> None:
         if self._chunks_cache_path is None:

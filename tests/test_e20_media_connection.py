@@ -50,15 +50,17 @@ class FakeText:
         return [[1.0, 0.0] for _ in texts]
 
 
-def make_indexer(folder, cfg, transport=None):
+def make_indexer(folder, cfg, transport=None, *, backend="memory"):
+    from mortis_rag_mcp.config import VectorConfig
     folder.mkdir(exist_ok=True)
     vault = folder / "vault"
     vault.mkdir(exist_ok=True)
-    config = AppConfig(embedding=cfg, cache=CacheConfig(
+    config = AppConfig(embedding=cfg, vector=VectorConfig(backend=backend), cache=CacheConfig(
         enabled=True, dir=str(folder / "cache"), embedding_max_workers=1))
     idx = MarkdownIndexer(vault, config, embedding_provider=FakeText(),
                           media_provider=create_media_provider(cfg, transport=transport))
     idx._storage_layout = resolve_storage_layout(config, vault, registered_vaults=[])
+    assert idx._vector_backend.name == backend, "test must use the requested real backend, not its fallback"
     return idx
 
 
@@ -94,6 +96,9 @@ def close(idx):
     idx.close_document_store()
     if idx._fts is not None:
         idx._fts.close()
+    close_vectors = getattr(idx._vector_backend, "close", None)
+    if callable(close_vectors):
+        close_vectors()
 
 
 def toml_config(tmp_path, cfg):
@@ -140,6 +145,39 @@ def test_auth_precedence(tmp_path, monkeypatch, route, dedicated, general, env, 
     if route == "toml":
         cfg = load_config(toml_config(tmp_path, cfg)).embedding
     assert create_media_provider(cfg)._transport.api_key == expected
+
+
+@pytest.mark.parametrize("adapter", ["openai_vl", "gemini", "embeddinggemma2"])
+@pytest.mark.parametrize("dedicated,generic,dedicated_env,new_global,old_global,expected", [
+    ("media", "generic", "env", "global", "legacy", "media"),
+    ("", "generic", "env", "global", "legacy", "generic"),
+    ("", "", "env", "global", "legacy", "env"),
+    ("", "", "", "global", "legacy", "global"),
+    ("", "", "", "", "legacy", "legacy"),
+    ("media", "", "env", "global", "legacy", "media"),
+    ("", "generic", "", "global", "legacy", "generic"),
+    ("", "", "env", "", "legacy", "env"),
+])
+def test_review_c01_real_toml_and_programmatic_auth_match(
+        tmp_path, monkeypatch, adapter, dedicated, generic, dedicated_env, new_global, old_global, expected):
+    monkeypatch.setenv("E20_MEDIA_KEY", dedicated_env)
+    monkeypatch.setenv("MORTIS_RAG_API_KEY", new_global)
+    monkeypatch.setenv("VAULT_MCP_API_KEY", old_global)
+    cfg = media_config(media_adapter=adapter, media_endpoint="https://googleapis.com/v1beta",
+                       media_api_key=dedicated, api_key=generic, media_api_key_env="E20_MEDIA_KEY")
+    loaded = load_config(toml_config(tmp_path, cfg))
+    # The media fix must not alter text's historical global fallback.
+    assert loaded.embedding.api_key == (generic or new_global or old_global)
+    observed = []
+    for route in (cfg, loaded.embedding):
+        provider = create_media_provider(route)
+        server = object.__new__(VaultMcpServer)
+        server.config = AppConfig(embedding=route)
+        server._indexers = {}
+        assembled, error = server._media_provider_and_error()
+        assert error is None and assembled is not None
+        observed.append((provider._transport.api_key, assembled._transport.api_key))
+    assert observed == [(expected, expected), (expected, expected)]
 
 
 @pytest.mark.parametrize("adapter", ["openai_vl", "gemini", "embeddinggemma2"])

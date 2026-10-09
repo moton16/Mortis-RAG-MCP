@@ -1308,3 +1308,7 @@ Codex 主流程整合；施工子代理 gpt-6.1-sol/high。真实存储分页3/9
 ### E20 bounded 复核 R01 转正与导出补足
 
 Codex 主流程：真实生产export/import新增copy前另一client覆写与chunks ENOSPC两回归，均先失败。导出vectors只按固定captured chunk ID选择；chunks持久化失败明确拒绝发布，保留此前输出与RAM搜索，不把旧磁盘cache冒充当前snapshot。两例green，snapshot14与store integrity12既有靶向通过。此项合并F03/ADD-09-OPS-3，不另造重复工单；schema/哈希/pin/引用护栏保持。证据 integration/export-durability-red/green及family。
+
+### E20 bounded C01/C02 与磁盘持久化收口
+
+Codex 主流程整合；媒体施工子代理 gpt-6.1-sol/high。C01真实TOML+程序化认证并存矩阵24新增例：12先失败，统一resolve_media_auth按raw显式generic选择media专用值/环境/全局回退，文本既有global规则保持。C02本地blob/proxy重试错误先红，逐occurrence核source/revision/profile/occurrence/blob身份并携已验证prefix；memory/sqlite_vec跨重启、五身份字段负对照、revision/profile漂移不复用，共媒体outcome39pass、connection44pass。R02真实disk backend抛错/空集/吞错3红→3绿，last_write_error传递最小定位，未落盘ID留RAM、写成功/真实重开后才清诊断；vector6既有例保留。ops13pass；长basetemp触发doctor既有自由文本截断，新断言保持诊断前缀并在typed resolver校验完整路径，不放宽公有文案保护。完整所有层尚未运行，修后重新测默认再唯一全层。

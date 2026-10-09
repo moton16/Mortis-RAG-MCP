@@ -201,7 +201,8 @@ def index_state(owner: MarkdownIndexer) -> dict[str, Any]:
     persistence = getattr(owner, "persistence_status", {})
     if persistence.get("state") == "failed":
         failures = "; ".join(
-            f"layer={layer} path={error['path']} errno={error['errno']} error={error['error']}"
+            f"layer={layer} path={error['path']} errno={error['errno']} error={error['error']} "
+            f"detail={error.get('detail', '')}"
             for layer, error in sorted(persistence.get("errors", {}).items())
         )
         action = (action + "; " if action else "") + (
