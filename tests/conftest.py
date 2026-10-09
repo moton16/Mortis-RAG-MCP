@@ -86,6 +86,10 @@ def isolated_cache_dir(request, monkeypatch, isolated_host):
     safe = re.sub(r"[^0-9A-Za-z_.-]+", "_", request.node.nodeid)[:80] or "node"
     cache_dir = isolated_host / "cache_root" / safe
     monkeypatch.setenv("MORTIS_RAG_CACHE_DIR", str(cache_dir))
+    # Low-priority legacy override keeps default registry in this test's sandbox,
+    # while tests of new/old override precedence can still set either variable.
+    registry = cache_dir / "vaults.toml"
+    monkeypatch.setenv("VAULT_MCP_REGISTRY", str(registry))
     return cache_dir
 
 

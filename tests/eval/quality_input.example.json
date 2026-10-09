@@ -1,0 +1,10 @@
+{
+  "scope": "fixture",
+  "queries": [
+    {"id": "ttl-expiry", "category": "text", "query": "TTL expiry",
+     "relevance": {"ttl.md": 2}, "ranking": ["ttl.md"], "baseline": ["ttl.md"]},
+    {"id": "cache-restart", "category": "text", "query": "cache after restart",
+     "relevance": {"cache.md": 2, "ttl.md": 1},
+     "ranking": ["cache.md", "ttl.md"], "baseline": ["ttl.md", "cache.md"]}
+  ]
+}

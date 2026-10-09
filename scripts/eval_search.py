@@ -3,8 +3,8 @@
 用法：
     python scripts/eval_search.py --golden tests/eval/golden_queries.json --k 5 [--config config/app.toml] [--vault path]
 退出码：全部命中 0；有 miss 1（可挂 CI）。
-注意：external embedding 模式下 sync/search 会真实调用 API，建议先用 static 模式
-（config 里 [embedding] mode = "static"）跑回归，外部模式只用于最终抽查。
+此入口只接受 static、禁用 rerank/ingest，不读取隐式宿主配置。
+真实语义质量由独立授权的候选运行采集，交给 eval_quality.py 比较。
 """
 from __future__ import annotations
 
@@ -16,8 +16,17 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from mortis_rag_mcp.config import load_config  # noqa: E402
+from mortis_rag_mcp.config import AppConfig, load_config  # noqa: E402
 from mortis_rag_mcp.indexer import MarkdownIndexer, SearchFilter  # noqa: E402
+
+
+def offline_config(path):
+    """Do not resolve an implicit host configuration or make paid requests."""
+    config = load_config(path) if path else AppConfig()
+    if config.embedding.mode != "static" or config.reranker.enabled or config.ingest.enabled:
+        raise ValueError("offline evaluation requires static embedding, no reranker and disabled ingest")
+    config.cache.enabled = False
+    return config
 
 
 def main() -> int:
@@ -29,10 +38,17 @@ def main() -> int:
     ap.add_argument("--rerank", action="store_true", default=False, help="是否使用 rerank（默认 False，避免依赖外部服务）")
     args = ap.parse_args()
 
-    config = load_config(args.config)
+    if args.rerank:
+        ap.error("offline evaluation does not enable external reranking")
+    try:
+        config = offline_config(args.config)
+    except ValueError as exc:
+        ap.error(str(exc))
     golden_path = Path(args.golden).resolve()
     golden = json.loads(golden_path.read_text(encoding="utf-8"))
     queries = golden["queries"]
+    if not queries or args.k <= 0:
+        ap.error("nonempty queries and positive k required")
 
     indexers: dict[str, MarkdownIndexer] = {}
     hits = 0
@@ -70,7 +86,7 @@ def main() -> int:
             
             hit_rank = None
             for rank, s in enumerate(sources, 1):
-                if case["expect"] in s:
+                if case["expect"].replace("\\", "/") == s.replace("\\", "/"):
                     hit_rank = rank
                     break
 
