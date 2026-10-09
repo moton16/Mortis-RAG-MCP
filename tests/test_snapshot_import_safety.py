@@ -104,6 +104,34 @@ def test_docstore_import_requires_explicit_replace_and_retains_backup(tmp_path):
     assert states.get(original) == "retained_backup"
 
 
+def test_import_rechecks_new_job_after_derived_staging(tmp_path, monkeypatch):
+    vault = tmp_path / "vault"
+    _write_notes(vault)
+    cfg = _config(tmp_path)
+    indexer = MarkdownIndexer(vault, cfg, embedding_provider=CountingProvider())
+    indexer.sync()
+    _commit_fact(indexer, "a.md", (vault / "a.md").read_bytes(), "parsed-A")
+    archive = tmp_path / "snapshot.zip"
+    indexer.export_snapshot(archive)
+    original = indexer.document_store(write=True).generation_id
+    writer = DocumentStore(indexer.document_store(write=True).layout, cfg)
+    writer.open(write=True)
+    stage = snapshot_mod._stage_derived_layers
+    def interleave(*args, **kwargs):
+        stage(*args, **kwargs)
+        writer.enqueue_job(source="late.pdf", source_sha256="b" * 64,
+                           parser_fingerprint="late-writer")
+    monkeypatch.setattr(snapshot_mod, "_stage_derived_layers", interleave)
+    try:
+        with pytest.raises(StoreBusy, match="IMPORT_BUSY"):
+            snapshot_mod.import_snapshot(indexer, archive, replace=True, confirm_replace=True)
+        assert indexer.document_store(write=True).generation_id == original
+        assert writer.list_jobs(source="late.pdf")[0].state == "queued"
+    finally:
+        writer.close()
+        indexer.document_store(write=True).close()
+
+
 def test_active_ingest_blocks_import_with_import_busy(tmp_path):
     """存在活跃摄取任务时默认拒绝导入（§20.7F），不覆盖未完成资产。"""
     vault = tmp_path / "vault"

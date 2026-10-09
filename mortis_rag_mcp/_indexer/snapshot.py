@@ -741,10 +741,16 @@ def _import_v2(owner: MarkdownIndexer, src: Path, archive: zipfile.ZipFile,
                 _stage_derived_layers(owner, text_target, vectors, compatible)
                 if prepared is not None:
                     prev_generation = str(prepared.get("expected_generation") or "")
-                    # 本次导入的单调操作序号（跨库操作的可审计 token，E04-c）。
-                    operation_seq = _next_operation_seq(store)
-                    store.publish_import(prepared, snapshot_sha256=_sha_file(src), trusted=trusted)
-                    published = True
+                    from ..doc_store import _mutation_lock
+                    snapshot_digest = _sha_file(src)
+                    # All writers use this existing OS mutex. Recheck immediately
+                    # before CAS, not merely before staging the derived files.
+                    with _mutation_lock(store.layout):
+                        _require_no_active_ingest(store)
+                        _require_import_gate_unchanged(store, gate)
+                        operation_seq = _next_operation_seq(store)
+                        store.publish_import(prepared, snapshot_sha256=snapshot_digest, trusted=trusted)
+                        published = True
                     _register_generation_state(store, prev_generation, "retained_backup")
             except BaseException:
                 _restore_live_derived(owner, backups)
