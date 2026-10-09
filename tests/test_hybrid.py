@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 from mortis_rag_mcp.config import AppConfig, CacheConfig, EmbeddingConfig
@@ -18,8 +19,9 @@ class RouteProvider:
 
     - text containing "B标记"  -> the query vector (cosine 1.0 with the query)
     - anything else           -> a deterministic per-text vector (near-orthogonal)
-    The query string "星核猎手 银狼" does not contain "B标记", so its vector is
-    NOT the query vector; only the B chunk lands on it.
+    - the exact query "星核猎手 银狼" -> the query vector as well
+    Non-target vectors have a zero first coordinate and a nonzero tail, making
+    the vector-only B route independent of Python hash randomization.
     """
 
     dimension = 8
@@ -27,11 +29,11 @@ class RouteProvider:
     def embed(self, texts):
         result = []
         for text in texts:
-            if "B标记" in text:
+            if "B标记" in text or text == "星核猎手 银狼":
                 result.append([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
             else:
-                h = hash(text) % 97
-                result.append([float((h >> i) & 1) for i in range(self.dimension)])
+                digest = hashlib.sha256(text.encode("utf-8")).digest()
+                result.append([0.0] + [float(byte + 1) for byte in digest[:self.dimension - 1]])
         return result
 
 
@@ -170,66 +172,7 @@ def test_warm_cache_upgrade_populates_fts(tmp_path):
     assert second.search("星核猎手", top_k=5, use_rerank=False)
 
 
-def test_rrf_per_route_config_roundtrip(tmp_path):
-    from mortis_rag_mcp.config import load_config
-
-    path = tmp_path / "app.toml"
-    path.write_text(
-        """
-        [embedding]
-        mode = "static"
-        dimension = 8
-        [index]
-        rrf_per_route = 7
-        rerank_cap = 11
-        """,
-        encoding="utf-8",
-    )
-    config = load_config(path)
-    assert config.rrf_per_route == 7
-    assert config.rerank_cap == 11
-
-    import pytest
-    from mortis_rag_mcp.config import AppConfig
-
-    with pytest.raises(ValueError):
-        AppConfig(rrf_per_route=0)
-    with pytest.raises(ValueError):
-        AppConfig(rerank_cap=0)
-
-
-def test_rrf_per_route_limits_fusion_pool(tmp_path):
-    """With rrf_per_route=2 only the top-2 candidates of each route enter the
-    fused pool, so the weakest of three matching files drops out entirely."""
-    (tmp_path / "a.md").write_text("# A\n" + "苹果香蕉梨 " * 5, encoding="utf-8")
-    (tmp_path / "b.md").write_text("# B\n" + "苹果香蕉梨 " * 3, encoding="utf-8")
-    (tmp_path / "c.md").write_text("# C\n苹果香蕉梨", encoding="utf-8")
-
-    config = AppConfig(
-        embedding=EmbeddingConfig(mode="static", dimension=8),
-        cache=CacheConfig(dir=str(tmp_path / "cache"), enabled=True),
-        rrf_per_route=2,
-    )
-    indexer = MarkdownIndexer(tmp_path, config)
-    indexer.sync()
-    results = indexer.search("苹果", top_k=10, use_rerank=False)
-    sources = {chunk.source for chunk in results}
-    assert "a.md" in sources and "b.md" in sources
-    assert "c.md" not in sources, f"rrf_per_route=2 应把最弱的 C 挡在融合池外, got {sources}"
-
-    # Default width (40) keeps C reachable.
-    default_indexer = MarkdownIndexer(
-        tmp_path,
-        AppConfig(
-            embedding=EmbeddingConfig(mode="static", dimension=8),
-            cache=CacheConfig(dir=str(tmp_path / "cache2"), enabled=True),
-        ),
-    )
-    default_indexer.sync()
-    default_sources = {chunk.source for chunk in default_indexer.search("苹果", top_k=10, use_rerank=False)}
-    assert "c.md" in default_sources
-
-
+# Retained live RRF definitions; earlier shadowed copies were removed.
 def test_rrf_per_route_config_roundtrip(tmp_path):
     from mortis_rag_mcp.config import load_config
 

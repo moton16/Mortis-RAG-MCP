@@ -124,7 +124,7 @@ def test_try_sync_with_guard_and_indexing_status(tmp_path):
         indexer._sync_lock.release()
 
 
-def test_kb_search_cold_start_progressive_feedback(tmp_path):
+def test_kb_search_cold_start_progressive_feedback(tmp_path, stdio_polling):
     """验证 stdio 下冷启动首检的渐进式反馈与防假死。"""
     vault = tmp_path / "vault_cold"
     vault.mkdir(parents=True)
@@ -133,23 +133,44 @@ def test_kb_search_cold_start_progressive_feedback(tmp_path):
     config = tmp_path / "app.toml"
     config.write_text('mode = "static"\n', encoding="utf-8")
 
-    # 验证 stdio 正常启动并初始化
-    requests = [
+    # 冷启动是合法的 indexing 响应；在同一个进程内等待首建完成再 read。
+    prefix = [
         {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
         {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "kb_init", "arguments": {"path": str(vault), "name": "ColdVault"}}},
-        {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "kb_search", "arguments": {"query": "重要资产", "vault_path": "ColdVault"}}},
-        {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "kb_read", "arguments": {"source": "data.md", "vault_path": "ColdVault"}}},
     ]
-    responses = _run_stdio(config, requests)
+    poll = {"jsonrpc": "2.0", "method": "tools/call", "params": {
+        "name": "kb_search", "arguments": {"query": "重要资产", "vault_path": "ColdVault"}}}
 
-    # 验证 search 与 read 均正常完成返回
-    for resp in responses:
+    def settled(data):
+        # 部分结果非空不等于首建完成：后台仍在飞时继续轮询。
+        return (data.get("status") != "indexing"
+                and not data.get("indexing_in_progress", False)
+                and data.get("index_state", "ready") == "ready"
+                and bool(data.get("chunks")))
+
+    session = stdio_polling(
+        config, prefix, poll, settled,
+        followup_requests=[{"jsonrpc": "2.0", "method": "tools/call", "params": {
+            "name": "kb_read", "arguments": {"source": "data.md", "vault_path": "ColdVault"}}}],
+        env_overrides={"MORTIS_RAG_REGISTRY": str(tmp_path / "vaults.toml"),
+                       "VAULT_MCP_REGISTRY": str(tmp_path / "vaults.toml")},
+    )
+    assert len(session["prefix"]) == 2
+    for resp in session["prefix"] + session["followups"]:
         assert "error" not in resp, resp.get("error")
-
-    r3 = json.loads(responses[2]["result"]["content"][0]["text"])
+        assert not resp["result"].get("isError", False), resp
+    assert session["observed"], "真实 stdio 至少返回一次 search 响应"
+    for data in session["observed"]:
+        assert "indexing_error" not in data, data
+        if data.get("status") == "indexing":
+            assert data["chunks"] == []
+            assert data["retry_after"] == 3
+    r3 = session["observed"][-1]
+    assert settled(r3), session["observed"]
     assert len(r3["chunks"]) > 0
-
-    r4 = json.loads(responses[3]["result"]["content"][0]["text"])
+    assert any(chunk["source"] == "data.md" for chunk in r3["chunks"])
+    assert len(session["followups"]) == 1, "settled 后必须在原会话内 read"
+    r4 = json.loads(session["followups"][0]["result"]["content"][0]["text"])
     assert "重要资产内容" in r4["content"]
 
 
@@ -291,4 +312,3 @@ def test_sync_progress_state_machine(tmp_path, monkeypatch):
     assert indexer._sync_progress["phase"] == "idle"
     assert indexer._sync_progress["files_total"] == 5
     assert indexer._sync_progress["files_done"] == 5
-

@@ -1292,3 +1292,7 @@ Codex 主流程整合；施工子代理 gpt-6.1-sol/high。已有活动代数据
 ### E20 F04/F08/F09、worker 栅栏与局部冗余
 
 Codex 主流程整合；施工子代理 gpt-6.1-sol/high。自动入队保留成功/拒绝部分结果，已有 queued 即使 new_jobs=0 仍唤醒worker；worker在claim后解析前捕获source-local CAS并原样提交。MinerU正文先去BOM/统一换行再算anchor/page坐标，回归对持久occurrence切片；旧raw legacy返回保留。图片 validate_image_source 原sha256字段改用完整流式SHA，parse实际payload另算完整SHA；主复核拒绝过一次header_sha256替名方案，纠正红绿记录保留。worker重复IngestConfig fallback清除，配置真源和导入别名同一性、完整发行包路径核验保留。恒真assert改为解析前/解析中确定性屏障两例。主复核正确性18passed、virtual10passed；兼容auto52/worker6/MinerU23/image10等离线靶向保留。已提交坏坐标/SHA不静默重写，恢复需显式新revision重摄取。
+
+### E20 FLK-01/02 与 TST-07 可靠性出口
+
+Codex 主流程整合；施工子代理 gpt-6.1-sol/high。stdio复用run_stdio_polling，保留冷启动indexing/empty/retry3并等待settled后同会话精读。vector迁移fixture用确定性SHA非零正交向量，迁移前后failed_files、ID全覆盖、维度与平方和范数均检查，seed0/336靶向通过，原node数不减少。hybrid清除最前两被覆盖死定义：56定义LOC+4分隔空行=60物理LOC，保留后活函数原字节/5assert+2raises及两个nodeid，case delta0；来源注释+1行，净减59LOC。首轮删后副本的方案经主复核纠正，历史日志保留。fixture等其他变化另计，未把所有净LOC等同纯删减。完整原始证据 .runtime/beta2/E20/tests/。
