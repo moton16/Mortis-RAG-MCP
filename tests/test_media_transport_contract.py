@@ -154,11 +154,12 @@ def test_response_contract_failure_is_not_marked_unknown():
         "before_send": lambda self, *a: events.append("intent") or "req-1",
         "mark_success": lambda self, *a: events.append("success"),
         "mark_unknown": lambda self, *a: events.append("unknown"),
+        "mark_response_failed": lambda self, *a: events.append("response_failed"),
     })()
     provider.configure_paid_requests(journal, lambda fingerprint: True, provider.profile.fingerprint)
     with pytest.raises(ProviderError):
         provider.embed_media([input_for("a"), input_for("b", PNG + b"2")])
-    assert events == ["intent", "success"]  # 请求已响应，绝不重发
+    assert events == ["intent", "response_failed"]  # 已响应的合同失败不是 success/unknown
 
 
 def test_evidence_version_mismatch_is_rejected():

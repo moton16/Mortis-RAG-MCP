@@ -11,6 +11,14 @@ from .models import Chunk
 from .token_chunking import chunking_profile, estimate_tokens
 
 
+class MediaStageError(RuntimeError):
+    """Retain successful native batches when a later batch fails."""
+
+    def __init__(self, message: str, chunks: list[Chunk]) -> None:
+        super().__init__(message)
+        self.chunks = chunks
+
+
 def _get(item: Any, key: str, default: Any = None) -> Any:
     return item.get(key, default) if isinstance(item, Mapping) else getattr(item, key, default)
 

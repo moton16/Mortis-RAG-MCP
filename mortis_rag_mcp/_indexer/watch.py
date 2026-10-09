@@ -188,6 +188,16 @@ def index_state(owner: MarkdownIndexer) -> dict[str, Any]:
         state, action = "empty", "run kb_init and a sync to build the index from local sources"
     else:
         state, action = "ready", ""
+    media_failures = {
+        source: error for source, error in getattr(owner, "failed_files", {}).items()
+        if str(error).startswith(("media_proxy:", "media_native:"))
+    }
+    if media_failures and state == "ready":
+        state, action = "rebuilding", (
+            "text index remains available; media derivation failed: "
+            + "; ".join(f"{source}: {error}" for source, error in sorted(media_failures.items()))
+            + "; fix the confirmed media failure and sync; unknown requests require explicit resolution"
+        )
     persistence = getattr(owner, "persistence_status", {})
     if persistence.get("state") == "failed":
         failures = "; ".join(

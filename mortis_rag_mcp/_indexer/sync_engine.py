@@ -473,6 +473,8 @@ def media_native_route(owner: MarkdownIndexer) -> Any:
     text_alignment = getattr(text_profile, "alignment_space_id", "") or ""
     if not text_alignment or getattr(profile, "alignment_space_id", "") != text_alignment:
         return None
+    if getattr(profile, "effective_dim", None) != getattr(text_profile, "effective_dim", None):
+        return None
     if not any(modality in getattr(profile, "modalities", ()) for modality in ("image", "audio")):
         return None
     return provider
@@ -486,8 +488,13 @@ def media_native_for_revision(owner: MarkdownIndexer, store: Any, source: str, r
     明确该 route 不可用，纯词法 proxy 仍可用，但**不**把 proxy 冒充 native。
     """
     from ..media_providers import EmbeddingInput
+    from .media import MediaStageError
 
     provider = media_native_route(owner)
+    if (occurrences and getattr(owner, "media_provider", None) is None
+            and getattr(owner.config.embedding, "media_modalities", ())):
+        error = getattr(owner, "_media_capability_error", None) or "declared media provider did not assemble"
+        raise ProviderError(f"MEDIA_CAPABILITY_UNAVAILABLE: {error}")
     if provider is None or not occurrences:
         return []
     ability = provider.ability()
@@ -507,8 +514,8 @@ def media_native_for_revision(owner: MarkdownIndexer, store: Any, source: str, r
         try:
             payload = store.read_media(source, revision_id=revision_id, occurrence_id=occ_id,
                                        variant_id="original", max_bytes=max_bytes, include_data=True)
-        except Exception:
-            continue
+        except Exception as exc:
+            raise ProviderError(f"native media blob read failed: {exc}") from exc
         mime = str(payload.get("mime_type") or "")
         data = payload.get("data") or b""
         if mime not in allowed or not data or len(data) > max_bytes:
@@ -517,29 +524,56 @@ def media_native_for_revision(owner: MarkdownIndexer, store: Any, source: str, r
         blob_hash = hashlib.sha256(bytes(data)).hexdigest()
         inputs.append(EmbeddingInput(request_id, kind, bytes(data), mime, blob_hash))
         identity[request_id] = (occ_id, kind, blob_hash)
+    from .token_chunking import embedding_key
+    candidates: dict[str, Chunk] = {}
+    for item in inputs:
+        occ_id, kind, blob_hash = identity[item.request_id]
+        chunk_id = "media-native-" + hashlib.sha256(
+            json.dumps([source, revision_id, occ_id, blob_hash, provider.profile.fingerprint],
+                       ensure_ascii=False).encode()).hexdigest()
+        metadata = {
+            "source_kind": "virtual", "revision_id": revision_id, "kind": "media_native",
+            "occurrence_id": occ_id, "media_occurrence_ids": [occ_id],
+            "media_route": "native", "blob_sha256": blob_hash,
+            "profile_key": provider.profile.fingerprint,
+            "alignment_space_id": provider.profile.alignment_space_id,
+            "line_basis": "media_alignment", "synthetic_segments": [],
+            "source_spans": [], "anchor_available": False, "anchor_confidence": "unavailable",
+            "embedding_key": embedding_key(
+                blob_hash, provider.profile.fingerprint, provider.profile.preprocess_version, (blob_hash,)),
+        }
+        candidates[item.request_id] = Chunk(
+            chunk_id, f"[Media native: {source} / {revision_id} / {occ_id}]", source, occ_id, metadata)
+    # A failed later batch must not discard/recharge its successful prefix.
+    old = {c.id: c for c in owner._chunks.get(source, ()) if c.metadata.get("kind") == "media_native"}
     chunks: list[Chunk] = []
-    for start in range(0, len(inputs), batch):
-        batch_inputs = inputs[start:start + batch]
-        vectors = provider.embed_media(batch_inputs)
+    pending: list[Any] = []
+    for item in inputs:
+        chunk = candidates[item.request_id]
+        prior = old.get(chunk.id)
+        vector = prior.embedding if prior is not None else None
+        if prior is not None and vector is None and owner._vectors_on_disk:
+            vector = owner._vector_backend.get_vectors([chunk.id]).get(chunk.id)
+        if vector is not None and len(vector):
+            chunk.embedding = _to_emb(vector)
+            chunks.append(chunk)
+        else:
+            pending.append(item)
+    if not pending:
+        return chunks
+    control = owner._paid_control_store()
+    if control is not None and owner.has_unresolved_paid_intents(control, "media", provider.profile.fingerprint):
+        raise MediaStageError("PAID_REQUEST_UNRESOLVED: native media outcome unknown; automatic retry disabled", chunks)
+    for start in range(0, len(pending), batch):
+        batch_inputs = pending[start:start + batch]
+        try:
+            vectors = provider.embed_media(batch_inputs)
+            if len(vectors) != len(batch_inputs):
+                raise ProviderError("native media response count mismatch")
+        except Exception as exc:
+            raise MediaStageError(str(exc), chunks) from exc
         for item, vector in zip(batch_inputs, vectors):
-            occ_id, kind, blob_hash = identity[item.request_id]
-            chunk_id = "media-native-" + hashlib.sha256(
-                json.dumps([source, revision_id, occ_id, blob_hash, provider.profile.fingerprint],
-                           ensure_ascii=False).encode()).hexdigest()
-            metadata = {
-                "source_kind": "virtual", "revision_id": revision_id, "kind": "media_native",
-                "occurrence_id": occ_id, "media_occurrence_ids": [occ_id],
-                "media_route": "native", "blob_sha256": blob_hash,
-                "profile_key": provider.profile.fingerprint,
-                "alignment_space_id": provider.profile.alignment_space_id,
-                "line_basis": "media_alignment", "synthetic_segments": [],
-                "source_spans": [], "anchor_available": False, "anchor_confidence": "unavailable",
-            }
-            from .token_chunking import embedding_key
-            metadata["embedding_key"] = embedding_key(
-                blob_hash, provider.profile.fingerprint, provider.profile.preprocess_version, (blob_hash,))
-            chunk = Chunk(chunk_id, f"[Media native: {source} / {revision_id} / {occ_id}]",
-                          source, occ_id, metadata)
+            chunk = candidates[item.request_id]
             chunk.embedding = _to_emb(vector)
             chunks.append(chunk)
     return chunks
@@ -552,6 +586,10 @@ def run_sync(owner: MarkdownIndexer) -> list[Chunk]:
     运行时通过 owner.* 就地变异 22 个内部状态属性。
     """
     failed_before = dict(owner.failed_files)
+    # Media and text are independent stages. Text success must not erase media
+    # failure; the existing persisted failure map is also the restart retry signal.
+    media_failures = {source: error for source, error in failed_before.items()
+                      if error.startswith(("media_proxy:", "media_native:"))}
     matcher = owner._ignore_matcher()
     scan = scan_indexable_files(owner.vault_path, matcher, _INDEXABLE_TEXT_EXTS)
     revoked = False
@@ -559,6 +597,17 @@ def run_sync(owner: MarkdownIndexer) -> list[Chunk]:
         store = owner._existing_document_store()
         captured_seq = store.change_seq() if store is not None else 0
         documents = store.list_documents() if store is not None else []
+        generation = store.get_derived_generation(owner._derived_profile_key()) if store is not None else None
+        if generation is not None and generation.status == "failed" and generation.last_error:
+            try:
+                recorded = json.loads(generation.last_error)
+            except (ValueError, TypeError):
+                recorded = {}
+            files = recorded.get("files", {}) if isinstance(recorded, dict) else {}
+            if isinstance(files, dict):
+                for source, error in files.items():
+                    if isinstance(source, str) and isinstance(error, str) and error.startswith(("media_proxy:", "media_native:")):
+                        media_failures.setdefault(source, error)
     except Exception:
         store = None
         captured_seq = 0
@@ -566,6 +615,28 @@ def run_sync(owner: MarkdownIndexer) -> list[Chunk]:
         for source, chunks in list(owner._chunks.items()):
             if any(chunk.metadata.get("revision_id") for chunk in chunks):
                 revoked = revoke_source(owner, source, reason="store_unavailable") or revoked
+    # E20/F02: first ingest may have no active revision yet. Reconcile its
+    # pending source on a complete scan too, so deletion fences a worker paused
+    # between source verification and stage/commit. Never infer deletion from
+    # an incomplete scan, a policy-pruned subtree, or permission errors.
+    if store is not None and scan.complete:
+        active = {doc.source for doc in documents if doc.visibility == "active" and doc.active_revision}
+        # An unverified fact without a live worker is not an observed deletion:
+        # imports/manual staging legitimately retain it with no physical source.
+        pending = set(store.pending_ingest_sources())
+        for source in sorted(pending - active):
+            if matcher.is_ignored(source)[0] or any(
+                    source == path or source.startswith(path + "/") for path in scan.policy_pruned):
+                continue
+            try:
+                from ..doc_store import normalize_source_path
+                normalize_source_path(source, owner.vault_path)
+                (owner.vault_path / source).stat()
+            except FileNotFoundError:
+                owner.document_store(write=True).mark_deleted(source)
+            except OSError:
+                pass
+        documents = store.list_documents()
     hidden = {doc.source for doc in documents if doc.visibility != "active"}
     hidden_keys = {source_compare_key(source) for source in hidden}
     virtual_sources = {source_compare_key(doc.source): doc.source for doc in documents
@@ -715,8 +786,16 @@ def run_sync(owner: MarkdownIndexer) -> list[Chunk]:
             signature = f"virtual:{revision.revision_id}:{raw_sha}:{revision.render_sha256}:media:{media_fingerprint}"
             missing_native = any(c.metadata.get("kind") == "media_native" and not chunk_has_vector(owner, c)
                                  for c in owner._chunks.get(source, ()))
-            if owner._signatures.get(source) == signature and not missing_native:
+            if owner._signatures.get(source) == signature and not missing_native and source not in media_failures:
                 continue
+            if (owner._signatures.get(source) == signature and not missing_native
+                    and source in media_failures and media_route is not None
+                    and owner.has_unresolved_paid_intents(
+                        owner._paid_control_store(), "media", media_fingerprint)):
+                # A settled source with an unknown send stays failed without
+                # regenerating identical caches or replaying successful batches.
+                continue
+            media_failures.pop(source, None)
             store_uuid = store.store_meta().store_uuid
             # §20.7B：虚拟 chunk ID 由 store_uuid/doc_id/revision_id/chunker 指纹/
             # index/content 共同决定（`virtual_chunk_id`），同文新 revision 与
@@ -739,20 +818,22 @@ def run_sync(owner: MarkdownIndexer) -> list[Chunk]:
                 chunks.extend(proxy_chunks)
             except Exception as exc:
                 occurrences = []
-                owner.failed_files[source] = f"media_proxy: {exc}"
+                media_failures[source] = f"media_proxy: {exc}"
             # E08-d：原生媒体向量路线（消费 E07 embed_media）。route 不可用即空，不冒充。
             try:
                 native_chunks = media_native_for_revision(
                     owner, owner.document_store(write=True), source, revision.revision_id, occurrences)
                 chunks.extend(native_chunks)
-                native_occurrences = {c.metadata["occurrence_id"] for c in native_chunks}
-                # 只停用确实已有 native 向量的 proxy；不支持的 MIME/模态仍保留文本召回。
-                for chunk in chunks:
-                    if (chunk.metadata.get("kind") == "media_proxy"
-                            and chunk.metadata.get("occurrence_id") in native_occurrences):
-                        chunk.metadata["embedding_disabled"] = True
             except Exception as exc:
-                owner.failed_files[source] = f"media_native: {exc}"
+                chunks.extend(getattr(exc, "chunks", ()))
+                media_failures[source] = f"media_native: {exc}"
+            # Successful prefixes are native too; never embed their proxies as text.
+            native_occurrences = {c.metadata["occurrence_id"] for c in chunks
+                                  if c.metadata.get("kind") == "media_native"}
+            for chunk in chunks:
+                if (chunk.metadata.get("kind") == "media_proxy"
+                        and chunk.metadata.get("occurrence_id") in native_occurrences):
+                    chunk.metadata["embedding_disabled"] = True
             for chunk in chunks:
                 chunk.metadata.update(source_sha256=raw_sha, render_sha256=revision.render_sha256)
             changed.append((source, signature, chunks,
@@ -779,6 +860,25 @@ def run_sync(owner: MarkdownIndexer) -> list[Chunk]:
         owner._sync_progress["phase"] = "fts"
     for source, signature, chunks, fast_sig, verified_at_ns in changed:
         old_chunks = owner._chunks.get(source)
+        # A native-stage retry doesn't change text inputs. Preserve their exact
+        # profile-scoped vectors instead of recharging the successful text stage.
+        prior_by_id = {c.id: c for c in old_chunks or ()}
+        from .token_chunking import embedding_key as text_embedding_key
+        profile = owner._embedding_profile
+        for chunk in chunks:
+            if chunk.metadata.get("kind") == "media_native" or chunk.metadata.get("embedding_disabled"):
+                continue
+            prior = prior_by_id.get(chunk.id)
+            hashes = chunk.metadata.get("media_hashes") or (
+                (chunk.metadata["blob_sha256"],) if chunk.metadata.get("blob_sha256") else ())
+            key = text_embedding_key(_document_input(owner, chunk.content), profile.fingerprint,
+                                     profile.preprocess_version, hashes)
+            if prior is not None and _reuse_key(prior) == key:
+                vector = prior.embedding
+                if vector is None and owner._vectors_on_disk:
+                    vector = owner._vector_backend.get_vectors([prior.id]).get(prior.id)
+                if vector is not None and len(vector):
+                    chunk.embedding = _to_emb(vector)
         owner._chunks[source] = chunks
         owner._signatures[source] = signature
         owner._stat_cache[source] = fast_sig
@@ -827,6 +927,11 @@ def run_sync(owner: MarkdownIndexer) -> list[Chunk]:
     owner._sync_state = "embedding"
     owner._sync_progress["phase"] = "embedding"
     embed_did_work = owner._embed_missing()
+    for source, error in media_failures.items():
+        if source in owner._chunks:
+            text_error = owner.failed_files.get(source, "")
+            owner.failed_files[source] = (error if not text_error or text_error.startswith(error)
+                                          else f"{error}; text: {text_error}")
     # Disk-backed mode: persist newly embedded vectors and release RAM.
     owner._flush_vectors_to_disk()
     if scan.complete and owner._vectors_on_disk and not owner._embedding_paused:
@@ -858,13 +963,20 @@ def run_sync(owner: MarkdownIndexer) -> list[Chunk]:
     if store is not None and (documents or latest_documents):
         try:
             generation = store.get_derived_generation(owner._derived_profile_key())
-            status = "ready" if scan.complete and not owner.failed_files and store.change_seq() == captured_seq else "stale"
+            media_failed = any(error.startswith(("media_proxy:", "media_native:"))
+                               for error in owner.failed_files.values())
+            status = ("failed" if media_failed else
+                      "ready" if scan.complete and not owner.failed_files
+                      and store.change_seq() == captured_seq else "stale")
+            last_error = (json.dumps({"files": owner.failed_files}, sort_keys=True, ensure_ascii=False)
+                          if owner.failed_files else "")
             if (changed or removed or revoked or embed_did_work or generation is None
-                    or generation.status != status or generation.change_seq != captured_seq):
+                    or generation.status != status or generation.change_seq != captured_seq
+                    or generation.last_error != last_error):
                 owner.document_store(write=True).mark_derived_generation(
                     owner._derived_profile_key(), change_seq=captured_seq,
                     chunker_fingerprint=owner._chunker_fingerprint(),
-                    space_fingerprint=owner._derived_profile_key(), status=status,
+                    space_fingerprint=owner._derived_profile_key(), status=status, last_error=last_error,
                 )
         except Exception:
             for source, chunks in list(owner._chunks.items()):

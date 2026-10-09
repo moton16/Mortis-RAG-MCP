@@ -16,6 +16,14 @@ from .providers import ProviderError
 _MAX_RESPONSE_BYTES = 10 * 1024 * 1024  # 10 MiB response body limit
 
 
+class MediaResponseError(ProviderError):
+    """The endpoint responded, but its response is not an indexable success."""
+
+    def __init__(self, message: str, reason: str = "media_response_contract_failed") -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
 def _read_bounded(resp: Any, limit: int = _MAX_RESPONSE_BYTES) -> bytes:
     """受限读取响应体，防无界内存爆炸（对齐 mineru 预算纪律）。"""
     declared = getattr(resp, "headers", None)
@@ -24,7 +32,7 @@ def _read_bounded(resp: Any, limit: int = _MAX_RESPONSE_BYTES) -> bytes:
         if cl is not None:
             try:
                 if int(str(cl).strip()) > limit:
-                    raise ProviderError(f"response Content-Length exceeds limit {limit} bytes")
+                    raise MediaResponseError(f"response Content-Length exceeds limit {limit} bytes")
             except (ValueError, TypeError):
                 pass
     try:
@@ -32,7 +40,7 @@ def _read_bounded(resp: Any, limit: int = _MAX_RESPONSE_BYTES) -> bytes:
     except TypeError:
         raw = resp.read()
     if len(raw) > limit:
-        raise ProviderError(f"response body exceeded limit {limit} bytes")
+        raise MediaResponseError(f"response body exceeded limit {limit} bytes")
     return raw
 
 
@@ -161,6 +169,8 @@ class HttpMediaTransport:
                         msg += f" - {err_text[:200]}"
                 except Exception:
                     msg += f" - {err_text[:200]}"
+            if 400 <= exc.code < 500 and exc.code != 429:
+                raise MediaResponseError(f"media embedding HTTP failure: {msg}", "media_response_rejected") from exc
             raise ProviderError(f"media embedding HTTP failure: {msg}") from exc
         except (URLError, OSError) as exc:
             raise ProviderError(f"media embedding network error: {exc}") from exc
@@ -168,16 +178,16 @@ class HttpMediaTransport:
         try:
             result = json.loads(raw_body.decode("utf-8"))
         except Exception as exc:
-            raise ProviderError(f"invalid JSON response from media embedding endpoint: {exc}") from exc
+            raise MediaResponseError(f"invalid JSON response from media embedding endpoint: {exc}") from exc
 
         if isinstance(result, dict) and "error" in result:
             err = result["error"]
             err_msg = err.get("message") if isinstance(err, dict) else str(err)
-            raise ProviderError(f"media embedding API error: {err_msg}")
+            raise MediaResponseError(f"media embedding API error: {err_msg}", "media_response_rejected")
 
         data = result.get("data") if isinstance(result, dict) else None
         if not isinstance(data, list):
-            raise ProviderError("media embedding response must contain a data list")
+            raise MediaResponseError("media embedding response must contain a data list")
         return data
 
 
@@ -320,6 +330,8 @@ class GeminiMediaTransport:
                         msg += f" - {err_text[:200]}"
                 except Exception:
                     msg += f" - {err_text[:200]}"
+            if 400 <= exc.code < 500 and exc.code != 429:
+                raise MediaResponseError(f"Gemini media embedding HTTP failure: {msg}", "media_response_rejected") from exc
             raise ProviderError(f"Gemini media embedding HTTP failure: {msg}") from exc
         except (URLError, OSError) as exc:
             raise ProviderError(f"Gemini media embedding network error: {exc}") from exc
@@ -327,37 +339,37 @@ class GeminiMediaTransport:
         try:
             result = json.loads(raw_body.decode("utf-8"))
         except Exception as exc:
-            raise ProviderError(f"invalid JSON response from Gemini media embedding endpoint: {exc}") from exc
+            raise MediaResponseError(f"invalid JSON response from Gemini media embedding endpoint: {exc}") from exc
 
         if isinstance(result, dict) and "error" in result:
             err = result["error"]
             err_msg = err.get("message") if isinstance(err, dict) else str(err)
-            raise ProviderError(f"Gemini media embedding API error: {err_msg}")
+            raise MediaResponseError(f"Gemini media embedding API error: {err_msg}", "media_response_rejected")
 
         mapped_records: list[dict[str, Any]] = []
         if isinstance(result, dict) and "embeddings" in result:
             embs = result["embeddings"]
             if not isinstance(embs, list):
-                raise ProviderError("Gemini media embedding response 'embeddings' must be a list")
+                raise MediaResponseError("Gemini media embedding response 'embeddings' must be a list")
             for idx, item_resp in enumerate(embs):
                 if not isinstance(item_resp, dict):
-                    raise ProviderError("Gemini media embedding item must be an object")
+                    raise MediaResponseError("Gemini media embedding item must be an object")
                 values = item_resp.get("values")
                 if not isinstance(values, list):
-                    raise ProviderError("Gemini media embedding item missing 'values' list")
+                    raise MediaResponseError("Gemini media embedding item missing 'values' list")
                 mapped_records.append({"index": idx, "embedding": values})
         elif isinstance(result, dict) and "embedding" in result:
             if len(items) != 1:
-                raise ProviderError(
+                raise MediaResponseError(
                     f"Gemini single embedding response received but request had {len(items)} items"
                 )
             emb = result["embedding"]
             values = emb.get("values") if isinstance(emb, dict) else None
             if not isinstance(values, list):
-                raise ProviderError("Gemini media embedding single response missing 'values' list")
+                raise MediaResponseError("Gemini media embedding single response missing 'values' list")
             mapped_records.append({"index": 0, "embedding": values})
         else:
-            raise ProviderError("Gemini media embedding response must contain 'embedding' or 'embeddings'")
+            raise MediaResponseError("Gemini media embedding response must contain 'embedding' or 'embeddings'")
 
         return mapped_records
 
@@ -470,13 +482,20 @@ class NativeMediaProvider:
         request_id = self.request_journal.before_send(payload_hash, self.profile.endpoint, self.profile.fingerprint)
         try:
             response = list(self._transport(items))
-            self.request_journal.mark_success(request_id)
+        except MediaResponseError as exc:
+            self.request_journal.mark_response_failed(request_id, exc.reason)
+            raise
         except Exception as exc:
             self.request_journal.mark_unknown(request_id, "response_unconfirmed")
             raise ProviderError("SUBMISSION_UNKNOWN: native media outcome unknown") from exc
-        # 请求已响应（mark_success 已记账，不重发）；此处只做**产物合同**校验：
-        # 数量/定位/向量不合规即抛错，绝不把契约失败的响应当可索引产物返回。
-        if len(response) != len(items):
-            raise ProviderError("native media response count mismatch")
-        mapped = map_media_response(response, ids)
-        return [validate_vector(mapped[item_id], self.profile) for item_id in ids]
+        # Receipt is not success. Validate every item before the durable success CAS.
+        try:
+            if len(response) != len(items):
+                raise ProviderError("native media response count mismatch")
+            mapped = map_media_response(response, ids)
+            vectors = [validate_vector(mapped[item_id], self.profile) for item_id in ids]
+        except Exception:
+            self.request_journal.mark_response_failed(request_id)
+            raise
+        self.request_journal.mark_success(request_id)
+        return vectors

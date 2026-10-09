@@ -4,7 +4,8 @@ R2：正常启用配置不新增费用审批；明确撤销、持久意图和未
 
 * **先落意图再发送**：任何非幂等计费 POST 在实际发出前必须 `before_send`，
   把 `request_id / payload_hash / endpoint / profile / attempt` 写进本机 control。
-* **结果只有 success / submission_unknown**：响应丢失（网络错误、5xx、429）一律
+* **结果分类**：success 只在产物合同通过后落账；已确认媒体拒绝/坏响应复用
+  abandoned + 固定 reason，不升级 schema。响应丢失（网络错误、5xx、429）一律
   记 unknown；未知受理**不得自动重传**，只能由持久任务/人工确认后再决定。
   这一条是**被强制的**，不只是文案：同一 `kind + payload_hash + endpoint + profile`
   只要存在未决意图（`prepared` / `submission_unknown`），`before_send` 一律拒绝
@@ -100,6 +101,18 @@ class PaidRequestJournal:
     def mark_unknown(self, request_id: str, reason: str = "response_unconfirmed") -> None:
         self._resolve().mark_intent(request_id, "submission_unknown", str(reason)[:200],
                                     expected_states=("prepared",))
+
+    def mark_response_failed(self, request_id: str, reason: str = "media_response_contract_failed") -> None:
+        """A confirmed unusable response is terminal, not success or unknown.
+
+        Reuse the existing abandoned state (no schema change); reason distinguishes
+        response rejection/contract failure from an operator abandoning an unknown.
+        Only a prepared intent may transition, so late responses cannot undo abandon.
+        """
+        if reason not in {"media_response_contract_failed", "media_response_rejected"}:
+            raise ValueError("unsupported confirmed media failure reason")
+        if not self._resolve().mark_intent(request_id, "abandoned", reason, expected_states=("prepared",)):
+            raise ProviderError("REQUEST_INTENT_FINALIZED: late response discarded")
 
     def pending(self) -> list[dict[str, Any]]:
         """仍无明确结果的意图（`prepared` / `submission_unknown`）。
