@@ -1280,3 +1280,7 @@ Codex（本地施工；模型底模未由系统明确标注）。开工 `e35ec03
 ### E20 F05/F06 媒体连接与认证收敛
 
 Codex 主流程整合；施工子代理 gpt-6.1-sol/high。resolved media connection 统一 adapter/endpoint/model/dimension 与认证解析；transport/profile/journal 共享真实媒体身份，凭据不纳入 fingerprint，保持既有显式 media key、通用 key、专用 env 与新旧通用 env 优先级。三个 adapter env-only 回归、单字段身份变化及重启缓存对照落地。红回归 15 failed/5 passed，绿回归 20 passed；既有 transport/profile 靶向保留。证据 .runtime/beta2/E20/media/；全部离线 HTTP 边界，不声明真实端点通过。
+
+### E20 registry 并发状态复核补足
+
+Codex 主流程：load/save 读状态与内存快照置于既有 RLock；直接 save 复用既有进程文件锁，保持原锁序/重入策略，避免并发 load 把 unknown 状态改写后放过覆盖写。registry 20 passed、E20 ops 13 passed，exit0；证据 ops/registry-serialized 与 ops/green-serialized。

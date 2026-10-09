@@ -181,6 +181,10 @@ class VaultRegistry:
     # ------------------------------------------------------------------ io
 
     def load(self) -> list[VaultEntry]:
+        with self._lock:
+            return self._load_locked()
+
+    def _load_locked(self) -> list[VaultEntry]:
         """Read known entries; unknown IO/parse state never authorizes overwrite.
 
         A missing file is a legal empty registry. For compatibility a first
@@ -260,6 +264,11 @@ class VaultRegistry:
         return file_entries
 
     def save(self, entries: list[VaultEntry]) -> None:
+        # Direct save() needs the same read-state serialization as mutations.
+        with self._lock, _process_file_lock(self._lock_path):
+            self._save_locked(entries)
+
+    def _save_locked(self, entries: list[VaultEntry]) -> None:
         """Atomic write (tmp + replace) so a killed process can't corrupt it."""
         # Also protects a fresh instance's direct save(), not only load→mutate.
         self.load()
