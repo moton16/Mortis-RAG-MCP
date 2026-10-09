@@ -175,6 +175,38 @@ def build_media_proxy_chunks(
     return chunks
 
 
+def merge_audio_segments(occurrences: Sequence[Any]) -> list[dict[str, Any]]:
+    """把同一父源/revision 的**相邻或重叠**音频片段按毫秒区间合并展示（E08-d 音频出口）。
+
+    只按时间相邻性合并，**绝不**按转录/caption 文本合并——两段音频即使转录逐字相同，
+    只要时间区间不相邻就保持独立，避免把不同音频误当成同一段。合并结果保留每个原始
+    片段的可读地址（`occurrence_ids`），展示侧据此仍能取回原片段。
+    """
+    segments: list[dict[str, Any]] = []
+    for occurrence in occurrences:
+        if _get(occurrence, "kind") != "audio":
+            continue
+        start = _get(occurrence, "t_start_ms")
+        end = _get(occurrence, "t_end_ms")
+        oid = _get(occurrence, "occurrence_id")
+        if not (_is_int(start) and _is_int(end) and end >= start and oid):
+            continue
+        segments.append({"t_start_ms": start, "t_end_ms": end, "occurrence_ids": [oid]})
+    segments.sort(key=lambda item: (item["t_start_ms"], item["t_end_ms"], item["occurrence_ids"][0]))
+    merged: list[dict[str, Any]] = []
+    for segment in segments:
+        if merged and segment["t_start_ms"] <= merged[-1]["t_end_ms"]:
+            last = merged[-1]
+            last["t_end_ms"] = max(last["t_end_ms"], segment["t_end_ms"])
+            last["occurrence_ids"].extend(segment["occurrence_ids"])
+            continue
+        merged.append(segment)
+    for item in merged:
+        item["kind"] = "audio"
+        item["occurrence_ids"] = sorted(set(item["occurrence_ids"]))
+    return merged
+
+
 def media_chunk_links(chunks: Sequence[Chunk], occurrences: Sequence[Any], *, revision_id: str,
                       profile_key: str, chunker_fingerprint: str,
                       derived_generation_id: str, markdown: str | None = None) -> list[dict[str, Any]]:

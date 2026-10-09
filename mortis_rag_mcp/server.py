@@ -1741,6 +1741,15 @@ class VaultMcpServer:
                   "media_refs_revision_id": revision_id}
         if text_range is not None:
             result["media_refs_text_range"] = text_range
+        # E08-d/联合音频出口：音频相邻片段按同一 revision + 毫秒区间合并展示去重叠，
+        # 保留每个原始片段地址（occurrence_ids）。跨页稳定：按整 revision 有界列举计算。
+        if any(str(row.get("kind")) == "audio" for row in rows):
+            try:
+                from ._indexer.media import merge_audio_segments
+                all_rows = store.list_media(source, revision_id=revision_id, offset=0, limit=1000)
+                result["media_audio_segments"] = merge_audio_segments(all_rows)
+            except Exception:
+                pass
         return result
 
     def _kb_stats(self, arguments: dict[str, Any]) -> dict[str, Any]:

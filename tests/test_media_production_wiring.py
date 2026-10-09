@@ -35,7 +35,8 @@ def _layout(server, vault):
 
 
 def _commit(store: DocumentStore, vault: Path, source: str, markdown: str,
-            blobs: list[bytes], mimes: list[str] | None = None) -> str:
+            blobs: list[bytes], mimes: list[str] | None = None,
+            kinds: list[str] | None = None, spans: list[tuple[int, int]] | None = None) -> str:
     path = vault / source
     sha = hashlib.sha256(path.read_bytes()).hexdigest()
     staged = store.stage_revision(
@@ -44,13 +45,16 @@ def _commit(store: DocumentStore, vault: Path, source: str, markdown: str,
         parser_fingerprint="fake-1", markdown=markdown, capabilities={"coverage": "full"},
     )
     mimes = mimes or ["image/png"] * len(blobs)
+    kinds = kinds or ["image"] * len(blobs)
     specs = []
     for index, data in enumerate(blobs):
         blob_id = store.put_media_blob(data=data, mime_type=mimes[index], width=8, height=8)
         anchor = markdown.index("media")
+        timing = spans[index] if spans else (None, None)
         specs.append(MediaOccurrenceSpec(
-            occurrence_id=f"occ-{index}", blob_id=blob_id, kind="image", ordinal=index,
+            occurrence_id=f"occ-{index}", blob_id=blob_id, kind=kinds[index], ordinal=index,
             mime_type=mimes[index], page=index + 1, caption="same caption",
+            t_start_ms=timing[0], t_end_ms=timing[1],
             anchor_start=anchor, anchor_end=anchor + len("media")))
     if specs:
         store.attach_occurrences(staged.revision_id, specs)
@@ -392,3 +396,55 @@ def test_rpc_budget_uses_real_request_id_and_stdio_serialization(tmp_path: Path)
         assert "data" not in rejected["result"]["content"][0]
     finally:
         server.shutdown()
+
+
+# --------------------------------------------------------- 联合音频出口（E08×E09）
+def test_joint_audio_occurrences_flow_through_the_same_sync_path(tmp_path: Path):
+    """E09 发布音频 occurrence 后走**同一** sync 路径：不另起 embed、不反向 import indexer。"""
+    server, vault = _build(tmp_path)
+    setup = DocumentStore(_layout(server, vault), server.config)
+    setup.open(write=True)
+    revision = _commit(setup, vault, "doc.pdf", MARKDOWN, [PNG_A, PNG_A],
+                       mimes=["audio/wav", "audio/wav"], kinds=["audio", "audio"],
+                       spans=[(0, 1000), (1000, 2000)])
+    setup.close()
+    try:
+        indexer = server._indexer_for({"vault_path": "Vault"})
+        indexer.sync()
+        chunks = indexer._chunks["doc.pdf"]
+        proxy = [c for c in chunks if c.metadata.get("kind") == "media_proxy"]
+        assert {c.metadata["occurrence_id"] for c in proxy} == {"occ-0", "occ-1"}
+        # 音频 proxy 走同一 FTS/embed 候选（有向量），且**没有**另起的原生 embed 通道。
+        assert all(c.metadata.get("embedding_key") for c in proxy)
+        assert not [c for c in chunks if c.metadata.get("kind") == "media_native"]
+        reader = _second_connection(server, vault)
+        try:
+            links = reader.list_media_chunk_links(revision_id=revision)
+            assert {link["occurrence_id"] for link in links} == {"occ-0", "occ-1"}
+        finally:
+            reader.close()
+
+        # refs 页暴露合并后的音频区间，并保留原始片段地址。
+        page = server._kb_read({"source": "doc.pdf", "vault_path": "Vault"})
+        segments = page["media_audio_segments"]
+        assert len(segments) == 1 and segments[0]["t_start_ms"] == 0 and segments[0]["t_end_ms"] == 2000
+        assert segments[0]["occurrence_ids"] == ["occ-0", "occ-1"]
+    finally:
+        server.shutdown()
+
+
+def test_merge_audio_segments_only_by_time_never_by_transcript():
+    from mortis_rag_mcp._indexer.media import merge_audio_segments
+
+    def occ(oid, start, end, caption):
+        return {"occurrence_id": oid, "kind": "audio", "t_start_ms": start, "t_end_ms": end,
+                "caption": caption, "ocr": caption}
+
+    # 相邻/重叠 → 合并；转录相同但时间不相邻 → 必须保持独立。
+    merged = merge_audio_segments([
+        occ("a", 0, 1000, "same transcript"),
+        occ("b", 900, 2000, "same transcript"),
+        occ("c", 50000, 51000, "same transcript"),
+    ])
+    assert [(s["t_start_ms"], s["t_end_ms"], s["occurrence_ids"]) for s in merged] == [
+        (0, 2000, ["a", "b"]), (50000, 51000, ["c"])]
