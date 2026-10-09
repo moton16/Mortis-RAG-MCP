@@ -16,6 +16,32 @@ class EmbeddingContractError(ValueError):
     pass
 
 
+#: 允许声明的模态。`text` 永远存在（正文与媒体共享同一 profile 身份）。
+SUPPORTED_MODALITIES = ("text", "image", "audio")
+#: 真正的原生媒体模态（`text` 不算媒体能力）。
+MEDIA_MODALITIES = ("image", "audio")
+
+
+def validate_media_modalities(modalities: Any) -> tuple[str, ...]:
+    """只接受显式声明的模态序列；字符串不是序列。不按模型名/维度推能力。"""
+    if isinstance(modalities, str):
+        raise EmbeddingContractError("modalities must be a sequence of strings, not a string")
+    try:
+        values = tuple(modalities)
+    except TypeError as exc:
+        raise EmbeddingContractError("modalities must be a sequence of strings") from exc
+    if not values:
+        raise EmbeddingContractError("modalities must not be empty")
+    if "text" not in values:
+        raise EmbeddingContractError("text modality is required for the shared space")
+    for value in values:
+        if value not in SUPPORTED_MODALITIES:
+            raise EmbeddingContractError(f"unsupported modality: {value!r}")
+    if len(set(values)) != len(values):
+        raise EmbeddingContractError("modalities must not repeat")
+    return values
+
+
 def normalize_endpoint(endpoint: str) -> str:
     parts = urlsplit(endpoint.strip())
     if parts.username or parts.password:
@@ -88,6 +114,10 @@ def resolve_embedding_profile(config: Any) -> ResolvedEmbeddingProfile:
     document_template = getattr(config, "document_template", "{text}")
     validate_text_template(query_template)
     validate_text_template(document_template)
+    # E07：模态与 alignment 只来自显式声明；未声明时保持文本默认（指纹不变）。
+    declared_media = tuple(getattr(config, "media_modalities", ()) or ())
+    modalities = validate_media_modalities(("text", *declared_media)) if declared_media else ("text",)
+    alignment_space_id = str(getattr(config, "media_alignment_space_id", "") or "")
     dim = config.dimension
     if isinstance(dim, bool) or not isinstance(dim, int) or dim <= 0:
         raise EmbeddingContractError("embedding dimension must be a positive integer")
@@ -97,9 +127,12 @@ def resolve_embedding_profile(config: Any) -> ResolvedEmbeddingProfile:
     native, context = dim, None
     evidence = "configured-unverified-text"
     if config.mode == "static":
+        if declared_media:
+            raise EmbeddingContractError("static profile cannot declare native media modalities")
         if slicing:
             raise EmbeddingContractError("static profile does not support client slicing")
         return ResolvedEmbeddingProfile("static", "static", "sha256", "", "v1", "", dim, dim, None, "unsupported",
+                                        modalities=("text",), alignment_space_id="",
                                         query_template=query_template, document_template=document_template,
                                         evidence_reference="local-deterministic")
     if name:
@@ -121,10 +154,40 @@ def resolve_embedding_profile(config: Any) -> ResolvedEmbeddingProfile:
         getattr(config, "endpoint_revision", ""), native, dim,
         dim if config.send_dimensions else None,
         "server" if config.send_dimensions else "unsupported",
+        modalities=modalities, alignment_space_id=alignment_space_id,
         query_template=query_template, document_template=document_template,
         preprocess_version=getattr(config, "preprocess_version", "text-v1"),
         max_context=context, evidence_reference=evidence,
     )
+
+
+def resolve_media_profile(config: Any) -> ResolvedEmbeddingProfile:
+    """装配原生媒体 profile（E07）：只消费**显式**声明，绝不按模型名/维度推断。
+
+    缺任一必需声明（modality / alignment_space_id / media preprocess_version /
+    media endpoint_revision）即拒绝——调用方据此判定「该 route 不可用」，不得
+    用文本成功、同维向量或模型名冒充媒体能力/对齐。
+    """
+    base = resolve_embedding_profile(config)
+    declared = tuple(getattr(config, "media_modalities", ()) or ())
+    modalities = validate_media_modalities(("text", *declared))
+    if not any(item in MEDIA_MODALITIES for item in modalities):
+        raise EmbeddingContractError("native media profile requires an explicit image/audio modality")
+    alignment = str(getattr(config, "media_alignment_space_id", "") or "").strip()
+    if not alignment:
+        raise EmbeddingContractError("native media profile requires an explicit alignment_space_id")
+    preprocess = str(getattr(config, "media_preprocess_version", "") or "").strip()
+    if not preprocess:
+        raise EmbeddingContractError("native media profile requires an explicit media preprocess_version")
+    endpoint_revision = str(getattr(config, "media_endpoint_revision", "") or "").strip()
+    if not endpoint_revision:
+        raise EmbeddingContractError("native media profile requires an explicit media endpoint_revision")
+    profile = replace(
+        base, modalities=modalities, alignment_space_id=alignment,
+        preprocess_version=preprocess, endpoint_revision=endpoint_revision,
+    )
+    validate_profile(profile)
+    return profile
 
 
 def validate_profile(profile: ResolvedEmbeddingProfile) -> None:

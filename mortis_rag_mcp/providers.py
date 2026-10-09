@@ -251,6 +251,46 @@ def create_embedding_provider(config: EmbeddingConfig) -> EmbeddingProvider:
     raise ValueError(f"unsupported embedding mode: {config.mode}")
 
 
+def create_media_provider(config: EmbeddingConfig, *, transport: Any = None) -> Any:
+    """受控原生媒体 provider 工厂（E07）。
+
+    - 配置未声明任何媒体模态 → 返回 `None`（该能力不存在，不是错误；文本路径不受影响）。
+    - 声明不完整（modality / alignment_space_id / media preprocess / endpoint revision /
+      MIME / 限额 / 证据引用）→ 抛 `ProviderError`：明确「该 route 不可用」，绝不用
+      文本成功、同维向量或模型名冒充，也绝不自动试端点。
+    - `transport` 必须由调用方显式注入；真实 HTTP 边界（Q09 合同）缺失时该能力同样不可用。
+    """
+    declared = tuple(getattr(config, "media_modalities", ()) or ())
+    if not declared:
+        return None
+    from .embedding_capabilities import EmbeddingContractError, resolve_media_profile
+    from .media_providers import NativeMediaEvidence, NativeMediaProvider
+    try:
+        profile = resolve_media_profile(config)
+    except EmbeddingContractError as exc:
+        raise ProviderError(f"native media capability unavailable: {exc}") from exc
+    mime = tuple(getattr(config, "media_allowed_mime_types", ()) or ())
+    max_bytes = int(getattr(config, "media_max_input_bytes", 0) or 0)
+    max_batch = int(getattr(config, "media_max_batch_size", 0) or 0)
+    references = tuple(str(getattr(config, name, "") or "") for name in (
+        "media_model_reference", "media_endpoint_fixture_reference",
+        "media_alignment_reference", "media_license_reference"))
+    if not mime:
+        raise ProviderError("native media capability unavailable: allowed MIME types are not declared")
+    if max_bytes <= 0 or max_batch <= 0:
+        raise ProviderError("native media capability unavailable: byte/batch limits are not declared")
+    if not all(references):
+        raise ProviderError("native media capability unavailable: endpoint evidence references are incomplete")
+    if transport is None:
+        raise ProviderError("native media capability unavailable: no declared transport (Q09 protocol missing)")
+    evidence = NativeMediaEvidence(
+        references[0], references[1], references[2], references[3],
+        profile.fingerprint, profile.alignment_space_id, max_bytes, max_batch, mime,
+        preprocess_version=profile.preprocess_version, endpoint_revision=profile.endpoint_revision,
+    )
+    return NativeMediaProvider(profile, evidence, transport)
+
+
 def create_reranker_provider(config: RerankerConfig) -> ExternalRerankerProvider | None:
     if not config.enabled:
         return None

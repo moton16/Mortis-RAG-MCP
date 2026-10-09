@@ -53,14 +53,42 @@ class EmbeddingConfig:
     model_revision: str = ""
     endpoint_revision: str = ""
     preprocess_version: str = "text-v1"
+    # ---- Native media declarations (E07)。全部留空 = 本配置不声明任何原生媒体能力。
+    # 媒体能力只由这些**显式字段**决定：不按 model 名推、不按维度推 alignment。
+    media_modalities: tuple[str, ...] = ()
+    media_alignment_space_id: str = ""
+    media_preprocess_version: str = ""
+    media_endpoint_revision: str = ""
+    media_allowed_mime_types: tuple[str, ...] = ()
+    media_max_input_bytes: int = 0
+    media_max_batch_size: int = 0
+    media_model_reference: str = ""
+    media_endpoint_fixture_reference: str = ""
+    media_alignment_reference: str = ""
+    media_license_reference: str = ""
 
     def __post_init__(self) -> None:
-        from .embedding_capabilities import validate_text_template
+        from .embedding_capabilities import validate_media_modalities, validate_text_template
         validate_text_template(self.query_template)
         validate_text_template(self.document_template)
-        for name in ("model_revision", "endpoint_revision", "preprocess_version"):
+        for name in ("model_revision", "endpoint_revision", "preprocess_version",
+                     "media_alignment_space_id", "media_preprocess_version", "media_endpoint_revision",
+                     "media_model_reference", "media_endpoint_fixture_reference",
+                     "media_alignment_reference", "media_license_reference"):
             if not isinstance(getattr(self, name), str):
                 raise ValueError(f"embedding.{name} must be a string")
+        for name in ("media_modalities", "media_allowed_mime_types"):
+            value = getattr(self, name)
+            if isinstance(value, str) or not isinstance(value, tuple):
+                raise ValueError(f"embedding.{name} must be a tuple of strings")
+            if any(not isinstance(item, str) or not item for item in value):
+                raise ValueError(f"embedding.{name} must contain non-empty strings")
+        if self.media_modalities:
+            validate_media_modalities(("text", *self.media_modalities))
+        for name in ("media_max_input_bytes", "media_max_batch_size"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"embedding.{name} must be a non-negative integer")
         if not isinstance(self.client_slicing, bool):
             raise ValueError("embedding.client_slicing must be a boolean")
         if not isinstance(self.capability_profile, str) or not isinstance(self.adapter, str) or not self.adapter:
@@ -716,6 +744,37 @@ def _boolean(section: Mapping[str, Any], key: str, default: bool) -> bool:
     return value
 
 
+def _string_tuple(section: Mapping[str, Any], key: str) -> tuple[str, ...]:
+    """读取字符串数组配置（TOML array），单项字符串按单元素处理；其余类型报错。"""
+    if key not in section or section[key] is None:
+        return ()
+    value = section[key]
+    if isinstance(value, str):
+        value = (value,)
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(f"config key '{key}' must be an array of strings, got {value!r}")
+    result: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not item:
+            raise ValueError(f"config key '{key}' must contain non-empty strings, got {item!r}")
+        result.append(item)
+    return tuple(result)
+
+
+def _string(section: Mapping[str, Any], key: str, default: str = "") -> str:
+    value = section.get(key, default)
+    if not isinstance(value, str):
+        raise ValueError(f"config key '{key}' must be a string, got {value!r}")
+    return value
+
+
+def _nonnegative(section: Mapping[str, Any], key: str, default: int = 0) -> int:
+    value = section.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"config key '{key}' must be a non-negative integer, got {value!r}")
+    return value
+
+
 def _load_chunking(data: Mapping[str, Any], index: Mapping[str, Any]) -> ChunkingConfig:
     section = _section(data, "chunking")
     alias_present = "legacy_chunking" in section or "legacy_chunking" in index or "legacy_chunking" in data
@@ -782,6 +841,17 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
         model_revision=embedding.get("model_revision", ""),
         endpoint_revision=embedding.get("endpoint_revision", ""),
         preprocess_version=embedding.get("preprocess_version", "text-v1"),
+        media_modalities=_string_tuple(embedding, "media_modalities"),
+        media_alignment_space_id=_string(embedding, "media_alignment_space_id"),
+        media_preprocess_version=_string(embedding, "media_preprocess_version"),
+        media_endpoint_revision=_string(embedding, "media_endpoint_revision"),
+        media_allowed_mime_types=_string_tuple(embedding, "media_allowed_mime_types"),
+        media_max_input_bytes=_nonnegative(embedding, "media_max_input_bytes"),
+        media_max_batch_size=_nonnegative(embedding, "media_max_batch_size"),
+        media_model_reference=_string(embedding, "media_model_reference"),
+        media_endpoint_fixture_reference=_string(embedding, "media_endpoint_fixture_reference"),
+        media_alignment_reference=_string(embedding, "media_alignment_reference"),
+        media_license_reference=_string(embedding, "media_license_reference"),
     )
     rer = RerankerConfig(
         enabled=bool(reranker.get("enabled", False)),

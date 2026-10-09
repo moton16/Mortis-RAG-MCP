@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol, Sequence
 
@@ -29,10 +30,49 @@ class NativeMediaEvidence:
     max_input_bytes: int
     max_batch_size: int
     allowed_mime_types: tuple[str, ...]
+    #: 可选：显式声明媒体 preprocess / endpoint 版本。提供时必须与 profile 一致，
+    #: 缺省不校验（低层构造兼容）；工厂装配路径要求二者非空（见 providers.create_media_provider）。
+    preprocess_version: str = ""
+    endpoint_revision: str = ""
 
 
 class MediaTransport(Protocol):
     def __call__(self, inputs: Sequence[EmbeddingInput]) -> Sequence[dict[str, Any]]: ...
+
+
+def map_media_response(response: Sequence[Any], ids: Sequence[str]) -> dict[str, Any]:
+    """把离线/服务响应归一为 `{内部 request_id: embedding}`。
+
+    只接受两种**精确**定位：显式 `request_id`（必须命中输入集合）或 `index`
+    （0..N-1，按输入顺序定位）。不要求服务回显 request_id；但数量必须完整、无
+    重复、无缺项、无越界——任何缺口都抛错，绝不静默补位。归一接口设计不等于
+    批准实际 HTTP 请求体。
+    """
+    ordered = list(ids)
+    mapped: dict[str, Any] = {}
+    for item in response:
+        if not isinstance(item, Mapping):
+            raise ProviderError("native media response items must be mappings")
+        key: str | None = None
+        if "request_id" in item:
+            candidate = item.get("request_id")
+            if not isinstance(candidate, str) or candidate not in ordered:
+                raise ProviderError("native media response request_id does not match an input")
+            key = candidate
+        elif "index" in item:
+            index = item.get("index")
+            if isinstance(index, bool) or not isinstance(index, int) or not 0 <= index < len(ordered):
+                raise ProviderError("native media response index is out of range")
+            key = ordered[index]
+        else:
+            raise ProviderError("native media response must map by request_id or index")
+        if key in mapped:
+            raise ProviderError("duplicate native media response entry")
+        mapped[key] = item.get("embedding")
+    missing = [item for item in ordered if item not in mapped]
+    if missing:
+        raise ProviderError("native media response is missing entries")
+    return mapped
 
 
 class NativeMediaProvider:
@@ -53,6 +93,10 @@ class NativeMediaProvider:
             raise ProviderError("native media limits must be verified positive integers")
         if not evidence.allowed_mime_types:
             raise ProviderError("native media MIME contract required")
+        if evidence.preprocess_version and evidence.preprocess_version != profile.preprocess_version:
+            raise ProviderError("native media preprocess version mismatch")
+        if evidence.endpoint_revision and evidence.endpoint_revision != profile.endpoint_revision:
+            raise ProviderError("native media endpoint revision mismatch")
         self.profile = profile
         self.evidence = evidence
         self._transport = transport
@@ -64,6 +108,19 @@ class NativeMediaProvider:
             raise ProviderError("native media authorization profile mismatch")
         self.request_journal = journal
         self.paid_guard = guard
+
+    def ability(self) -> dict[str, Any]:
+        """只报告**声明**事实（不是已测能力，也不代表真实端点可用），供 E08 消费。"""
+        return {
+            "profile_fingerprint": self.profile.fingerprint,
+            "modalities": tuple(self.profile.modalities),
+            "alignment_space_id": self.profile.alignment_space_id,
+            "preprocess_version": self.profile.preprocess_version,
+            "endpoint_revision": self.profile.endpoint_revision,
+            "allowed_mime_types": tuple(self.evidence.allowed_mime_types),
+            "max_input_bytes": self.evidence.max_input_bytes,
+            "max_batch_size": self.evidence.max_batch_size,
+        }
 
     def embed_media(self, inputs: Sequence[EmbeddingInput]) -> list[list[float]]:
         items = list(inputs)
@@ -94,14 +151,9 @@ class NativeMediaProvider:
         except Exception as exc:
             self.request_journal.mark_unknown(request_id, "response_unconfirmed")
             raise ProviderError("SUBMISSION_UNKNOWN: native media outcome unknown") from exc
+        # 请求已响应（mark_success 已记账，不重发）；此处只做**产物合同**校验：
+        # 数量/定位/向量不合规即抛错，绝不把契约失败的响应当可索引产物返回。
         if len(response) != len(items):
             raise ProviderError("native media response count mismatch")
-        mapped: dict[str, Any] = {}
-        for result in response:
-            if not isinstance(result, dict) or result.get("request_id") not in ids:
-                raise ProviderError("native media response must map exact request ids")
-            request_id = result["request_id"]
-            if request_id in mapped:
-                raise ProviderError("duplicate native media response request id")
-            mapped[request_id] = result.get("embedding")
-        return [validate_vector(mapped[request_id], self.profile) for request_id in ids]
+        mapped = map_media_response(response, ids)
+        return [validate_vector(mapped[item_id], self.profile) for item_id in ids]

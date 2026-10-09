@@ -40,6 +40,23 @@ capability_profile = ""
 adapter = "openai_text"
 client_slicing = false
 
+# ---- 原生媒体（图像/音频）声明：E07 ----
+# 全部留空 = 不声明任何原生媒体能力；文本路径完全不受影响。
+# 媒体能力**只**由下面的显式声明决定：不按 model 名推、不按同维向量推 alignment。
+# 缺任一必需声明（modalities / alignment_space_id / preprocess / endpoint_revision /
+# MIME / 限额 / 证据引用）时该 route 判定为不可用，绝不自动试端点。
+# media_modalities = ["image", "audio"]
+# media_alignment_space_id = ""            # 与文本 profile 共享的对齐空间标识（显式）
+# media_preprocess_version = ""            # 媒体预处理版本（显式，不是文本 text-v1）
+# media_endpoint_revision = ""             # 媒体端点版本（显式）
+# media_allowed_mime_types = ["image/png", "image/jpeg", "image/webp"]
+# media_max_input_bytes = 0                # 单件媒体字节上限（正整数）
+# media_max_batch_size = 0                 # 单请求媒体件数上限（正整数）
+# media_model_reference = ""
+# media_endpoint_fixture_reference = ""
+# media_alignment_reference = ""
+# media_license_reference = ""
+
 [reranker]
 enabled = false
 endpoint = "https://api.siliconflow.cn/v1/rerank"

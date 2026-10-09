@@ -33,7 +33,7 @@ from .fsnotify import WindowsDirectoryWatcher
 from .fts import FtsIndex
 from .ingest import INGEST_EXTS
 from .ingest.tables import iter_table_blocks, split_table_into_chunks
-from .providers import EmbeddingProvider, ProviderError, RerankerProvider, create_embedding_provider, create_reranker_provider
+from .providers import EmbeddingProvider, ProviderError, RerankerProvider, create_embedding_provider, create_media_provider, create_reranker_provider
 from .vector import create_vector_backend
 # v0.8.0 P2：数据模型与缓存编解码提取至私有包 _indexer/（本文件转为 Facade）。
 # 下方 re-export 保持 `from mortis_rag_mcp.indexer import ...` 公开导入面 100% 不变。
@@ -158,6 +158,14 @@ class MarkdownIndexer:
         self._chunking_compatibility_notice: str | None = None
         self._embedding_paused = False
         self.embedding_provider = embedding_provider or create_embedding_provider(self.config.embedding)
+        # E07：原生媒体能力按**显式声明**装配。未声明 → None（无该能力）；声明不完整或
+        # 无已声明 transport（Q09 缺协议）→ 记录「该 route 不可用」，但**不**影响文本路径。
+        self.media_provider: Any = None
+        self._media_capability_error: str | None = None
+        try:
+            self.media_provider = create_media_provider(self.config.embedding)
+        except Exception as exc:
+            self._media_capability_error = str(exc)
         self.reranker_provider = reranker_provider
         if reranker_provider is None:
             try:
@@ -544,6 +552,10 @@ class MarkdownIndexer:
                                      self._embedding_profile.fingerprint)
         self.configure_paid_provider("rerank", self.reranker_provider,
                                      self._reranker_profile_fingerprint())
+        # E07：原生媒体 provider 走同一持久 journal/闸门（§20.7B 覆盖 media）。
+        if self.media_provider is not None:
+            self.configure_paid_provider("media", self.media_provider,
+                                         self.media_provider.profile.fingerprint)
 
     def may_use_paid_profile(self, profile_fingerprint: str, *, kind: str = "embed") -> bool:
         """统一闸门（§20.7B）：embed_missing / query / fanout / rerank / 媒体 / 转录
