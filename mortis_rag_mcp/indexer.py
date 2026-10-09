@@ -211,6 +211,7 @@ class MarkdownIndexer:
         # 文本后再按 chunk.id 补挂（见 _load_vectors_cache / _attach_pending_vectors）。
         self._pending_vectors: dict[str, Any] = {}
         self.failed_files: dict[str, str] = {}
+        self.persistence_status: dict[str, Any] = {"state": "disabled", "errors": {}}
         self.last_sync: float | None = None
         self._watch_stop = threading.Event()
         self._watch_thread: threading.Thread | None = None
@@ -712,7 +713,7 @@ class MarkdownIndexer:
         """Persist the failure map so kb_stats stays informative across restarts.
 
         名单为空时直接删文件，不留空壳。缓存 IO 是尽力而为：这里失败绝不能
-        拖垮 sync，所以所有异常都吞掉。
+        拖垮 sync；IO 失败保留可定位诊断，不把内存可用冒充持久化成功。
         """
         if self._failed_cache_path is None:
             return
@@ -720,13 +721,16 @@ class MarkdownIndexer:
             if not self.failed_files:
                 if self._failed_cache_path.exists():
                     self._failed_cache_path.unlink()
+                self._clear_persistence_error("failed_files")
                 return
             payload = json.dumps({"version": 1, "files": dict(self.failed_files)}, ensure_ascii=False)
             tmp = self._failed_cache_path.with_suffix(self._failed_cache_path.suffix + ".tmp")
             tmp.write_text(payload, encoding="utf-8")
             tmp.replace(self._failed_cache_path)
-        except OSError:
-            pass
+        except OSError as exc:
+            self._record_persistence_error("failed_files", self._failed_cache_path, exc)
+        else:
+            self._clear_persistence_error("failed_files")
 
     def _save_cache(self) -> None:
         """Persist both layers under a single lock; failures degrade gracefully."""
@@ -734,6 +738,19 @@ class MarkdownIndexer:
             self._save_chunks_cache()
             self._save_vectors_cache()
             self._save_failed_files()
+            self.persistence_status["state"] = (
+                "failed" if self.persistence_status["errors"] else
+                "ready" if self._chunks_cache_path is not None else "disabled"
+            )
+
+    def _record_persistence_error(self, layer: str, path: Path, exc: OSError) -> None:
+        self.persistence_status["errors"][layer] = {
+            "path": str(path), "errno": exc.errno, "error": type(exc).__name__,
+        }
+        self.persistence_status["state"] = "failed"
+
+    def _clear_persistence_error(self, layer: str) -> None:
+        self.persistence_status["errors"].pop(layer, None)
 
     def _save_chunks_cache(self) -> None:
         if self._chunks_cache_path is None:
@@ -754,8 +771,10 @@ class MarkdownIndexer:
                 # （或全部豁免）后，旧 chunks.bin 原封不动留在磁盘上，
                 # 下次启动会把已删除的笔记重新载回索引。
                 self._chunks_cache_path.unlink()
-        except OSError:
-            pass
+        except OSError as exc:
+            self._record_persistence_error("chunks", self._chunks_cache_path, exc)
+        else:
+            self._clear_persistence_error("chunks")
 
     @staticmethod
     def _strip_embedding(chunk: Chunk) -> Chunk:
@@ -780,8 +799,10 @@ class MarkdownIndexer:
                 # 同上：全库删空后旧 .bin 必须一起清掉，否则重启会把陈旧
                 # 向量重新挂回来（向量 meta 还可能与新配置不符）。
                 self._vectors_cache_path.unlink()
-        except OSError:
-            pass
+        except OSError as exc:
+            self._record_persistence_error("vectors", self._vectors_cache_path, exc)
+        else:
+            self._clear_persistence_error("vectors")
 
     # ------------------------------------------------------------------ sync
 

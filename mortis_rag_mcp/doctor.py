@@ -516,6 +516,8 @@ def check_registry() -> dict:
         from .registry import VaultRegistry, registry_path
         reg = VaultRegistry(registry_path())
         vaults = reg.load()
+        if reg.read_status == "unknown":
+            return _section(False, f"注册表加载失败：{_sanitize_free_text(reg.path)}：{_sanitize_free_text(reg.read_error)}")
         names, missing = [], []
         for v in vaults:
             name = str(getattr(v, "name", getattr(v, "path", "?")))
@@ -626,6 +628,11 @@ def _configure_probe_paid(provider: object, cfg: object, *, kind: str, fingerpri
         # 非 AppConfig（测试桩/自定义对象）无法证明控制面可用：交给调用方按
         # 「无法持久化意图」处理，绝不为了跑通探测而跳过闸门。
         return False
+
+    # Provider's existing predicate proves both loopback and absent credential;
+    # never infer free status merely from a model name or unknown custom object.
+    if getattr(provider, "is_local_free", False) is True:
+        return True
 
     cache_cfg = getattr(cfg, "cache", None)
     if not bool(getattr(cache_cfg, "enabled", False)):

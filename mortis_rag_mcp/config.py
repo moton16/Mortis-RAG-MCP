@@ -601,6 +601,25 @@ def _env(value: Any) -> Any:
     return value
 
 
+def _without_toml_comment(line: str) -> str:
+    """Strip comments only outside TOML basic/literal strings (Python 3.10)."""
+    quote = ""
+    escaped = False
+    for index, char in enumerate(line):
+        if quote:
+            if escaped:
+                escaped = False
+            elif quote == '"' and char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = ""
+        elif char in "\"'":
+            quote = char
+        elif char == "#":
+            return line[:index].rstrip()
+    return line
+
+
 def _fallback_toml(text: str) -> dict[str, Any]:
     """Small TOML subset for Python 3.10 when tomli is not installed."""
     import ast
@@ -608,7 +627,7 @@ def _fallback_toml(text: str) -> dict[str, Any]:
     result: dict[str, Any] = {}
     section: dict[str, Any] = result
     for raw in text.splitlines():
-        line = raw.strip()
+        line = _without_toml_comment(raw).strip()
         if not line or line.startswith("#"):
             continue
         # [[array-of-table]]: append a fresh dict to the named list.
@@ -628,7 +647,6 @@ def _fallback_toml(text: str) -> dict[str, Any]:
         if "=" not in line:
             continue
         key, raw_value = (part.strip() for part in line.split("=", 1))
-        raw_value = raw_value.split(" #", 1)[0].strip()
         if raw_value.lower() in {"true", "false"}:
             value: Any = raw_value.lower() == "true"
         elif raw_value.startswith("[") and raw_value.endswith("]"):
@@ -665,13 +683,16 @@ def resolve_config_path(explicit: str | os.PathLike[str] | None = None) -> Path 
     """
     if explicit is not None:
         candidate = Path(explicit).expanduser()
-        return candidate if candidate.is_file() else None
+        if not candidate.is_file():
+            raise FileNotFoundError(f"Explicit configuration file not found: {candidate}")
+        return candidate
     env_path = (os.getenv("MORTIS_RAG_CONFIG", "").strip()
                 or os.getenv("VAULT_MCP_CONFIG", "").strip())
     if env_path:
         candidate = Path(env_path).expanduser()
-        if candidate.is_file():
-            return candidate
+        if not candidate.is_file():
+            raise FileNotFoundError(f"Environment configuration file not found: {candidate}")
+        return candidate
     candidates = [
         Path.home() / ".mortis_rag_mcp" / "config.toml",
         Path.home() / ".vault_mcp" / "config.toml",

@@ -1263,3 +1263,16 @@ virtual不可用错误与后台stdio等待按现行接口；estimated保尾空�
 > - 全量（本批完成后单次）：555 passed, 4 skipped in 32.63s
 >   `bundled python -m pytest tests -q --basetemp=.runtime/ship-v081-20261007/pytest-full-4 -p no:cacheprovider`
 > - 真实用户注册表残留复查：`name = "OS"` 0 条（清理后无新增）。
+
+---
+
+## E20 运维缺陷与诊断（2026-10-09 / America_New_York）
+
+Codex（本地施工；模型底模未由系统明确标注）。开工 `e35ec03`，用户已批准 E20-FIX/A/B/C/D。
+
+- ADD-09-OPS-1：显式参数/环境指向缺失配置时失败，未配置自动默认仍合法；Python 3.10 fallback 只剥离字符串外的 `#` 注释，保留带空格、引号及 `#` 的路径。
+- ADD-09-OPS-2：registry 读状态区分 missing/ok/unknown；拒读保留进程内已知注册项，未知状态禁止覆盖写，包括新实例直接 save；schema 不变。
+- ADD-09-OPS-3：内存索引可用与 chunks/vectors/failed_files 持久化成功分开。内部 persistence_status 保留 layer/path/errno/error，既有 next_action 披露失败，未增加 MCP 字段；恢复写盘后消除诊断。
+- E20-C：doctor 仅对现有 provider 谓词已证明 loopback 且无 key 的 local_free 显式动作豁免 cache=false；付费/带 key 对照仍拒绝且零请求。
+- 隔离证据 `.runtime/beta2/E20/ops/`：正确红回归 9 failed/3 passed；修后 13 passed；registry 20、doctor 35、lane-config 30、missing-env 1、management 9、path-migration 10 passed，均 exit0。初次 fixture 导入名错误及不存在的 test_config.py exit4 原始日志保留，不作缺陷证据。
+- 本批不联网、不安装、不操作真实库/用户配置；后续媒体、摄取、存储和测试施工由主流程继续整合。

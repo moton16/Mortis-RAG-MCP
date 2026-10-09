@@ -188,6 +188,16 @@ def index_state(owner: MarkdownIndexer) -> dict[str, Any]:
         state, action = "empty", "run kb_init and a sync to build the index from local sources"
     else:
         state, action = "ready", ""
+    persistence = getattr(owner, "persistence_status", {})
+    if persistence.get("state") == "failed":
+        failures = "; ".join(
+            f"layer={layer} path={error['path']} errno={error['errno']} error={error['error']}"
+            for layer, error in sorted(persistence.get("errors", {}).items())
+        )
+        action = (action + "; " if action else "") + (
+            "memory index remains available; cache persistence failed: " + failures +
+            "; restore writable disk space, then save/rebuild the derived cache"
+        )
     return {"index_state": state, "isolated_facts": isolated,
             "visible_sources": visible, "next_action": action}
 
