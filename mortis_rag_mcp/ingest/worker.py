@@ -993,6 +993,7 @@ class VirtualIngestWorker:
         chunker_fingerprint_provider: Callable[[], str] | None = None,
         audio_config: Any = None,
         audio_decoder: Any = None,
+        media_provider: Any = None,
     ) -> None:
         self.vault_path = Path(vault_path).expanduser().resolve()
         self.config = config
@@ -1005,6 +1006,7 @@ class VirtualIngestWorker:
         # flat（`audio_segment_seconds` …）读取路径；注入后 `audio.*` 参数才真正生效。
         self.audio_config = audio_config
         self.audio_decoder = audio_decoder
+        self.media_provider = media_provider
         # 显式提交的图片标题/说明（`kb_ingest submit` 的可选事实）。发布后该说明已写进
         # occurrence/revision，是持久事实；进程重启发生在发布前则退回文件名（见 `_image_caption`）。
         self._image_captions: dict[str, str] = {}
@@ -1783,6 +1785,43 @@ class VirtualIngestWorker:
         capabilities["warnings"] = list(result.warnings)
         capabilities["parser_fingerprint"] = result.parser_fingerprint
         capabilities["duration_ms"] = round(result.duration_ms, 3)
+
+        # E16：媒体 occurrence 原生能力核验 hunk
+        media_items = [it for it in sink.items if getattr(it, "kind", "") in ("image", "audio")]
+        if media_items:
+            if self.media_provider is None:
+                capabilities["warnings"].append(
+                    "native media capability unavailable: media_provider not configured (falling back to proxy / text recall)"
+                )
+                capabilities["media_route"] = "proxy"
+            else:
+                try:
+                    ability = self.media_provider.ability()
+                    allowed_mimes = set(ability.get("allowed_mime_types", ()))
+                    modalities = set(ability.get("modalities", ()))
+
+                    unsupported: list[str] = []
+                    for it in media_items:
+                        kind = getattr(it, "kind", "")
+                        mime = getattr(it, "mime_type", "")
+                        if kind not in modalities:
+                            unsupported.append(f"{kind} modality not supported by media_provider")
+                        elif mime not in allowed_mimes:
+                            unsupported.append(f"{mime} not in media_provider allowed_mime_types")
+                    if unsupported:
+                        for err in unsupported:
+                            capabilities["warnings"].append(
+                                f"native media capability unavailable: {err} (falling back to proxy / text recall)"
+                            )
+                        capabilities["media_route"] = "proxy"
+                    else:
+                        capabilities["media_route"] = "native"
+                except Exception as exc:
+                    capabilities["warnings"].append(
+                        f"native media capability verification failed: {exc} (falling back to proxy / text recall)"
+                    )
+                    capabilities["media_route"] = "proxy"
+
         staged = store.stage_revision(
             source=job.source,
             source_sha256=job.source_sha256,
@@ -1831,6 +1870,7 @@ def make_ingest_manager(
     chunker_fingerprint_provider: Callable[[], str] | None = None,
     audio_config: Any = None,
     audio_decoder: Any = None,
+    media_provider: Any = None,
 ) -> Any:
     """按 `ingest.storage` 选择摄取实现（唯一的路径分派点）。
 
@@ -1850,6 +1890,7 @@ def make_ingest_manager(
             parse_budget=parse_budget, audio_adapter=audio_adapter,
             chunker_fingerprint_provider=chunker_fingerprint_provider,
             audio_config=audio_config, audio_decoder=audio_decoder,
+            media_provider=media_provider,
         )
     return IngestManager(
         vault_path, config, on_job_finished=on_job_finished, ignore_provider=ignore_provider

@@ -926,6 +926,38 @@ class VaultMcpServer:
                         configure(journal, guard, fp)
         return adapter
 
+    def _media_provider(self, vault_path: str | Path | None = None) -> Any:
+        """原生媒体 provider 装配点（E16）。"""
+        from .providers import create_media_provider
+        if vault_path is not None:
+            key = str(Path(vault_path).resolve())
+            indexer = self._indexers.get(key)
+            if indexer is not None and getattr(indexer, "media_provider", None) is not None:
+                return indexer.media_provider
+        try:
+            provider = create_media_provider(self.config.embedding)
+        except Exception:
+            return None
+        if provider is None:
+            return None
+
+        if vault_path is not None:
+            key = str(Path(vault_path).resolve())
+            indexer = self._indexers.get(key)
+            fp = getattr(getattr(provider, "profile", None), "fingerprint", "")
+            if indexer is not None:
+                indexer.configure_paid_provider("media", provider, fp)
+            else:
+                control = self._paid_control_store_for(vault_path)
+                if control is not None:
+                    from .paid_requests import PaidRequestJournal, paid_request_guard
+                    journal = PaidRequestJournal(control, "media")
+                    guard = lambda profile_fp: paid_request_guard(control, profile_fp)
+                    configure = getattr(provider, "configure_paid_requests", None)
+                    if callable(configure):
+                        configure(journal, guard, fp)
+        return provider
+
     def _audio_decoder(self) -> Any:
         """显式解码组件装配点（E09）。
 
@@ -997,6 +1029,7 @@ class VaultMcpServer:
                         audio_adapter=self._transcription_adapter(vault_path),
                         audio_decoder=self._audio_decoder(),
                         chunker_fingerprint_provider=_chunker_fingerprint_provider,
+                        media_provider=self._media_provider(vault_path),
                     )
                     self._ingest_managers[key] = manager
         return manager

@@ -540,3 +540,70 @@ def test_merge_audio_segments_only_by_time_never_by_transcript():
     ])
     assert [(s["t_start_ms"], s["t_end_ms"], s["occurrence_ids"]) for s in merged] == [
         (0, 2000, ["a", "b"]), (50000, 51000, ["c"])]
+
+
+def _valid_png(width: int = 4, height: int = 4) -> bytes:
+    return (b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\rIHDR"
+            + width.to_bytes(4, "big") + height.to_bytes(4, "big")
+            + b"\x08\x06\x00\x00\x00" + b"\x00" * 64)
+
+
+def test_worker_media_occurrence_capability_verification_and_sync_native(tmp_path: Path):
+    """E16：Worker 消费 media occurrence 时的原生能力核验 hunk，及发布后经由 E08 sync 生成 native chunk。"""
+    from mortis_rag_mcp.doc_store import DocumentStore
+
+    server, vault = _build(tmp_path)
+    server.config.ingest.enabled = True
+    try:
+        # 1. 未配置 media_provider 时：worker 记录显式 capability error，落 media_route="proxy"
+        img_path = vault / "figure.png"
+        img_path.write_bytes(_valid_png())
+
+        worker_no_media = server._ingest_manager_for(str(vault))
+        assert worker_no_media.media_provider is None
+
+        # 显式提交图片
+        res = server.call_tool("kb_ingest", {"action": "submit", "sources": ["figure.png"], "vault_path": "Vault"})
+        worker_no_media._worker.join(timeout=10.0)
+
+        store = DocumentStore(_layout(server, vault), server.config)
+        store.open(write=False)
+        try:
+            active = store.get_active("figure.png")
+            assert active is not None
+            caps = active.revision.capabilities
+            assert caps["media_route"] == "proxy"
+            assert any("media_provider not configured" in w for w in caps["warnings"])
+        finally:
+            store.close()
+
+        # 2. 注入具备能力的 media_provider：worker 校验能力，落 media_route="native"
+        class MockMediaProvider:
+            def ability(self):
+                return {
+                    "modalities": ("image", "audio"),
+                    "allowed_mime_types": ("image/png",),
+                    "max_input_bytes": 10 * 1024 * 1024,
+                    "max_batch_size": 16,
+                }
+
+        worker_with_media = server._ingest_manager_for(str(vault))
+        worker_with_media.media_provider = MockMediaProvider()
+
+        img2_path = vault / "figure2.png"
+        img2_path.write_bytes(_valid_png(width=8, height=8))
+        server.call_tool("kb_ingest", {"action": "submit", "sources": ["figure2.png"], "vault_path": "Vault"})
+        worker_with_media._worker.join(timeout=10.0)
+
+        store = DocumentStore(_layout(server, vault), server.config)
+        store.open(write=False)
+        try:
+            active2 = store.get_active("figure2.png")
+            assert active2 is not None
+            caps2 = active2.revision.capabilities
+            assert caps2["media_route"] == "native"
+            assert not any("native media capability unavailable" in w for w in caps2["warnings"])
+        finally:
+            store.close()
+    finally:
+        server.shutdown()
