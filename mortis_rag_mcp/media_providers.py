@@ -161,6 +161,187 @@ class HttpMediaTransport:
         return data
 
 
+class GeminiMediaTransport:
+    """真实 Google Gemini 多模态与音频媒体 embeddings transport。
+
+    遵循 Google Generative Language API / Gemini Embeddings 协议（如 gemini-embedding-2）。
+    - 原生支持图像模态（image/png, image/jpeg, image/webp）与音频模态（audio/mp3, audio/mpeg, audio/wav）；
+    - 请求体使用 content.parts[].inline_data { mime_type, data (base64) } 结构；
+    - 优先支持 batchEmbedContents 端点（多条批量），单条兼容 embedContent 端点；
+    - 响应提取 embeddings[].values 并映射为符合 map_media_response 契约的 index 结构；
+    - 认证支持 x-goog-api-key 请求头或 Bearer Authorization；
+    - 网络或 HTTP 错误抛出 ProviderError，由上层 NativeMediaProvider 捕获并落 journal mark_unknown。
+    """
+
+    def __init__(
+        self,
+        endpoint: str,
+        model: str = "gemini-embedding-2",
+        api_key: str = "",
+        timeout: float = 30.0,
+        *,
+        dimension: int | None = None,
+        send_dimensions: bool = False,
+        allowed_mime_types: tuple[str, ...] = (
+            "image/png",
+            "image/jpeg",
+            "image/webp",
+            "audio/mp3",
+            "audio/mpeg",
+            "audio/wav",
+        ),
+        max_input_bytes: int = 10 * 1024 * 1024,
+        max_batch_size: int = 16,
+    ) -> None:
+        if not endpoint:
+            raise ValueError("gemini media transport endpoint is required")
+        self.endpoint = endpoint
+        self.model = model or "gemini-embedding-2"
+        self.api_key = api_key
+        self.timeout = timeout
+        self.dimension = dimension
+        self.send_dimensions = send_dimensions
+        self.allowed_mime_types = tuple(allowed_mime_types)
+        self.max_input_bytes = max_input_bytes
+        self.max_batch_size = max_batch_size
+
+    def __call__(self, inputs: Sequence[EmbeddingInput]) -> Sequence[dict[str, Any]]:
+        items = list(inputs)
+        if not items:
+            return []
+        if len(items) > self.max_batch_size:
+            raise ProviderError(f"media batch size {len(items)} exceeds limit {self.max_batch_size}")
+
+        if self.endpoint.endswith(":embedContent") and len(items) > 1:
+            raise ProviderError(
+                f"Gemini single :embedContent endpoint does not accept batch requests (got {len(items)} items); "
+                "use :batchEmbedContents endpoint for batched requests"
+            )
+
+        is_single_embed = self.endpoint.endswith(":embedContent") and len(items) == 1
+
+        requests_payload: list[dict[str, Any]] = []
+        for item in items:
+            if item.modality not in ("image", "audio"):
+                raise ProviderError(
+                    f"media modality {item.modality!r} unsupported by Gemini media embedding transport "
+                    "(only 'image' and 'audio' supported)"
+                )
+            if item.mime_type not in self.allowed_mime_types:
+                raise ProviderError(f"media mime type {item.mime_type!r} not in allowed types {self.allowed_mime_types}")
+            if len(item.data) > self.max_input_bytes:
+                raise ProviderError(f"media data size {len(item.data)} exceeds limit {self.max_input_bytes}")
+            b64_data = base64.b64encode(item.data).decode("ascii")
+            part_content = {
+                "parts": [
+                    {
+                        "inline_data": {
+                            "mime_type": item.mime_type,
+                            "data": b64_data,
+                        }
+                    }
+                ]
+            }
+            req_item: dict[str, Any] = {
+                "content": part_content,
+            }
+            model_res = self.model if self.model.startswith("models/") else f"models/{self.model}"
+            req_item["model"] = model_res
+            if self.dimension is not None and self.send_dimensions:
+                req_item["output_dimensionality"] = self.dimension
+            requests_payload.append(req_item)
+
+        if is_single_embed:
+            payload: dict[str, Any] = {
+                "model": requests_payload[0]["model"],
+                "content": requests_payload[0]["content"],
+            }
+            if self.dimension is not None and self.send_dimensions:
+                payload["output_dimensionality"] = self.dimension
+        else:
+            payload = {
+                "requests": requests_payload,
+            }
+
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+        if self.api_key:
+            if self.api_key.startswith("Bearer "):
+                headers["Authorization"] = self.api_key
+            else:
+                headers["x-goog-api-key"] = self.api_key
+
+        req = Request(
+            self.endpoint,
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        try:
+            with urlopen(req, timeout=self.timeout) as resp:
+                raw_body = resp.read()
+        except HTTPError as exc:
+            err_text = ""
+            try:
+                err_text = exc.read(1024).decode("utf-8", errors="replace")
+            except Exception:
+                pass
+            msg = f"HTTP Error {exc.code}: {exc.reason}"
+            if err_text:
+                try:
+                    err_json = json.loads(err_text)
+                    if isinstance(err_json, dict) and "error" in err_json:
+                        e = err_json["error"]
+                        detail = e.get("message") if isinstance(e, dict) else str(e)
+                        msg += f" - {detail}"
+                    else:
+                        msg += f" - {err_text[:200]}"
+                except Exception:
+                    msg += f" - {err_text[:200]}"
+            raise ProviderError(f"Gemini media embedding HTTP failure: {msg}") from exc
+        except (URLError, OSError) as exc:
+            raise ProviderError(f"Gemini media embedding network error: {exc}") from exc
+
+        try:
+            result = json.loads(raw_body.decode("utf-8"))
+        except Exception as exc:
+            raise ProviderError(f"invalid JSON response from Gemini media embedding endpoint: {exc}") from exc
+
+        if isinstance(result, dict) and "error" in result:
+            err = result["error"]
+            err_msg = err.get("message") if isinstance(err, dict) else str(err)
+            raise ProviderError(f"Gemini media embedding API error: {err_msg}")
+
+        mapped_records: list[dict[str, Any]] = []
+        if isinstance(result, dict) and "embeddings" in result:
+            embs = result["embeddings"]
+            if not isinstance(embs, list):
+                raise ProviderError("Gemini media embedding response 'embeddings' must be a list")
+            for idx, item_resp in enumerate(embs):
+                if not isinstance(item_resp, dict):
+                    raise ProviderError("Gemini media embedding item must be an object")
+                values = item_resp.get("values")
+                if not isinstance(values, list):
+                    raise ProviderError("Gemini media embedding item missing 'values' list")
+                mapped_records.append({"index": idx, "embedding": values})
+        elif isinstance(result, dict) and "embedding" in result:
+            if len(items) != 1:
+                raise ProviderError(
+                    f"Gemini single embedding response received but request had {len(items)} items"
+                )
+            emb = result["embedding"]
+            values = emb.get("values") if isinstance(emb, dict) else None
+            if not isinstance(values, list):
+                raise ProviderError("Gemini media embedding single response missing 'values' list")
+            mapped_records.append({"index": 0, "embedding": values})
+        else:
+            raise ProviderError("Gemini media embedding response must contain 'embedding' or 'embeddings'")
+
+        return mapped_records
+
+
 
 def map_media_response(response: Sequence[Any], ids: Sequence[str]) -> dict[str, Any]:
     """把离线/服务响应归一为 `{内部 request_id: embedding}`。

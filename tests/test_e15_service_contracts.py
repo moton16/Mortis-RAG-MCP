@@ -42,6 +42,7 @@ from mortis_rag_mcp.ingest.transcription import (
 from mortis_rag_mcp.ingest.worker import StoreMediaSink
 from mortis_rag_mcp.media_providers import (
     EmbeddingInput,
+    GeminiMediaTransport,
     HttpMediaTransport,
     NativeMediaEvidence,
     NativeMediaProvider,
@@ -49,6 +50,7 @@ from mortis_rag_mcp.media_providers import (
 from mortis_rag_mcp.providers import ProviderError, create_media_provider
 
 PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+WAV_BYTES = b"RIFF$\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00\x80>\x00\x00\x00}\x00\x00\x02\x00\x10\x00data\x00\x00\x00\x00"
 SAMPLE_VEC = [0.1, 0.2, 0.3, 0.4]
 
 
@@ -232,6 +234,273 @@ def test_media_provider_end_to_end_with_journal_and_failure_stops():
 
     # 验证 journal 闭环：before_send 后立即 mark_unknown，绝不静默重发
     assert [ev[0] for ev in journal.events] == ["before_send", "mark_unknown"]
+
+
+def _gemini_media_config(**changes) -> EmbeddingConfig:
+    values = dict(
+        mode="external",
+        model="gemini-embedding-2",
+        endpoint="https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-2:batchEmbedContents",
+        adapter="gemini",
+        dimension=4,
+        send_dimensions=True,
+        media_modalities=("audio",),
+        media_alignment_space_id="gemini-audio-space-v1",
+        media_preprocess_version="gemini-audio-v1",
+        media_endpoint_revision="gemini-ep-1",
+        media_allowed_mime_types=("audio/mp3", "audio/mpeg", "audio/wav", "image/png"),
+        media_max_input_bytes=1024 * 1024,
+        media_max_batch_size=4,
+        media_model_reference="gemini-embedding-2-ref",
+        media_endpoint_fixture_reference="gemini-audio-fixture",
+        media_alignment_reference="gemini-audio-align",
+        media_license_reference="gemini-license",
+    )
+    values.update(changes)
+    return EmbeddingConfig(**values)
+
+
+def test_gemini_media_transport_batch_audio_and_image_request():
+    captured_request = {}
+
+    def fake_urlopen(req, timeout=30.0):
+        captured_request["url"] = req.full_url
+        captured_request["headers"] = dict(req.headers)
+        captured_request["body"] = json.loads(req.data.decode("utf-8"))
+        resp_data = {
+            "embeddings": [
+                {"values": SAMPLE_VEC},
+                {"values": [0.5, 0.6, 0.7, 0.8]},
+            ]
+        }
+        return io.BytesIO(json.dumps(resp_data).encode("utf-8"))
+
+    transport = GeminiMediaTransport(
+        endpoint="https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-2:batchEmbedContents",
+        model="gemini-embedding-2",
+        api_key="test-api-key",
+        dimension=4,
+        send_dimensions=True,
+    )
+
+    items = [
+        _input("aud-1", data=WAV_BYTES, modality="audio", mime="audio/wav"),
+        _input("img-1", data=PNG_BYTES, modality="image", mime="image/png"),
+    ]
+
+    with patch("mortis_rag_mcp.media_providers.urlopen", side_effect=fake_urlopen):
+        result = transport(items)
+
+    assert len(result) == 2
+    assert result[0]["index"] == 0
+    assert result[0]["embedding"] == SAMPLE_VEC
+    assert result[1]["index"] == 1
+    assert result[1]["embedding"] == [0.5, 0.6, 0.7, 0.8]
+
+    assert captured_request["url"] == "https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-2:batchEmbedContents"
+    assert captured_request["headers"]["X-goog-api-key"] == "test-api-key"
+    assert captured_request["headers"]["Content-type"] == "application/json"
+
+    body = captured_request["body"]
+    assert "requests" in body
+    assert len(body["requests"]) == 2
+    req0 = body["requests"][0]
+    assert req0["model"] == "models/gemini-embedding-2"
+    assert req0["output_dimensionality"] == 4
+    assert req0["content"]["parts"][0]["inline_data"]["mime_type"] == "audio/wav"
+
+    req1 = body["requests"][1]
+    assert req1["model"] == "models/gemini-embedding-2"
+    assert req1["output_dimensionality"] == 4
+    assert req1["content"]["parts"][0]["inline_data"]["mime_type"] == "image/png"
+
+
+def test_gemini_media_transport_single_embed_content_endpoint():
+    captured_request = {}
+
+    def fake_urlopen(req, timeout=30.0):
+        captured_request["body"] = json.loads(req.data.decode("utf-8"))
+        resp_data = {"embedding": {"values": SAMPLE_VEC}}
+        return io.BytesIO(json.dumps(resp_data).encode("utf-8"))
+
+    transport = GeminiMediaTransport(
+        endpoint="https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-2:embedContent",
+        model="gemini-embedding-2",
+        api_key="Bearer token-123",
+    )
+
+    with patch("mortis_rag_mcp.media_providers.urlopen", side_effect=fake_urlopen):
+        result = transport([_input("aud-1", data=WAV_BYTES, modality="audio", mime="audio/wav")])
+
+    assert len(result) == 1
+    assert result[0]["index"] == 0
+    assert result[0]["embedding"] == SAMPLE_VEC
+    assert captured_request["body"]["content"]["parts"][0]["inline_data"]["mime_type"] == "audio/wav"
+
+
+def test_gemini_media_transport_error_handling():
+    transport = GeminiMediaTransport(
+        endpoint="https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-2:batchEmbedContents",
+        model="gemini-embedding-2",
+    )
+
+    # 1. 429 Rate limited
+    err_body = io.BytesIO(json.dumps({"error": {"code": 429, "message": "RESOURCE_EXHAUSTED", "status": "RESOURCE_EXHAUSTED"}}).encode("utf-8"))
+    with patch("mortis_rag_mcp.media_providers.urlopen", side_effect=HTTPError("https://api.test", 429, "Too Many Requests", {}, err_body)):
+        with pytest.raises(ProviderError, match="Gemini media embedding HTTP failure: HTTP Error 429.*RESOURCE_EXHAUSTED"):
+            transport([_input("1", data=WAV_BYTES, modality="audio", mime="audio/wav")])
+
+    # 2. Network error (URLError)
+    with patch("mortis_rag_mcp.media_providers.urlopen", side_effect=URLError("Connection refused")):
+        with pytest.raises(ProviderError, match="Gemini media embedding network error"):
+            transport([_input("1", data=WAV_BYTES, modality="audio", mime="audio/wav")])
+
+    # 3. HTTP 200 with API error
+    with patch("mortis_rag_mcp.media_providers.urlopen", return_value=io.BytesIO(json.dumps({"error": {"message": "Invalid model"}}).encode("utf-8"))):
+        with pytest.raises(ProviderError, match="Gemini media embedding API error: Invalid model"):
+            transport([_input("1", data=WAV_BYTES, modality="audio", mime="audio/wav")])
+
+    # 4. Malformed response JSON missing embeddings
+    with patch("mortis_rag_mcp.media_providers.urlopen", return_value=io.BytesIO(json.dumps({"wrong": 1}).encode("utf-8"))):
+        with pytest.raises(ProviderError, match="must contain 'embedding' or 'embeddings'"):
+            transport([_input("1", data=WAV_BYTES, modality="audio", mime="audio/wav")])
+
+
+def test_gemini_media_transport_enforces_limits_and_modality():
+    transport = GeminiMediaTransport(
+        endpoint="https://api.test/embed",
+        model="gemini-embedding-2",
+        max_batch_size=1,
+        max_input_bytes=10,
+        allowed_mime_types=("audio/wav",),
+    )
+
+    # 批大小超限
+    with pytest.raises(ProviderError, match="batch size"):
+        transport([
+            _input("1", data=WAV_BYTES, modality="audio", mime="audio/wav"),
+            _input("2", data=WAV_BYTES, modality="audio", mime="audio/wav"),
+        ])
+
+    # 不支持的模态（如视频）拒绝
+    with pytest.raises(ProviderError, match="modality 'video' unsupported"):
+        transport([_input("1", modality="video")])
+
+    # 不在白名单的 MIME 类型
+    with pytest.raises(ProviderError, match="not in allowed types"):
+        transport([_input("1", data=WAV_BYTES, modality="audio", mime="audio/mp3")])
+
+    # 字节超限
+    with pytest.raises(ProviderError, match="data size"):
+        transport([_input("1", data=b"x" * 20, modality="audio", mime="audio/wav")])
+
+
+def test_create_media_provider_for_gemini_adapter():
+    cfg = _gemini_media_config()
+    provider = create_media_provider(cfg)  # transport=None
+    assert isinstance(provider, NativeMediaProvider)
+    assert isinstance(provider._transport, GeminiMediaTransport)
+    assert provider._transport.endpoint == cfg.endpoint
+    assert provider._transport.model == cfg.model
+
+    journal = _MockJournal()
+    provider.configure_paid_requests(journal, lambda fp: True, provider.profile.fingerprint)
+
+    fake_response = {"embeddings": [{"values": [1.0, 0.0, 0.0, 0.0]}]}
+    with patch("mortis_rag_mcp.media_providers.urlopen", return_value=io.BytesIO(json.dumps(fake_response).encode("utf-8"))):
+        vecs = provider.embed_media([_input("aud-1", data=WAV_BYTES, modality="audio", mime="audio/wav")])
+    assert vecs == [[1.0, 0.0, 0.0, 0.0]]
+    assert [ev[0] for ev in journal.events] == ["before_send", "mark_success"]
+
+
+def test_gemini_media_transport_rejects_batch_on_embed_content_endpoint():
+    transport = GeminiMediaTransport(
+        endpoint="https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-2:embedContent",
+        model="gemini-embedding-2",
+    )
+    with pytest.raises(ProviderError, match="single :embedContent endpoint does not accept batch"):
+        transport([
+            _input("aud-1", data=WAV_BYTES, modality="audio", mime="audio/wav"),
+            _input("aud-2", data=WAV_BYTES, modality="audio", mime="audio/wav"),
+        ])
+
+
+def test_gemini_media_transport_accepts_single_embedding_without_embed_content_suffix():
+    def fake_urlopen(req, timeout=30.0):
+        resp_data = {"embedding": {"values": SAMPLE_VEC}}
+        return io.BytesIO(json.dumps(resp_data).encode("utf-8"))
+
+    transport = GeminiMediaTransport(
+        endpoint="https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-2:customEndpoint",
+        model="gemini-embedding-2",
+    )
+    with patch("mortis_rag_mcp.media_providers.urlopen", side_effect=fake_urlopen):
+        result = transport([_input("aud-1", data=WAV_BYTES, modality="audio", mime="audio/wav")])
+    assert len(result) == 1
+    assert result[0]["embedding"] == SAMPLE_VEC
+
+
+def test_gemini_media_transport_rejects_single_embedding_for_multiple_items():
+    def fake_urlopen(req, timeout=30.0):
+        resp_data = {"embedding": {"values": SAMPLE_VEC}}
+        return io.BytesIO(json.dumps(resp_data).encode("utf-8"))
+
+    transport = GeminiMediaTransport(
+        endpoint="https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-2:batchEmbedContents",
+        model="gemini-embedding-2",
+    )
+    with patch("mortis_rag_mcp.media_providers.urlopen", side_effect=fake_urlopen):
+        with pytest.raises(ProviderError, match="single embedding response received but request had 2 items"):
+            transport([
+                _input("aud-1", data=WAV_BYTES, modality="audio", mime="audio/wav"),
+                _input("aud-2", data=WAV_BYTES, modality="audio", mime="audio/wav"),
+            ])
+
+
+def test_create_media_provider_for_embeddinggemma_adapter():
+    # 1. Google Cloud endpoint -> routes to GeminiMediaTransport
+    cfg_cloud = _gemini_media_config(
+        adapter="embeddinggemma2",
+        endpoint="https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-2:batchEmbedContents",
+    )
+    provider_cloud = create_media_provider(cfg_cloud)
+    assert isinstance(provider_cloud, NativeMediaProvider)
+    assert isinstance(provider_cloud._transport, GeminiMediaTransport)
+
+    # 2. Local loopback endpoint -> raises informative ProviderError
+    cfg_local = _gemini_media_config(
+        adapter="embeddinggemma2",
+        endpoint="http://127.0.0.1:8080/v1/embeddings",
+    )
+    with pytest.raises(ProviderError, match="local inference server.*lacks a verified HTTP REST audio embedding schema"):
+        create_media_provider(cfg_local)
+
+
+def test_multimodal_audio_contract_fixtures_integrity():
+    fixtures_dir = Path(__file__).parent / "fixtures"
+    gemini_fixture = fixtures_dir / "gemini_multimodal_embedding_contract.json"
+    gemma_fixture = fixtures_dir / "embeddinggemma2_model_card_contract.json"
+
+    assert gemini_fixture.is_file()
+    assert gemma_fixture.is_file()
+
+    with open(gemini_fixture, "r", encoding="utf-8") as f:
+        gemini_data = json.load(f)
+    assert gemini_data["contract_name"] == "gemini_multimodal_embeddings_v1"
+    assert "audio" in gemini_data["supported_modalities"]
+    assert "audio/mp3" in gemini_data["allowed_mime_types"]
+    assert "audio/wav" in gemini_data["allowed_mime_types"]
+    assert gemini_data["audio_specifications"]["max_duration_seconds"] == 180
+
+    with open(gemma_fixture, "r", encoding="utf-8") as f:
+        gemma_data = json.load(f)
+    assert gemma_data["model_identifier"] == "google/embeddinggemma-2"
+    assert gemma_data["parameters"]["total"] == "740M"
+    assert gemma_data["vector_space"]["native_dimension"] == 768
+    assert "audio" in gemma_data["supported_modalities"]
+    assert gemma_data["audio_specifications"]["sample_rate_hz"] == 16000
+    assert gemma_data["audio_specifications"]["placeholder_token"] == "<|audio|>"
+
 
 
 # =====================================================================
