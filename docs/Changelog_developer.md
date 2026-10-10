@@ -1375,3 +1375,9 @@ Codex 主流程（2026-10-09 / America_New_York）。代码候选93c39a50b09ec61
 - 此前该用例只等「索引就绪」（`_kb_init_ready`：`kb_init` + 重试 `sync()` 直到切片可见），但 C66 之后 `kb_search` 自身会顺带请求一次后台刷新，检索仍可能与刷新并发而拿到空 `chunks`。改为对**检索响应本身**轮询到命中（上限 10s），断言口径一条未放宽。
 - 四条断言补上响应体作为失败消息，下次再出现可直接看出是冷启动、`budget_exceeded` 还是路由空集，不必再靠重跑猜。
 - 验证：`tests/test_exact_terms.py` 本地连跑三遍 13 passed ×3；main 上该 job 重跑通过。
+### [v0.9.0 许可证署名与再授权同意留痕] — moton16,2026-10-09,CodeBuddy,Hy4-Preview — chore(license): 补齐第二著作权人与同意事实
+
+- `NOTICE`：版权行补 `Copyright 2026 Vodyanitsaaa`；新增著作权人映射——`Moton <moton16@163.com>` 对应 git 身份 `moton16 <moton233@outlook.com>` 与 `Moton <moton16@163.com>`，`Vodyanitsaaa <vodyanitsa@foxmail.com>` 对应 git 身份 `Vodyanitsaaa <vodyanitsa@foxmail.com>`；并写明本项目的 Apache-2.0 再授权（v0.9.0，覆盖双方提交）经两位著作权人同意，v0.8.1 及更早仍为 MIT 且该授权继续有效。
+- `LICENSE` 附录版权行同步补 `Copyright 2026 Vodyanitsaaa`。
+- `pyproject.toml` 新增 PEP 621 `authors` 两项。
+- 背景：v0.9.0 发布时包内仍有第二著作权人的 3869 行代码（15.0%，全部落在 v0.8.1 及更早），MIT→Apache-2.0 的再授权需其同意；主人 2026-10-09 确认对方同意并给出双方邮箱，本条据此留痕。**v0.9.0 已发布的 tag 与附件早于本条**，其中的 NOTICE/LICENSE 不含上述署名，是否以补丁版本（v0.9.1）重新出包由主人裁定。

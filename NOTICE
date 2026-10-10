@@ -1,8 +1,19 @@
 Mortis'RAG MCP
 Copyright 2026 Moton
+Copyright 2026 Vodyanitsaaa
 
 This product includes software developed at
 Mortis'RAG MCP (https://github.com/moton16/Mortis-RAG-MCP).
+
+Copyright holders (every commit in this repository belongs to one of them):
+
+  Moton          moton16@163.com          (git: moton16 <moton233@outlook.com>, Moton <moton16@163.com>)
+  Vodyanitsaaa   vodyanitsa@foxmail.com   (git: Vodyanitsaaa <vodyanitsa@foxmail.com>)
+
+The Apache-2.0 relicensing of this project (v0.9.0, covering the commits of
+both holders) was agreed by both copyright holders. Releases up to and
+including v0.8.1 were published under the MIT License; that grant remains in
+force for those releases.
 
 Licensed under the Apache License, Version 2.0. See the LICENSE file for
 the full license text.
