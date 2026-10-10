@@ -148,8 +148,10 @@ AI agent (WorkBuddy/Codex/...)
 ```
 
 **索引健康看 `failed_files`**（kb_stats），不是看 files/chunks 数。
-**修少量失败文件不要 rebuild**：每次调任何 `kb_*` 工具都会触发增量 sync，
-反复调 `kb_stats` 就能一轮轮补齐。`kb_rebuild` = 全量重嵌，只在换模型/维度时用。
+**修少量失败文件不要 rebuild**：监听、`kb_search`/`kb_stats` 等路径会请求后台增量刷新，
+需要进度时再查看状态，不紧密反复调用。`kb_read` 只读原文、不主动同步或请求 embedding；
+`submission_unknown` 先核原请求，不能靠刷新自动重发。`kb_rebuild` 清派生层、可能全量重嵌，
+适用于用户要求的空间变更或派生数据修复，不重解析 committed 正文/媒体事实。
 
 ### 4.2 检索管线（`MarkdownIndexer.search()`）
 

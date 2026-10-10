@@ -1388,4 +1388,14 @@ Codex 主流程（2026-10-09 / America_New_York）。代码候选93c39a50b09ec61
 - README_EN.md 首行 ## Current 0.9.0 candidate (local preparation, not released) → ## Current release: 0.9.0 (released 2026-10-09)。
 - QUICKSTART_user.md：### 0.4 0.9 候选升级与恢复 → ### 0.4 0.9 升级与恢复；正文「本候选尚未发布；…」→「0.9.0 已于 2026-10-09 发布；…」。
 - skills/mortis-rag-mcp/SKILL.md：## 0.9 候选增量（尚未发布） → ## 0.9 增量（0.9.0 已于 2026-10-09 发布）。
+
+### [v0.9.0 配套 Skill 精简与接口适配] — moton16,2026-10-10,Codex（子代理 GPT-6.1-Sol/high，工作区变更）
+
+- `skills/mortis-rag-mcp/SKILL.md` 从 102 行收敛为 48 行；重复判定表/纪律/反模式合并成一条查询路径。仅将条件性细节移至三份 `references/`，不删定向、solo、预算、原文回读、正文/分组续页和后台状态等关键约束。
+- `references/retrieval.md` 补齐过滤 OR/AND 语义、修改时间与事件时间区别、三类游标、陈旧源与存档证据；避免把主题名当注册库名，也不全面禁止合法绝对路径。
+- `references/media-and-ingest.md` 核当前原生媒体/proxy/profile 空间、完整 JSON-RPC 媒体预算、固定 revision 引用及分页、独立图片显式提交、virtual 与 legacy、失败/取消与 unknown 的恢复区别。图片源已经有代码与正向测试，不继续引用历史“独立图片未闭合”说明；不外推任意模型品牌或宿主展示。
+- `references/maintenance.md` 补齐 16 工具分组、移除派生缓存与保留解析事实、豁免写入面、快照信任/替换/force 区别、`index_state/next_action`、旧字符切块兼容、请求台账、旧镜像迁移与完整副本恢复；正常已配置能力不增加审批系统。
+- 实际纠错：frontmatter 顶层 `version` 改为 `metadata.version`；媒体 `inline=true` 改为 `representation="inline"`；当前 CLI `--doctor` 也需 `--vault`，而旧 server instructions 的命令未列该必需参数。Skill 按当前 CLI 提供完整调用，不修改生产代码。
+- `QUICKSTART_user.md` §5 改整目录安装，保留入口与参考相对结构；§0.5 更新独立图片行为与真实端点/宿主验证区别。`PROJECT_GUIDE.md` 增加当前 Skill 导航及历史概览订正；`Quick-start_developer.md` §4.1 订正“每个工具都会 sync、反复 stats 可修好”的旧说法，区分只读、后台刷新与 unknown。既有 README/用户 Changelog 修改和本机 installed skill junction 保持原样。
+- `tests/test_skill_contract.py` 从当前 `_tool_definitions()` 校验所有 JSON 示例的必填项、未知字段、类型、枚举与数值范围，并校验参考可达性及 frontmatter；负对照覆盖旧 inline、臆造 read revision、布尔整数等误用。新检查在修改前准确暴露上述两项缺陷，既有生产路径靶向套件未失败；修改后 172 passed / 1 skipped。另执行官方 skill validator、安装复制烟测、独立场景前向检查和 skill 副本回滚；原始命令/输出/退出码及 SHA 在 `.runtime/skill-v090/` 独立运行目录记录，不将离线检查写成真实外部服务验收。
 - 验证：	ests/test_beta2_docs_contract.py + 	ests/test_version_sync.py = 9 passed；全仓再扫「尚未发布/本地准备/not released」无残留。

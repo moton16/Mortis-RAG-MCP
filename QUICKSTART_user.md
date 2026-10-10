@@ -75,7 +75,7 @@ python -m mortis_rag_mcp --app-config ".\config\app.toml" --abandon-request REQU
 - 旧媒体配置身份漂移或错误 ready/缺 native 的派生数据，纠正配置后可显式 `kb_rebuild` 重新对账。未知受理闸门仍生效；不要把重建成功当成真实端点或宿主展示已验收。
 - E20 本地全层中，EG2 `http://127.0.0.1:8000/v1/embeddings` 的两个不同载体合同均通过：真实文本请求配合媒体向量装配、真实图像 transport 往返配合文本查询；不外推其他媒体端点、单独图片摄取或宿主展示。
 
-媒体先通过 `kb_read` 返回的 `media_refs` 选 source/revision/occurrence，再调用 `kb_read_media`；分页沿返回的 revision/offset 继续。**用文字检索到库里的图片**已在本机验证跑通；但真实媒体端点的通用装配、单独放一张图片直接入库、以及在真实客户端里显示图片仍未闭合。文本成功或同维向量不证明跨模态对齐。
+媒体先通过 `kb_read` 返回的 `media_refs` 选 source/revision/occurrence，再调用 `kb_read_media`；内联用 `representation="inline"`，分页沿返回的 revision/offset 继续。**用文字检索到库里的图片**已在本机验证跑通；当前也支持 `kb_ingest` 显式提交 PNG/JPEG/WebP 独立图片（virtual，可带用户 caption，不做 OCR、不自动扫描全库图片）。具体远端部署的跨模态质量与真实客户端显示仍需分别验证，文本成功或同维向量不证明对齐。
 
 `--doctor` 是显式诊断，可能访问真实端点；STATUS.md 缺失不触发 Agent 自动探活。正常查询直接用已有工具，实际报错再按错误/本地状态排查。
 
@@ -179,13 +179,15 @@ MCP 连上后，对 AI 说一句（或手动发 tools/call）：
 
 ## 5. 安装配套 Skill（可选，推荐 AI 助手用户）
 
-仓库 `skills/mortis-rag-mcp/SKILL.md` 是配套的调用技能（教 AI 正确路由、避坑 rebuild 限流等）。按你的助手平台的 skills 目录放置：
+仓库 `skills/mortis-rag-mcp/` 是配套调用技能：`SKILL.md` 保留日常路由要点，`references/` 按需提供检索精读、媒体摄取、管理恢复细节。安装时复制**整个技能目录**，不要只复制入口文件：
 
-- **WorkBuddy**：复制到 `~/.workbuddy/skills/mortis-rag-mcp/SKILL.md`（Windows 即 `C:\Users\<你>\.workbuddy\skills\`）
-- 其他支持 SKILL.md 规范的 agent（Claude Code / OpenCode 等）：复制到对应 skills 目录
+- **WorkBuddy**：复制到 `~/.workbuddy/skills/mortis-rag-mcp/`（Windows 即 `C:\Users\<你>\.workbuddy\skills\mortis-rag-mcp\`）
+- **Codex / Claude Code / OpenCode 等**：复制到对应平台的 skills 目录，保留 `SKILL.md` 与 `references/` 的相对结构
 
 ```powershell
-Copy-Item .\skills\mortis-rag-mcp\SKILL.md "$env:USERPROFILE\.workbuddy\skills\mortis-rag-mcp\SKILL.md"
+$target = Join-Path $env:USERPROFILE ".workbuddy\skills\mortis-rag-mcp"
+New-Item -ItemType Directory -Path $target -Force | Out-Null
+Copy-Item .\skills\mortis-rag-mcp\* $target -Recurse -Force
 ```
 
 装好后，对 AI 说"搜知识库 / 查笔记 / kb_search xxx"即可自动触发。

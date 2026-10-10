@@ -27,6 +27,20 @@
 6. 可选 docs/media 正向格式已本地执行；vec 磁盘后端已在本地两套解释器（PATH python 与仓库 `.venv`）装上 `sqlite-vec` 0.1.9 并跑通 `vec0` KNN 与本地复刻的 CI `extras` lane（E17），远端 CI 仍未 push 故无链接。质量脚本区分 fixture_measured/incomplete，合成资源峰值不是 RSS；真实语料、付费端点、跨模态质量结论与宿主显示仍未验收。
 7. 极端 legacy 超长多格表格仍有历史截失；保持其旧地址兼容，本次不隐式改变 golden。estimated 完整保留超限表格并不发 embedding。
 
+## v0.9.0 配套 Skill 同步（2026-10-10，editor: moton16, Codex）
+
+当前 `skills/mortis-rag-mcp/` 使用短入口 + 三份按需参考：`retrieval.md`（过滤、投影、
+消歧及续页）、`media-and-ingest.md`（固定 revision 媒体读取与文档/独立图片摄取）、
+`maintenance.md`（注册、豁免、迁移、配置及恢复）。安装须复制整个目录，详见用户快速开始 §5。
+
+本节订正上述历史概览与旧 Skill 的遗漏，不改写历史验收记录：当前 `kb_ingest` 已支持
+用户显式提交 PNG/JPEG/WebP 独立图片（virtual、可选 caption），不自动扫描图片、不做 OCR。
+媒体内联字段是 `representation="inline"`，不是 `inline=true`；媒体预算作用于完整 JSON-RPC
+返回（含 base64），不能照搬搜索预算。跨模态能力依显式 media/profile/space 配置判定，
+不按模型品牌或同维向量推定。导入 `index_state/next_action`、unknown 请求台账、取消重试
+checkpoint 边界、旧切块兼容与存档续页均保留在对应参考。宿主图片展示与具体外部端点质量
+仍需单独验证，配套 Skill 更新本身不是这些验证。
+
 ## 目录
 
 1. [项目定位](#一项目定位)

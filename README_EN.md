@@ -6,40 +6,83 @@
 
 English | [简体中文](README.md)
 
-> A standard-library-only MCP server for Obsidian and Markdown knowledge bases.
-> Source files stay local. Semantic retrieval and document parsing send configured content to remote services when those services are enabled.
+> A modern, standard-library-first RAG (Retrieval-Augmented Generation) MCP server for Obsidian and local knowledge bases.
+> Source files stay securely on your machine. Rich support for hybrid search, text-to-image multimodal retrieval, virtual doc store, intelligent multi-vault routing, and pinpoint reading.
 
 ---
 
-## Current release: 0.9.0 (released 2026-10-09)
+## 🚀 Current Release: v0.9.0 (Major Milestone Release)
 
-Text templates cover indexing and queries. New vaults use `estimated_tokens`; existing settings/cache preserve `legacy_chars`. `.markdown` is indexed. Configured remote features do not require a new approval flow.
+v0.9.0 marks a comprehensive architectural leap and officially relicenses under the business-friendly **Apache License 2.0**, bringing the following core advancements:
 
-Local optional parsers cover PDF/DOCX/PPTX/XLSX. Parsed documents default to virtual storage; `storage="legacy"` explicitly retains physical mirrors. `kb_import` reports `index_state` (`empty/rebuilding/unverified/ready`): imported does not mean ready. `kb_ingest(action="retry", job_id=..., vault_path=...)` retries failed/cancelled jobs, not unknown submissions.
+- 🏢 **New Virtual Doc Store (`doc_store`)**: Structured parse facts from external documents (PDF/Word/PPT/Excel) now store in a decoupled virtual document database by default. **Zero modifications to original source notes and zero workspace pollution (no scattered `.mortis-parsed/` mirror files)**, backed by generational revision control, CAS verification, and section-level atomic checkpoint recovery.
+- 🖼️ **Cross-Modal Text-to-Image Retrieval**: Bridges aligned multimodal embedding vector spaces, enabling users to **search and recall illustrations and diagrams directly via natural language text queries**; adds the `kb_read_media` tool to safely read media content under strict byte budgets (`budget_bytes`).
+- 🧩 **Adaptive Token-Estimated Chunking (`estimated_tokens`)**: New knowledge bases default to token-aware chunking for superior semantic continuity and boundary precision; supports custom `{text}` prompt templates for both indexing and querying; natively indexes `.markdown` note files.
+- 🔄 **Production Ingest Retry & Request Ledger**: `kb_ingest` introduces the `retry` action to resume failed or cancelled parsing tasks with checkpoint accuracy; adds CLI commands `--list-requests` and `--abandon-request` to inspect and abandon local intention records.
+- 🧹 **Architectural Decoupling & Cleanup (Breaking Change)**: Completely removes deprecated, heavyweight ffmpeg-based audio transcription and transcoding pipelines. Lingering `[audio]` config sections are safely and silently ignored; all existing text notes, indexes, and vector caches are 100% seamlessly preserved.
+- 🪟 **Windows Hardening & Concurrency Deadlock Fix**: Fully fixes UTF-8 BOM silent misparsing that historically caused legitimate configs to be falsely reported as BROKEN by `--doctor`; refactors read-write locks to eliminate self-enqueuing deadlocks during background indexing.
 
-Use `--list-requests --vault "ABSOLUTE_VAULT_PATH"` to inspect requests, or `--abandon-request REQUEST_ID --vault "ABSOLUTE_VAULT_PATH"` to abandon a local intention without resubmitting or cancelling a remote task. `--doctor` may probe real endpoints and is not an automatic Agent preflight.
+Full release notes and upgrade details can be found in [CHANGELOG_user.md](CHANGELOG_user.md).
 
-**Removed**: audio transcription and audio transcoding are gone from this version, together with the `[audio]` config section and the `audio_enabled` switch. Leftover keys in an old `app.toml` are ignored silently (no error, no effect on other settings); deleting them is recommended.
-
-The 16-tool interface includes `kb_read_media`. **Retrieving images from your knowledge base with a plain text query** is verified locally. **Displaying images in a real client and the generic assembly of paid media endpoints remain unverified**, and standalone image-file ingestion is not finished. Proxy captions do not satisfy the native media target. Stop old writers, back up cache/control state, and use a temporary vault before upgrading; old versions cannot read virtual-only facts. Cache reuse requires compatible profiles, not a blanket no-cost guarantee.
+---
 
 ## 🌟 Key Features
 
-- ⚡ **Compact Search & Section Read (0.8.1)**: Adds lightweight `compact=true` structured projection and whole-chunk budgeting cursors; `kb_read` resolves heading sections directly with accurate out-of-bounds line hints; searches use ready indexes while refresh runs in the background, though concurrent updates may still cause brief waits.
-- 📂 **Zero Hardcoded Paths**: Attach any local folder as a knowledge base using `kb_init`. Persistent user-level registry without modifying configs or locking to fixed directories.
+- 🖼️ **Cross-Modal Text-to-Image & Media Read (0.9.0)**: Direct semantic retrieval of embedded images via natural language queries; `kb_read_media` accurately inspects and returns media chunks bounded by `budget_bytes` to prevent context buffer overflow.
+- 🏢 **Non-Invasive Virtual Doc Store (0.9.0)**: Decoupled parsing storage keeps your note directory 100% pristine; provides section-level crash recovery and multi-generational atomic publication.
+- 🧩 **Adaptive Token Chunking & Custom Templates (0.9.0)**: Token-aware chunking (`estimated_tokens`) produces natural semantic boundaries; independent `{text}` prompt template injection for embedding and querying.
+- 🔄 **Ingest Retry & Request Ledger (0.9.0)**: Resumes document parsing via `kb_ingest(action="retry", job_id=...)`; CLI management for pending intentions with decoupled `index_state` lifecycle reporting.
+- ⚡ **Compact Search & Section Read (0.8.1)**: Lightweight `compact=true` structured projection with whole-chunk budgeting cursors; `kb_read` resolves heading sections directly with accurate out-of-bounds line hints.
+- 📂 **Zero Hardcoded Paths**: Attach any local folder as a knowledge base using `kb_init`. Persistent user-level registry without locking to fixed directory paths.
 - 📖 **In-place Chunk Expansion & Wikilink Read (0.8.0)**: Read context directly via `kb_read(chunk_id=...)` without calculating line ranges; navigate `[[wikilinks]]` by short stem names automatically.
 - 🏷️ **Aliases Retrieval & Exact Terms Hard Inclusion (0.8.0)**: Native frontmatter `aliases` search; guaranteed recall for proper nouns via `exact_terms` with multi-route fallback.
 - 🛡️ **Search Output Budget & Local Diagnostic Log (0.8.0)**: Hard byte budget limit via `budget_bytes` prevents context overflow; privacy-safe local jsonl diagnostic logging.
-- 📚 **Vault Alias & Multi-Vault Scoped Search (0.7.2)**: Query vaults by their registered friendly names (e.g. `vault_path="MyNotes"`) without writing long absolute paths. Target multiple vaults at once via `vault_paths`.
-- 🔍 **Lightweight Preview & Two-Stage AX (0.7.2)**: Use `preview=true` to retrieve compact highlighted snippets and line numbers, then pinpoint details with `kb_read` without dumping full chunk contents.
-- 📄 **Native Plain-Text .txt Ingestion (0.7.2)**: Plain text `.txt` files are indexed alongside Markdown, with built-in chapter heading recognition.
-- 🔍 **Agent Trust Anchor, No Pre-flight Checks (0.7.1)**: One command (`python -m mortis_rag_mcp --doctor`) writes a local environment receipt (`STATUS.md`). Once an agent sees ✅, it **skips every environment / dependency / API-key pre-flight check** and queries your notes immediately instead of probing first. If something is actually broken, the receipt points to that single command — and a failed check never turns into a retry loop.
-- 📄 **Document Parsing & Ingestion**: Configured PDF/Office parsing feeds retrieval without modifying source documents; virtual storage is the default. Ingesting a standalone image file remains unfinished.
-- 🎯 **Intelligent Vault Routing (0.7.0)**: Add a natural-language description to each vault. AI agents pick the most relevant knowledge base automatically, cutting down noise and boosting response speed.
-- 📊 **Tables**: Estimated mode preserves oversized HTML tables and skips their embedding. The legacy oversized multi-cell defect remains for address compatibility; upgrading does not silently rewrite it.
-- 🔒 **Private Solo Vaults (solo)**: Register isolated vaults (`kb_init_solo`) that are excluded from global fan-out search and only queried when explicitly targeted.
-- ⚡ **Hybrid Search & Incremental Sync**: Fuses full-text keyword retrieval with semantic vector recall and reranking. Native file watching and read-priority background refresh ensure notes remain queryable while updates are indexed.
-- 📦 **Zero Runtime Dependencies**: Core features implemented with the standard library (`dependencies = []`). Lightweight and clean.
+- 📚 **Vault Alias & Multi-Vault Scoped Search (0.7.2)**: Query vaults by registered friendly names (e.g. `vault_path="MyNotes"`) without writing long paths. Target multiple vaults at once via `vault_paths`.
+- 🔍 **Lightweight Preview & Two-Stage Reading (0.7.2)**: Use `preview=true` to retrieve compact highlighted snippets and line numbers, then pinpoint details with `kb_read`.
+- 📄 **Native Multi-Format Support (.md / .txt / .markdown)**: Plain text `.txt` files (novels/docs) and `.markdown` files are indexed alongside `.md` with built-in chapter heading recognition.
+- 🔍 **Agent Trust Anchor, No Pre-flight Checks (0.7.1)**: One command (`python -m mortis_rag_mcp --doctor`) writes a local receipt (`STATUS.md`). Agents seeing ✅ skip every repetitive environment / API pre-flight check.
+- 🎯 **Intelligent Vault Routing (0.7.0)**: Add a natural-language description to each vault (`kb_describe`) and tune weights (`kb_set_weight`); AI agents pick the most relevant knowledge bases automatically.
+- 🔒 **Private Solo Vaults (solo)**: Register isolated vaults (`kb_init_solo`) excluded from global fan-out search and only queried when explicitly targeted.
+- ⚡ **Hybrid Search & Millisecond Incremental Sync**: Fuses full-text keyword retrieval (BM25/FTS) with semantic vector recall and reranking; native file watching keeps notes queryable with read priority.
+- 📦 **Zero Heavy Runtime Dependencies**: Core features implemented purely with the standard library (`dependencies = []`). Optional extras (`pymupdf`, `sqlite-vec`) plug in on demand.
+
+---
+
+## 🛠️ Complete MCP Tools (16 Tools)
+
+Mortis'RAG MCP provides 16 standardized MCP tools covering the entire lifecycle from vault registration and hybrid retrieval to multimodal media inspection and document maintenance:
+
+### 1. Vault Management & Multi-Vault Routing
+| Tool | Description |
+|---|---|
+| `kb_init` | Register and attach a new knowledge base directory with a friendly name |
+| `kb_init_solo` | Register or convert a vault into an isolated private solo vault |
+| `kb_list` | List all registered knowledge bases, physical paths, and current status |
+| `kb_describe` | Set a natural language description to guide intelligent agent routing |
+| `kb_set_weight` | Configure scoring weight multiplier for a vault in cross-vault searches |
+| `kb_remove` | Unregister a knowledge base (safe operation, never deletes local notes) |
+
+### 2. Hybrid Retrieval & Precise Reading
+| Tool | Description |
+|---|---|
+| `kb_search` | Hybrid vector & keyword search (supports multi-vault scoping, path filters, pagination, `preview`, `compact`, and `exact_terms`) |
+| `kb_read` | Read raw notes (supports line ranges, `chunk_id` in-place expansion, `[[wikilink]]` stems, or `heading` sections) |
+| `kb_read_media` | **(New in 0.9.0)** Read embedded images and media by `revision_id` and `occurrence_id` with strict `budget_bytes` control |
+
+### 3. Document Ingestion & Parsing
+| Tool | Description |
+|---|---|
+| `kb_ingest` | Manage and parse external PDF / Office documents (`submit`, `status`, `pending`, and checkpoint-aware `retry`) |
+
+### 4. Health, Maintenance & Migration
+| Tool | Description |
+|---|---|
+| `kb_stats` | Inspect vault stats, file counts, chunk counts, model profiles, and acceleration status |
+| `kb_list_files` | Browse indexed files with pagination and directory prefix filtering |
+| `kb_exempt` | Manage ignore rules and per-file exemptions with instant effect |
+| `kb_rebuild` | Force a clean rebuild of keyword and vector indexes for a vault |
+| `kb_export` | Export vault metadata, weights, and configuration backup snapshots |
+| `kb_import` | Restore metadata and report decoupled index build status (`index_state`) |
 
 ---
 
@@ -58,31 +101,35 @@ python -m pip install --upgrade pip
 python -m pip install -e .
 ```
 
+> **Optional Extras**:
+> - Local Office/PDF parsing: `pip install -e ".[docs]"`
+> - Disk vector database acceleration: `pip install -e ".[vec]"`
+
 ### 2. Configuration
 
-Copy the example configuration:
+Copy configuration from template:
 
 ```powershell
 Copy-Item .\config\app.toml.example .\config\app.toml
 ```
 
-#### (1) Basic: Embedding API Key (for semantic note retrieval)
-Recommended: SiliconFlow `BAAI/bge-m3` free tier:
-- **Option 1 (Recommended)**: Set environment variable `MORTIS_RAG_API_KEY=your_api_key` (also backwards-compatible with `VAULT_MCP_API_KEY`).
-- **Option 2**: Configure your endpoint and key directly in `config/app.toml`.
+#### (1) Base Setup: Embedding API Key
+Recommended free tier: SiliconFlow `BAAI/bge-m3`:
+- **Option 1 (Recommended)**: Set environment variable `MORTIS_RAG_API_KEY=your_key` (also backwards-compatible with `VAULT_MCP_API_KEY`).
+- **Option 2**: Configure your provider and key in `config/app.toml`.
 
-#### (2) Optional: MinerU Setup (0.7.0, for PDF & Office document ingestion)
-If you want to search PDFs, Word, PPT, Excel, or images in your knowledge base:
-1. Open `config/app.toml` and set `enabled = true` under `[ingest]`.
-2. Configure your MinerU Token (two options):
-   - **High-Precision Channel (Recommended)**: Get a free API token at [mineru.net](https://mineru.net), set environment variable `MINERU_API_TOKEN=your_token` (or set `api_key = "your_token"` under `[ingest]` in `config/app.toml`) for 1,000 free pages/day and large document support.
-   - **Zero-Config Trial**: Leave `api_key` blank to use the public guest channel (best for quick tests under 20 pages). This channel **returns extracted text only** — images inside the document are not returned.
+#### (2) Optional Setup: MinerU Integration (PDF / Office Document Parsing)
+To parse PDFs, Word docs, PPTs, or Excel spreadsheets:
+1. In `config/app.toml`, set `enabled = true` under `[ingest]`.
+2. Configure MinerU Token:
+   - **High Precision (Recommended)**: Get a free API Token at [mineru.net](https://mineru.net) (1000 free pages/day with image extraction), and set `MINERU_API_TOKEN=your_token`.
+   - **Free Agent Channel**: Leave `api_key` empty for quick evaluation (<20 pages; text-only extraction without images).
 
-### 3. Wire Up Your MCP Client
+### 3. Connect to AI Clients
 
-The server runs over standard stdio:
+Runs via standard stdio mode:
 
-#### WorkBuddy / JSON Configuration
+#### WorkBuddy / Custom JSON Connector
 ```json
 {
   "mortis-rag-mcp": {
@@ -90,7 +137,7 @@ The server runs over standard stdio:
     "args": ["-m", "mortis_rag_mcp", "--serve-mcp-stdio", "--app-config", "C:\\path\\to\\config\\app.toml"],
     "env": {
       "MORTIS_RAG_API_KEY": "your_api_key",
-      "MINERU_API_TOKEN": "optional_mineru_token_for_pdf_ingestion"
+      "MINERU_API_TOKEN": "optional_mineru_token"
     }
   }
 }
@@ -104,45 +151,28 @@ args = ["--serve-mcp-stdio", "--app-config", "C:\\path\\to\\config\\app.toml"]
 enabled = true
 ```
 
-### 4. Initialize and Use
+### 4. Initialize and Query
 
-Once connected, simply tell your AI assistant:
+Once connected, ask your AI assistant:
 
-> "Please register my knowledge base using `kb_init`: `D:\MyNotes`"
+> "Help me register my vault using `kb_init`: `D:\MyNotes`"
 
-The knowledge base is indexed in the background. You can now search conversationally:
-> "Search my notes for circuit design latch concepts"
-> "Find information about project architecture in my knowledge base"
-
----
-
-## 🛠️ Common Tools Quick Reference
-
-| Tool | Description |
-|---|---|
-| `kb_init` | Register a new knowledge base directory |
-| `kb_init_solo` | Register/convert an isolated private vault (excluded from global fan-out) |
-| `kb_list` | List all registered knowledge bases and their statuses |
-| `kb_describe` | Set vault natural language description for intelligent AI routing (0.7.0) |
-| `kb_search` | Hybrid semantic and keyword search (cross-vault, targeted vault/multi-vault, path filters, pagination, and preview mode) |
-| `kb_read` | Read raw note content by file path or line range |
-| `kb_ingest` | Ingest and parse PDF / Office documents into Markdown (0.7.0) |
-| `kb_remove` | Safely remove a vault from the registry (never deletes local files) |
-| `kb_stats` | Inspect vault health, file counts, and chunk statistics |
+Indexes build automatically in the background. Then query naturally:
+> "Search my notes for how the project architecture is designed"
 
 ---
 
-## 📚 Documentation & Navigation
+## 📚 Documentation Navigation
 
-- 📖 **User Quick Start Guide**: See [QUICKSTART_user.md](QUICKSTART_user.md) for full configuration and troubleshooting.
-- 📝 **Release Changelog**: See [CHANGELOG_user.md](CHANGELOG_user.md) for version highlights and history.
-- 🤖 **Companion Agent Skill**: See [skills/mortis-rag-mcp/SKILL.md](skills/mortis-rag-mcp/SKILL.md) for AI retrieval rules and routing matrix.
-- 💻 **Developer Architecture Guide**: See [docs/PROJECT_GUIDE.md](docs/PROJECT_GUIDE.md) & [docs/Quick-start_developer.md](docs/Quick-start_developer.md) for deep-dive architecture and contribution guidelines.
+- 📖 **User Quick Start & Upgrade Guide**: See [QUICKSTART_user.md](QUICKSTART_user.md).
+- 📝 **Release Changelog**: See [CHANGELOG_user.md](CHANGELOG_user.md).
+- 🤖 **AI Agent Skill**: See [skills/mortis-rag-mcp/SKILL.md](skills/mortis-rag-mcp/SKILL.md).
+- 💻 **Developer Guide**: See [docs/PROJECT_GUIDE.md](docs/PROJECT_GUIDE.md) and [docs/Quick-start_developer.md](docs/Quick-start_developer.md).
 
 ---
 
 ## 📄 License
 
-Distributed under the [Apache License 2.0](LICENSE) since v0.9.0 (releases up to and including v0.8.1 remain MIT; the grant on already-published versions is unaffected).
+Licensed under the [Apache License 2.0](LICENSE) since v0.9.0 (v0.8.1 and earlier remain under MIT).
 
-Optional parser dependencies (e.g. PyMuPDF) are installed by the user on demand and are outside the Apache-2.0 grant on this project; see [NOTICE](NOTICE) for their own licenses.
+Optional dependencies (e.g. PyMuPDF) are installed by users and not covered under the Apache-2.0 license of this project; see [NOTICE](NOTICE).

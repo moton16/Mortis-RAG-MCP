@@ -51,10 +51,10 @@ def test_skill_package_version_matches():
     expected_version = SERVER_INFO["version"]
     skill_text = root.joinpath("skills", "mortis-rag-mcp", "SKILL.md").read_text(encoding="utf-8")
 
-    m_title = re.search(r'#\s*mortis-rag-mcp\s*检索路由[（\(]([^）\)]+)[）\)]', skill_text)
+    m_title = re.search(r'#\s*(?:mortis-rag-mcp\s*检索路由|Mortis 知识库调用指南)[（\(](?:v)?([^）\)]+)[）\)]', skill_text)
     assert m_title, "SKILL.md 标题缺少版本标注"
     assert m_title.group(1) == expected_version, f"SKILL.md 标题中的包版本 ({m_title.group(1)}) 与当前版本 ({expected_version}) 不一致"
 
-    m_fm = re.search(r'^version:\s*([0-9\.]+)', skill_text, re.MULTILINE)
+    m_fm = re.search(r'(?:^version:\s*|version:\s*["\'])([0-9\.]+)', skill_text, re.MULTILINE)
     assert m_fm, "SKILL.md frontmatter 缺少 version"
     assert m_fm.group(1) == expected_version
