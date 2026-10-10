@@ -1514,3 +1514,34 @@ Codex 主流程（2026-10-09 / America_New_York）。代码候选93c39a50b09ec61
 - 根因 3（P3）、根因 4（P4）按 §6 排在后两批，本批未动。
 - watcher **不在线**（Linux 轮询模式 / 降级）时，读路径仍会在 1 秒后每查排一轮——该场景的收益要等 P4 或单开一卡评估轮询兜底间隔。
 - 未改版本号；未 push、未开 PR、未打 tag / Release、未发 PyPI。
+
+### [FIX-issue15-P3] — moton16,2026-10-10,CodeBuddy,Hy4-Preview — perf(search): 可见性过滤按 source 记忆化 `is_ignored`（GitHub issue #15 根因 3）
+
+> **涵盖提交**：`d3a5453`
+
+**代码改动概况**
+
+`mortis_rag_mcp/indexer.py::_filter_visible_chunks`：
+
+1. `matcher.is_ignored(chunk.source)` 改为**按 `chunk.source` 记忆化**（本地 dict）。此前它对**每个 chunk** 调一次，而单次检索要过滤三轮（`all_chunks()` 一次 + 融合排序前后各一次）——issue 环境 9,270 次而不是 137 个 source。现在每轮过滤内每个 source 只判一次。
+2. 把原来的三条 `and` 短路条件展开为显式 `for` 循环（为记忆化留位置）。语义**逐条等价**；顺带确认旧 `except` 分支里那句「预过滤掉带 `revision_id` 的 chunk」是冗余的——`documents = {}` 时同一条判据（`chunk.source in documents` 为假）已经把它们全部过滤掉，故未保留。
+
+**明确没做的两件事（都是实测撞回来的，不是取舍偷懒）**
+
+- **不做跨调用缓存**（P3-b）：`DocumentStore.set_visibility` 只改 `visibility` / `updated_at`、**不 bump `change_seq`**（只有 `mark_deleted` 会 bump），任何以 `change_seq` 为失效键的跨调用缓存都收不到豁免/撤销的变更。
+- **计划里「三次过滤共用 documents/matcher」未实施**：先按计划做了「视图复用」，本机直接撞红两条既有合同——
+  * `tests/test_virtual_sync.py::test_empty_query_filters_recheck_visibility`（§9 标记为**最脆**）：`filters.matches` 是调用方可注入的钩子，钩子期间 `set_visibility('exempt')` 必须被**后一次**过滤看到；
+  * `tests/test_virtual_sync.py::test_ignore_final_filter_with_broken_store`：`rerank_chunks` 期间新写的 `.vaultignore` 必须被后一次过滤看到。
+
+  即三次过滤各自重读文档库与 `.vaultignore` 本身就是被钉住的语义，故本卡**只做调用内记忆化**，`list_documents()` 仍是 3 次。已在 `search.py:413` 与 `indexer.py` 的函数注释里写明原因，避免后人再踩。若要再降这一项，必须先补一个由 `set_visibility` / `invalidate_source` / `mark_deleted` 共同 bump 的可见性纪元（P3-b，本批不做）。
+
+**验证**
+
+- 反向确认：`tests/test_issue15_perf.py::test_single_search_does_not_recompute_visibility_per_chunk` —— 3 个 source / 多个 chunk 的库，统计 `IgnoreMatcher.is_ignored` 与 `store.list_documents()` 的调用次数：修复前 `is_ignored` **12 次（红）**，修复后 **≤ 3 × source 数（绿）**；同时钉住 `list_documents` 仍为 **3 次**（不得因为优化而变多，也不得因为记忆化而悄悄退化成跨阶段缓存）。
+- 靶向（逐文件跑，全部通过）：`test_virtual_sync` 25、`test_index_state` 5、`test_exempt` 7（可见性/豁免面）、`test_indexer` 11、`test_anti_contention` 8、`test_dedup` 8、`test_scoped_search` 14、`test_kb_read_chunkid` 21、`test_hybrid` 10、`test_import_refresh` 5、`test_read_stale` 8、`test_watch_integration` 17、`test_subvaults` 5、`test_concurrency_hardening` 8、`test_multivault` 9、`test_e20_media_outcome` 42、`test_paid_request_journal` 20、`test_e15_service_contracts` 22、`test_issue15_perf` 4。
+- §9「最脆」钉子：本批**实际撞到两颗**（`test_virtual_sync.py:381` 与 `:265`），均已通过收窄改动保住，见上。
+
+**未做（明确不声称已修）**
+
+- 根因 4（P4：`kb_rebuild` 双重全量 + 逐文件 FTS 事务）按 §6 排在最后一批，本批未动。
+- 未改版本号；未 push、未开 PR、未打 tag / Release、未发 PyPI。
