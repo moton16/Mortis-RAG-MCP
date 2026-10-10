@@ -20,6 +20,7 @@ from mortis_rag_mcp._indexer import watch
 from mortis_rag_mcp.config import AppConfig, CacheConfig, EmbeddingConfig
 from mortis_rag_mcp.doc_store import MediaOccurrenceSpec
 from mortis_rag_mcp.indexer import MarkdownIndexer
+from mortis_rag_mcp.server import VaultMcpServer
 
 # 与 issue 同量级：issue 报告 2,870 个已摄取虚拟文档、9,828 行 request_intents。
 VIRTUAL_SOURCES = 500
@@ -236,6 +237,90 @@ def test_single_search_does_not_recompute_visibility_per_chunk(tmp_path, monkeyp
         assert len(ignored_calls) <= 3 * len(sources), (
             f"is_ignored 调了 {len(ignored_calls)} 次：应按 source 记忆化，"
             f"上界为 3×{len(sources)}（共 {total_chunks} 个 chunk，修复前约 3×chunk 数）")
+    finally:
+        idx.stop_watching()
+        idx.close_document_store()
+
+
+def test_kb_rebuild_runs_a_single_full_build(tmp_path, monkeypatch):
+    """P4-a：一次 `kb_rebuild` 不得把派生层完整构建两遍。
+
+    现状（修复前）：`_indexer_for` 对尚未加载的库先 `start_watching()`，监听线程
+    启动即跑一次首轮全量 sync；紧接着 `rebuild()` 清空缓存再全量重建一次——两次
+    全量在 `_sync_lock` 上串行（issue #15 根因 4）。
+    """
+    import json
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (vault / "a.md").write_text("# A\nrebuild needle 的内容。\n", encoding="utf-8")
+    server = VaultMcpServer()
+    server.call_tool("kb_init", {"path": str(vault), "name": "R"})
+    indexer = server._indexer_for({"vault_path": str(vault)})
+    events: list[str] = []
+    real_stop, real_rebuild, real_start = (
+        indexer.stop_watching, indexer.rebuild, indexer.start_watching)
+
+    def spy_stop():
+        events.append("stop")
+        return real_stop()
+
+    def spy_rebuild():
+        events.append("rebuild")
+        return real_rebuild()
+
+    def spy_start():
+        events.append("start")
+        return real_start()
+
+    monkeypatch.setattr(indexer, "stop_watching", spy_stop)
+    monkeypatch.setattr(indexer, "rebuild", spy_rebuild)
+    monkeypatch.setattr(indexer, "start_watching", spy_start)
+    response = server.call_tool("kb_rebuild", {"vault_path": str(vault)})
+    assert events == ["stop", "rebuild", "start"], (
+        f"kb_rebuild 期间监听的收放顺序不对：{events}（应为 stop → rebuild → start，"
+        f"修复前是 ['rebuild']，即后台首轮与前台 rebuild 两次全量串行）")
+    stats = json.loads(response["content"][0]["text"])
+    assert stats["files"] >= 1
+    server.shutdown()
+
+
+def test_rebuild_writes_fts_in_one_transaction(tmp_path, monkeypatch):
+    """P4-b：`rebuild()` 末尾的 FTS 回填必须是**一个**事务，而不是逐 source 一个。
+
+    现状（修复前）：`FtsIndex.upsert_source` 内部是 `with conn:`，每个 source 一个
+    独立事务（DELETE + executemany），issue 环境 137 个 source = 137 个事务
+    （issue #15 根因 4）。
+    """
+    from mortis_rag_mcp.fts import FtsIndex
+
+    idx = _plain_indexer(tmp_path)
+    try:
+        idx.sync()
+        calls = {"single": 0, "batch": 0, "sources": 0}
+        real_single, real_batch = FtsIndex.upsert_source, getattr(FtsIndex, "upsert_sources", None)
+
+        def counting_single(self, source, chunks):
+            calls["single"] += 1
+            return real_single(self, source, chunks)
+
+        def counting_batch(self, mapping):
+            items = list(mapping)
+            calls["batch"] += 1
+            calls["sources"] = len(items)
+            if real_batch is None:
+                return None
+            return real_batch(self, items)
+
+        monkeypatch.setattr(FtsIndex, "upsert_source", counting_single)
+        monkeypatch.setattr(FtsIndex, "upsert_sources", counting_batch, raising=False)
+        idx.rebuild()
+        assert calls["batch"] == 1, f"整批 FTS 回填事务数为 {calls['batch']}（应为 1）"
+        assert calls["single"] == 0, (
+            f"仍有 {calls['single']} 次逐 source 事务（修复前 = source 数）")
+        assert calls["sources"] == len(idx._chunks) >= 3
+        # 批量写必须保持同样的结果：`test_hybrid.py:166/171` 的口径。
+        assert idx._fts.count() == len(idx.all_chunks())
     finally:
         idx.stop_watching()
         idx.close_document_store()

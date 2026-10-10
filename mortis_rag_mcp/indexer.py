@@ -1057,10 +1057,17 @@ class MarkdownIndexer:
     def _flush_vectors_to_disk(self) -> None:
         _sync_engine.flush_vectors_to_disk(self)
     def _fts_upsert(self, source: str, chunks: list[Chunk]) -> None:
+        self._fts_upsert_many(((source, chunks),))
+
+    def _fts_upsert_many(self, mapping: Iterable[tuple[str, list[Chunk]]]) -> None:
+        """一次事务内写入多个 source（issue #15 根因 4：rebuild 末尾的逐 source 事务）。
+
+        单个 source 走 `_fts_upsert` 仍是「一个 source 一个事务」，与历史行为一致。
+        """
         if self._fts is None:
             return
         try:
-            self._fts.upsert_source(source, chunks)
+            self._fts.upsert_sources(list(mapping))
         except Exception:
             # A broken FTS index must never take the sync down; degrade to off.
             try:
@@ -1666,8 +1673,10 @@ class MarkdownIndexer:
                 except Exception:
                     self._fts = None
                 if self._fts is not None:
-                    for source, chunks in self._chunks.items():
-                        self._fts_upsert(source, chunks)
+                    # issue #15 根因 4：此前逐 source 各开一个事务（137 个 source =
+                    # 137 个事务）。整批一个事务；写入顺序与「逐 source 先删后插」
+                    # 语义由 FtsIndex.upsert_sources 保证。
+                    self._fts_upsert_many(list(self._chunks.items()))
             return result
 
     _READABLE_SUFFIXES = {".md", ".markdown", ".txt"}

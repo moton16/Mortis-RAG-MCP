@@ -1201,7 +1201,17 @@ class VaultMcpServer:
         return {"path": entry.path, "name": entry.name, "weight": entry.weight}
     def _kb_rebuild(self, arguments: dict[str, Any]) -> dict[str, Any]:
         indexer = self._indexer_for(arguments)
-        indexer.rebuild()
+        # issue #15 根因 4：`_indexer_for` 对尚未加载的库会先 `start_watching()`，而
+        # 监听线程启动即跑一次首轮全量 sync（watch.py「没有这一句就永远等不到第一次
+        # 索引」）；紧接着 `rebuild()` 又清空缓存全量重建一次——两次全量在 `_sync_lock`
+        # 上串行，派生层被完整构建两遍。这里在重建期间停掉监听，重建完再拉起，保证
+        # 「一次 kb_rebuild = 一次全量构建」。
+        # 拉起后的首轮 sync 在重建之后跑，此时索引已是最新，该轮基本为空转。
+        indexer.stop_watching()
+        try:
+            indexer.rebuild()
+        finally:
+            indexer.start_watching()
         return indexer.stats()
 
     def _kb_export(self, arguments: dict[str, Any]) -> dict[str, Any]:
