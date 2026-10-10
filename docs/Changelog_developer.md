@@ -1486,3 +1486,31 @@ Codex 主流程（2026-10-09 / America_New_York）。代码候选93c39a50b09ec61
 - 根因 2/3/4（P2/P3/P4）按 §6 排在后三批，本批未动。
 - 虚拟源没有向 `mtime_samples` 贡献刻度探测样本（文本路径提供）；零文本文件、纯虚拟库的场景下刻度探测不触发，余量退回固定下限——方向安全（下限更保守）。
 - 全量 pytest 留到整合窗口；性能基准脚本留到整合窗口做相对口径。
+
+### [FIX-issue15-P2] — moton16,2026-10-10,CodeBuddy,Hy4-Preview — perf(read): watcher 在线时读路径不再自排全量 sync（GitHub issue #15 根因 2）
+
+> **涵盖提交**：`f55e8a8`
+
+**背景**：`_server/search_dispatch.py:99`、`_server/fanout.py:338`、`server.py:1257`（`kb_list_files`）、`server.py:1857`（`kb_stats`）四处都以 `for_read=True` 调用 `request_refresh`。该分支的抑制窗口只有 `_READ_REFRESH_MIN_INTERVAL_SECONDS = 1.0` 秒：只要距上次同步超过 1 秒，读路径就真的登记一轮全量 sync → `refresh_status` 的 `pending` 为真 → `indexing_in_progress: True` → `index_state` 判 `rebuilding` 并返回「wait for the background sync to finish, then retry」。**一个完全就绪的静态库被它自己发起的机会性刷新判成正在重建**——这正是 issue 里「恒报 rebuilding」的直接来源，也让每次查询都背上一轮全量 sync 的成本。
+
+**代码改动概况**
+
+`mortis_rag_mcp/_indexer/watch.py`（`request_refresh`）：把抑制条件拆成两段——
+
+1. **新增**：`for_read` 请求在「无 pending、`_indexing` 为假、`_sync_state == idle`、无 `_refresh_error`、且 `last_sync is not None`」的前提下，若**原生 watcher 在线且存活**（`owner._fs_watcher is not None and owner._fs_watcher.is_alive()`）则直接 `return False`。真实文件变动由 watcher 事件入队，读路径不需要再自排一轮兜底轮询。
+2. **保留**：watcher 不在线（轮询 / 降级模式）或冷启动（`last_sync is None`）时维持原判据（1 秒抑制窗口）。
+
+四处 `for_read=True` 调用点**未改动**，改判据即全覆盖。
+
+**方案裁定**：走调研报告 §5 P2 的**方案 A（收窄「刷新已登记」的适用面）**。方案 B（保留登记行为、只给读路径一个「排除本次请求自身置位」的视图，需动 `index_state()` 签名）未采用。这一条实际是在收窄 `watch.py:161` 注释里把 `rebuilding` 定义为「后台 sync 在跑**或刷新已登记**」中的后半条；若认为该定义必须原样保留，请改裁定为方案 B。
+
+**验证**
+
+- 反向确认：`tests/test_issue15_perf.py::test_read_refresh_does_not_mark_a_ready_vault_as_rebuilding` —— 已同步的库把 `last_sync` 拨回 5 秒（让 1 秒抑制窗口失效），挂上「watchr 在线且存活」替身：修复前 `request_refresh(for_read=True)` 返回 **True** 且 `index_state` 报 **rebuilding（红）**，修复后返回 **False** 且保持 **ready（绿）**。同用例还钉住「显式请求仍必须排得进去」（非 for_read 返回 True 且 `refresh_pending` 为真）。CI 的非 Windows 平台无原生监听，故用例用替身对象保证跨平台确定性。
+- 靶向（逐文件跑，全部通过）：`test_index_state` 5（§9 标为**最脆**的 `:109` 在此）、`test_import_refresh` 5、`test_read_stale` 8、`test_watch_integration` 17、`test_multivault` 9、`test_virtual_sync` 25、`test_exempt` 7、`test_hybrid` 10、`test_subvaults` 5、`test_concurrency_hardening` 8、`test_e20_media_outcome` 42、`test_paid_request_journal` 20、`test_e20_ops` 13、`test_e20_disk_durability` 3、`test_scoped_search` 14、`test_anti_contention` 8、`test_budget_bytes` 15、`test_ingest_server` 12、`test_kb_read_chunkid` 21、`test_e15_service_contracts` 22、`test_beta2_docs_contract` 3、`test_text_profile_wiring` 26、`test_issue15_perf` 3。
+
+**未做（明确不声称已修）**
+
+- 根因 3（P3）、根因 4（P4）按 §6 排在后两批，本批未动。
+- watcher **不在线**（Linux 轮询模式 / 降级）时，读路径仍会在 1 秒后每查排一轮——该场景的收益要等 P4 或单开一卡评估轮询兜底间隔。
+- 未改版本号；未 push、未开 PR、未打 tag / Release、未发 PyPI。
