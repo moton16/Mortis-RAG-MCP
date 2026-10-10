@@ -1283,6 +1283,14 @@ class ControlStore:
                      "endpoint TEXT NOT NULL, profile_fingerprint TEXT NOT NULL DEFAULT '', "
                      "attempt INTEGER NOT NULL DEFAULT 1, state TEXT NOT NULL, reason TEXT NOT NULL DEFAULT '', "
                      "created_at REAL NOT NULL, updated_at REAL NOT NULL)")
+        # issue #15 / P1-c：未决意图的判别是 (kind, profile_fingerprint, state) 三元组上的
+        # 存在性查询，而 list_request_intents 的 SQL 只有可选的 state 过滤、且要整表反
+        # 序列化。既有控制库（schema_version=1）缺这个索引时每次查询都是全表扫描
+        # （实测 9,828 行 ≈ 16.33 ms/次）。索引是**兜底**：根治是调用方整轮只查一次，
+        # 但万一将来又出现逐次调用，单次成本可降约 38 倍。与表本身同策略：只加索引、
+        # 不改 schema_version。
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_request_intents_kind_fp_state "
+                     "ON request_intents(kind, profile_fingerprint, state)")
         conn.commit()
 
     def authorize_paid_profile(self, profile_fingerprint: str, *, scope: str,

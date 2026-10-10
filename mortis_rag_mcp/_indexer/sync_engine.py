@@ -495,11 +495,17 @@ def media_native_route(owner: MarkdownIndexer) -> Any:
 
 
 def media_native_for_revision(owner: MarkdownIndexer, store: Any, source: str, revision_id: str,
-                              occurrences: list[Any], *, reuse_only: bool = False) -> list[Chunk]:
+                              occurrences: list[Any], *, reuse_only: bool = False,
+                              unresolved_paid: Any = None) -> list[Chunk]:
     """从**已验证 blob** 读受限 bytes 并消费 E07 `embed_media`，产出原生媒体向量 chunk。
 
     route 不可用（无 provider / 未声明 alignment / 无受限读取能力）时返回空列表——
     明确该 route 不可用，纯词法 proxy 仍可用，但**不**把 proxy 冒充 native。
+
+    `unresolved_paid`（issue #15 / P1-b）：由调用方给出的「当前是否存在未决付费
+    意图」，可以是 bool，也可以是返回 bool 的零参回调（回调形式允许调用方在本轮
+    内真的发过一次付费请求后重新求值，避免用陈旧值放行第二次计费）。缺省 None 时
+    按现状自行查询。
     """
     from ..media_providers import EmbeddingInput
     from .media import MediaStageError
@@ -578,9 +584,12 @@ def media_native_for_revision(owner: MarkdownIndexer, store: Any, source: str, r
     if not pending or reuse_only:
         return chunks
     control = owner._paid_control_store()
+    unresolved = unresolved_paid() if callable(unresolved_paid) else unresolved_paid
+    if unresolved is None:
+        unresolved = owner.has_unresolved_paid_intents(control, "media", provider.profile.fingerprint)
     if (control is not None
             and not getattr(provider, "is_local_free", False)
-            and owner.has_unresolved_paid_intents(control, "media", provider.profile.fingerprint)):
+            and unresolved):
         raise MediaStageError("PAID_REQUEST_UNRESOLVED: native media outcome unknown; automatic retry disabled", chunks)
     for start in range(0, len(pending), batch):
         batch_inputs = pending[start:start + batch]
@@ -765,6 +774,27 @@ def run_sync(owner: MarkdownIndexer) -> list[Chunk]:
     # 探测的余量做跳过决定。
     owner._finalize_mtime_tick_probe(mtime_samples)
 
+    # issue #15 / P1-a + P1-b：未决付费意图判据只依赖 (kind, profile_fingerprint)，
+    # **与 source 无关**。此前它在下面的虚拟文档循环内逐 source 调用，而每次调用都
+    # 要对 request_intents 做一次全表扫描（无 WHERE 过滤 + 跨进程 OS 锁），实测
+    # 16.33 ms/次；2,870 个 source 就是 46.9 s/轮，超过 30 s 重排间隔 → 后台线程
+    # 永远追不上、GIL 被焊死，同进程内其它库的前台检索一起被拖慢。
+    #
+    # 判据输入逐 source 完全相同，所以整轮只求值一次即**逐 source 等价**。唯一需要
+    # 重新求值的情形是**本轮内真的发过一次付费请求且结果未知**（此时判据由 False 翻
+    # 转为 True）；若沿用陈旧值，同一轮里后续 source 会重复计费。故缓存带失效标记，
+    # 只在本轮媒体阶段落败时失效，命中时零成本。
+    media_route = media_native_route(owner)
+    media_fingerprint = media_route.profile.fingerprint if media_route is not None else ""
+    _media_probe: dict[str, Any] = {"value": False, "fresh": media_route is None}
+
+    def unresolved_media() -> bool:
+        if not _media_probe["fresh"]:
+            _media_probe["value"] = owner.has_unresolved_paid_intents(
+                owner._paid_control_store(), "media", media_fingerprint)
+            _media_probe["fresh"] = True
+        return _media_probe["value"]
+
     for document in documents:
         source = document.source
         if document.visibility != "active" or not document.active_revision:
@@ -799,8 +829,6 @@ def run_sync(owner: MarkdownIndexer) -> list[Chunk]:
             revision = active.revision
             if raw_sha != revision.source_sha256:
                 raise ValueError("source SHA differs from committed revision")
-            media_route = media_native_route(owner)
-            media_fingerprint = media_route.profile.fingerprint if media_route is not None else ""
             signature = f"virtual:{revision.revision_id}:{raw_sha}:{revision.render_sha256}:media:{media_fingerprint}"
             missing_native = any(c.metadata.get("kind") == "media_native" and not chunk_has_vector(owner, c)
                                  for c in owner._chunks.get(source, ()))
@@ -808,8 +836,7 @@ def run_sync(owner: MarkdownIndexer) -> list[Chunk]:
                 continue
             if (owner._signatures.get(source) == signature and not missing_native
                     and source in media_failures and media_route is not None
-                    and owner.has_unresolved_paid_intents(
-                        owner._paid_control_store(), "media", media_fingerprint)):
+                    and unresolved_media()):
                 # A settled source with an unknown send stays failed without
                 # regenerating identical caches or replaying successful batches.
                 continue
@@ -849,11 +876,14 @@ def run_sync(owner: MarkdownIndexer) -> list[Chunk]:
             try:
                 native_chunks = media_native_for_revision(
                     owner, owner.document_store(write=True), source, revision.revision_id, occurrences,
-                    reuse_only=proxy_failed)
+                    reuse_only=proxy_failed, unresolved_paid=unresolved_media)
                 chunks.extend(native_chunks)
             except Exception as exc:
                 chunks.extend(getattr(exc, "chunks", ()))
                 media_failures[source] = f"media_native: {exc}"
+                # 本轮媒体阶段落败：付费意图可能刚被置为未决，缓存判据失效，
+                # 下一个 source 必须重新求值（否则同一轮内可能重复计费）。
+                _media_probe["fresh"] = False
             # Successful prefixes are native too; never embed their proxies as text.
             native_occurrences = {c.metadata["occurrence_id"] for c in chunks
                                   if c.metadata.get("kind") == "media_native"}
