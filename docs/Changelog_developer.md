@@ -7,6 +7,84 @@
 
 ---
 
+### [v0.9.0 CI 全矩阵收绿（PR #8，七轮）] — moton16,2026-10-09,CodeBuddy,DeepSeek-V4.1-Flash — fix(ci)+test: 修掉三处本地测不出的真实产品缺陷与多处时序用例
+
+涵盖提交：`4a14269`（首轮收绿）、`262bb94`（py3.11 / windows 收口）、`65ba598`（`test_kb_read_chunkid` 轮询）、`52fbd75`（`_kb_init_ready` 等索引可见性）、`d33a9f2`（`test_search_oracle` 等待首建）；`121ebdf`、`83394d8` 为本批技术记账（只改本文档）。七笔同为 moton16 / CodeBuddy / DeepSeek-V4.1-Flash。
+
+**背景**：本地 Windows 全量当时全绿，而 PR #8 首轮 CI 五档核心 job 全红（仅 extras 两档 pass）——本地通过不是 CI 通过的证据。按 job 日志逐条定位，六类失败里三处是**真实产品缺陷**。
+
+**真实产品缺陷（代码修复）**
+
+1. py3.13 `stop_watching` 退栈崩溃 — `mortis_rag_mcp/_indexer/watch.py`：三个线程直接 `join(timeout=2)`，而 `start_watching` 存在多条提前返回路径会让线程停在「已构造但未 start」，`Thread.join()` 遂抛 `RuntimeError: cannot join thread before it is started`，stdio 会话以非零码退出并把 traceback 写进 stderr。新增 `_join_started_thread()`（先判 `ident` 再 join，未启动即视为已结束），三处引用同步。
+2. doctor 路径被自由文本上限截断 — `mortis_rag_mcp/doctor.py`：路径的判别信息在**尾部**（`.mortis_rag_mcp` 还是 `.vault_mcp`、缓存根在哪一侧），深家目录（CI 容器、长用户名、深层挂载）实测超过 `_FREE_TEXT_LIMIT=160`，截断后正好把要判别的信息丢掉。新增 `_PATH_TEXT_LIMIT=1024`，配置路径 / 注册表路径 / 缓存目录 / 文档库根四处按新上限输出，异常消息等仍走 160。
+3. `try_sync_with_guard` 进入的同步不标「索引在飞」 — `mortis_rag_mcp/indexer.py`：`_indexing` 原先只在监听线程的 `_run_sync_quietly` 包装里置位，经守护式入口进入的同步对 `kb_search` / `kb_stats` 完全不可见，客户端会把同步期间返回的部分结果当成终态（C66 读优先契约的静默漏洞）。改为在 `_sync_locked()`（所有真同步的共同内层）置位并保存/恢复旧值。
+
+**测试侧修正**
+
+4. `tests/test_e20_media_connection.py`：参数化磁盘后端用例在核心 lane（不装 extras）静默回退 memory 后端被判失败，补 `pytest.importorskip("sqlite_vec")`，与 `test_vector_backend.py` 既有惯例一致。
+5. `tests/test_e20_eval_cli.py`：冻结哈希与「未被改写」比较原先走原生字节，autocrlf=true 的 Windows 检出与 Linux 检出字节不同，等于让换行形态决定结果；统一改走 `_golden_bytes()`（`read_text` 后 `encode("utf-8")` 折算 LF），冻结值不变。
+6. `tests/test_scoped_search.py`、`tests/test_kb_read_chunkid.py`：批式 stdio 一次性喂完 stdin，读到的 `files`/`chunks` 取决于后台首建推进到哪一步；改用 conftest 的 `stdio_polling` 轮询到 `index_state=ready` 且命中非空，再于同一条会话内做定向统计与 chunk_id 精读。用例对人的合同（不得误抛 multiple vaults、不得降级盲搜、solo 不进 `excluded_solo`）一条未减。
+7. `tests/test_virtual_read_server.py`：`_indexer_for` 建库时顺带 `start_watching()`，用例改写物理源文件制造 STALE 后监听线程可在两次断言之间重签源文件，读取判定随机器快慢漂移。该模块的合同是读取判定本身，新增 autouse `no_background_watch` 把监听惰性化；**未改产品读取语义**——若要把该竞争当作产品行为修订，需另行开卡。
+8. `tests/test_read_stale.py`：阻塞点从 `_sync_locked` 移到内层 `_sync_locked_impl`（原写法先掐掉进度标记再断言能看见它），并新增 `test_guarded_sync_is_visible_as_indexing` 钉住缺陷 3。
+9. `tests/test_exact_terms.py`、`tests/test_compact_search.py`、`tests/test_budget_bytes.py`：三份重复的 `_kb_init_ready`（共 19 处调用）改为「重试 sync 直到切片可见，上限 10s」；`tests/test_search_oracle.py::test_server_search_dispatch_delegation` 补同样的等待（原先连 sync 都没做，纯靠后台首建抢跑）。
+10. `tests/test_watch_integration.py`、`tests/test_doctor.py`：为缺陷 1、2 补确定性回归（SimpleNamespace 替身 + 三个未启动线程；构造确定 >160 字符的家目录）。
+
+**CI 轮次与验证**
+
+- 轮 1：五档核心 job 全红、仅 extras 两档 pass → 上述 1–5。
+- 轮 2（`4a14269`）：py3.10/3.12/3.13 转绿，py3.11 与 windows 仍红（缺陷 3 未修 + eval CLI 收尾比较只改了一半）→ 6、8，以及 5 的补全。
+- 轮 3（`262bb94`）：仅 py3.12 红在 `test_kb_read_chunkid`（`assert 0 > 0`）→ 6 的 chunkid 部分。
+- 轮 4（`65ba598`）= **7/7 全绿**。
+- 轮 5（`121ebdf`，**只改文档**、被测代码与轮 4 完全相同）py3.13 红在 `test_exact_terms`（0 chunks）——证明是既有竞态而非本批引入 → 9。
+- 轮 6（`52fbd75`）py3.11 红在 `test_search_oracle` → 9 的 search_oracle 部分。
+- 轮 7（`d33a9f2`）与轮 8（`83394d8` 记账后）= **7/7 全绿**（ubuntu 3.10/3.11/3.12/3.13、windows-3.12、extras ubuntu/windows）。
+- 本地：受影响文件多轮靶向全绿（`test_kb_read_chunkid` 21 passed×3、三文件 35 passed×3、`test_search_oracle` 9 passed×3 等）；最终全量 `.venv` = **1282 passed / 14 skipped / 3 deselected in 152.84s**（较发版收尾批 +3，为新增回归用例）。本机只有 py3.10，py3.13 与非 Windows 内核的结论只由 CI 给出。
+
+**遗留风险（未声称已修）**：仓库仍有若干「依赖后台首建抢跑」的批式 stdio 老用例（`test_scoped_search` 余下三条、`test_registry_server`、`test_subvaults` 等），本批只在**实际报红**处加固；彻底收敛需单开一卡做全仓改造。
+
+**未执行**：merge、tag、GitHub Release、PyPI 发布均未授权未执行；本批只到 push 与 PR #8 开立（均由主人授权）。
+
+---
+
+---
+
+### [v0.9.0 发版收尾：许可证 MIT→Apache-2.0、候选包重建、隔离安装与 MCP 冒烟] — moton16,2026-10-09,CodeBuddy,DeepSeek-V4.1-Flash — chore(release): 许可证切换 + 从 HEAD 重建 wheel/sdist + 隔离安装与 MCP 初始化冒烟
+
+涵盖提交：`040b909`（本批仅此一笔；候选包重建、隔离安装与冒烟都是该提交内的交付验证，不另立条目）。基线 HEAD `4fcde07`（E20 收尾），分支 `feat/v0.9.0-lane-ab`。
+
+**许可证 MIT → Apache-2.0**
+
+- `LICENSE`：整篇替换为 Apache License 2.0 全文（201 行，含 END OF TERMS AND CONDITIONS 与附录 `Copyright 2026 Moton`）。
+- `NOTICE`（新增 29 行）：披露可选 extras 的第三方许可（pymupdf AGPL-3.0/商业、pypdf BSD-3、python-docx/pptx/openpyxl MIT、Pillow HPND、sqlite-vec MIT、numpy BSD-3），并声明把本代码与 AGPL 组件组合为单一分发作品的责任归分发者。
+- `pyproject.toml`：PEP 639 `license = "Apache-2.0"`、`license-files = ["LICENSE", "NOTICE"]`；`[docs]` extra 注释同步为「非 Apache-2.0 授权范围，见 NOTICE」。
+- `README.md` / `README_EN.md`：徽章与 License 段改写，写明「自 v0.9.0 起 Apache-2.0，v0.8.1 及更早仍为 MIT，已发布版本的授权不受影响」。
+- `CHANGELOG_user.md`：0.9.0 条目日期改 2026-10-09、去掉「尚未正式发布」口径、新增 `### Changed`（许可证变更，用户视角只说结论）。
+- 历史条目按纪律未回改：本文档中「PyMuPDF 为 AGPL/commercial，非全 MIT」等当日记录原样保留。
+
+**候选包重建（E17 历史包作废）**
+
+- 清掉 E17 遗留 `build/` 与 `mortis_rag_mcp.egg-info`；本机 PATH 解释器（python 3.10.11）无 `venv` 模块，PEP 517 隔离不可用，改用 `python -m build --no-isolation --outdir dist`（本机 setuptools 82.0.1 / wheel 0.46.3，满足 build-system `setuptools>=77`）。
+- 产物：wheel 49 项（42 个 py 模块）、sdist 176 项。METADATA 为 Metadata-Version 2.4、`License-Expression: Apache-2.0`、两条 `License-File`；wheel `dist-info/licenses/LICENSE` 实测 201 行且含 END OF TERMS；包内 42 个 `.py` 与提交源码逐字节一致；sdist 内 README 与仓库当前 README 一致（E18 遗留的「sdist 内嵌 README 早于 E18」由此闭合）。
+- **最终候选包**（后续 CI 修复后按 `262bb94` 重建；其后提交只改测试与文档，包代码未变）：wheel SHA256 `2C5EDCF89462BEC9646561C3B01D0AD22F81912971BBBB78D04C7018D9E0A0AC`、sdist `A2C734EB88F8CAA5CF403F7092AB86793A13AAAFB017BECD1914110AF9EC4D93`。首建版本 `1C80CE51…` / `3CD65F86…` 因产品缺陷修复而作废，不冒充最终候选。
+
+**隔离安装**（同因无法建 venv，`.venv` 亦无 pip/ensurepip）
+
+- `pip install --no-deps --target .runtime/ship/site <wheel>`，PYTHONPATH 指向该 site、cwd 置于 `.runtime/ship`：`import mortis_rag_mcp` 落在安装副本、`__version__=0.9.0`、`importlib.metadata` 的 License-Expression=Apache-2.0、License-File=['LICENSE','NOTICE']，证明源码树零参与且零运行时依赖；sdist 另以 `--no-build-isolation --no-deps --target .runtime/ship/site-sdist` 安装并导入通过。
+
+**MCP 初始化与关键功能冒烟**（打的是安装副本，不是源码树）
+
+- `.runtime/ship/smoke.py` 起 `site\bin\mortis-rag-mcp.exe --serve-mcp-stdio`，每场景独立 home/registry/cache（`MORTIS_RAG_REGISTRY` / `MORTIS_RAG_CACHE_DIR` / `MORTIS_RAG_NO_STATUS_HOOK=1`），不碰真实 `~/.mortis_rag_mcp`。
+- 两场景均 rc=0、stderr 空、无 JSON-RPC error 与 isError：① static 离线静态向量（缓存落 `.384.` vec.bin 905B）；② external 本机 EG2 `http://127.0.0.1:8000/v1/embeddings`（model embeddinggemma2、dimension 768、send_dimensions=false，缓存落 `.768.` vec.bin 11882B——真实端点出向量而非静默回退）。
+- 每场景完整走通 initialize（protocolVersion 2025-06-18、serverInfo version 0.9.0）、notifications/initialized、ping、tools/list（16 个工具含 `kb_read_media`）、kb_init（2 个 md）、kb_search 轮询至就绪并命中、kb_read（60 字）、kb_list。
+
+**验证**：本批全量 `.venv` `pytest -q --basetemp=.runtime/ship/pytest`（PYTHONHASHSEED=0、TEMP/TMP/TMPDIR 钉 `.runtime`）= 1279 passed / 14 skipped / 3 deselected in 136.20s，与 E20 最终默认层逐项一致，许可证与 pyproject 改动未影响用例数与结果。
+
+**未执行 / 开放项**：tag、GitHub Release、PyPI 发布未授权未执行（push 与 PR #8 另由主人授权，见下条）；sdist 内 `tests/` 只含 `test_*.py`，未含 `conftest.py` 与 fixtures（既有打包行为，本批未改），sdist 单独跑测试不可用。
+
+---
+
+---
+
 ### [E18 文档整合、收尾与内容差异报告] — moton16,2026-10-09,CodeBuddy,DeepSeek-V4.1-Flash
 
 按用户侧 / 开发者侧分工对 v0.9.0 文档做一致性整合与发布前收尾，**不改代码逻辑、不改测试断言、不做任何发布动作**（无 push / PR / tag / release / publish）。本批只动文档，合并为一个提交（同任务连续提交按本文档开头约定合并整理）。逐项盘点、两个对比基准的原始 git 证据与全部结论见本地忽略目录 `docs/v0.9.0/V0.9.0_CHANGE_DIFF_2026-10-09.md`（本机交付，不在本提交内）。
@@ -1319,41 +1397,3 @@ Codex 主流程整合；媒体施工子代理 gpt-6.1-sol/high。C01真实TOML+�
 Codex 主流程（2026-10-09 / America_New_York）。代码候选93c39a50b09ec617a76b1a50f97cc538283cba99：最终默认层1279 passed /14 skipped /3 deselected in98.29s，唯一全层显式-o addopts=解除排除后1282 passed /14 skipped in207.77s，PYTHONHASHSEED=0，均exit0。完整节点1296，较E19新增143/移除1（原源变化一例拆两例），净+142；旧保留节点状态迁移0。默认少执行原slow与两个real_carrier，实测差109.48s（52.69%），不是slow算法加速；全链slow93.80s保留。EG2本地http://127.0.0.1:8000/v1/embeddings两个不同真实载体均passed（10.28s/2.23s）；精确HTTP请求数未埋点，不记为0；真实paid请求0。14skip为12缺docs/media依赖与2非Windows平台例；既有PATH解释器12额外格式/preview/分卷靶向证据独立，不拼接core总数或site-packages。
 
 原TST07两死定义清理case delta0，FLK原节点保持；四真实fast分页+4；worker配置fallback及媒体装配只局部收敛，兼容、watch quiet-window、恢复家族与virtual_worker_queue保留。主副本回滚剧本恢复初始186项tracked原字节，正确性回归恢复旧10failed/3passed；主分支和修改工件不回退。报告E20_EXECUTION_2026-10-09.md、统一入口仅追加§20与manifest round11/E20保留round10链，按仓库既有忽略交付，不force-add。最终收尾仅当前用户说明与追加技术记账，162项生产/测试/pyproject SHA保持本轮全层候选。真实用户旧库/其他paid端点/宿主展示/远端CI/包重建发布未执行；E17转录/ffmpeg移除保持。原bounded复核已完成；收口后第二次代理只读复核transport失败，无closure交付，不冒已完成。最终保护、工件重开与副本事务精确命令/输入/结果/exit见.runtime/beta2/E20/VERIFICATION.txt与final_validation.json。
-
-### v0.9.0 CI 全矩阵修复（PR #8 首轮 CI 反馈）
-
-editor:moton16，agent:codebuddy（2026-10-09）。推送 PR #8 后 CI 全矩阵报红（ubuntu 3.10/3.11/3.12/3.13 + windows-3.12 五档全 fail，仅 extras 两档 pass），本地 Windows 全量当时是全绿的——本地通过不是 CI 通过的证据。按 job 日志逐条定位，六类失败里**两类是真实产品缺陷**：
-
-1. **py3.13 `stop_watching` 退栈崩溃（真实产品缺陷）**：`_indexer/watch.py` 对三个线程直接 `join(timeout=2)`，而 `start_watching` 存在多条提前返回路径会让线程停在「已构造但未 start」；`Thread.join()` 对未启动线程抛 `RuntimeError: cannot join thread before it is started`，导致 stdio 会话以非零码退出并把 traceback 写进 stderr。改为 `_join_started_thread()`（先判 `ident` 再 join，未启动即视为已结束），三处引用同步；新增 `test_watch_integration.py::test_stop_watching_tolerates_threads_that_never_started`（SimpleNamespace 替身 + 三个未启动线程）作为确定性回归。
-2. **doctor 路径被 160 字符自由文本上限截断（真实产品缺陷）**：路径的判别信息在**尾部**（`.mortis_rag_mcp` 还是 `.vault_mcp`、缓存根在哪一侧），深家目录（CI 容器、长用户名、深层挂载）实测超过 `_FREE_TEXT_LIMIT=160`，截断后「依据 config.toml 在哪一侧判断」的信息又取不到。新增 `_PATH_TEXT_LIMIT=1024`，配置路径/注册表路径/缓存目录/文档库根四处改按该上限输出，异常消息等仍走 160；新增 `test_doctor.py::test_doctor_check_config_keeps_full_path_when_home_root_is_deep`（构造确定 >160 字符的家目录）回归。
-3. **`sqlite_vec` 参数缺依赖时误报「实现回退」**：E20 媒体用例的 `make_indexer(backend="sqlite_vec")` 在核心 lane（不装 extras）会静默回退 memory 后端并被 `assert idx._vector_backend.name == backend` 判失败。补 `pytest.importorskip("sqlite_vec")`，与 `test_vector_backend.py` 既有惯例一致。
-4. **`test_eval_cli_exact_source_contract` 冻结哈希依赖换行形态**：`golden_queries.json` 在 autocrlf=true 的检出（Windows CI）与默认检出里字节不同，`read_bytes()` 哈希把它自己变成唯一的平台相关性来源。改为 `read_text(encoding="utf-8").encode("utf-8")`（通用换行折算成 LF），冻结值不变（等于 LF 形态）。
-5. **`test_issue2_minimal_reproduction` 批式 stdio 依赖后台时序**：一次性喂完 stdin 的会话读到的 `files`/`chunks` 取决于后台线程推进到哪一步（C66 读优先之后尤甚），py3.12 那一档读到 `files=0`。改为 conftest 的 `stdio_polling`：轮询到 `index_state=ready` 且命中非空后，再在同一条会话里做定向统计与检索；用例对人的合同（不得误抛 multiple vaults、不得降级盲搜、solo 不进 excluded_solo）一条未减。
-6. **`test_virtual_read_server` 允许后台监听插进 STALE 判定（py3.13 踩到）**：`_indexer_for` 建库时顺带 `start_watching()`，用例改写物理源文件制造 STALE 后，监听线程可在两次断言之间并发重签源文件、改动文档库可见性，同一份 `allow_stale` 读取在快/慢机器上给出不同结果。该模块的合同是读取判定本身，新增 autouse `no_background_watch` 把监听惰性化；**未改产品读取语义**——若把该竞争当作产品行为来修订，需另行开卡。
-
-本轮本地验证：受影响 13 个测试文件 189 passed / 1 skipped；全量 `.venv` = **1281 passed / 14 skipped / 3 deselected in 149.33s**（较上一轮 +2，正是两个新增回归用例）。py3.13 与非 Windows 内核行为仍只能由 CI 判定：本机只有 py3.10，不替 CI 下结论。
-
-**第二轮 CI（4a14269）**：py3.10/3.12/3.13 转绿，py3.11 与 windows 仍红。① py3.11 `test_read_stale::test_foreground_search_returns_immediately_while_sync_blocked` 断言 `indexing_in_progress is True` 拿到 None —— 深挖后是**第三个真实产品缺陷**：`try_sync_with_guard()` 直接调 `_sync_locked()`，而「索引在飞」的 `_indexing` 只在监听线程的 `_run_sync_quietly` 包装里置位，于是从守护式入口进入的同步对 `kb_search`/`kb_stats` 完全不可见，客户端会把同步期间的部分结果当成终态（C66 读优先契约的静默漏洞）。改为在 `_sync_locked()`（所有真同步的共同内层）置位并保存/恢复旧值；新增 `test_read_stale.py::test_guarded_sync_is_visible_as_indexing` 钉住该入口。同时该用例原先卡的是 `_sync_locked` 本身，等于先掐掉进度标记再断言能看见它，改为卡内层 `_sync_locked_impl`。② windows 仍红的 eval CLI 是上一处改了一半：`GOLDEN.read_bytes() == before` 的收尾比较还留在原始字节上（autocrlf 检出是 CRLF），统一走 `_golden_bytes()` 换行折算 helper。
-**第三轮 CI（262bb94）**：py3.10/3.11/3.13/windows 转绿，py3.12 剩 `test_kb_read_chunkid::test_stdio_search_and_read_chunk_id`（`assert 0 > 0`：批式 stdio 在冷启动阶段读到 0 chunks），与第 5 条同源，改为轮询到就绪后再在同一条会话里做 chunk_id 精读，断言一条未减（本地连跑三遍 21 passed）。
-**第四轮 CI（65ba598，测试-only）= 全矩阵 7/7 全绿**：ubuntu 3.10/3.11/3.12/3.13、windows-3.12、extras ubuntu/windows 全部 pass。本地全量 1282 passed / 14 skipped / 3 deselected。
-**遗留风险（不在本次声称已修）**：仓库还有若干「批式 stdio 一次性喂完 stdin」的老用例（`test_scoped_search` 的其余三条、`test_registry_server`、`test_subvaults` 等）共享同一类冷启动时序依赖，本次只修了实际报红的三个；它们此前长期绿，但理论上仍会随机器的负载漂移。若要彻底收敛需单开一卡批量改造，不在发版收尾范围内。
-
-**第五、六轮（52fbd75 / d33a9f2）：同类残余 flakes 收口**。第五轮是**只改文档**的提交（被测代码与第四轮全绿时完全相同），py3.13 仍红在 `test_exact_terms::test_exact_terms_combined_with_budget_bytes`（0 chunks）——证明这不是我改出来的，而是「kb_init 只把首建丢进后台线程、随后一次 `sync()` 也可能读到空索引」的既有竞态。据此把三个文件里重复的 `_kb_init_ready`（`test_exact_terms` / `test_compact_search` / `test_budget_bytes`，共 19 处调用）统一改为「重试 sync 直到切片可见，上限 10s」，第六轮又按同一判据修掉 `test_search_oracle::test_server_search_dispatch_delegation`（它连 sync 都没做，纯靠后台首建抢跑）。
-**第七轮 CI（d33a9f2）= 全矩阵 7/7 全绿**（ubuntu 3.10/3.11/3.12/3.13、windows-3.12、extras ×2）。本地最终全量 1282 passed / 14 skipped / 3 deselected in 152.84s。**仍未消除的残余风险**：同类「依赖后台首建抢跑」的用例在仓库里还有（上面列出的批式 stdio 几处），本轮只在**实际报红**的地方加固；如需彻底收敛应单开一卡做全仓改造，不在发版收尾范围。
-
-### v0.9.0 发版收尾：许可证转 Apache-2.0、候选包重建、隔离安装与 MCP 冒烟
-
-editor:moton16，agent:codebuddy（2026-10-09）。基线 HEAD `4fcde07`（E20 收尾提交，分支 feat/v0.9.0-lane-ab）。
-
-**许可证 MIT → Apache-2.0**：`LICENSE` 整篇替换为 Apache License 2.0 全文（201 行，含 END OF TERMS AND CONDITIONS 与附录 Copyright 2026 Moton）；新增 `NOTICE` 披露可选 extras 的第三方许可（pymupdf AGPL-3.0/商业、pypdf BSD-3、python-docx/pptx/openpyxl MIT、Pillow HPND、sqlite-vec MIT、numpy BSD-3），并声明组合分发责任自负。`pyproject.toml` 改 PEP 639 `license = "Apache-2.0"`、`license-files = ["LICENSE", "NOTICE"]`，`[docs]` extra 注释同步改为「非 Apache-2.0 授权范围，见 NOTICE」。`README.md` / `README_EN.md` 徽章与 License 段改写，`CHANGELOG_user.md` 0.9.0 条目日期改 2026-10-09、去掉「尚未正式发布」口径并新增 Changed：许可证变更（v0.8.1 及更早仍为 MIT，已发布版本授权不变）。`docs/Changelog_developer.md` 既有历史条目按纪律未回改。
-
-**候选包重建**：清掉 E17 遗留 `build/` 与 `mortis_rag_mcp.egg-info`；PATH 解释器（python 3.10.11）无 `venv` 模块，PEP 517 隔离不可用，改用 `python -m build --no-isolation --outdir dist`（本机 setuptools 82.0.1 / wheel 0.46.3 满足 build-system requires setuptools>=77）。产物 wheel 49 项（42 个 py 模块）、sdist 176 项（含 LICENSE/NOTICE/README.md/pyproject.toml/tests）。METADATA 为 Metadata-Version 2.4，`License-Expression: Apache-2.0`，两条 `License-File`；wheel `dist-info/licenses/LICENSE` 实测 201 行且含 END OF TERMS。SHA256：wheel `1C80CE51905B40DA5F8E3144B94BDEFB0B6AE72F4E5FF661E3E28182549008AC`、sdist `3CD65F86788231D77A35C757D663A961CBD7F05182DF3DC666C2789F33D82FC9`。
-**该候选包已被后续 CI 修复（`indexer._sync_locked` 置位）作废**：下面三轮修完后按 HEAD `262bb94` 重建，最终候选包 SHA256 为 wheel `2C5EDCF89462BEC9646561C3B01D0AD22F81912971BBBB78D04C7018D9E0A0AC`、sdist `A2C734EB88F8CAA5CF403F7092AB86793A13AAAFB017BECD1914110AF9EC4D93`；最后一笔 `65ba598` 只改测试，包内 42 个 `.py` 与 `262bb94` 逐字节一致，故候选包仍对应最终 HEAD。最终候选包重新隔离安装并重跑两场景冒烟（static 384 维 + EG2 768 维），rc=0、stderr 空、16 工具、kb_init/kb_search/kb_read/kb_list 全通。
-
-**隔离安装**：同一原因无法建 venv（`.venv` 亦无 pip/ensurepip），改为 `pip install --no-deps --target .runtime/ship/site <wheel>`，以 PYTHONPATH 指向该 site、cwd 置于 `.runtime/ship`，`import mortis_rag_mcp` 落在安装副本且 `__version__=0.9.0`、`importlib.metadata` 的 License-Expression=Apache-2.0、License-File=['LICENSE','NOTICE']，证明源码树零参与与零运行时依赖。sdist 另以 `--no-build-isolation --target .runtime/ship/site-sdist` 安装并导入通过。
-
-**MCP 与关键功能冒烟**：脚本 `.runtime/ship/smoke.py` 起安装副本 `site\bin\mortis-rag-mcp.exe --serve-mcp-stdio`，每个场景独立 home/registry/cache（`MORTIS_RAG_REGISTRY`/`MORTIS_RAG_CACHE_DIR`/`MORTIS_RAG_NO_STATUS_HOOK=1`），不碰真实 `~/.mortis_rag_mcp`。两场景均 rc=0、stderr 空、无 JSON-RPC error 与 isError：① static 离线静态向量（缓存落 `.384.` vec.bin 905B）；② external 本机 EG2 `http://127.0.0.1:8000/v1/embeddings`（model embeddinggemma2、dimension 768、send_dimensions=false，缓存落 `.768.` vec.bin 11882B，证明真实端点出向量而非静默回退）。每场景完成 initialize（protocolVersion 2025-06-18、serverInfo version 0.9.0）、notifications/initialized、ping、tools/list（16 个工具，含 kb_read_media）、kb_init（2 个 md）、kb_search 轮询至就绪并命中、kb_read（60 字）、kb_list。
-
-**全量回归**：`.venv` `pytest -q --basetemp=.runtime/ship/pytest`（PYTHONHASHSEED=0、TEMP 钉 .runtime）= **1279 passed / 14 skipped / 3 deselected in 136.20s**，与 E20 最终默认层逐项一致，许可证与 pyproject 改动未影响结果。
-
-**未执行 / 待裁定**：push / PR / tag 推送 / GitHub Release / PyPI 发布均未授权、未执行。sdist 内 `tests/` 只含 `test_*.py`，未含 `conftest.py` 与 fixtures（既有打包行为，本轮未改），sdist 单独跑测试不可用。**许可证变更需全体著作权人同意**：`git shortlog -sne --all` 为 moton16（156）、Vodyanitsaaa <vodyanitsa@foxmail.com>（50）、Moton（3）；第二身份是否与主人同一人未经确认，若另有其人，须先取得其对 Apache-2.0 再授权的同意（或剔除其贡献）后再对外分发。
