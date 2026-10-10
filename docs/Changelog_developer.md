@@ -7,90 +7,6 @@
 
 ---
 
-### [E18 文档整合、收尾与内容差异报告] — moton16,2026-10-09,CodeBuddy,DeepSeek-V4.1-Flash
-
-按用户侧 / 开发者侧分工对 v0.9.0 文档做一致性整合与发布前收尾，**不改代码逻辑、不改测试断言、不做任何发布动作**（无 push / PR / tag / release / publish）。本批只动文档，合并为一个提交（同任务连续提交按本文档开头约定合并整理）。逐项盘点、两个对比基准的原始 git 证据与全部结论见本地忽略目录 `docs/v0.9.0/V0.9.0_CHANGE_DIFF_2026-10-09.md`（本机交付，不在本提交内）。
-
-**用户侧文档（只讲功能增减与体验，无技术细节）**
-
-- `README.md` / `README_EN.md`：候选节新增「音频转录与音频转码能力已移除」——`[audio]` 段与 `audio_enabled` 开关一并消失，旧配置留着会被忽略（不报错、不影响其它配置），建议删除；删去已不存在的「完整音频 adapter/解码装配」待验收表述；媒体待验收边界改写为「文字检索图片已在本机跑通 / 真实客户端显示与付费端点通用装配未验收」；MinerU 免登通道补注「只取回解析出的文字，不带文档里的图片」；核心特性表去掉「完整音频生产链」。
-- `QUICKSTART_user.md`：§0.4 新增第 5 条（音频能力移除与旧配置键处理）；媒体段落按实际验证边界改写；MinerU 节补注免登只回文字；**修正「解析产物自动存放于 `.mortis-parsed/`」**——0.9 起默认落本机文档库（virtual），只有显式旧镜像模式才在库内写 Markdown。
-- `CHANGELOG_user.md`：0.9.0 条目新增 `### Removed`（音频转录/转码移除 + 用户侧迁移影响），`### Upgrade` 补一条「旧键可安全删除」；顶部候选说明去掉「完整音频接入」。
-
-**开发者侧文档（技术流水与实现细节）**
-
-- `docs/PROJECT_GUIDE.md`：§0.9 候选增量更新两条现状（真实载体跨模态「文字检索图片」已跑通；sqlite-vec 已装入本机两套解释器并跑通 `vec0` KNN 与 `extras` lane，远端 CI 仍未 push 故无链接）；§一项目定位把 `.mortis-parsed/` 镜像口径改为 virtual 文档库（`cache.dir/<namespace>/doc_store/`）；§3.1 与 §六工具面 15→16 并补 `kb_read_media` 行（必填 vault_path/source/revision_id/occurrence_id，`metadata`/`inline`、`preview`/`original`、`budget_bytes` 默认 2097152 上限 8388608）、修正 `kb_ingest` action 枚举为 `submit/status/pending/retry` 并写明 retry 语义；§4.3/4.4/4.5/4.8/4.10/4.11 行数按实测更新（426/398/1695/2307/937/4842），§4.11 改写任务生命周期与 `storage` 落点、新增免登通道「只返回 markdown」的协议事实（并说明原 mock 断言为何误导）；新增 §4.12 `doc_store.py`（4099 行，版本化文档库：事实与派生索引分离、OS mutation lock、revision pin、purge 边界）；§七配置参考补 `[chunking]`/`[doc_store]`/`[media]`/`[diag]` 四节与 `[ingest]` 0.9 键、`[embedding]` 模板/media 声明组；§八磁盘布局区分 virtual/legacy 并补 doc_store；§十一测试体系 56→106 个文件、skip 归类改写；§14.2 版本历史速览补齐 0.7.0–0.9.0；§14.3 新增文档库与媒体声明两条不变量。
-- `docs/Quick-start_developer.md`：仓库地图行数与模块清单按实测更新（新增 `doc_store.py` / `media_providers.py` / `paid_requests.py` / ingest 子模块，包体 ~25260 行 / 42 个 .py）；§5 模块表 15→16 并补 doc_store 与 media/provider 两行；§7 测试文件数 56→106；§10 checklist 改为「靶向 pytest 全绿，全量回归交 CI」。
-- `docs/Docs_Folder-descriptions.md`：**删除错误口径**「`docs/v0.8.1/` 是 `.gitignore` 版本目录特例、随版本入库」——用 `git check-ignore -v` 与 `git ls-files docs` 核实：实际规则是 `docs/*` 加四行白名单，`docs/v0.8.1/**` 与 `docs/v0.9.0/**` 均未被跟踪（该例外由 `21722ef` 撤销，文件仍在磁盘但已解除跟踪、仍被忽略）；补文档分工说明。
-- `skills/mortis-rag-mcp/SKILL.md`：候选增量去掉「完整音频 adapter/解码装配」并补「音频转录/转码链路已物理移除」；媒体待验收边界改为「文字检索图片已本机验证 / 真实端点通用装配与宿主显示未验收」。
-
-**未改动（有意保留）**：代码逻辑与测试断言（含 `tests/test_version_sync.py`、`tests/test_beta2_docs_contract.py` 断言的版本徽章、Skill frontmatter/标题、用户 changelog 标题与 CLI 文案）；`Changelog_developer.md`、`PROJECT_GUIDE.md`、`Quick-start_developer.md` 的历史条目按纪律不改写——例如历史批次里「仍有缺口：完整 AudioConfig/adapter/解码装配」记录的是当日状态，已被 E17 物理移除取代，新结论写在本条与 E17 条，不回改历史。
-
-**验证**（`.venv/Scripts/python.exe`；`--basetemp` 钉仓库 `.runtime`，TEMP/TMP/TMPDIR 全隔离）：
-
-- 配置与版本只读探针：`load_config(config/app.toml.example)` 正常加载、10 个段全部被识别、示例中无被拒键；`hasattr(AppConfig,'audio')=False`、`AudioConfig` 类不存在、`IngestConfig.audio_enabled` 不存在；仍带 `[audio]`/`audio_enabled` 的旧配置可正常加载（被静默忽略）；带 UTF-8 BOM 的配置 `cache.enabled=true`、`reranker.enabled=false`（`b328dc9` 回归）。版本单一真源 pyproject = 包 `__version__` = `SERVER_INFO["version"]` = `0.9.0`，`_tool_definitions()` 实测 16 个工具。
-- 文档契约靶向：`pytest -q tests/test_version_sync.py tests/test_beta2_docs_contract.py` = **9 passed**，exit0。
-- 核心全量（本窗口唯一一次）：**1140 passed / 14 skipped / exit0**（收集 1154；14 个 skip = `.venv` 缺 docs/media 可选依赖 12 个（pymupdf/docx/pptx/openpyxl/PIL/fitz）+ 非 Windows 平台用例 2 个），与 E17 终态计数完全一致，文档改动未影响用例数与结果。
-- 边界与授权：`.gitignore` 未改、未 `git add -f`、`docs/v0.9.0/**` 与 `.runtime/**` 未入库；真实计费 API 调用 0、真实知识库/用户配置写操作 0、安装包 0、push/PR/tag/release 均未执行。待授权项与开放项清单见统一入口 §18 与差异报告 §9。
-
----
-
-### [E17 架构收敛：物理清除 ffmpeg 音频解码与 Whisper 转录链路] — moton16,2026-10-09,CodeBuddy,DeepSeek-V4.1-Flash
-
-按统一入口 §16 架构收敛裁定，把音频转码 / 转录链路整体移出核心代码库（不新增业务功能，只做删除与去悬空）：
-
-- **删除模块**：`mortis_rag_mcp/ingest/audio.py`（PCM 分段/解码接缝/`parse_audio` 编排）、`mortis_rag_mcp/ingest/transcription.py`（OpenAI Whisper 转录 adapter 与付费闸门装配点）。
-- **配置面**：移除 `config.AudioConfig`、`AppConfig.audio`、`IngestConfig.audio_enabled`、`_load_audio` 与 `[audio]` 解析；`config/app.toml.example` 删除 `[audio]` 段与 `audio_enabled`。
-- **装配面**：`server.py` 删除 `_transcription_adapter`/`_audio_decoder` 与转录 paid_guard 装配，`make_ingest_manager` 不再传 `audio_config/audio_adapter/audio_decoder`；`doctor.py` 删除 `audio_enabled`/`transcription` 报告字段；`ingest/worker.py` 删除 `AUDIO_EXTS`/`AUDIO_ROUTE_UNSUPPORTED`、音频分卷与转录 subjobs 调度、段级 audio checkpoint 与 audio 指纹。
-- **测试**：删除 `test_audio_ingest.py`、`test_audio_production_adapter.py`、`tests/fixtures/transcription_contract.json`；`test_e15_service_contracts.py` 移除转录子出口用例；`test_lane_be_config.py`/`test_route_execution_upgrade.py` 移除音频配置断言。混合文件去音频后更名为 `test_virtual_worker_queue.py`、`test_subjob_checkpoint_contract.py`（保留非音频合同用例，未降低覆盖口径）。
-- **保留（与转录无关）**：音频原生 embedding transport（`media_providers.py`）、音频 occurrence 展示（`_server/media_dispatch.py`、`_indexer/media.py::merge_audio_segments`）、`doc_store` 的 `audio_frames/audio_ms` range kind（读旧库 checkpoint 兼容）。
-
-E17 同一窗口另外落地三项真实验收发现：
-
-- `5e37bc5` **test(e2e)**：本机 EG2 文本→图片用例硬编码端口且无载体门控，缺载体时是**失败**而非 skip（CI 必红）。改为 `MORTIS_EG2_MEDIA_ENDPOINT`（默认 `127.0.0.1:8000`）并加可达性 skip，保留载体在线时的强断言。
-- `50793f3` **test(e2e)**：新增零 mock 跨模态回归——真实 PNG → `HttpMediaTransport` → EG2 Tier2 图文向量 → native chunk → 图片查询自命中（cos>0.999）+ 文本查询召回。载体在线实测 2 passed。
-- `57caeca` **test(mineru)**：真实端点实测确认**免费 agent 通道只返回 markdown**（无图片字节 / 无 `content_list.json`/page_map），原 mock 用例名与文档暗示「免登通道可提取图片与锚点」属误导，已改名+改写说明并新增 `test_agent_channel_protocol_is_text_only` 固定该协议事实。
-- `b328dc9` **fix(config)**：宿主机首用检查复现出真实缺陷——配置文件带 UTF-8 BOM（记事本 / `Set-Content -Encoding utf8` 默认）时会**静默错解**：首个 `[section]` 头丢失、段内键泄漏到顶层，`[cache] enabled = true` 被 flat-legacy 别名读成 `reranker.enabled = True`，doctor 对合法配置误判 ❌ BROKEN。`_read_toml` 改为 `utf-8-sig` 解码，并加 BOM/非 BOM 等价回归。
-
-**验证**（本窗口，`.venv/Scripts/python.exe`，basetemp 与 TEMP/TMP/TMPDIR 全隔离）：
-
-- 音频清除静态探针 PASS（模块导入 + 被清除符号/签名/成员缺席）。
-- 受影响靶向：97 passed/4 skipped 与 158 passed/2 skipped，均 exit0。
-- 全量 run1（修复载体门控前）1128 passed/17 skipped/**1 failed**（EG2 载体未运行，记录保留不改写）；run2（修复后）1128 passed/18 skipped；run3（载体在线）1132 passed/17 skipped；**run4（终态，装入 sqlite-vec 后）1140 passed / 14 skipped，exit0**；载体在线复跑 `test_text_to_image_search_e2e.py` 为 2 passed。
-- 发布候选（离线、隔离 src、setuptools 后端直调）：wheel 48 项 / sdist 166 项，归档卫生 0 项违禁；隔离导入 `ISOLATED_IMPORT_OK 0.9.0`；pyproject = 包 = `server.SERVER_INFO` = 0.9.0。
-
-**sqlite-vec 后端正向检查（主人授权后闭合）**：主人授权安装后，按**本机已有离线 wheel**（`C:\tmp\sqlitevec_probe\sqlite_vec-0.1.9-py3-none-win_amd64.whl`，此前有窗口下载过但**从未装入任何解释器**）以 `--no-index --no-deps` 离线装入 PATH python 与仓库 `.venv`；`vec0` 虚拟表 KNN 实测通过（`SQLITE_VEC_POSITIVE_OK`），本地复刻 CI `extras` lane（`MORTIS_REQUIRE_EXTRAS=1`）`import pymupdf…sqlite_vec` = `EXTRAS_IMPORTS_OK` 且 `test_extra_formats.py + test_vector_backend.py` = **11 passed**，核心全量比 run3 多跑通 8 个此前被 `importorskip` 跳过的磁盘后端用例。首轮记 BLOCKED 的根因是只查了两套解释器的 `pip show`——「下载过」≠「装上了」。`pyproject.toml` 的 `vec` extra 与 CI `extras` lane 原样保留。
-
-**主人裁定（2026-10-09）**：远端 CI、≥100 问七类质量语料、真实旧库升级演练三项属**需要实际使用才能知道的结论**，按 PASS 收口、不再作为阻塞项；本窗口不为它们编造本地证据（CI 未推送故无链接、质量门禁仍只记 `fixture_measured`、旧库只有合成升级/快照恢复证据），逐项区分见 `docs/v0.9.0/E17_FINAL_ACCEPTANCE_2026-10-09.md` §9/§10 与统一入口 §17.6。
-
-**仍未闭合**：push/PR 未经主人显式授权 → 分支未推送、CI 未触发；宿主真实 image/audio 显示验收需真实 MCP 客户端；MinerU v4 带图 occurrence/正文锚点需授权商业 key。
-
----
-
-### [beta2 第四批与前三批局部复核] — moton16,2026-10-08,Codex
-
-只做本地候选准备，未调用真实 API/迁移真实资产/执行远端 Git 或发布。只读增量复核由内置 gpt-6.1-sol/high 完成，主流程核实与修复。
-
-E14 本地目标0.9.0：同步包、pyproject、SERVER_INFO衍生版本、README badges、Skill标题/frontmatter和用户候选changelog；stdio smoke从包版本取断言。未创建 tag/release，候选构建/回归证据由统一入口另记，不预写外部CI绿。
-
-整合末 `8866bb5` 一次全量实际为1084passed/20failed/13skipped（286.09s、exit1），保留原记录。
-`d88b234` 修复读轮询自己不断enqueue而永远rebuilding：`for_read=True`仅机会性读刷新在刚完成时返回False；显式请求/import/文件事件仍保pending，原E04接受承诺不变。import5/read_stale7/txt3/multivault9/compact7通过。
-后续靶向合同对齐：legacy字符上限/dedup/v073 golden显式mode，golden原数据不改且只剥新增embedding_key；
-scanning spy改实际扫描入口；迁移测试在临时home去掉隔离override；旧fake checkpoint换真实SQLite record_subjob(done)；
-virtual不可用错误与后台stdio等待按现行接口；estimated保尾空白/可变metadata预算按实际包络，短块预览不承诺固定压缩比（长正文压缩unit仍锁比例）。
-涉及12个失败文件分别靶向112passed/1skip，另txt3passed，关闭原20个失败点；未重复跑全量，不能将旧候选全量记录改为最终候选全绿。
-
-- `f4577c1`：PPTX 正常 printerSettings 二进制是惰性打印元数据，不应按嵌入 OLE 拒绝；仅精确豁免此路径，真实 PDF/Office/Pillow 正向5例通过。
-- `c11f762`（E11）：必需 docs/media/vec CI lane；离线检索拒外部配置；成对质量/资源工具与合同测试。2问指标 fixture 不是七类100问验收；Python tracemalloc 不冒充 RSS。
-- `4e69b1d`：retry 启动 idle worker；cancelled 重试清失去 blob 保护的段 checkpoint；9个 management 和5个 checkpoint用例通过。
-- `5f5b4c0`：import 最终忙态/gate重核和generation发布复用同一 mutation lock，保原补偿；6个 import安全用例通过。
-- `d631ff9`：native 缺向量不走文本补嵌、媒体 fingerprint 进入签名、媒体chunk补 SHA、固定 revision occurrence 分页、完整同步清磁盘派生 orphan。14个媒体接线用例通过；真实 sqlite_vec 本地缺包，新增磁盘回归待必需 CI。
-- `9050ed7`：第二轮局部证伪再现重开 chunker/profile 后旧 pending 覆盖 native，以及不支持MIME误停 proxy；native ID 含媒体 profile、仅补缺向量、仅成功native停其proxy。3个靶向+7个codec+5个sync通过。
-- E12：真实16工具/配置合同、合成 legacy 缓存升级/快照恢复与源/备份hash不变；同步 virtual/import/retry/请求CLI/升级边界；取消 Agent 缺 STATUS 即自动 doctor。相应提交由统一入口登记，不伪造未产生的 SHA。
-- `8cd52ca`：真实示例未设API环境变量触发 `_env` 的缺失 sys import；最小修正+1个unset用例+33个配置用例通过。E12提交 `ccdb9d0` 的文案/升级3例、virtual配置33例、stdio5例、import6例通过。
-
-仍有实际范围缺口：真实媒体 transport、完整 AudioConfig/adapter/解码装配、独立图片摄取、真实质量/宿主验收；legacy 极端多格截失未静默改兼容语义。完整候选回归/构建结果在后续交接登记，不预写通过。
-
 ### D0 — Vodyanitsaaa,2026-9-13,WorkBuddy(工作区改动，未commit),WorkBuddy,kimi-k3-1 — docs: 开发者文档体系建立
 - **新增 `docs/Execution-plan_developer.md`**：v0.7.0 代码级执行方案。P0 检索评测 harness（scripts/eval_search.py + 金标准查询集）→ P1 定向检索路由（registry 加 description 字段 + kb_describe 工具 + MCP initialize instructions + kb_search 描述路由纪律 + fan-out hint + SKILL.md 5.0 判定表化重写）→ P2 PDF/Office 摄取层（**默认关闭**、按需异步 kb_ingest、内嵌 MinerU 双通道客户端 v4/Agent免登、产物收 `.mortis-parsed/`、HTML 表格原子块保护 + 小表转 pipe、pymupdf 兜底）→ P3 可选增强（title/alias boost、per-source 限流，eval 数据决定是否做）。每步含可直接粘贴的代码、测试清单、commit 切分与验收标准。
 - **补全 `docs/Quick-start_developer.md`**（原为空胚）：项目概况、架构分层图、索引/检索/tools-call 三条数据流、8 个模块职责与改动坑位表、缓存布局、测试约定、开发约定（文档分工/原子写/fail-closed/Breaking 流程）、常见任务食谱（加工具/改检索/加配置）、上手 checklist。
@@ -1147,7 +1063,7 @@ virtual不可用错误与后台stdio等待按现行接口；estimated保尾空�
 > （request_id/kind/state/attempt）与「未决暂停」的 `embedding_paused_reason`
 > —— 否则「嵌入静默暂停」看起来像坏了；该可观测性也是 D5（解绑入口）的前置。
 
-### v0.9.0 集中 review（第三窗口；未单独成提交，见 `Lane_CDE_REVIEW_2026-10-08.md`）
+### v0.9.0 集中 review（第三窗口；未单独成提交，见 `Lane_CDE_REVIEW_2026-10-08.md`） — moton16,2026-10-08,Codex,GPT-6.1-Sol
 
 > **范围**：只读核对 + **3 轮对抗式独立证伪**（子代理全新上下文）+ 只修 review 确认的核心故障。
 > 未做新功能、未加通用框架、未动版本号与用户 changelog、未并入 v0.8.2 DCGFH。
@@ -1266,7 +1182,93 @@ virtual不可用错误与后台stdio等待按现行接口；estimated保尾空�
 
 ---
 
-## E20 运维缺陷与诊断（2026-10-09 / America_New_York）
+### [beta2 第四批与前三批局部复核] — moton16,2026-10-08,Codex
+
+只做本地候选准备，未调用真实 API/迁移真实资产/执行远端 Git 或发布。只读增量复核由内置 gpt-6.1-sol/high 完成，主流程核实与修复。
+
+E14 本地目标0.9.0：同步包、pyproject、SERVER_INFO衍生版本、README badges、Skill标题/frontmatter和用户候选changelog；stdio smoke从包版本取断言。未创建 tag/release，候选构建/回归证据由统一入口另记，不预写外部CI绿。
+
+整合末 `8866bb5` 一次全量实际为1084passed/20failed/13skipped（286.09s、exit1），保留原记录。
+`d88b234` 修复读轮询自己不断enqueue而永远rebuilding：`for_read=True`仅机会性读刷新在刚完成时返回False；显式请求/import/文件事件仍保pending，原E04接受承诺不变。import5/read_stale7/txt3/multivault9/compact7通过。
+后续靶向合同对齐：legacy字符上限/dedup/v073 golden显式mode，golden原数据不改且只剥新增embedding_key；
+scanning spy改实际扫描入口；迁移测试在临时home去掉隔离override；旧fake checkpoint换真实SQLite record_subjob(done)；
+virtual不可用错误与后台stdio等待按现行接口；estimated保尾空白/可变metadata预算按实际包络，短块预览不承诺固定压缩比（长正文压缩unit仍锁比例）。
+涉及12个失败文件分别靶向112passed/1skip，另txt3passed，关闭原20个失败点；未重复跑全量，不能将旧候选全量记录改为最终候选全绿。
+
+- `f4577c1`：PPTX 正常 printerSettings 二进制是惰性打印元数据，不应按嵌入 OLE 拒绝；仅精确豁免此路径，真实 PDF/Office/Pillow 正向5例通过。
+- `c11f762`（E11）：必需 docs/media/vec CI lane；离线检索拒外部配置；成对质量/资源工具与合同测试。2问指标 fixture 不是七类100问验收；Python tracemalloc 不冒充 RSS。
+- `4e69b1d`：retry 启动 idle worker；cancelled 重试清失去 blob 保护的段 checkpoint；9个 management 和5个 checkpoint用例通过。
+- `5f5b4c0`：import 最终忙态/gate重核和generation发布复用同一 mutation lock，保原补偿；6个 import安全用例通过。
+- `d631ff9`：native 缺向量不走文本补嵌、媒体 fingerprint 进入签名、媒体chunk补 SHA、固定 revision occurrence 分页、完整同步清磁盘派生 orphan。14个媒体接线用例通过；真实 sqlite_vec 本地缺包，新增磁盘回归待必需 CI。
+- `9050ed7`：第二轮局部证伪再现重开 chunker/profile 后旧 pending 覆盖 native，以及不支持MIME误停 proxy；native ID 含媒体 profile、仅补缺向量、仅成功native停其proxy。3个靶向+7个codec+5个sync通过。
+- E12：真实16工具/配置合同、合成 legacy 缓存升级/快照恢复与源/备份hash不变；同步 virtual/import/retry/请求CLI/升级边界；取消 Agent 缺 STATUS 即自动 doctor。相应提交由统一入口登记，不伪造未产生的 SHA。
+- `8cd52ca`：真实示例未设API环境变量触发 `_env` 的缺失 sys import；最小修正+1个unset用例+33个配置用例通过。E12提交 `ccdb9d0` 的文案/升级3例、virtual配置33例、stdio5例、import6例通过。
+
+仍有实际范围缺口：真实媒体 transport、完整 AudioConfig/adapter/解码装配、独立图片摄取、真实质量/宿主验收；legacy 极端多格截失未静默改兼容语义。完整候选回归/构建结果在后续交接登记，不预写通过。
+
+---
+
+### [E17 架构收敛：物理清除 ffmpeg 音频解码与 Whisper 转录链路] — moton16,2026-10-09,CodeBuddy,DeepSeek-V4.1-Flash
+
+按统一入口 §16 架构收敛裁定，把音频转码 / 转录链路整体移出核心代码库（不新增业务功能，只做删除与去悬空）：
+
+- **删除模块**：`mortis_rag_mcp/ingest/audio.py`（PCM 分段/解码接缝/`parse_audio` 编排）、`mortis_rag_mcp/ingest/transcription.py`（OpenAI Whisper 转录 adapter 与付费闸门装配点）。
+- **配置面**：移除 `config.AudioConfig`、`AppConfig.audio`、`IngestConfig.audio_enabled`、`_load_audio` 与 `[audio]` 解析；`config/app.toml.example` 删除 `[audio]` 段与 `audio_enabled`。
+- **装配面**：`server.py` 删除 `_transcription_adapter`/`_audio_decoder` 与转录 paid_guard 装配，`make_ingest_manager` 不再传 `audio_config/audio_adapter/audio_decoder`；`doctor.py` 删除 `audio_enabled`/`transcription` 报告字段；`ingest/worker.py` 删除 `AUDIO_EXTS`/`AUDIO_ROUTE_UNSUPPORTED`、音频分卷与转录 subjobs 调度、段级 audio checkpoint 与 audio 指纹。
+- **测试**：删除 `test_audio_ingest.py`、`test_audio_production_adapter.py`、`tests/fixtures/transcription_contract.json`；`test_e15_service_contracts.py` 移除转录子出口用例；`test_lane_be_config.py`/`test_route_execution_upgrade.py` 移除音频配置断言。混合文件去音频后更名为 `test_virtual_worker_queue.py`、`test_subjob_checkpoint_contract.py`（保留非音频合同用例，未降低覆盖口径）。
+- **保留（与转录无关）**：音频原生 embedding transport（`media_providers.py`）、音频 occurrence 展示（`_server/media_dispatch.py`、`_indexer/media.py::merge_audio_segments`）、`doc_store` 的 `audio_frames/audio_ms` range kind（读旧库 checkpoint 兼容）。
+
+E17 同一窗口另外落地三项真实验收发现：
+
+- `5e37bc5` **test(e2e)**：本机 EG2 文本→图片用例硬编码端口且无载体门控，缺载体时是**失败**而非 skip（CI 必红）。改为 `MORTIS_EG2_MEDIA_ENDPOINT`（默认 `127.0.0.1:8000`）并加可达性 skip，保留载体在线时的强断言。
+- `50793f3` **test(e2e)**：新增零 mock 跨模态回归——真实 PNG → `HttpMediaTransport` → EG2 Tier2 图文向量 → native chunk → 图片查询自命中（cos>0.999）+ 文本查询召回。载体在线实测 2 passed。
+- `57caeca` **test(mineru)**：真实端点实测确认**免费 agent 通道只返回 markdown**（无图片字节 / 无 `content_list.json`/page_map），原 mock 用例名与文档暗示「免登通道可提取图片与锚点」属误导，已改名+改写说明并新增 `test_agent_channel_protocol_is_text_only` 固定该协议事实。
+- `b328dc9` **fix(config)**：宿主机首用检查复现出真实缺陷——配置文件带 UTF-8 BOM（记事本 / `Set-Content -Encoding utf8` 默认）时会**静默错解**：首个 `[section]` 头丢失、段内键泄漏到顶层，`[cache] enabled = true` 被 flat-legacy 别名读成 `reranker.enabled = True`，doctor 对合法配置误判 ❌ BROKEN。`_read_toml` 改为 `utf-8-sig` 解码，并加 BOM/非 BOM 等价回归。
+
+**验证**（本窗口，`.venv/Scripts/python.exe`，basetemp 与 TEMP/TMP/TMPDIR 全隔离）：
+
+- 音频清除静态探针 PASS（模块导入 + 被清除符号/签名/成员缺席）。
+- 受影响靶向：97 passed/4 skipped 与 158 passed/2 skipped，均 exit0。
+- 全量 run1（修复载体门控前）1128 passed/17 skipped/**1 failed**（EG2 载体未运行，记录保留不改写）；run2（修复后）1128 passed/18 skipped；run3（载体在线）1132 passed/17 skipped；**run4（终态，装入 sqlite-vec 后）1140 passed / 14 skipped，exit0**；载体在线复跑 `test_text_to_image_search_e2e.py` 为 2 passed。
+- 发布候选（离线、隔离 src、setuptools 后端直调）：wheel 48 项 / sdist 166 项，归档卫生 0 项违禁；隔离导入 `ISOLATED_IMPORT_OK 0.9.0`；pyproject = 包 = `server.SERVER_INFO` = 0.9.0。
+
+**sqlite-vec 后端正向检查（主人授权后闭合）**：主人授权安装后，按**本机已有离线 wheel**（`C:\tmp\sqlitevec_probe\sqlite_vec-0.1.9-py3-none-win_amd64.whl`，此前有窗口下载过但**从未装入任何解释器**）以 `--no-index --no-deps` 离线装入 PATH python 与仓库 `.venv`；`vec0` 虚拟表 KNN 实测通过（`SQLITE_VEC_POSITIVE_OK`），本地复刻 CI `extras` lane（`MORTIS_REQUIRE_EXTRAS=1`）`import pymupdf…sqlite_vec` = `EXTRAS_IMPORTS_OK` 且 `test_extra_formats.py + test_vector_backend.py` = **11 passed**，核心全量比 run3 多跑通 8 个此前被 `importorskip` 跳过的磁盘后端用例。首轮记 BLOCKED 的根因是只查了两套解释器的 `pip show`——「下载过」≠「装上了」。`pyproject.toml` 的 `vec` extra 与 CI `extras` lane 原样保留。
+
+**主人裁定（2026-10-09）**：远端 CI、≥100 问七类质量语料、真实旧库升级演练三项属**需要实际使用才能知道的结论**，按 PASS 收口、不再作为阻塞项；本窗口不为它们编造本地证据（CI 未推送故无链接、质量门禁仍只记 `fixture_measured`、旧库只有合成升级/快照恢复证据），逐项区分见 `docs/v0.9.0/E17_FINAL_ACCEPTANCE_2026-10-09.md` §9/§10 与统一入口 §17.6。
+
+**仍未闭合**：push/PR 未经主人显式授权 → 分支未推送、CI 未触发；宿主真实 image/audio 显示验收需真实 MCP 客户端；MinerU v4 带图 occurrence/正文锚点需授权商业 key。
+
+---
+
+### [E18 文档整合、收尾与内容差异报告] — moton16,2026-10-09,CodeBuddy,DeepSeek-V4.1-Flash
+
+按用户侧 / 开发者侧分工对 v0.9.0 文档做一致性整合与发布前收尾，**不改代码逻辑、不改测试断言、不做任何发布动作**（无 push / PR / tag / release / publish）。本批只动文档，合并为一个提交（同任务连续提交按本文档开头约定合并整理）。逐项盘点、两个对比基准的原始 git 证据与全部结论见本地忽略目录 `docs/v0.9.0/V0.9.0_CHANGE_DIFF_2026-10-09.md`（本机交付，不在本提交内）。
+
+**用户侧文档（只讲功能增减与体验，无技术细节）**
+
+- `README.md` / `README_EN.md`：候选节新增「音频转录与音频转码能力已移除」——`[audio]` 段与 `audio_enabled` 开关一并消失，旧配置留着会被忽略（不报错、不影响其它配置），建议删除；删去已不存在的「完整音频 adapter/解码装配」待验收表述；媒体待验收边界改写为「文字检索图片已在本机跑通 / 真实客户端显示与付费端点通用装配未验收」；MinerU 免登通道补注「只取回解析出的文字，不带文档里的图片」；核心特性表去掉「完整音频生产链」。
+- `QUICKSTART_user.md`：§0.4 新增第 5 条（音频能力移除与旧配置键处理）；媒体段落按实际验证边界改写；MinerU 节补注免登只回文字；**修正「解析产物自动存放于 `.mortis-parsed/`」**——0.9 起默认落本机文档库（virtual），只有显式旧镜像模式才在库内写 Markdown。
+- `CHANGELOG_user.md`：0.9.0 条目新增 `### Removed`（音频转录/转码移除 + 用户侧迁移影响），`### Upgrade` 补一条「旧键可安全删除」；顶部候选说明去掉「完整音频接入」。
+
+**开发者侧文档（技术流水与实现细节）**
+
+- `docs/PROJECT_GUIDE.md`：§0.9 候选增量更新两条现状（真实载体跨模态「文字检索图片」已跑通；sqlite-vec 已装入本机两套解释器并跑通 `vec0` KNN 与 `extras` lane，远端 CI 仍未 push 故无链接）；§一项目定位把 `.mortis-parsed/` 镜像口径改为 virtual 文档库（`cache.dir/<namespace>/doc_store/`）；§3.1 与 §六工具面 15→16 并补 `kb_read_media` 行（必填 vault_path/source/revision_id/occurrence_id，`metadata`/`inline`、`preview`/`original`、`budget_bytes` 默认 2097152 上限 8388608）、修正 `kb_ingest` action 枚举为 `submit/status/pending/retry` 并写明 retry 语义；§4.3/4.4/4.5/4.8/4.10/4.11 行数按实测更新（426/398/1695/2307/937/4842），§4.11 改写任务生命周期与 `storage` 落点、新增免登通道「只返回 markdown」的协议事实（并说明原 mock 断言为何误导）；新增 §4.12 `doc_store.py`（4099 行，版本化文档库：事实与派生索引分离、OS mutation lock、revision pin、purge 边界）；§七配置参考补 `[chunking]`/`[doc_store]`/`[media]`/`[diag]` 四节与 `[ingest]` 0.9 键、`[embedding]` 模板/media 声明组；§八磁盘布局区分 virtual/legacy 并补 doc_store；§十一测试体系 56→106 个文件、skip 归类改写；§14.2 版本历史速览补齐 0.7.0–0.9.0；§14.3 新增文档库与媒体声明两条不变量。
+- `docs/Quick-start_developer.md`：仓库地图行数与模块清单按实测更新（新增 `doc_store.py` / `media_providers.py` / `paid_requests.py` / ingest 子模块，包体 ~25260 行 / 42 个 .py）；§5 模块表 15→16 并补 doc_store 与 media/provider 两行；§7 测试文件数 56→106；§10 checklist 改为「靶向 pytest 全绿，全量回归交 CI」。
+- `docs/Docs_Folder-descriptions.md`：**删除错误口径**「`docs/v0.8.1/` 是 `.gitignore` 版本目录特例、随版本入库」——用 `git check-ignore -v` 与 `git ls-files docs` 核实：实际规则是 `docs/*` 加四行白名单，`docs/v0.8.1/**` 与 `docs/v0.9.0/**` 均未被跟踪（该例外由 `21722ef` 撤销，文件仍在磁盘但已解除跟踪、仍被忽略）；补文档分工说明。
+- `skills/mortis-rag-mcp/SKILL.md`：候选增量去掉「完整音频 adapter/解码装配」并补「音频转录/转码链路已物理移除」；媒体待验收边界改为「文字检索图片已本机验证 / 真实端点通用装配与宿主显示未验收」。
+
+**未改动（有意保留）**：代码逻辑与测试断言（含 `tests/test_version_sync.py`、`tests/test_beta2_docs_contract.py` 断言的版本徽章、Skill frontmatter/标题、用户 changelog 标题与 CLI 文案）；`Changelog_developer.md`、`PROJECT_GUIDE.md`、`Quick-start_developer.md` 的历史条目按纪律不改写——例如历史批次里「仍有缺口：完整 AudioConfig/adapter/解码装配」记录的是当日状态，已被 E17 物理移除取代，新结论写在本条与 E17 条，不回改历史。
+
+**验证**（`.venv/Scripts/python.exe`；`--basetemp` 钉仓库 `.runtime`，TEMP/TMP/TMPDIR 全隔离）：
+
+- 配置与版本只读探针：`load_config(config/app.toml.example)` 正常加载、10 个段全部被识别、示例中无被拒键；`hasattr(AppConfig,'audio')=False`、`AudioConfig` 类不存在、`IngestConfig.audio_enabled` 不存在；仍带 `[audio]`/`audio_enabled` 的旧配置可正常加载（被静默忽略）；带 UTF-8 BOM 的配置 `cache.enabled=true`、`reranker.enabled=false`（`b328dc9` 回归）。版本单一真源 pyproject = 包 `__version__` = `SERVER_INFO["version"]` = `0.9.0`，`_tool_definitions()` 实测 16 个工具。
+- 文档契约靶向：`pytest -q tests/test_version_sync.py tests/test_beta2_docs_contract.py` = **9 passed**，exit0。
+- 核心全量（本窗口唯一一次）：**1140 passed / 14 skipped / exit0**（收集 1154；14 个 skip = `.venv` 缺 docs/media 可选依赖 12 个（pymupdf/docx/pptx/openpyxl/PIL/fitz）+ 非 Windows 平台用例 2 个），与 E17 终态计数完全一致，文档改动未影响用例数与结果。
+- 边界与授权：`.gitignore` 未改、未 `git add -f`、`docs/v0.9.0/**` 与 `.runtime/**` 未入库；真实计费 API 调用 0、真实知识库/用户配置写操作 0、安装包 0、push/PR/tag/release 均未执行。待授权项与开放项清单见统一入口 §18 与差异报告 §9。
+
+---
+
+### E20 运维缺陷与诊断（2026-10-09 / America_New_York） — moton16,2026-10-09,Codex,GPT-6.1-Sol
 
 Codex（本地施工；模型底模未由系统明确标注）。开工 `e35ec03`，用户已批准 E20-FIX/A/B/C/D。
 
@@ -1277,44 +1279,44 @@ Codex（本地施工；模型底模未由系统明确标注）。开工 `e35ec03
 - 隔离证据 `.runtime/beta2/E20/ops/`：正确红回归 9 failed/3 passed；修后 13 passed；registry 20、doctor 35、lane-config 30、missing-env 1、management 9、path-migration 10 passed，均 exit0。初次 fixture 导入名错误及不存在的 test_config.py exit4 原始日志保留，不作缺陷证据。
 - 本批不联网、不安装、不操作真实库/用户配置；后续媒体、摄取、存储和测试施工由主流程继续整合。
 
-### E20 F05/F06 媒体连接与认证收敛
+### E20 F05/F06 媒体连接与认证收敛 — moton16,2026-10-09,Codex,GPT-6.1-Sol
 
 Codex 主流程整合；施工子代理 gpt-6.1-sol/high。resolved media connection 统一 adapter/endpoint/model/dimension 与认证解析；transport/profile/journal 共享真实媒体身份，凭据不纳入 fingerprint，保持既有显式 media key、通用 key、专用 env 与新旧通用 env 优先级。三个 adapter env-only 回归、单字段身份变化及重启缓存对照落地。红回归 15 failed/5 passed，绿回归 20 passed；既有 transport/profile 靶向保留。证据 .runtime/beta2/E20/media/；全部离线 HTTP 边界，不声明真实端点通过。
 
-### E20 registry 并发状态复核补足
+### E20 registry 并发状态复核补足 — moton16,2026-10-09,Codex,GPT-6.1-Sol
 
 Codex 主流程：load/save 读状态与内存快照置于既有 RLock；直接 save 复用既有进程文件锁，保持原锁序/重入策略，避免并发 load 把 unknown 状态改写后放过覆盖写。registry 20 passed、E20 ops 13 passed，exit0；证据 ops/registry-serialized 与 ops/green-serialized。
 
-### E20 F01/F02/F03 存储不变量出口
+### E20 F01/F02/F03 存储不变量出口 — moton16,2026-10-09,Codex,GPT-6.1-Sol
 
 Codex 主流程整合；施工子代理 gpt-6.1-sol/high。已有活动代数据库缺失/零长度显式失败，不创建替代空库；合法首次初始化先建库再发布指针。删除原子推进 change_seq、tombstone 与旧任务栅栏，source_seq 从已有事实生成 source-local CAS，schema/epoch 不变。generation pin 保护必要 committed revision，导出冻结 chunks staging member，并对 backup sequence、引用、最终 pin 做发布前验证，避免其他客户端换缓存后形成混包。原红 8 failed/1 passed，新增 immutable-cache 红2failed；主复核12passed，既有docstore/snapshot/recovery靶向通过。worker CAS消费者与首摄取删除sync补丁在下一批串行整合。证据 .runtime/beta2/E20/store/；不声明真实丢盘/旧用户库已验。
 
-### E20 F04/F08/F09、worker 栅栏与局部冗余
+### E20 F04/F08/F09、worker 栅栏与局部冗余 — moton16,2026-10-09,Codex,GPT-6.1-Sol
 
 Codex 主流程整合；施工子代理 gpt-6.1-sol/high。自动入队保留成功/拒绝部分结果，已有 queued 即使 new_jobs=0 仍唤醒worker；worker在claim后解析前捕获source-local CAS并原样提交。MinerU正文先去BOM/统一换行再算anchor/page坐标，回归对持久occurrence切片；旧raw legacy返回保留。图片 validate_image_source 原sha256字段改用完整流式SHA，parse实际payload另算完整SHA；主复核拒绝过一次header_sha256替名方案，纠正红绿记录保留。worker重复IngestConfig fallback清除，配置真源和导入别名同一性、完整发行包路径核验保留。恒真assert改为解析前/解析中确定性屏障两例。主复核正确性18passed、virtual10passed；兼容auto52/worker6/MinerU23/image10等离线靶向保留。已提交坏坐标/SHA不静默重写，恢复需显式新revision重摄取。
 
-### E20 FLK-01/02 与 TST-07 可靠性出口
+### E20 FLK-01/02 与 TST-07 可靠性出口 — moton16,2026-10-09,Codex,GPT-6.1-Sol
 
 Codex 主流程整合；施工子代理 gpt-6.1-sol/high。stdio复用run_stdio_polling，保留冷启动indexing/empty/retry3并等待settled后同会话精读。vector迁移fixture用确定性SHA非零正交向量，迁移前后failed_files、ID全覆盖、维度与平方和范数均检查，seed0/336靶向通过，原node数不减少。hybrid清除最前两被覆盖死定义：56定义LOC+4分隔空行=60物理LOC，保留后活函数原字节/5assert+2raises及两个nodeid，case delta0；来源注释+1行，净减59LOC。首轮删后副本的方案经主复核纠正，历史日志保留。fixture等其他变化另计，未把所有净LOC等同纯删减。完整原始证据 .runtime/beta2/E20/tests/。
 
-### E20 F07 阶段失败与 F02 生产删除接缝
+### E20 F07 阶段失败与 F02 生产删除接缝 — moton16,2026-10-09,Codex,GPT-6.1-Sol
 
 Codex 主流程整合；施工子代理 gpt-6.1-sol/high。媒体成功必须在数量/映射/向量合同验证后journal成功CAS；明确响应失败复用既有abandoned终态与原因，网络/5xx/429等受理未知保持submission_unknown并禁止自动重传。正文及成功native批次保留，持久媒体失败可跨重启恢复，重试复用正文向量，既有工具/schema未增。主流程串行应用watch诊断与first-ingest pending-job删除栅栏；完整扫描中真正缺源才推进删除，ignore/incomplete/permission均保留。补4对照，红1failed3passed→绿4passed。两次整合偏差（nonmedia source-changed误置failed、无活worker的unverified误置deleted）均修实现保留原stale/unverified断言，不改旧预期。媒体outcome26、virtual_sync25、transport13、paid journal10 passed，exit0。旧错误ready/无native派生数据可显式rebuild重建；unknown必须先人工核实并走既有请求解决入口，不自动补发。
 
-### E20 测试分层、薄弱断言与当前说明
+### E20 测试分层、薄弱断言与当前说明 — moton16,2026-10-09,Codex,GPT-6.1-Sol
 
 Codex 主流程整合；施工子代理 gpt-6.1-sol/high。真实存储分页3/999/1000/1001新增4参数例（16边界断言）；原1001 sync/proxy/links全链保留slow；两不同真实载体合同保留real_carrier。默认快层只排除上述3节点，完整验收显式-o addopts=；未修改远端CI。GAP03 SourcePathError/错误码/零store访问，GAP04 import失败后vectors/FTS/generation/epoch/失败账本与重开恢复，原node保留；薄断言负注入先放过、增厚后失败日志保留。GAPOPS01独立CLI完整source HIT与目录expect MISS两新例，冻结golden不改，当前开发说明订正。主流程修正新增CLI evidence路径误限recovery子目录（红2failed→绿2passed）以支持完整E20 runner。snapshot6、virtual_read24、fast-pagination4passed，exit0；默认节省及完整层成本留最终实测，未把deselect当成算法加速。
 
-### E20 bounded 复核 R01 转正与导出补足
+### E20 bounded 复核 R01 转正与导出补足 — moton16,2026-10-09,Codex,GPT-6.1-Sol
 
 Codex 主流程：真实生产export/import新增copy前另一client覆写与chunks ENOSPC两回归，均先失败。导出vectors只按固定captured chunk ID选择；chunks持久化失败明确拒绝发布，保留此前输出与RAM搜索，不把旧磁盘cache冒充当前snapshot。两例green，snapshot14与store integrity12既有靶向通过。此项合并F03/ADD-09-OPS-3，不另造重复工单；schema/哈希/pin/引用护栏保持。证据 integration/export-durability-red/green及family。
 
-### E20 bounded C01/C02 与磁盘持久化收口
+### E20 bounded C01/C02 与磁盘持久化收口 — moton16,2026-10-09,Codex,GPT-6.1-Sol
 
 Codex 主流程整合；媒体施工子代理 gpt-6.1-sol/high。C01真实TOML+程序化认证并存矩阵24新增例：12先失败，统一resolve_media_auth按raw显式generic选择media专用值/环境/全局回退，文本既有global规则保持。C02本地blob/proxy重试错误先红，逐occurrence核source/revision/profile/occurrence/blob身份并携已验证prefix；memory/sqlite_vec跨重启、五身份字段负对照、revision/profile漂移不复用，共媒体outcome39pass、connection44pass。R02真实disk backend抛错/空集/吞错3红→3绿，last_write_error传递最小定位，未落盘ID留RAM、写成功/真实重开后才清诊断；vector6既有例保留。ops13pass；长basetemp触发doctor既有自由文本截断，新断言保持诊断前缀并在typed resolver校验完整路径，不放宽公有文案保护。完整所有层尚未运行，修后重新测默认再唯一全层。
 
 
-### E20 最终实测、回滚与交付收尾
+### E20 最终实测、回滚与交付收尾 — moton16,2026-10-09,Codex,GPT-6.1-Sol
 
 Codex 主流程（2026-10-09 / America_New_York）。代码候选93c39a50b09ec617a76b1a50f97cc538283cba99：最终默认层1279 passed /14 skipped /3 deselected in98.29s，唯一全层显式-o addopts=解除排除后1282 passed /14 skipped in207.77s，PYTHONHASHSEED=0，均exit0。完整节点1296，较E19新增143/移除1（原源变化一例拆两例），净+142；旧保留节点状态迁移0。默认少执行原slow与两个real_carrier，实测差109.48s（52.69%），不是slow算法加速；全链slow93.80s保留。EG2本地http://127.0.0.1:8000/v1/embeddings两个不同真实载体均passed（10.28s/2.23s）；精确HTTP请求数未埋点，不记为0；真实paid请求0。14skip为12缺docs/media依赖与2非Windows平台例；既有PATH解释器12额外格式/preview/分卷靶向证据独立，不拼接core总数或site-packages。
 
@@ -1369,3 +1371,9 @@ Codex 主流程（2026-10-09 / America_New_York）。代码候选93c39a50b09ec61
 ### 54e3e7c — moton16,2026-10-09,CodeBuddy,DeepSeek-V4.1-Flash — docs(changelog): 按仓库格式重写 v0.9.0 条目
 
 - 本文档此前被写成 `editor:moton16，agent:codebuddy` 的两段散文且**追加在 E20 之后但无规范头**；改为带 `— 用户名,日期,Agent,模型` 头、列涵盖提交的条目（本笔的位置仍有误，见下笔）。
+
+### 0.9.0-changelog-归位 — moton16,2026-10-09,CodeBuddy,DeepSeek-V4.1-Flash — docs(changelog): 存量 0.9.0 条目补规范头并归位到文件末尾
+
+- 补规范头（统一按主人指定的 moton16,<日期>,Codex,GPT-6.1-Sol）：## E20 运维缺陷与诊断（2026-10-09 / America_New_York） 由二级降为三级条目并补头；### v0.9.0 集中 review（第三窗口；未单独成提交，见 \Lane_CDE_REVIEW_2026-10-08.md\） 补 — moton16,2026-10-08,Codex,GPT-6.1-Sol；### E20 ... 系列 10 条（F05/F06、registry、F01/F02/F03、F04/F08/F09、FLK-01/02 与 TST-07、F07 与 F02、测试分层、bounded R01、bounded C01/C02、最终实测）统一补 — moton16,2026-10-09,Codex,GPT-6.1-Sol。
+- 归位：原堆在文件最顶部、与「最新在底部」口径冲突的三条 0.9.0 条目（beta2 第四批 → E17 → E18，按提交时间升序）移到文件末尾区域、E20 系列之前；同时去掉归位过程中产生的重复 \---\ 分隔行。
+- 未动正文内容，未改历史事实；仅头部署名与位置。仍是**段落级组标题**、未带头的一条：## v0.9.0（Lane A–E，C90–C104 + 集中 review；2026-10-07 ~ 2026-10-08）（它标的是一个区段而非单笔提交），是否也改由主人裁定。
