@@ -1435,3 +1435,29 @@ Codex 主流程（2026-10-09 / America_New_York）。代码候选93c39a50b09ec61
 - 分批持久化部分向量（让前导批不重发）才是重复计费的根治，属另一件事。
 - profile 级暂停也只是阻尼器：人工 abandon 后下一轮仍整文件重嵌，可能重复计费一次（`abandon_request` 已显式警告），只是从「每轮自动、无上界」降为「每次人工确认后最多一次」。
 - 未改任何已发布版本号；未提交 tag / Release / PyPI。
+
+### [FIX-issue15-P1] — moton16,2026-10-10,CodeBuddy,Hy4-Preview — perf(sync): 未决付费意图整轮只探查一次 + request_intents 补索引（GitHub issue #15 根因 1）
+
+> **涵盖提交**：`418afeb`
+
+**背景**：issue #15 报告「多库下 `kb_search` 比本地推理后端慢 15~20 倍，且恒定携带 `indexing_in_progress: true` / `index_state: "rebuilding"`」。调研报告 `docs/v0.9.1/PLAN_issue15_perf_2026-10-10.md` 核实出四条独立根因，本批修的是**根因 1（收益最大）**。
+
+**代码改动概况**
+
+1. `mortis_rag_mcp/_indexer/sync_engine.py`（`run_sync`）：把 `media_native_route(owner)` / `media_fingerprint` / `has_unresolved_paid_intents(...)` 从虚拟文档循环体内提到循环外，整轮求值一次。判据输入是 `(kind="media", profile_fingerprint)`，逐 source 完全相同（`media_native_route` 只依赖 `owner.media_provider` 与 `owner._embedding_profile`），故外提**逐 source 等价**。
+2. 同一文件的 `media_native_for_revision`：新增 `unresolved_paid` 可选参数（bool 或零参回调），传入上面那次求值结果，消除该路径上的第二次全表扫描（#12/#13 批次只给它加了零成本短路，未消除付费路径上的重复调用）。
+3. **缓存失效判据（关键，不能省）**：整轮只求一次会的漏洞是「本轮内真的发过一次付费请求且结果未知」时判据由 False 翻转为 True，沿用陈旧值会让同一轮里后续 source 重复计费。故缓存带 `fresh` 标记，只在本轮媒体阶段落败（`media_native:` 记录）时失效并重新求值；命中路径零成本。
+4. `mortis_rag_mcp/doc_store.py`（`ControlStore._ensure_payment_schema`）：追加 `CREATE INDEX IF NOT EXISTS idx_request_intents_kind_fp_state ON request_intents(kind, profile_fingerprint, state)`。该函数本就是「只加表/只加索引、不改 schema_version」的惰性补建策略，符合既有约定。这是**兜底**（单次 16.33 ms → 约 0.427 ms，约 38×），根治仍是上面的「整轮一次」。
+
+**验证**
+
+- 反向确认（新用例先在未修复代码上跑红）：`tests/test_issue15_perf.py::test_unresolved_media_intent_probed_once_per_sync` 造 500 个带媒体的已摄取虚拟源 + 5,000 行 `request_intents`（与 issue 同量级），用计数桩统计整轮 `kind="media"` 的探查次数 —— 修复前 **500 次（红）**，修复后 **≤ 1 次（绿）**。同用例还钉住「未决仍必须拦住重算：本轮不产生原生媒体向量」。
+- 靶向（§7.1 集合，逐文件跑，全部通过）：`test_e20_media_outcome` 42、`test_index_state` 5、`test_import_refresh` 5、`test_read_stale` 8、`test_virtual_sync` 25、`test_exempt` 7、`test_hybrid` 10、`test_subvaults` 5、`test_concurrency_hardening` 8、`test_watch_integration` 17、`test_text_profile_wiring` 26、`test_issue15_perf` 1。
+- 补充靶向（媒体/同步面）：`test_paid_request_journal` 20、`test_e20_media_connection` 44、`test_media_dispatch` 11、`test_media_indexing` 11、`test_media_occurrence_anchor` 5、`test_media_transport_contract` 13、`test_migration_media` 3、`test_sync_engine` 5、`test_kb_read_media` 6 —— 全部通过。§9 里标记为「最脆」的两颗钉子（`test_e20_media_outcome.py:243`、`test_virtual_sync.py:381`）本批**未触碰**。
+
+**未做（明确不声称已修）**
+
+- 根因 2（读路径自污染 `index_state`）、根因 3（`_filter_visible_chunks` 重复调用）、根因 4（`kb_rebuild` 双重全量 + 逐文件 FTS 事务）分属 P2/P3/P4，按 §6 排在后三批，本批未动。
+- 墙钟/倍率口径的性能基准未跑：脚本按 §7.3 落 `.runtime/issue15/bench.py`，**不写进 `tests/`**，留到整合窗口做「修复前/修复后」相对口径。
+- 全量 pytest 按既有纪律留到整合窗口跑一次（本机 `--basetemp` 复用旧目录会被宿主的批量删除守护打断，故每轮改用全新 basetemp 目录）。
+- 未改版本号；未 push、未开 PR、未打 tag / Release、未发 PyPI。
