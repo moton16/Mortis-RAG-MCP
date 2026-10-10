@@ -17,7 +17,7 @@ version: 0.9.0
 - **熔断保护**：若运行一次 `--doctor` 后状态依然为 ❌，**禁止反复重试**，直接停止预检并向用户汇报失败项。
 - kb_* 工具实际报错时：报错 > STATUS.md。依据错误与已有状态排障；不以历史凭证覆盖当前失败，也不默认重发 unknown 请求。
 
-## 0.9 候选增量（尚未发布）
+## 0.9 增量（0.9.0 已于 2026-10-09 发布）
 
 - `kb_import` 的 `index_state=empty/rebuilding/unverified/ready` 与 import 成功分开；沿 `next_action` 核源/重解析，不自动信任包内正文。
 - `kb_ingest(action="retry", job_id="实际ID", vault_path="库名")` 只对 failed/cancelled 重试，unknown 先查询原任务。取消后的重试重做失去 blob 保护的段，不伪称断点都可保留。

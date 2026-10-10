@@ -11,7 +11,7 @@ English | [简体中文](README.md)
 
 ---
 
-## Current 0.9.0 candidate (local preparation, not released)
+## Current release: 0.9.0 (released 2026-10-09)
 
 Text templates cover indexing and queries. New vaults use `estimated_tokens`; existing settings/cache preserve `legacy_chars`. `.markdown` is indexed. Configured remote features do not require a new approval flow.
 

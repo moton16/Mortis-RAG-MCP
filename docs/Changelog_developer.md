@@ -1381,3 +1381,11 @@ Codex 主流程（2026-10-09 / America_New_York）。代码候选93c39a50b09ec61
 - `LICENSE` 附录版权行同步补 `Copyright 2026 Vodyanitsaaa`。
 - `pyproject.toml` 新增 PEP 621 `authors` 两项。
 - 背景：v0.9.0 发布时包内仍有第二著作权人的 3869 行代码（15.0%，全部落在 v0.8.1 及更早），MIT→Apache-2.0 的再授权需其同意；主人 2026-10-09 确认对方同意并给出双方邮箱，本条据此留痕。
+
+### [v0.9.0 发布后用户侧文本订正] — moton16,2026-10-09,CodeBuddy,Hy4-Preview — docs: 去掉 README/QUICKSTART/SKILL 里的「候选/尚未发布」口径
+
+- README.md 首行 ## 当前候选：0.9.0（本地准备，尚未发布） → ## 当前版本：0.9.0（2026-10-09 发布）；文档摄取条目里「参见上述候选状态」→「见上方版本状态」；§0.4 锚点链接随章节改名同步为 QUICKSTART_user.md#04-09-升级与恢复。
+- README_EN.md 首行 ## Current 0.9.0 candidate (local preparation, not released) → ## Current release: 0.9.0 (released 2026-10-09)。
+- QUICKSTART_user.md：### 0.4 0.9 候选升级与恢复 → ### 0.4 0.9 升级与恢复；正文「本候选尚未发布；…」→「0.9.0 已于 2026-10-09 发布；…」。
+- skills/mortis-rag-mcp/SKILL.md：## 0.9 候选增量（尚未发布） → ## 0.9 增量（0.9.0 已于 2026-10-09 发布）。
+- 验证：	ests/test_beta2_docs_contract.py + 	ests/test_version_sync.py = 9 passed；全仓再扫「尚未发布/本地准备/not released」无残留。
