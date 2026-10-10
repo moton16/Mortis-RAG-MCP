@@ -2201,25 +2201,14 @@ def list_requests(*, vault_path: str | Path, config_path: str | Path | None = No
         rows = control.list_request_intents()
     finally:
         control.close()
-    from .paid_requests import INTENT_LEASE_SECONDS, intent_age
-    from .providers import _is_loopback_endpoint
-
-    now = time.time()
-    requests = []
-    for row in rows:
-        state = str(row["state"])
-        age = intent_age(row, now)
-        requests.append({
-            "request_id": str(row["request_id"]), "kind": str(row["kind"]),
-            "state": state, "attempt": int(row["attempt"] or 0),
-            "age_seconds": round(age, 1),
-            "stale": state == "prepared" and age >= INTENT_LEASE_SECONDS,
-            # 端点原文仍按既有脱敏口径不外露；只补「是否零成本」这一个运维真正需要
-            # 的判别位——用来判断某条未决记录能不能安全 abandon（issue #13）。
-            "endpoint_is_loopback": _is_loopback_endpoint(str(row.get("endpoint") or "")),
-            "profile_fingerprint": str(row.get("profile_fingerprint") or ""),
-            "next_action": _request_next_action(state),
-        })
+    # 脱敏口径（既有合同，见 tests/test_management_recovery.py）：只暴露
+    # request_id / kind / state / attempt / next_action，端点与 payload_hash 不外露。
+    # issue #13 提出的「把 endpoint / profile_fingerprint 加进本命令」属口径取舍，
+    # 未在此擅自放宽；存活时长与「是否零成本」改由 kb_stats 的
+    # pending_paid_requests / paid_route_blocked 提供。
+    requests = [{"request_id": str(row["request_id"]), "kind": str(row["kind"]),
+                 "state": str(row["state"]), "attempt": int(row["attempt"] or 0),
+                 "next_action": _request_next_action(str(row["state"]))} for row in rows]
     return {"vault_path": str(Path(vault_path).expanduser()), "count": len(requests),
             "requests": requests,
             "hint": "只读列表：放弃用 --abandon-request REQUEST_ID（只改本机记录，不重发请求）"}
