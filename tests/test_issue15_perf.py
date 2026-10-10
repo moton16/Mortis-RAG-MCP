@@ -183,10 +183,62 @@ class _LiveWatcher:
 def _plain_indexer(tmp_path):
     vault = tmp_path / "vault"
     vault.mkdir(parents=True, exist_ok=True)
-    (vault / "a.md").write_text("# 甲\n\n第一份笔记的内容。\n", encoding="utf-8")
+    for name, title in (("a.md", "甲"), ("b.md", "乙"), ("c.md", "丙")):
+        (vault / name).write_text(
+            f"# {title}\n\n" + ("共享针 shared needle 的内容段落。" * 60) + "\n", encoding="utf-8")
     config = AppConfig(embedding=EmbeddingConfig(mode="static", dimension=8),
                        cache=CacheConfig(dir=str(tmp_path / "cache"), enabled=True))
     return MarkdownIndexer(vault, config)
+
+
+def test_single_search_does_not_recompute_visibility_per_chunk(tmp_path, monkeypatch):
+    """P3：`is_ignored` 必须按 source 记忆化，不能按 chunk 重算。
+
+    现状（修复前）：`_filter_visible_chunks` 对**每个 chunk** 调一次
+    `matcher.is_ignored`，而单次检索要过滤三轮（`all_chunks()` + 融合排序前后各
+    一次）——issue 环境 9,270 次而不是 137 个 source（issue #15 根因 3）。
+
+    注意本卡**只做调用内优化**：三次过滤仍必须各自重读文档库与 `.vaultignore`
+    （`test_empty_query_filters_recheck_visibility` 与
+    `test_ignore_final_filter_with_broken_store` 两条既有合同钉住），故上界是
+    3 × source 数而不是 1 ×。
+    """
+    from mortis_rag_mcp._indexer.scanning import IgnoreMatcher
+
+    idx = _plain_indexer(tmp_path)
+    try:
+        idx.sync()
+        sources = set(idx._chunks)
+        total_chunks = sum(len(chunks) for chunks in idx._chunks.values())
+        assert len(sources) >= 3 and total_chunks > len(sources), "fixture 必须多 chunk/多 source"
+
+        listed = []
+        store = idx.document_store()
+        real_list = store.list_documents
+
+        def counting_list(*args, **kwargs):
+            listed.append("list")
+            return real_list(*args, **kwargs)
+
+        monkeypatch.setattr(store, "list_documents", counting_list)
+        ignored_calls = []
+        real_ignored = IgnoreMatcher.is_ignored
+
+        def counting_ignored(self, rel_path, is_dir=False):
+            ignored_calls.append(rel_path)
+            return real_ignored(self, rel_path, is_dir)
+
+        monkeypatch.setattr(IgnoreMatcher, "is_ignored", counting_ignored)
+        idx.search("shared needle", use_rerank=False)
+        # 三轮过滤仍各自读库（见 docstring），不在这里断言次数收敛；只读库次数本身
+        # 不得因为记忆化而变多。
+        assert len(listed) == 3, f"单次检索读库 {len(listed)} 次，与修复前口径应一致（3 次）"
+        assert len(ignored_calls) <= 3 * len(sources), (
+            f"is_ignored 调了 {len(ignored_calls)} 次：应按 source 记忆化，"
+            f"上界为 3×{len(sources)}（共 {total_chunks} 个 chunk，修复前约 3×chunk 数）")
+    finally:
+        idx.stop_watching()
+        idx.close_document_store()
 
 
 def test_read_refresh_does_not_mark_a_ready_vault_as_rebuilding(tmp_path):

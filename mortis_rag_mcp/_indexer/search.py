@@ -410,6 +410,12 @@ def search_single_vault(
     # E08-d：媒体候选按 occurrence 归并去双计权（proxy 与 native 只留一条）。
     ranked = dedupe_by_occurrence(ranked)
 
+    # issue #15 根因 3：这里的两次过滤**必须各自重新**读文档库与 `.vaultignore`——
+    # `tests/test_virtual_sync.py::test_ignore_final_filter_with_broken_store` 钉住
+    # 「rerank 期间新写的 `.vaultignore` 必须被后一次过滤看到」。同理，上面
+    # `all_chunks()` 那次也不能与这次合并：`filters.matches` 是调用方可注入的钩子，
+    # `test_empty_query_filters_recheck_visibility` 钉住「set_visibility 之后同一次
+    # 检索内必须返回空」。所以本卡只做**调用内**的按 source 记忆化。
     ranked = owner._filter_visible_chunks(ranked)
     if use_rerank and owner.reranker_provider and ranked:
         ranked = rerank_chunks(query, ranked, owner.reranker_provider, cap=owner.config.rerank_cap)

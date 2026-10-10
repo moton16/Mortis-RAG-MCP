@@ -1261,18 +1261,41 @@ class MarkdownIndexer:
         return generation is None or generation.status not in {"stale", "failed"}
 
     def _filter_visible_chunks(self, chunks: list[Chunk]) -> list[Chunk]:
+        # issue #15 根因 3：`is_ignored` **按 chunk 调**（issue 环境 9,270 次而非
+        # 137 个 source）。这里按 `chunk.source` 记忆化——纯**调用内**优化，不做任
+        # 何跨调用缓存。
+        #
+        # 为什么不做跨调用缓存：`DocumentStore.set_visibility` 只改 `visibility` /
+        # `updated_at`、**不 bump `change_seq`**（只有 `mark_deleted` 会 bump），
+        # 所以任何以 `change_seq` 为失效键的跨调用缓存都收不到豁免/撤销的变更，会
+        # 打破 `tests/test_virtual_sync.py::test_empty_query_filters_recheck_
+        # visibility`。同理，单次检索内的三次过滤也不能共用 documents/matcher：
+        # `filters.matches` 与 `rerank_chunks` 都是调用方可注入的钩子，既有用例钉住
+        # 「钩子期间改掉的可见性 / 新写的 `.vaultignore` 必须被后一次过滤看到」。
+        # 跨调用缓存必须先补一个由 `set_visibility` / `invalidate_source` /
+        # `mark_deleted` 共同 bump 的可见性纪元（P3-b，本批不做）。
         try:
             store = self._existing_document_store()
             documents = {doc.source: doc for doc in store.list_documents()} if store else {}
         except Exception:
             documents = {}
-            chunks = [chunk for chunk in chunks if not chunk.metadata.get("revision_id")]
         matcher = self._ignore_matcher()
-        return [chunk for chunk in chunks
-                if not matcher.is_ignored(chunk.source)[0]
-                and (chunk.source not in documents or documents[chunk.source].visibility == "active")
-                and (not chunk.metadata.get("revision_id") or chunk.source in documents
-                     and documents[chunk.source].active_revision == chunk.metadata["revision_id"])]
+        ignored: dict[str, bool] = {}
+        visible: list[Chunk] = []
+        for chunk in chunks:
+            source = chunk.source
+            if source not in ignored:
+                ignored[source] = matcher.is_ignored(source)[0]
+            if ignored[source]:
+                continue
+            document = documents.get(source)
+            if document is not None and document.visibility != "active":
+                continue
+            revision_id = chunk.metadata.get("revision_id")
+            if revision_id and (document is None or document.active_revision != revision_id):
+                continue
+            visible.append(chunk)
+        return visible
 
     def all_chunks(self) -> list[Chunk]:
         """全部 chunk 的快照。
