@@ -1332,48 +1332,41 @@ Codex 主流程（2026-10-09 / America_New_York）。代码候选93c39a50b09ec61
 - 验证：全量 `.venv` `pytest -q --basetemp=.runtime/ship/pytest`（PYTHONHASHSEED=0、TEMP/TMP/TMPDIR 钉 `.runtime`）= 1279 passed / 14 skipped / 3 deselected in 136.20s，与 E20 最终默认层逐项一致。
 - 未执行：tag / GitHub Release / PyPI 发布未授权；sdist 内 `tests/` 只含 `test_*.py`（无 `conftest.py` 与 fixtures，既有打包行为未改），sdist 单独跑测试不可用。
 
-### 4a14269 — moton16,2026-10-09,CodeBuddy,DeepSeek-V4.1-Flash — fix(ci): PR #8 首轮 CI 五档全红收口（两处真实产品缺陷 + 四处用例）
+### FIX-v090-ci — moton16,2026-10-09,CodeBuddy,Hy4-Preview — fix(ci)+test: PR #8 全矩阵收绿（三处真实产品缺陷 + 多处时序用例）
 
-- `mortis_rag_mcp/_indexer/watch.py`：`stop_watching()` 直接 `join(timeout=2)`，而 `start_watching` 有多条提前返回路径会让线程停在「已构造但未 start」，py3.13 下 `Thread.join()` 抛 `RuntimeError: cannot join thread before it is started`，stdio 会话非零码退出并把 traceback 写进 stderr。新增 `_join_started_thread()`（先判 `ident` 再 join），三处引用同步。
-- `mortis_rag_mcp/doctor.py`：路径被 `_FREE_TEXT_LIMIT=160` 截断，正好丢掉区分 `.mortis_rag_mcp` / `.vault_mcp` 的尾部（深家目录必现）。新增 `_PATH_TEXT_LIMIT=1024`，配置路径 / 注册表路径 / 缓存目录 / 文档库根四处按新上限输出，异常消息等仍走 160。
-- `tests/test_e20_media_connection.py` 补 `pytest.importorskip("sqlite_vec")`（核心 lane 不装 extras 时静默回退 memory 后端被判失败）；`tests/test_e20_eval_cli.py` 冻结哈希与「未被改写」比较改走换行折算（autocrlf 检出不再决定结果）；`tests/test_scoped_search.py::test_issue2_minimal_reproduction`、`tests/test_virtual_read_server.py` 改轮询到就绪 / 监听惰性化；`tests/test_watch_integration.py`、`tests/test_doctor.py` 各补一条确定性回归。
-- 验证：受影响 12 个文件 189 passed / 1 skipped；全量 1281 passed / 14 skipped / 3 deselected in 149.33s（+2 为新增回归）。本地只有 py3.10，py3.13 结论由 CI 给出。
+涵盖提交：`4a14269`、`262bb94`、`65ba598`、`52fbd75`、`d33a9f2`。
 
-### 262bb94 — moton16,2026-10-09,CodeBuddy,DeepSeek-V4.1-Flash — fix(ci): 补掉 py3.11 与 windows 剩下的两处
+**背景**：本地 Windows 全量当时全绿，而 PR #8 首轮 CI 五档核心 job 全红（仅 extras 两档 pass）——本地通过不是 CI 通过的证据。按 job 日志逐条定位，六类失败里三处是真实产品缺陷。
 
-- `mortis_rag_mcp/indexer.py`（第三处真实缺陷）：`try_sync_with_guard()` 直接调 `_sync_locked()`，而「索引在飞」的 `_indexing` 原先只在监听线程的 `_run_sync_quietly` 包装里置位，于是守护式入口进入的同步对 `kb_search`/`kb_stats` 完全不可见，客户端会把同步期间的部分结果当成终态（C66 读优先契约的静默漏洞）。改为在 `_sync_locked()`（所有真同步的共同内层）置位并保存/恢复旧值。
-- `tests/test_read_stale.py`：阻塞点由 `_sync_locked` 移到内层 `_sync_locked_impl`（原写法先掐掉进度标记再断言能看见它），新增 `test_guarded_sync_is_visible_as_indexing` 钉住该缺陷；`tests/test_e20_eval_cli.py` 的 `GOLDEN.read_bytes() == before` 收尾比较补完换行折算（上一笔只改了一半，windows 因此仍红）。
-- 验证：受影响文件 94 passed；全量 1282 passed / 14 skipped / 3 deselected in 145.54s。
+**真实产品缺陷（代码修复）**
 
-### 65ba598 — moton16,2026-10-09,CodeBuddy,DeepSeek-V4.1-Flash — test(kb_read_chunkid): 轮询到就绪，不再假定索引已建好
+1. `mortis_rag_mcp/_indexer/watch.py`：`stop_watching()` 对三个线程直接 `join(timeout=2)`，而 `start_watching` 存在多条提前返回路径会让线程停在「已构造但未 start」，`Thread.join()` 遂抛 `RuntimeError: cannot join thread before it is started`（py3.13 必现），stdio 会话以非零码退出并把 traceback 写进 stderr。新增 `_join_started_thread()`（先判 `ident` 再 join，未启动即视为已结束），三处引用同步。
+2. `mortis_rag_mcp/doctor.py`：路径的判别信息在**尾部**（`.mortis_rag_mcp` 还是 `.vault_mcp`、缓存根在哪一侧），深家目录（CI 容器、长用户名、深层挂载）实测超过 `_FREE_TEXT_LIMIT=160`，截断后正好把要判别的信息丢掉。新增 `_PATH_TEXT_LIMIT=1024`，配置路径 / 注册表路径 / 缓存目录 / 文档库根四处按新上限输出，异常消息等仍走 160。
+3. `mortis_rag_mcp/indexer.py`：`try_sync_with_guard()` 直接调 `_sync_locked()`，而「索引在飞」的 `_indexing` 原先只在监听线程的 `_run_sync_quietly` 包装里置位，于是守护式入口进入的同步对 `kb_search`/`kb_stats` 完全不可见，客户端会把同步期间返回的部分结果当成终态（C66 读优先契约的静默漏洞）。改为在 `_sync_locked()`（所有真同步的共同内层）置位并保存/恢复旧值。
 
-- `tests/test_kb_read_chunkid.py::test_stdio_search_and_read_chunk_id`：批式 stdio 里 `kb_init` 后立刻 `kb_search`，能否读到 chunks 取决于后台首建推进到哪一步（py3.12 档读到 0 chunks）。改用 conftest 的 `stdio_polling` 轮询到 `index_state=ready` 且命中非空，再于同一条会话 followup 里用 chunk_id 精读；断言一条未减。
-- 验证：该文件连跑三遍 21 passed×3。
+**测试侧修正**
 
-### 121ebdf — moton16,2026-10-09,CodeBuddy,DeepSeek-V4.1-Flash — docs: 记录三轮 CI 修复与最终 v0.9.0 候选包
+4. `tests/test_e20_media_connection.py`：参数化磁盘后端用例在核心 lane（不装 extras）静默回退 memory 后端被判失败，补 `pytest.importorskip("sqlite_vec")`，与 `test_vector_backend.py` 既有惯例一致。
+5. `tests/test_e20_eval_cli.py`：冻结哈希与「未被改写」比较原先走原生字节，autocrlf=true 的 Windows 检出与 Linux 检出字节不同，等于让换行形态决定结果；统一改走 `_golden_bytes()`（`read_text` 后 `encode("utf-8")` 折算 LF），冻结值不变。
+6. `tests/test_scoped_search.py`、`tests/test_kb_read_chunkid.py`：批式 stdio 一次性喂完 stdin，读到的 `files`/`chunks` 取决于后台首建推进到哪一步；改用 conftest 的 `stdio_polling` 轮询到 `index_state=ready` 且命中非空，再于同一条会话内做定向统计与 chunk_id 精读。用例对人的合同（不得误抛 multiple vaults、不得降级盲搜、solo 不进 `excluded_solo`）一条未减。
+7. `tests/test_virtual_read_server.py`：`_indexer_for` 建库时顺带 `start_watching()`，用例改写物理源文件制造 STALE 后监听线程可在两次断言之间重签源文件，读取判定随机器快慢漂移；该模块的合同是读取判定本身，新增 autouse `no_background_watch` 把监听惰性化（**未改产品读取语义**）。
+8. `tests/test_read_stale.py`：阻塞点从 `_sync_locked` 移到内层 `_sync_locked_impl`（原写法先掐掉进度标记再断言能看见它），并新增 `test_guarded_sync_is_visible_as_indexing` 钉住缺陷 3。
+9. `tests/test_exact_terms.py`、`tests/test_compact_search.py`、`tests/test_budget_bytes.py`：三份重复的 `_kb_init_ready`（共 19 处调用）改为「重试 sync 直到切片可见，上限 10s」；`tests/test_search_oracle.py::test_server_search_dispatch_delegation` 补同样的等待（原先连 sync 都没做，纯靠后台首建抢跑）。
+10. `tests/test_watch_integration.py`、`tests/test_doctor.py`：为缺陷 1、2 补确定性回归（SimpleNamespace 替身 + 三个未启动线程；构造确定 >160 字符的家目录）。
 
-- 只改本文档；补记轮 1–4 的失败项、修复点与全绿结论，并把候选包哈希订正为按 `262bb94` 重建的最终值（wheel `2C5EDCF8…0A0AC`、sdist `A2C734EB…4D93`；首建 `1C80CE51…`/`3CD65F86…` 因产品缺陷修复作废）。
+**CI 轮次**：轮 1 五档全红、仅 extras 两档 pass → 1–5；轮 2（`4a14269`）py3.10/3.12/3.13 转绿、py3.11 与 windows 仍红（缺陷 3 + eval CLI 收尾比较只改一半）→ 6、8；轮 3（`262bb94`）仅 py3.12 红在 `test_kb_read_chunkid` → 6；轮 4（`65ba598`）= 7/7 全绿；轮 5 是只改文档的提交（被测代码与轮 4 相同）py3.13 仍红在 `test_exact_terms`（0 chunks），证明是既有竞态而非本批引入 → 9；轮 6（`52fbd75`）py3.11 红在 `test_search_oracle` → 9 的 search_oracle 部分；轮 7（`d33a9f2`）= **7/7 全绿**（ubuntu 3.10/3.11/3.12/3.13、windows-3.12、extras ubuntu/windows）。
 
-### 52fbd75 — moton16,2026-10-09,CodeBuddy,DeepSeek-V4.1-Flash — test: kb_init 之后等到索引真的可见
+**验证**：受影响文件多轮靶向全绿（`test_kb_read_chunkid` 21 passed×3、三文件 35 passed×3、`test_search_oracle` 9 passed×3 等）；全量 `.venv` 终值 = **1282 passed / 14 skipped / 3 deselected in 152.84s**（较发版收尾批 +3，为新增回归用例）。本机只有 py3.10，py3.13 与非 Windows 内核的结论只由 CI 给出。
 
-- `tests/test_exact_terms.py`、`tests/test_compact_search.py`、`tests/test_budget_bytes.py` 三份重复的 `_kb_init_ready`（共 19 处调用）改为「重试 sync 直到切片可见，上限 10s」；触发背景是轮 5（`121ebdf`，只改文档、被测代码与轮 4 全绿时相同）py3.13 仍红在 `test_exact_terms`（0 chunks），证明是既有竞态而非本轮引入。
-- 验证：三文件连跑三遍 35 passed×3。
+**遗留风险（未声称已修）**：仓库仍有若干「依赖后台首建抢跑」的批式 stdio 老用例（`test_scoped_search` 余下三条、`test_registry_server`、`test_subvaults` 等），本批只在**实际报红**处加固；彻底收敛需单开一卡做全仓改造。
 
-### d33a9f2 — moton16,2026-10-09,CodeBuddy,DeepSeek-V4.1-Flash — test(search_oracle): 断言前先等首建
+### FIX-v090-changelog — moton16,2026-10-09,CodeBuddy,Hy4-Preview — docs(changelog): 技术记账、候选包哈希订正与 v0.9.0 条目按仓库规范整改
 
-- `tests/test_search_oracle.py::test_server_search_dispatch_delegation` 原先连 `sync()` 都没做，纯靠后台首建抢跑，py3.11 档读到 0 chunks；补同样的「等到切片可见」等待。
-- 验证：该文件连跑三遍 9 passed×3。
+涵盖提交：`121ebdf`、`83394d8`、`54e3e7c`、`8bec8ae`、`eb8fbbb`（及本笔，只改本文档，不动代码与测试）。
 
-### 83394d8 — moton16,2026-10-09,CodeBuddy,DeepSeek-V4.1-Flash — docs: 记录 CI 第五至七轮与残余冷启动竞态
-
-- 只改本文档；记轮 5–7 的失败/修复对应关系与 7/7 全绿结论，并明确写出**未声称已修**的遗留风险：仓库仍有若干「依赖后台首建抢跑」的批式 stdio 老用例（`test_scoped_search` 余下三条、`test_registry_server`、`test_subvaults` 等），彻底收敛需单开一卡。
-
-### 54e3e7c — moton16,2026-10-09,CodeBuddy,DeepSeek-V4.1-Flash — docs(changelog): 按仓库格式重写 v0.9.0 条目
-
-- 本文档此前被写成 `editor:moton16，agent:codebuddy` 的两段散文且**追加在 E20 之后但无规范头**；改为带 `— 用户名,日期,Agent,模型` 头、列涵盖提交的条目（本笔的位置仍有误，见下笔）。
-
-### 0.9.0-changelog-归位 — moton16,2026-10-09,CodeBuddy,DeepSeek-V4.1-Flash — docs(changelog): 存量 0.9.0 条目补规范头并归位到文件末尾
-
-- 补规范头（统一按主人指定的 moton16,<日期>,Codex,GPT-6.1-Sol）：## E20 运维缺陷与诊断（2026-10-09 / America_New_York） 由二级降为三级条目并补头；### v0.9.0 集中 review（第三窗口；未单独成提交，见 \Lane_CDE_REVIEW_2026-10-08.md\） 补 — moton16,2026-10-08,Codex,GPT-6.1-Sol；### E20 ... 系列 10 条（F05/F06、registry、F01/F02/F03、F04/F08/F09、FLK-01/02 与 TST-07、F07 与 F02、测试分层、bounded R01、bounded C01/C02、最终实测）统一补 — moton16,2026-10-09,Codex,GPT-6.1-Sol。
-- 归位：原堆在文件最顶部、与「最新在底部」口径冲突的三条 0.9.0 条目（beta2 第四批 → E17 → E18，按提交时间升序）移到文件末尾区域、E20 系列之前；同时去掉归位过程中产生的重复 \---\ 分隔行。
-- 未动正文内容，未改历史事实；仅头部署名与位置。仍是**段落级组标题**、未带头的一条：## v0.9.0（Lane A–E，C90–C104 + 集中 review；2026-10-07 ~ 2026-10-08）（它标的是一个区段而非单笔提交），是否也改由主人裁定。
+- `121ebdf`：记轮 1–4 的失败项、修复点与全绿结论；把候选包哈希订正为按 `262bb94` 重建的最终值（wheel `2C5EDCF8…0A0AC`、sdist `A2C734EB…4D93`；首建 `1C80CE51…`/`3CD65F86…` 因产品缺陷修复作废）。
+- `83394d8`：记轮 5–7 的失败/修复对应关系与 7/7 全绿结论，并写明未声称已修的遗留冷启动竞态（见上条末尾）。
+- `54e3e7c`、`8bec8ae`：本文档此前被写成 `editor:moton16，agent:codebuddy` 的两段散文、且**追加在 E20 之后但无规范头**；先改为带 `— 用户名,日期,Agent,模型` 头并列出涵盖提交的条目，再纠正位置——本文档主体是**升序**、最新的更新在**最底部**（此前误搬到文件顶部），并改回按 commit 逐条。
+- `eb8fbbb`：存量 0.9.0 条目补规范头（统一 `moton16,<日期>,Codex,GPT-6.1-Sol`）：`## E20 运维缺陷与诊断（2026-10-09 / America_New_York）` 降为三级条目并补头；`### v0.9.0 集中 review（第三窗口…）` 补 `— moton16,2026-10-08,Codex,GPT-6.1-Sol`；`### E20 ...` 系列 10 条统一补 `— moton16,2026-10-09,Codex,GPT-6.1-Sol`；并把原堆在文件最顶部的三条 0.9.0 条目（beta2 第四批 → E17 → E18，按提交时间升序）归位到文件末尾区域、E20 系列之前，同时清掉搬动产生的重复 `---` 分隔行。
+- **本笔**：按主人指定，`040b909` 之后的全部提交统一署名 `moton16,2026-10-09,CodeBuddy,Hy4-Preview`，并把上述一堆记账提交整合为 `FIX-v090-ci` 与 `FIX-v090-changelog` 两块（同一次任务、同一 Agent 连续提交按本文档开头的组织说明合并整理，并列出涵盖提交）。
+- 仍未带头的一条是**区段级组标题** `## v0.9.0（Lane A–E，C90–C104 + 集中 review；2026-10-07 ~ 2026-10-08）`，它标的是一个区段而非单笔提交，是否也补头由主人裁定。
