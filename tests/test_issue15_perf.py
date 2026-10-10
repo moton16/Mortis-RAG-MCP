@@ -7,6 +7,7 @@
 修复后才应该转绿。
 """
 import hashlib
+import time
 from pathlib import Path
 from urllib.error import URLError
 
@@ -15,7 +16,10 @@ import pytest
 from test_e20_media_connection import (
     close, make_indexer, media_config, native, offline,
 )
+from mortis_rag_mcp._indexer import watch
+from mortis_rag_mcp.config import AppConfig, CacheConfig, EmbeddingConfig
 from mortis_rag_mcp.doc_store import MediaOccurrenceSpec
+from mortis_rag_mcp.indexer import MarkdownIndexer
 
 # 与 issue 同量级：issue 报告 2,870 个已摄取虚拟文档、9,828 行 request_intents。
 VIRTUAL_SOURCES = 500
@@ -161,3 +165,53 @@ def test_virtual_source_is_not_reread_on_every_sync(tmp_path, monkeypatch):
         assert len(idx._chunks) == VIRTUAL_SOURCES
     finally:
         close(idx)
+
+
+class _LiveWatcher:
+    """原生 watcher 在线且存活的替身（CI 的 Linux/非 Windows 平台无原生监听）。"""
+
+    def is_alive(self):
+        return True
+
+    def stop(self):
+        return None
+
+    def close(self):
+        return None
+
+
+def _plain_indexer(tmp_path):
+    vault = tmp_path / "vault"
+    vault.mkdir(parents=True, exist_ok=True)
+    (vault / "a.md").write_text("# 甲\n\n第一份笔记的内容。\n", encoding="utf-8")
+    config = AppConfig(embedding=EmbeddingConfig(mode="static", dimension=8),
+                       cache=CacheConfig(dir=str(tmp_path / "cache"), enabled=True))
+    return MarkdownIndexer(vault, config)
+
+
+def test_read_refresh_does_not_mark_a_ready_vault_as_rebuilding(tmp_path):
+    """P2：watcher 在线时，读路径的机会性刷新不得把一个就绪库判成 rebuilding。
+
+    现状（修复前）：`request_refresh(for_read=True)` 的抑制窗口只有 1 秒，之后每次
+    `kb_search` / `kb_stats` / `kb_list_files` 都会真的排一轮全量 sync —— 于是
+    `refresh_status` 的 `pending` 为真 → `indexing_in_progress: True` →
+    `index_state` 判 `rebuilding`，并返回「等后台同步完成再重试」（issue #15 根因 2，
+    也是 issue 里「恒报 rebuilding」的直接来源）。
+    """
+    idx = _plain_indexer(tmp_path)
+    try:
+        idx.sync()
+        assert idx.index_state()["index_state"] == "ready"
+        # 让「距上次同步 < 1 秒」这条抑制失效：issue 里每查必排正是发生在这之后。
+        idx.last_sync = time.time() - 5.0
+        idx._fs_watcher = _LiveWatcher()
+        assert watch.request_refresh(idx, for_read=True, start_scheduler=False) is False
+        assert idx.refresh_status()["refresh_pending"] is False
+        assert idx.index_state()["index_state"] == "ready", (
+            "就绪的静态库被读路径自己的机会性刷新判成了 rebuilding")
+        # 真实变动仍然必须排得进去：显式请求不被收窄。
+        assert watch.request_refresh(idx, start_scheduler=False) is True
+        assert idx.refresh_status()["refresh_pending"] is True
+    finally:
+        idx.stop_watching()
+        idx.close_document_store()

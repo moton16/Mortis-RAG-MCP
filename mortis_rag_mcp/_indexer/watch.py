@@ -114,15 +114,28 @@ def request_refresh(owner: MarkdownIndexer, *, immediate: bool = False,
         _start_fs_scheduler(owner)
     with owner._fs_debounce_lock:
         now = time.monotonic()
-        # 查询只是机会性刷新：刚完成的索引无需因每次轮询再排一轮。
+        # 查询只是机会性刷新：刚完成的索引无需因每次轮询再排一轮；原生 watcher
+        # 在线时更是连轮询兜底都不需要（真实变动由 watcher 事件入队）。
         # 文件事件/import/显式请求不走此分支，接受仍等于真实保留 pending。
         if (for_read and not immediate and not owner._fs_requested
                 and not getattr(owner, "_indexing", False)
                 and getattr(owner, "_sync_state", "idle") == "idle"
                 and not getattr(owner, "_refresh_error", None)
-                and owner.last_sync is not None
-                and time.time() - owner.last_sync < owner._READ_REFRESH_MIN_INTERVAL_SECONDS):
-            return False
+                and owner.last_sync is not None):
+            # issue #15 根因 2：只要距上次同步超过 1 秒，读路径的机会性刷新就会
+            # 真的登记一轮全量 sync —— 于是**一个完全就绪的静态库**被它自己发起的
+            # 刷新判成 `rebuilding`，每次 kb_search / kb_stats / kb_list_files 都排
+            # 一轮（抑制窗口只有 1 s，之后每查必排）。
+            #
+            # 但读路径的轮询兜底只在「没有事件源」时才需要：原生 watcher 在线且存活
+            # 时，真实文件变动由 watcher 事件入队，读路径不需要再自排一轮。故此处
+            # 收窄「刷新已登记」的适用面（方案 A，见调研报告 §5 P2）：watcher 在线
+            # 即直接返回 False；watcher 不在线（轮询/降级）或冷启动维持原判据。
+            watcher = getattr(owner, "_fs_watcher", None)
+            if watcher is not None and bool(getattr(watcher, "is_alive", lambda: False)()):
+                return False
+            if time.time() - owner.last_sync < owner._READ_REFRESH_MIN_INTERVAL_SECONDS:
+                return False
         owner._refresh_requested_at = now
         if immediate:
             owner._fs_refresh_immediate = True
