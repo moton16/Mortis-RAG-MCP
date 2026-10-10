@@ -112,6 +112,11 @@ def _paid_embedding_allowed(owner: MarkdownIndexer) -> bool:
     该暂停**不**施加到查询期嵌入（单次、载荷唯一、不重放）。
     Facade 未提供该方法时按「不可用」处理（fail closed）。
     """
+    # 零成本端点（loopback + 无凭据）不产生费用，既不需要授权也不受历史未决意图
+    # 牵连：让它继续走付费暂停判据，等于本机推理后端一次抖动就冻死整条索引
+    # （issue #12）。
+    if getattr(getattr(owner, "embedding_provider", None), "is_local_free", False) is True:
+        return True
     may = getattr(owner, "may_use_paid_profile", None)
     if not callable(may):
         return False
@@ -573,7 +578,9 @@ def media_native_for_revision(owner: MarkdownIndexer, store: Any, source: str, r
     if not pending or reuse_only:
         return chunks
     control = owner._paid_control_store()
-    if control is not None and owner.has_unresolved_paid_intents(control, "media", provider.profile.fingerprint):
+    if (control is not None
+            and not getattr(provider, "is_local_free", False)
+            and owner.has_unresolved_paid_intents(control, "media", provider.profile.fingerprint)):
         raise MediaStageError("PAID_REQUEST_UNRESOLVED: native media outcome unknown; automatic retry disabled", chunks)
     for start in range(0, len(pending), batch):
         batch_inputs = pending[start:start + batch]

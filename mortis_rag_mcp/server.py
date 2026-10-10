@@ -934,6 +934,10 @@ class VaultMcpServer:
             fp = getattr(getattr(provider, "profile", None), "fingerprint", "")
             if indexer is not None:
                 indexer.configure_paid_provider("media", provider, fp)
+            elif getattr(provider, "is_local_free", False) is True:
+                # 未建 indexer 的旁路装配：零成本端点同样不进台账（issue #12），
+                # 与 indexer.configure_paid_provider 保持同一判据。
+                return provider, None
             else:
                 control = self._paid_control_store_for(vault_path)
                 if control is not None:
@@ -1866,9 +1870,22 @@ class VaultMcpServer:
             # 结果未知的付费请求必须可观测，否则「嵌入静默暂停」看起来像坏了。
             stats["pending_paid_requests"] = [
                 {"request_id": item["request_id"], "kind": item["kind"],
-                 "state": item["state"], "attempt": item["attempt"]}
+                 "state": item["state"], "attempt": item["attempt"],
+                 "age_seconds": item.get("age_seconds"),
+                 "stale": bool(item.get("stale")),
+                 "endpoint_is_loopback": bool(item.get("endpoint_is_loopback"))}
                 for item in unresolved_intents
             ]
+            # 真正在冻结路由的那一条（其余只是历史堆积）：此前两者混在同一个列表里，
+            # 运维只能靠比对后端日志计数反推是否被冻（issue #13）。
+            blocked: dict[str, str] = {}
+            for item in unresolved_intents:
+                if (item.get("stale") and item.get("endpoint_is_loopback")
+                        and item["state"] == "prepared"):
+                    continue
+                blocked.setdefault(item["kind"], item["request_id"])
+            if blocked:
+                stats["paid_route_blocked"] = blocked
         if getattr(indexer, "_embedding_paused", False):
             stats["embedding_paused"] = True
             stats["embedding_paused_reason"] = (
@@ -2184,9 +2201,25 @@ def list_requests(*, vault_path: str | Path, config_path: str | Path | None = No
         rows = control.list_request_intents()
     finally:
         control.close()
-    requests = [{"request_id": str(row["request_id"]), "kind": str(row["kind"]),
-                 "state": str(row["state"]), "attempt": int(row["attempt"] or 0),
-                 "next_action": _request_next_action(str(row["state"]))} for row in rows]
+    from .paid_requests import INTENT_LEASE_SECONDS, intent_age
+    from .providers import _is_loopback_endpoint
+
+    now = time.time()
+    requests = []
+    for row in rows:
+        state = str(row["state"])
+        age = intent_age(row, now)
+        requests.append({
+            "request_id": str(row["request_id"]), "kind": str(row["kind"]),
+            "state": state, "attempt": int(row["attempt"] or 0),
+            "age_seconds": round(age, 1),
+            "stale": state == "prepared" and age >= INTENT_LEASE_SECONDS,
+            # 端点原文仍按既有脱敏口径不外露；只补「是否零成本」这一个运维真正需要
+            # 的判别位——用来判断某条未决记录能不能安全 abandon（issue #13）。
+            "endpoint_is_loopback": _is_loopback_endpoint(str(row.get("endpoint") or "")),
+            "profile_fingerprint": str(row.get("profile_fingerprint") or ""),
+            "next_action": _request_next_action(state),
+        })
     return {"vault_path": str(Path(vault_path).expanduser()), "count": len(requests),
             "requests": requests,
             "hint": "只读列表：放弃用 --abandon-request REQUEST_ID（只改本机记录，不重发请求）"}

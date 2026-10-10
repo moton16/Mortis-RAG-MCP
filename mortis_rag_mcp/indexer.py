@@ -24,8 +24,11 @@ from .doc_store import (
     vault_cache_key,
 )
 from .paid_requests import (
+    INTENT_LEASE_SECONDS,
     PaidRequestJournal,
     UNRESOLVED_INTENT_STATES,
+    intent_age,
+    is_stale_prepared,
     open_paid_control,
     paid_request_guard,
 )
@@ -33,7 +36,7 @@ from .fsnotify import WindowsDirectoryWatcher
 from .fts import FtsIndex
 from .ingest import INGEST_EXTS
 from .ingest.tables import iter_table_blocks, split_table_into_chunks
-from .providers import EmbeddingProvider, ProviderError, RerankerProvider, create_embedding_provider, create_media_provider, create_reranker_provider
+from .providers import EmbeddingProvider, ProviderError, RerankerProvider, _is_loopback_endpoint, create_embedding_provider, create_media_provider, create_reranker_provider
 from .vector import create_vector_backend
 # v0.8.0 P2：数据模型与缓存编解码提取至私有包 _indexer/（本文件转为 Facade）。
 # 下方 re-export 保持 `from mortis_rag_mcp.indexer import ...` 公开导入面 100% 不变。
@@ -518,18 +521,29 @@ class MarkdownIndexer:
         切片，某批结果未知时同一文件的前导批已发过并计费，而调用方「全有或全无」——
         只拦失败批会让每轮 sync 都重发前导批却永远完不成（实测每次重计费 1 批）。
         读不到控制库时返回 True（不能证明安全 → fail closed）。
+
+        例外：指向零成本 loopback 端点、且已超租约的 `prepared` 不再计入（详见
+        `is_stale_prepared`）—— 它是落账失败或进程中断留下的泄漏记录，继续让它
+        阻塞等于把整条路由永久冻死（issue #13）。
         """
         try:
             items = control.list_request_intents()
         except Exception:
             return True
+        now = time.time()
         return any(item["kind"] == kind and item["state"] in UNRESOLVED_INTENT_STATES
                    and (not profile_fingerprint
                         or item["profile_fingerprint"] == str(profile_fingerprint))
+                   and not is_stale_prepared(item, now)
                    for item in items)
 
     def unresolved_paid_intents(self) -> list[dict[str, Any]]:
-        """本库当前所有未决付费意图（供 `kb_stats` 观测，不触发任何网络动作）。"""
+        """本库当前所有未决付费意图（供 `kb_stats` 观测，不触发任何网络动作）。
+
+        附带三个派生字段：`age_seconds`（存活时长）、`stale`（已超租约，需人工
+        处理）、`endpoint_is_loopback`（零成本端点，可安全 abandon）。运维据此能
+        区分「正在冻结路由」与「历史堆积」——此前两者混在一个列表里无法分辨。
+        """
         control = self._paid_control_store()
         if control is None:
             return []
@@ -537,17 +551,30 @@ class MarkdownIndexer:
             items = control.list_request_intents()
         except Exception:
             return []
-        return [item for item in items if item["state"] in UNRESOLVED_INTENT_STATES]
+        now = time.time()
+        rows = [item for item in items if item["state"] in UNRESOLVED_INTENT_STATES]
+        for item in rows:
+            item["age_seconds"] = round(intent_age(item, now), 1)
+            item["stale"] = item["age_seconds"] >= INTENT_LEASE_SECONDS
+            item["endpoint_is_loopback"] = _is_loopback_endpoint(str(item.get("endpoint") or ""))
+        return rows
 
     def configure_paid_provider(self, kind: str, provider: Any, profile_fingerprint: str) -> bool:
         """把持久 journal + 闸门装配到任何 `configure_paid_requests` provider 上。
 
         媒体等新 provider 必须经此装配（§20.7B 覆盖 media）：
         返回 False 表示该 provider 不支持付费装配，调用方必须自行拒绝外部请求。
+        返回 True 表示已接线，**或**该 provider 是零成本端点（loopback + 无凭据），
+        无需台账即可直发。
         """
         configure = getattr(provider, "configure_paid_requests", None)
         if not callable(configure):
             return False
+        # 零成本端点不进付费台账：它不产生费用，装配 journal 只会让控制面的一次
+        # 抖动把整条路由冻死（issue #12）。跳过装配后 provider 自身按「无 journal
+        # + 本地直发」处理，真实的网络故障仍会报 LOCAL_REQUEST_FAILED。
+        if getattr(provider, "is_local_free", False) is True:
+            return True
         configure(PaidRequestJournal(self._paid_control_store, kind),
                   self._paid_guard_for(profile_fingerprint, kind), profile_fingerprint)
         return True
