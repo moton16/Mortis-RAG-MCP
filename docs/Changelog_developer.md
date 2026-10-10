@@ -1399,3 +1399,39 @@ Codex 主流程（2026-10-09 / America_New_York）。代码候选93c39a50b09ec61
 - `QUICKSTART_user.md` §5 改整目录安装，保留入口与参考相对结构；§0.5 更新独立图片行为与真实端点/宿主验证区别。`PROJECT_GUIDE.md` 增加当前 Skill 导航及历史概览订正；`Quick-start_developer.md` §4.1 订正“每个工具都会 sync、反复 stats 可修好”的旧说法，区分只读、后台刷新与 unknown。既有 README/用户 Changelog 修改和本机 installed skill junction 保持原样。
 - `tests/test_skill_contract.py` 从当前 `_tool_definitions()` 校验所有 JSON 示例的必填项、未知字段、类型、枚举与数值范围，并校验参考可达性及 frontmatter；负对照覆盖旧 inline、臆造 read revision、布尔整数等误用。新检查在修改前准确暴露上述两项缺陷，既有生产路径靶向套件未失败；修改后 172 passed / 1 skipped。另执行官方 skill validator、安装复制烟测、独立场景前向检查和 skill 副本回滚；原始命令/输出/退出码及 SHA 在 `.runtime/skill-v090/` 独立运行目录记录，不将离线检查写成真实外部服务验收。
 - 验证：	ests/test_beta2_docs_contract.py + 	ests/test_version_sync.py = 9 passed；全仓再扫「尚未发布/本地准备/not released」无残留。
+
+### [FIX-issue12-13] — moton16,2026-10-10,CodeBuddy,Hy4-Preview — fix(paid): 零成本端点不受付费闸门管辖 + prepared 落账补位与租约回收（GitHub issue #12 / #13）
+
+涵盖提交：`ba07551`（代码）、`54d2ca3`（回归测试）。基于 HEAD `697ffc2` 实测调研。
+
+**调研结论（先证后改）**
+
+两条 issue 的机制层断言全部复现，但 #13 的「profile 级未决判据冗余、应收窄到载荷级」**不成立**，已否掉：
+
+- `providers.py` 的 `is_local_free` 只在 `_post` 的「journal 为空」分支生效（`providers.py:132-138`），而生产装配点 `indexer.configure_paid_provider`（`indexer.py:551`）无条件注入 journal —— 该豁免自 `ef6bd5e` 落地起就是死代码。**不是回归**：`_configure_paid_providers` 更早由 `73a6f83`（Lane C/C96）引入，是「修错了层」。`tests/test_providers.py:545` 靠手工置空 journal 才通过，恰好掩盖了这一点。
+- 比 issue 描述的更严重：`[cache] enabled=false` 时，loopback 端点直接被 `PAID_REQUEST_CONTROL_UNAVAILABLE` 拒在门内，网络一次都没发出。付费端点的 fail-closed 裁定被一并套到了零成本端点上。
+- #13 的「判据过宽」诊断方向对，但轴错了。载荷级拦不住真正的钱漏：`embed_one_file`（`sync_engine.py:249-279`）是文件级全有或全无，`provider.embed` 按 `batch_size` 切片，某批未决 → 整个文件无向量 → 下轮从头重嵌，而**已 success 的前导批的意图不阻止重发**（`doc_store.py:1365-1372` 只拒 prepared/submission_unknown），于是每轮重复计费一次。profile 级暂停是唯一挡住这个自动重试环路的东西（`indexer.py:517-519` / `sync_engine.py:108-111` 有实测记录）。真该收的维度是**端点成本**与**路径**（查询期不拦，上一轮 review 已这么收过），不是载荷。
+
+**代码修复（`ba07551`）**
+
+1. `indexer.configure_paid_provider`：provider 的 `is_local_free` 为 True 时**跳过装配**（返回 True 表示「已接线或无需接线」，调用方均不使用该返回值）。不装 no-op journal —— 后者会把「控制面不可用」这类真实故障一并掩盖。跳过装配后 `_post` 走既有的本地直发分支，真实故障报 `LOCAL_REQUEST_FAILED`。
+2. `sync_engine._paid_embedding_allowed`：零成本 provider 直接返回 True，不受授权与未决意图暂停影响。
+3. `media_providers.NativeMediaProvider`：新增 `is_local_free`（`profile.endpoint` + `transport.api_key`）；`embed_media` 对零成本端点不落意图、不受闸门管辖，传输失败报 `LOCAL_MEDIA_REQUEST_FAILED` 而非 `SUBMISSION_UNKNOWN`。付费路径的结构（before_send → mark_* → 校验后 mark_success）一条未动。
+4. `sync_engine.media_native_for_revision`：网关对零成本 provider 不施加未决暂停。
+5. `server._media_provider_and_error`：无 indexer 的旁路装配分支同步该豁免。
+6. `paid_requests`：`mark_success` / `mark_unknown` / `mark_response_failed` 收敛到 `_mark()`，对**可重试**的控制库错误（锁竞争/StoreBusy）补位一次；不可重试（损坏/契约/绑定降级）照旧立即抛出，fail closed 未放宽。修的是「请求已 200、向量已取到，却因一次锁竞争永久留在 prepared」这一类。
+7. 新增 `INTENT_LEASE_SECONDS = 300.0` 与 `is_stale_prepared()`：超租约的 `prepared` **仅当端点为 loopback** 时退出阻塞判据。付费端点的 prepared 即便超期也永不自动放行——它可能代表已计费请求，自动 abandon 等于丢掉对账凭据（issue #13 评论里那 12 条远程付费端点记录正是此类）。`submission_unknown` 不适用租约。记录本身不删不改，`--abandon-request` 仍是唯一出口。
+8. 可观测性：`unresolved_paid_intents()` 增 `age_seconds` / `stale` / `endpoint_is_loopback`；`kb_stats` 增 `paid_route_blocked`（仍在冻结路由的那一条，与历史堆积分开）；`--list-requests` 增 `age_seconds` / `stale` / `endpoint_is_loopback` / `profile_fingerprint`。**端点原文仍按既有脱敏口径不外露**（`server.py` 原注释明确「不含 endpoint/密钥等内部字段」），只补「是否零成本」这一个判别位——运维据此能区分「本机可放心 abandon」与「付费必须去对账」。此项属口径取舍，如需外露 endpoint 原文请另行裁定。
+
+**验证**
+
+- 一次性探针 `.runtime/probe_issues_12_13.py`（临时目录，未入库）：修复前 loopback 端点 `journal wired: True` → `SUBMISSION_UNKNOWN` → `paid_embed_allowed: False`；修复后 `journal wired: False` → `LOCAL_REQUEST_FAILED` → 无意图 → `paid_embed_allowed: True`；`[cache] enabled=false` 场景从「拒在门内」变为「请求发出、只报本地失败」；付费端点上瞬时锁竞争补位后落账 `success`（2 次调用），持续锁失败仍留 `prepared` 且 `_paid_embedding_allowed` False。
+- 反向确认：`test_local_free_media_endpoint_is_not_frozen_by_a_leftover_intent` 在 `ba07551~1` 上红（`native(idx)` 为空，路由被遗留意图冻住），在 `ba07551` 上绿。
+- 靶向：`test_paid_request_journal.py` + `test_e20_media_outcome.py` 新增 9 例；连同 `test_providers` / `test_media_production_wiring` / `test_e15_service_contracts` / `test_e20_media_connection` / `test_text_profile_wiring` / `test_index_state` / `test_e20_ops` / `test_request_lifecycle` = **236 passed / 1 deselected**。全量按既有纪律留给整合窗口，不在本批跑。
+
+**未做（明确不声称已修）**
+
+- 媒体失败仍要等整轮 sync 结束才并入 `failed_files`（`sync_engine.py` 文本嵌入阶段之后），故障期 `kb_stats` 看不见。改合并时机牵动 `embedding_changed_state` 的落盘判据，单开一卡。
+- 分批持久化部分向量（让前导批不重发）才是重复计费的根治，属另一件事。
+- profile 级暂停也只是阻尼器：人工 abandon 后下一轮仍整文件重嵌，可能重复计费一次（`abandon_request` 已显式警告），只是从「每轮自动、无上界」降为「每次人工确认后最多一次」。
+- 未改任何已发布版本号；未提交 tag / Release / PyPI。
