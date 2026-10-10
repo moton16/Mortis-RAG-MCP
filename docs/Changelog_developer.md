@@ -1461,3 +1461,28 @@ Codex 主流程（2026-10-09 / America_New_York）。代码候选93c39a50b09ec61
 - 墙钟/倍率口径的性能基准未跑：脚本按 §7.3 落 `.runtime/issue15/bench.py`，**不写进 `tests/`**，留到整合窗口做「修复前/修复后」相对口径。
 - 全量 pytest 按既有纪律留到整合窗口跑一次（本机 `--basetemp` 复用旧目录会被宿主的批量删除守护打断，故每轮改用全新 basetemp 目录）。
 - 未改版本号；未 push、未开 PR、未打 tag / Release、未发 PyPI。
+
+### [FIX-issue15-P1d] — moton16,2026-10-10,CodeBuddy,Hy4-Preview — perf(sync): 虚拟源物理校验接入 Fast-Stat 缓存（GitHub issue #15 根因 1 的第二处放大器）
+
+> **涵盖提交**：`a41fda7`
+
+**背景**：调研报告 §3.1 指出虚拟文档循环内还有第二处放大器——虚拟分支**没有**普通文本路径（`_stat_cache` / `_effective_margin_ns` / `_fast_path_is_trustworthy`）的零读盘短路，每轮对每个虚拟文档全量读盘重算 SHA-256。issue 环境 2,892 个已摄取虚拟文档，与根因 1 的 46.9 s 叠加成「后台永远追不上」。
+
+**代码改动概况**
+
+1. `mortis_rag_mcp/indexer.py`：新增 `self._virtual_sha_cache: dict[str, str]`（source → 上一轮实测的 `raw_sha`），并在 `rebuild()` 与缓存整体丢弃处与 `_stat_cache` / `_stat_seen_ns` 一并 `clear()`。
+2. `mortis_rag_mcp/_indexer/sync_engine.py`（`run_sync` 虚拟文档分支）：命中条件**逐字照抄**文本路径已论证过的判据，不另发明余量逻辑 —— `owner._stat_cache.get(source) == (mtime_ns, size, ctime_ns)` **且** `owner._fast_path_is_trustworthy(source, mtime_ns)`（余量由 `_effective_margin_ns()` 从实际文件系统刻度推导，粗刻度时整体禁用快速路径）。命中即复用 `raw_sha`；未命中（首次 / racily clean / 快速路径被禁用）时行为与加缓存前**逐字一致**：全量读盘 + 读前读后双 stat 的 TOCTOU 复核。
+3. 命中路径**仍保留一次 `path.open("rb")` + close 的可读性探针（不读一个字节）**。这不是多余动作：`tests/test_virtual_sync.py::test_virtual_root_offline_retains_committed_fact` 钉住「stat 成功但 open 被拒（脱机 / ACL）时必须把已提交事实降为 `unverified`」，纯内存缓存会让该合同静默失效（本机实测：不做探针该用例转红）。开销是 ~µs 级系统调用，省掉的仍是整文件的 GB 级读盘。
+4. `revoke_source` 的清理元组加入 `_virtual_sha_cache`，撤销/豁免/删除时与 `_stat_cache` 同步清空。
+
+**验证**
+
+- 反向确认：`tests/test_issue15_perf.py::test_virtual_source_is_not_reread_on_every_sync`（500 个已摄取虚拟源，只统计**真的读了多少字节**，允许保留 open+close 探针）—— 修复前第二轮仍读 **13,890 字节（红）**，修复后 **0 字节（绿）**；同时钉住「第一轮必须真的读盘」与「缓存命中不改变索引结果（500 个 source 全在）」。
+- 靶向（逐文件跑，全部通过）：§7.1 集合 `test_e20_media_outcome` 42 / `test_paid_request_journal` 20 / `test_index_state` 5 / `test_import_refresh` 5 / `test_read_stale` 8 / `test_virtual_sync` 25 / `test_exempt` 7 / `test_hybrid` 10 / `test_subvaults` 5 / `test_concurrency_hardening` 8 / `test_watch_integration` 17；Fast-Stat 判据面 `test_indexer` 11 / `test_anti_contention` 8 / `test_p5_lifecycle` 3 / `test_improvements` 8；同步与装配面 `test_sync_engine` 5 / `test_e20_media_connection` 44。
+- §9「最脆」钉子：本批**实际撞到一颗**——`test_virtual_sync.py` 的「物理源不可读必须降级」（见上第 3 点），已用可读性探针修好并复跑通过；`test_e20_media_outcome.py:243` 与 `test_virtual_sync.py:381` 未受影响。
+
+**未做（明确不声称已修）**
+
+- 根因 2/3/4（P2/P3/P4）按 §6 排在后三批，本批未动。
+- 虚拟源没有向 `mtime_samples` 贡献刻度探测样本（文本路径提供）；零文本文件、纯虚拟库的场景下刻度探测不触发，余量退回固定下限——方向安全（下限更保守）。
+- 全量 pytest 留到整合窗口；性能基准脚本留到整合窗口做相对口径。
