@@ -1581,3 +1581,39 @@ Codex 主流程（2026-10-09 / America_New_York）。代码候选93c39a50b09ec61
 - `_fts_ensure_populated`（1083 行附近）与同步路径的逐 source FTS 写入未改批量：计划只点名 `rebuild()` 末尾，且这两处的写入规模通常是增量级。
 - 全量 pytest 与 §7.3 性能基准留到整合窗口。
 - 未改版本号；未 push、未开 PR、未打 tag / Release、未发 PyPI。
+
+### [FIX-issue15-整合窗口] — moton16,2026-10-10,CodeBuddy,Hy4-Preview — test+perf: issue #15 四条根因的全量回归与相对口径基准
+
+> **涵盖提交**：`418afeb`（P1-a/b/c）、`a41fda7`（P1-d）、`f55e8a8`（P2）、`d3a5453`（P3）、`1b5ef0f`（P4-a/b）
+
+**全量 pytest（整合窗口，只跑一次）**
+
+`python -m pytest -q --basetemp .runtime/pytest-full6` → **1322 passed / 2 skipped / 3 deselected**（约 3 分钟）。
+
+> 环境注记（与产品代码无关，供下个窗口避坑）：第一次全量尝试（`.runtime/pytest-full`）以 **1322 个 ERROR at setup** 收场，原因是宿主的安全删除守护拦截了 pytest 清理临时目录时的批量删除（`tests/conftest.py:31 tmp_path_factory.mktemp("host_iso")` → shim `_safe_shutil_rmtree` → `_check_bulk_delete_guard`），并非用例失败。改用**全新的 basetemp 目录**后同一套用例全绿。同理，本窗口整个批次的靶向运行都采用「每轮一个全新 basetemp」（`.runtime/pt/b<批号>-<序号>`），复用旧目录会随机触发同一个守护。
+
+**性能基准（相对口径，脚本与产物都在 `.runtime/issue15/`，不入库、不进 `tests/`）**
+
+同一脚本 `bench.py` 跑同一场景：**400 个已摄取虚拟源 + 5,000 行 `request_intents` + 媒体 route 可用且首轮留下未决意图**（三者缺一就走不到根因 1 那一行）。「修复前」用 `git archive 1e0840a mortis_rag_mcp` 导出的基线包（`.runtime/issue15/baseline/`）跑，保证是同一脚本、同一台机器。
+
+| 指标 | 修复前 | 修复后 | 相对 |
+|---|---|---|---|
+| (a) 稳态整轮 `run_sync` 墙钟（中位数） | 4.868 s | 0.783 s | **6.2×** |
+| (b) 单次 `kb_search` 墙钟（中位数） | 0.0124 s | 0.0109 s | 1.14× |
+| (c) 8 秒空闲窗口内后台线程 CPU（进程级） | 4.594 s（**单核 57.4%**） | 0.797 s（**单核 9.9%**） | **5.8×** |
+
+(c) 正是 issue 里「纯空闲期也 100% 占满一个 CPU 核心」的可复现代理量：修复前一轮全量 sync 就要 ~4.9 s，而兜底重排间隔是 30 s、意图扫描还要叠加，本机缩尺场景下已能吃掉一个核的一半以上；修复后落到 10% 以内。
+
+**口径声明**：这里**不**声称达到了 issue 里的 15~20 倍——那是特定硬件/特定语料（3,475 md + 2,892 虚拟文档）的端到端数字，本机无法复现。上表只做「同一台机器、同一脚本、修复前 vs 修复后」的相对口径。
+
+**四条根因的最终状态**
+
+| 根因 | 卡 | 状态 |
+|---|---|---|
+| 1 虚拟循环内 `O(N×M)` 意图扫描 | P1-a/b/c | 已修（整轮 1 次探查；另补 `(kind, profile_fingerprint, state)` 索引作兜底） |
+| 1 的第二处放大器：虚拟源每轮全量读盘 | P1-d | 已修（照抄文本路径 Fast-Stat 判据；保留 open+close 可读性探针） |
+| 2 读路径自污染 `index_state` | P2 | 已修（方案 A：watcher 在线时不再自排全量 sync） |
+| 3 `_filter_visible_chunks` 按 chunk 匹配 | P3 | 部分修（按 source 记忆化；三次读库/重读 `.vaultignore` 是被既有合同钉住的语义，未共享） |
+| 4 `kb_rebuild` 双重全量 + 逐文件 FTS 事务 | P4-a/b | 已修（单次全量 + 单事务回填；**冷启动时序下仍有残余，见 P4 条目**） |
+
+**未做（明确不声称）**：未改版本号；未 push、未开 PR、未打 tag / Release、未发 PyPI；P3-b（跨调用可见性纪元）与 P4 的方案 2/3 未做；`--list-requests` 脱敏口径未动。
