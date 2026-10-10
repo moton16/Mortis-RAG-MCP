@@ -411,8 +411,9 @@ def embed_missing(owner: MarkdownIndexer) -> bool:
 def revoke_source(owner: MarkdownIndexer, source: str, *, reason: str) -> bool:
     chunks = owner._chunks.pop(source, [])
     ids = {chunk.id for chunk in chunks}
-    for state in (owner._signatures, owner._stat_cache, owner._stat_seen_ns,
-                  owner._stat_confirmations, owner.fast_path_warnings, owner.failed_files):
+    for state in (owner._signatures, owner._stat_cache, getattr(owner, "_virtual_sha_cache", {}),
+                  owner._stat_seen_ns, owner._stat_confirmations, owner.fast_path_warnings,
+                  owner.failed_files):
         state.pop(source, None)
     for chunk_id in ids:
         owner._pending_vectors.pop(chunk_id, None)
@@ -812,16 +813,45 @@ def run_sync(owner: MarkdownIndexer) -> list[Chunk]:
             normalize_source_path(source, owner.vault_path)
             path = owner.vault_path / source
             stat = path.stat()
-            digest = hashlib.sha256()
-            with path.open("rb") as stream:
-                for block in iter(lambda: stream.read(1024 * 1024), b""):
-                    digest.update(block)
-            raw_sha = digest.hexdigest()
-            after = path.stat()
-            if (stat.st_mtime_ns, stat.st_size, stat.st_ctime_ns) != (
-                after.st_mtime_ns, after.st_size, after.st_ctime_ns
-            ):
-                raise ValueError("source changed during verification")
+            # issue #15 / P1-d：虚拟文档分支此前**没有**文本路径那种零读盘短路，
+            # 每轮对每个虚拟源全量读盘重算 SHA-256（issue 环境 2,892 个已摄取虚拟
+            # 文档 = 每轮数十 MB~数 GB 读盘，与根因 1 的 46.9 s 叠加成「后台永远
+            # 追不上」）。这里**照抄**文本路径已论证过的判据，不另发明余量逻辑：
+            #   命中 = 签名三元组 (mtime_ns, size, ctime_ns) 与上次内容级验证时登记
+            #   的完全一致 + `_fast_path_is_trustworthy`（mtime 严格早于「上次内容级
+            #   验证时刻 - _effective_margin_ns()」，余量由实际文件系统刻度推导）。
+            # 未命中（含首次、racily clean、快速路径被整体禁用）时下面的行为与加
+            # 缓存前逐字一致：全量读盘 + 读前读后双 stat 的 TOCTOU 复核。
+            fast_sig = (int(stat.st_mtime_ns), int(stat.st_size), int(stat.st_ctime_ns))
+            cached_sha = owner._virtual_sha_cache.get(source)
+            if (cached_sha is not None and owner._stat_cache.get(source) == fast_sig
+                    and owner._fast_path_is_trustworthy(source, int(stat.st_mtime_ns))):
+                # 跳过的是**读盘取内容**，不是「物理源仍然可读」这条判据本身：
+                # `test_virtual_sync.py::test_virtual_root_offline_retains_committed_fact`
+                # 钉住「stat 成功但 open 被拒（脱机/ACL）时必须把已提交事实降为
+                # unverified」。所以这里仍要开一次文件（open+close、不读一个字节，
+                # 开销是 ~µs 级系统调用，而不是整文件的 GB 级读盘）。
+                with path.open("rb"):
+                    pass
+                raw_sha = cached_sha
+            else:
+                digest = hashlib.sha256()
+                with path.open("rb") as stream:
+                    for block in iter(lambda: stream.read(1024 * 1024), b""):
+                        digest.update(block)
+                raw_sha = digest.hexdigest()
+                after = path.stat()
+                if (stat.st_mtime_ns, stat.st_size, stat.st_ctime_ns) != (
+                    after.st_mtime_ns, after.st_size, after.st_ctime_ns
+                ):
+                    raise ValueError("source changed during verification")
+                # 可信时刻在读盘之后取：此后若文件再被写入，新 mtime 必晚于该时刻，
+                # 签名随之失配、自动重读（与文本路径同一论证）。登记进 _stat_cache
+                # 的是**读盘前**的 fast_sig，不重新 stat——否则可能把「新 mtime +
+                # 旧哈希」固化进缓存（理由同文本路径）。
+                owner._virtual_sha_cache[source] = raw_sha
+                owner._stat_cache[source] = fast_sig
+                owner._stat_seen_ns[source] = time.time_ns()
             active = store.get_active(source, include_hidden=True)
             if active is None:
                 revoked = revoke_source(owner, source, reason="visibility") or revoked
@@ -893,9 +923,7 @@ def run_sync(owner: MarkdownIndexer) -> list[Chunk]:
                     chunk.metadata["embedding_disabled"] = True
             for chunk in chunks:
                 chunk.metadata.update(source_sha256=raw_sha, render_sha256=revision.render_sha256)
-            changed.append((source, signature, chunks,
-                            (int(stat.st_mtime_ns), int(stat.st_size), int(stat.st_ctime_ns)),
-                            time.time_ns()))
+            changed.append((source, signature, chunks, fast_sig, time.time_ns()))
         except FileNotFoundError as exc:
             writable = owner.document_store(write=True)
             if scan.complete:

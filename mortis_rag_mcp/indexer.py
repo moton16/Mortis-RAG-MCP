@@ -188,6 +188,11 @@ class MarkdownIndexer:
         self._chunks: dict[str, list[Chunk]] = {}
         self._signatures: dict[str, str] = {}
         self._stat_cache: dict[str, tuple[int, int, int]] = {}
+        # 虚拟源（已摄取文档的物理源）上一轮实测出来的 raw_sha，键与失效判据与
+        # _stat_cache 完全同源（issue #15 / P1-d）：此前每个虚拟文档每轮都要全量
+        # 读盘重算 SHA-256，2,892 个虚拟文档就是每轮数十 MB~数 GB 的读盘。命中
+        # 时零读盘，未命中时行为与加缓存前逐字一致。
+        self._virtual_sha_cache: dict[str, str] = {}
         # 记录每个 source 的 (mtime_ns, size, ctime_ns) 签名是在哪个进程时钟时刻通过
         # 内容级验证（read + sha256）的。快速路径判据要求文件 mtime 严格早于该时刻
         # 减去安全余量（余量从实际时间戳刻度推导，见 _effective_margin_ns）才信任
@@ -1564,6 +1569,7 @@ class MarkdownIndexer:
             # 缓存整体丢弃，失败名单也随之作废（它只是缓存的附属观测数据）。
             self.failed_files.clear()
             self._stat_cache.clear()
+            self._virtual_sha_cache.clear()
             self._stat_seen_ns.clear()
             self._stat_confirmations.clear()
             self.fast_path_warnings.clear()
@@ -1615,6 +1621,7 @@ class MarkdownIndexer:
             self._chunks.clear()
             self._signatures.clear()
             self._stat_cache.clear()
+            self._virtual_sha_cache.clear()
             self._stat_seen_ns.clear()
             self._stat_confirmations.clear()
             self.fast_path_warnings.clear()
