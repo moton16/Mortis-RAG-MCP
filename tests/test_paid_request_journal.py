@@ -13,9 +13,14 @@ import json
 import pytest
 
 from mortis_rag_mcp.config import AppConfig
-from mortis_rag_mcp.doc_store import resolve_storage_layout
+from mortis_rag_mcp.doc_store import LockUnavailable, resolve_storage_layout
 from mortis_rag_mcp.indexer import MarkdownIndexer
-from mortis_rag_mcp.paid_requests import PaidRequestJournal, paid_request_guard
+from mortis_rag_mcp.paid_requests import (
+    INTENT_LEASE_SECONDS,
+    PaidRequestJournal,
+    is_stale_prepared,
+    paid_request_guard,
+)
 from mortis_rag_mcp.providers import ProviderError
 from mortis_rag_mcp.server import approve_reembedding
 
@@ -346,3 +351,167 @@ def test_approve_reembedding_authorizes_exact_fingerprint(tmp_path, monkeypatch)
         assert paid_request_guard(control, "fp-exact", pending_approval=True) is True
     finally:
         control.close()
+
+
+# --------------------------------------------------------------------------
+# issue #12：零成本（loopback + 无凭据）端点不受付费闸门管辖
+# --------------------------------------------------------------------------
+
+def make_local_free_config(tmp_path) -> AppConfig:
+    cfg = make_config(tmp_path)
+    cfg.embedding.endpoint = "http://127.0.0.1:8000/v1/embeddings"
+    cfg.embedding.api_key = ""
+    return cfg
+
+
+class _FlakyControl:
+    """只实现 `mark_intent` 的替身：前 N 次抛可重试的锁竞争，之后正常落账。"""
+
+    def __init__(self, fail_times: int) -> None:
+        self.fail_times = fail_times
+        self.calls = 0
+
+    def mark_intent(self, request_id: str, state: str, reason: str = "", *,
+                    expected_states=("prepared",)) -> bool:
+        self.calls += 1
+        if self.calls <= self.fail_times:
+            raise LockUnavailable("simulated control lock contention")
+        return True
+
+
+def test_local_free_endpoint_is_not_wired_into_the_paid_journal(tmp_path):
+    """装配入口必须跳过零成本端点，否则 provider 里的 is_local_free 恒为死代码。"""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (vault / "a.md").write_text("probe body", encoding="utf-8")
+    free = MarkdownIndexer(vault, make_local_free_config(tmp_path))
+    try:
+        assert free.embedding_provider.is_local_free is True
+        assert free.embedding_provider.request_journal is None, "零成本端点不得进付费台账"
+        assert free.embedding_provider.paid_guard is None
+        assert free.configure_paid_provider(
+            "embed", free.embedding_provider, free._embedding_profile.fingerprint) is True
+    finally:
+        free.close_document_store()
+
+    paid = MarkdownIndexer(vault, make_config(tmp_path))
+    try:
+        assert paid.embedding_provider.is_local_free is False
+        assert paid.embedding_provider.request_journal is not None, "付费端点必须照旧装配"
+    finally:
+        paid.close_document_store()
+
+
+def test_local_free_endpoint_never_freezes_batch_embedding(tmp_path, monkeypatch):
+    """本机推理后端抖动不得把整条索引冻住，也不得留下待人工清账的意图。"""
+    sent = []
+
+    def failing_urlopen(request, timeout=None):
+        sent.append(json.loads(request.data.decode("utf-8")))
+        raise OSError("simulated local backend restart")
+
+    monkeypatch.setattr("mortis_rag_mcp.providers.urlopen", failing_urlopen)
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (vault / "a.md").write_text("probe body", encoding="utf-8")
+    indexer = MarkdownIndexer(vault, make_local_free_config(tmp_path))
+    try:
+        indexer.sync()
+        assert len(sent) == 1, "零成本端点应当直发，不落意图"
+        indexer.sync()
+        assert len(sent) == 2, "本地失败只报本地错误，不得暂停后续轮次"
+        assert indexer._embedding_paused is False
+        assert indexer.unresolved_paid_intents() == []
+        assert all("LOCAL_REQUEST_FAILED" in str(err) for err in indexer.failed_files.values())
+    finally:
+        indexer.close_document_store()
+
+
+# --------------------------------------------------------------------------
+# issue #13：落账失败的补位，与超租约 prepared 的回收
+# --------------------------------------------------------------------------
+
+def test_mark_retries_transient_lock_instead_of_leaking_prepared(monkeypatch):
+    """瞬时锁竞争不得把「已成功、只是没记上」的请求永久留在 prepared。"""
+    monkeypatch.setattr("mortis_rag_mcp.paid_requests.time.sleep", lambda _seconds: None)
+    control = _FlakyControl(fail_times=1)
+    journal = PaidRequestJournal(control, "embed")
+    journal.mark_success("rid-1")
+    assert control.calls == 2, "可重试的锁冲突必须补位一次"
+    journal.mark_unknown("rid-2", "response_unconfirmed")
+    assert control.calls == 3, "补位成功后不再多落一次"
+
+
+def test_mark_persistent_failure_stays_fail_closed(monkeypatch):
+    """补位也失败时不得放宽：意图留在 prepared，由人工对账。"""
+    monkeypatch.setattr("mortis_rag_mcp.paid_requests.time.sleep", lambda _seconds: None)
+    control = _FlakyControl(fail_times=99)
+    journal = PaidRequestJournal(control, "embed")
+    with pytest.raises(LockUnavailable):
+        journal.mark_success("rid-1")
+    assert control.calls == 2, "只补一次，不无限重试"
+
+
+def test_stale_prepared_on_loopback_stops_blocking(tmp_path):
+    """零成本端点上超租约的 prepared 是泄漏记录，不得再冻住整条路由。"""
+    cfg = make_config(tmp_path)
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    indexer = MarkdownIndexer(vault, cfg)
+    try:
+        control = indexer._paid_control_store()
+        assert control is not None
+        control.record_send_intent(
+            "rid-loopback", kind="media", payload_hash="h",
+            endpoint="http://127.0.0.1:8000/v1/embeddings",
+            profile_fingerprint="FP", attempt=None, reject_unresolved=True)
+        assert indexer.has_unresolved_paid_intents(control, "media", "FP") is True, "新鲜意图照旧阻塞"
+
+        with control.mutation() as conn:
+            aged = 0.0 - (INTENT_LEASE_SECONDS + 60.0)
+            conn.execute("UPDATE request_intents SET created_at=?, updated_at=? WHERE request_id=?",
+                         (aged, aged, "rid-loopback"))
+            conn.commit()
+        assert indexer.has_unresolved_paid_intents(control, "media", "FP") is False, "超租约后必须解冻"
+
+        rows = indexer.unresolved_paid_intents()
+        assert len(rows) == 1, "解冻不等于删除，对账凭据必须保留"
+        assert rows[0]["stale"] is True and rows[0]["endpoint_is_loopback"] is True
+    finally:
+        indexer.close_document_store()
+
+
+def test_stale_prepared_never_relaxes_paid_endpoints(tmp_path):
+    """付费端点上超租约的 prepared 可能是已计费请求，回收会丢对账凭据。"""
+    cfg = make_config(tmp_path)
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    indexer = MarkdownIndexer(vault, cfg)
+    try:
+        control = indexer._paid_control_store()
+        assert control is not None
+        control.record_send_intent(
+            "rid-paid", kind="embed", payload_hash="h",
+            endpoint="https://example.invalid/v1/embeddings",
+            profile_fingerprint="FP", attempt=None, reject_unresolved=True)
+        with control.mutation() as conn:
+            aged = 0.0 - (INTENT_LEASE_SECONDS + 60.0)
+            conn.execute("UPDATE request_intents SET created_at=?, updated_at=? WHERE request_id=?",
+                         (aged, aged, "rid-paid"))
+            conn.commit()
+        assert indexer.has_unresolved_paid_intents(control, "embed", "FP") is True
+    finally:
+        indexer.close_document_store()
+
+
+@pytest.mark.parametrize(("state", "endpoint", "aged", "expected"), [
+    ("prepared", "http://127.0.0.1:8000/v1/embeddings", True, True),
+    ("prepared", "http://127.0.0.1:8000/v1/embeddings", False, False),
+    ("prepared", "https://example.invalid/v1/embeddings", True, False),
+    ("submission_unknown", "http://127.0.0.1:8000/v1/embeddings", True, False),
+])
+def test_is_stale_prepared_boundaries(state, endpoint, aged, expected):
+    """租约只适用于 prepared，且只对零成本端点放宽。"""
+    stamp = (0.0 - INTENT_LEASE_SECONDS - 1.0) if aged else 0.0
+    item = {"state": state, "endpoint": endpoint, "created_at": stamp, "updated_at": stamp}
+    assert is_stale_prepared(item, now=0.0) is expected
