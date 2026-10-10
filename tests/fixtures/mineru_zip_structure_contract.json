@@ -1,0 +1,55 @@
+{
+  "contract_name": "mineru_v4_zip_structure_v1",
+  "provider": "mineru_v4_archive",
+  "archive_format": "zip",
+  "root_members": {
+    "markdown": "full.md",
+    "structure_json": "content_list.json",
+    "media_dir": "images/"
+  },
+  "field_mapping": {
+    "content_list_json": {
+      "type": "block type: image | table | chart | text | equation",
+      "img_path": "archive relative path to image asset, e.g. images/figure_1.jpg",
+      "image_caption": "list of strings or string describing the image",
+      "table_caption": "list of strings or string describing the table",
+      "chart_caption": "list of strings or string describing the chart",
+      "page_idx": "0-based page index, maps to MediaOccurrence.page = page_idx + 1",
+      "bbox": "[x0, y0, x1, y1] normalized coordinates in [0, 1000]",
+      "text": "equation LaTeX / table representation text when present",
+      "ocr": "ocr text when present; empty string if omitted (no guessing)"
+    },
+    "markdown_anchor": {
+      "anchor_start": "Character offset in full.md where ![...](img_path) begins",
+      "anchor_end": "Character offset in full.md where ![...](img_path) ends",
+      "note": "Only written when real textual reference evidence exists; width/height must never be used as anchor"
+    }
+  },
+  "sample_content_list": [
+    {
+      "type": "text",
+      "text": "Research Report Title\n\nIntroduction paragraph.",
+      "page_idx": 0,
+      "bbox": [50, 100, 950, 300]
+    },
+    {
+      "type": "image",
+      "img_path": "images/fig_1.png",
+      "image_caption": [
+        "Figure 1: Observed distribution curves across iterations."
+      ],
+      "page_idx": 1,
+      "bbox": [62, 480, 946, 904]
+    },
+    {
+      "type": "table",
+      "img_path": "images/table_1.png",
+      "table_caption": [
+        "Table 1: Benchmark quantitative metrics comparison."
+      ],
+      "page_idx": 2,
+      "bbox": [100, 200, 900, 800]
+    }
+  ],
+  "sample_markdown": "# Research Report Title\n\nIntroduction paragraph.\n\n![Figure 1: Observed distribution curves across iterations.](images/fig_1.png)\n\nDetailed analysis follows.\n\n![Table 1: Benchmark quantitative metrics comparison.](images/table_1.png)\n\nConclusion section.\n"
+}

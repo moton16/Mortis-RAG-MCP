@@ -36,17 +36,19 @@ def test_foreground_search_returns_immediately_while_sync_blocked(tmp_path: Path
     idx.sync()  # 先预热好索引
     assert len(idx.all_chunks()) > 0
 
-    # 用 Event 卡住 _sync_locked
+    # 用 Event 卡住真同步的**内层**（_sync_locked_impl）：标记 index 在飞的动作在
+    # 它的外层 _sync_locked 里，从更外层的 _sync_locked 卡住会把对外可见的进度信号
+    # 一起掐掉，等于先手动制造"看不见的同步"再断言能看见它。
     sync_blocker = threading.Event()
     sync_started = threading.Event()
-    orig_sync_locked = idx._sync_locked
+    orig_sync_impl = idx._sync_locked_impl
 
-    def slow_sync_locked(*args, **kwargs):
+    def slow_sync_locked_impl(*args, **kwargs):
         sync_started.set()
         sync_blocker.wait(timeout=5)
-        return orig_sync_locked(*args, **kwargs)
+        return orig_sync_impl(*args, **kwargs)
 
-    idx._sync_locked = slow_sync_locked
+    idx._sync_locked_impl = slow_sync_locked_impl
 
     try:
         # 触发一次后台刷新
@@ -65,6 +67,47 @@ def test_foreground_search_returns_immediately_while_sync_blocked(tmp_path: Path
         assert content.get("indexing_in_progress") is True
     finally:
         sync_blocker.set()
+        server.shutdown()
+
+
+def test_guarded_sync_is_visible_as_indexing(tmp_path: Path):
+    """try_sync_with_guard 进入的同步也必须对外标注「索引在飞」。
+
+    修复前只有监听线程的包装会置 `_indexing`，于是从 try_sync_with_guard（前台守护
+    式增量对账）进入的同步对 kb_search / kb_stats 完全不可见：客户端会把同步期间
+    返回的部分结果当成终态。
+    """
+    vault = tmp_path / "vault_guarded_sync"
+    vault.mkdir()
+    (vault / "note.md").write_text("# Target\nguarded sync content\n", encoding="utf-8")
+
+    config_path = tmp_path / "app.toml"
+    config_path.write_text('mode = "static"\n', encoding="utf-8")
+    server = VaultMcpServer(config_path)
+    server.registry.add(str(vault), name="GuardedVault")
+
+    idx = server._indexer_for({"vault_path": "GuardedVault"})
+    idx.sync()
+
+    gate = threading.Event()
+    entered = threading.Event()
+    orig_impl = idx._sync_locked_impl
+
+    def blocking_impl(*args, **kwargs):
+        entered.set()
+        gate.wait(timeout=5)
+        return orig_impl(*args, **kwargs)
+
+    idx._sync_locked_impl = blocking_impl
+    worker = threading.Thread(target=idx.try_sync_with_guard, daemon=True, name="guarded-sync")
+    worker.start()
+    try:
+        assert entered.wait(timeout=2), "守护式同步未按时进入真同步"
+        status = idx.refresh_status()
+        assert status["indexing_in_progress"] is True, status
+    finally:
+        gate.set()
+        worker.join(timeout=5)
         server.shutdown()
 
 

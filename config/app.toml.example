@@ -20,6 +20,12 @@ endpoint = "https://api.siliconflow.cn/v1/embeddings"
 model = "BAAI/bge-m3"
 # 是否向 API 发送 dimensions 参数（支持 MRL 裁剪的模型可开；标准定长端点请保持 false）。
 send_dimensions = false
+# R2 通用原样默认；仅按端点明确合同设置非对称模板，不按模型名猜前缀。
+query_template = "{text}"
+document_template = "{text}"
+# model_revision = ""
+# endpoint_revision = ""
+# preprocess_version = "text-v1"
 # Prefer environment interpolation over committing a secret.
 # api_key 为空时会自动回退读取环境变量 MORTIS_RAG_API_KEY（同时兼容 VAULT_MCP_API_KEY）。
 api_key = "${MORTIS_RAG_API_KEY}"
@@ -29,6 +35,29 @@ timeout = 30
 max_retries = 3
 batch_size = 32
 retry_backoff = 1.0
+# Empty profile retains conservative text-only behavior; no automatic model guessing.
+capability_profile = ""
+adapter = "openai_text"
+client_slicing = false
+
+# ---- 原生媒体（图像/音频）声明：E07 ----
+# 当前仅提供可注入 transport 的内部合同；普通工厂尚未装配真实媒体 HTTP adapter。
+# 填这些声明本身不代表真实端点可用或已经验证，不按模型名猜线协议。
+# 全部留空 = 不声明任何原生媒体能力；文本路径完全不受影响。
+# 媒体能力**只**由下面的显式声明决定：不按 model 名推、不按同维向量推 alignment。
+# 缺任一必需声明（modalities / alignment_space_id / preprocess / endpoint_revision /
+# MIME / 限额 / 证据引用）时该 route 判定为不可用，绝不自动试端点。
+# media_modalities = ["image", "audio"]
+# media_alignment_space_id = ""            # 与文本 profile 共享的对齐空间标识（显式）
+# media_preprocess_version = ""            # 媒体预处理版本（显式，不是文本 text-v1）
+# media_endpoint_revision = ""             # 媒体端点版本（显式）
+# media_allowed_mime_types = ["image/png", "image/jpeg", "image/webp"]
+# media_max_input_bytes = 0                # 单件媒体字节上限（正整数）
+# media_max_batch_size = 0                 # 单请求媒体件数上限（正整数）
+# media_model_reference = ""
+# media_endpoint_fixture_reference = ""
+# media_alignment_reference = ""
+# media_license_reference = ""
 
 [reranker]
 enabled = false
@@ -42,9 +71,22 @@ max_retries = 1
 retry_backoff = 1.0
 # When enabled, provider failure must fall back to base retrieval order.
 
+[chunking]
+mode = "estimated_tokens"
+target_tokens = 384
+overlap_tokens = 64
+hard_limit_tokens = 768
+estimator_profile = "unicode-estimate-v1"
+# Type: 纯标准库 Unicode 权重估算（未离线校准），不是真实 LLM tokenizer；
+# legacy 别名 "calibrated-v1" 仅为读取旧库缓存保留，不使用也不代表已校准。
+# Existing explicit chunk_size/chunk_overlap without a new mode retain legacy_chars.
+# R2: AppConfig() 和空 TOML 的新库默认一致；已有缓存模式/字符参数保留，
+# 迁移已有库请显式设置 mode。硬上限不是 embedding 向量维度。
+# estimated 超硬上限的 HTML 表格完整保留并标 embedding_disabled，不猜表头/丢单元格。
+
 [index]
-chunk_size = 1200
-chunk_overlap = 0
+# chunk_size = 1200
+# chunk_overlap = 0
 debounce_seconds = 0.5
 # 0.5.0：注入图片 alt/图注使其可检索。注意这会改写 chunk content → chunk.id，
 # 开启 = 全库重新 embedding（一次付费操作）。
@@ -90,18 +132,34 @@ embedding_max_workers = 2
 placement = "home"
 subdir = ".mcp_cache"
 
+# ── 版本化文档库（v0.9.0 起，解析事实的容量策略）──────────────────
+# 虚拟摄取把 PDF/Office 的解析 Markdown 与媒体存进缓存根下的文档库
+# （cache.dir/<namespace>/doc_store/），默认不再在知识库里生成 .mortis-parsed/ 镜像。
+# 文档库是**解析事实**而不是可重建的派生索引：删除它可能重新产生解析费用，
+# 所以普通清缓存/kb_rebuild 不会碰它，只有显式 purge 授权才会清理。
+# 虚拟摄取要求 [cache] enabled = true 且放置位置不在任何已注册知识库内
+# （cache.placement="vault" 是显式例外）；否则入队前即拒绝，不会静默改写路径。
+[doc_store]
+# 单库文档库逻辑容量上限（MiB）。含 active 版本、上一 committed 版本、staged 候选
+# 与媒体 blob；超额时拒绝新的提交并提示显式维护，绝不隐式删除计费资产。
+# 0 不是「无限制」：配置解析会拒绝小于 1 的值。
+max_size_mb = 2048
+
 # The current indexer always filters .md files, .obsidian, and common
 # temporary Markdown names (~*.md, *.tmp.md, *.swp.md, *.swo.md).
 # Those filters are implementation defaults, not configurable keys today.
 
 # ── PDF/Office 摄取层（默认关闭）────────────────────────────
-# 开启后可用 kb_ingest 把库里的 PDF/DOCX/PPTX/XLSX 解析成 Markdown 收进
-# .mortis-parsed/ 子目录并纳入索引。解析走 MinerU 云端 API：
+# 开启后可用 kb_ingest 把 PDF/DOCX/PPTX/XLSX 解析事实纳入 virtual 文档库。
+# 显式 storage="legacy" 才写 .mortis-parsed/；routing 控制本地/云端解析：
 #   - 配了 api_key → v4 精准接口（≤200MB/200页，每天 1000 页高优先级额度）
-#   - 没配 api_key → Agent 免登接口（≤10MB/20页，IP 限频，零配置试用）
+#   - 没配 api_key → Agent 免登接口（≤10MB/20页，IP 限频，零配置试用）；
+#     该通道上游协议**只返回正文 markdown**，不返回文档内图片素材（图片需 v4 授权或本地解析）
 # 云端都失败且装了 pymupdf（pip install pymupdf）→ 本地纯文本兜底。
 [ingest]
 enabled = false
+# Routing: auto | mineru | local. local never selects the cloud parser.
+routing = "auto"
 # 自动监听并摄取知识库内的 PDF/Office 文档（默认关闭：必须显式配置 enabled=true 与 auto_watch=true 才生效）。
 # 开启后会自动扫描并排队摄取知识库内既有文档及后续新增/修改的文档。
 # 支持所有 INGEST_EXTS 格式（.pdf, .doc, .docx, .ppt, .pptx, .xls, .xlsx）。
@@ -114,6 +172,32 @@ auto_watch = false
 max_file_size_mb = 20
 # api_key = "${MINERU_API_KEY}"
 # model_version = "vlm"
+
+# ── v0.9.0 有界解析与队列（默认值即安全起点；0 不是「关闭限制」）─────────
+# storage：解析事实落点。virtual（默认）= 只写文档库（document_revisions/媒体），
+# 由 kb_read/kb_search 按 revision 读回，不再产生 .mortis-parsed 物理镜像；
+# legacy = 保留旧物理镜像路径（旧库回退用，不自动迁移、不自动删除旧镜像）。
+# storage = "virtual"
+# network_policy：configured（默认）允许已授权的云端解析；local_only 在**入队前**
+# 拒绝一切云路径（不会先上传再报错）。
+# network_policy = "configured"
+# 解压/归档安全配额（单位 MiB）。压缩响应上限、累计解压上限、单 markdown / 单 JSON /
+# 单媒体上限。这些是进程内可执行的消费预算，不是 RSS 保证；小于 1 的配置会被拒绝。
+# archive_max_mb = 32
+# extracted_max_mb = 200
+# markdown_max_mb = 16
+# json_max_mb = 8
+# media_max_mb = 8
+# memory_budget_mb = 128
+# queue_limit = 1000
+# max_parse_workers = 1
+
+[media]
+inline_max_bytes = 8388608
+refs_limit = 20
+preview_enabled = true
+preview_max_edge = 1600
+preview_max_bytes = 524288
 
 # ── 本地诊断日志（默认关闭）────────────────────────────────
 # 开启后在本地输出结构化 jsonl 诊断日志，用于排查检索退化与阶段耗时。

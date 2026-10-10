@@ -1,0 +1,52 @@
+{
+  "contract_name": "embeddinggemma_2_model_card_specification",
+  "model_identifier": "google/embeddinggemma-2",
+  "creator": "Google DeepMind",
+  "release_date": "2026-10-06",
+  "license": "Apache-2.0",
+  "parameters": {
+    "total": "740M",
+    "text_backbone": "270M (130M transformer + 140M embedder based on Gemma 4)",
+    "vision_encoder": "170M",
+    "audio_encoder": "300M (Gemma 4 Audio encoder)"
+  },
+  "supported_modalities": ["text", "code", "image", "audio", "video"],
+  "vector_space": {
+    "native_dimension": 768,
+    "mrl_truncation_dimensions": [128, 256, 512, 768],
+    "context_window_tokens": 8192,
+    "normalization": "l2-float32-v1"
+  },
+  "audio_specifications": {
+    "sample_rate_hz": 16000,
+    "channels": "mono",
+    "token_rate": "40ms per token (4x time reduction on 10ms SSCP convolution frames)",
+    "max_audio_length_tokens": 750,
+    "total_audio_capacity_minutes": 5.5,
+    "placeholder_token": "<|audio|>"
+  },
+  "execution_profiles": {
+    "text_only": {
+      "parameters": "270M",
+      "config_kwargs": "{\"vision_config\": None, \"audio_config\": None}"
+    },
+    "text_and_vision": {
+      "parameters": "440M",
+      "config_kwargs": "{\"audio_config\": None}"
+    },
+    "text_and_audio": {
+      "parameters": "570M",
+      "config_kwargs": "{\"vision_config\": None}"
+    },
+    "full_multimodal": {
+      "parameters": "740M",
+      "config_kwargs": "{}"
+    }
+  },
+  "deployment_classification": {
+    "nature": "Open-weight on-device / local edge embedding model",
+    "python_runtime": "sentence-transformers >= 6.1.0, transformers >= 5.1",
+    "edge_frameworks": ["Google AI Edge LiteRT (.litertlm)", "MediaPipe Universal Embedder Task"],
+    "cloud_http_service_status": "No standalone managed public REST SaaS endpoint provided directly by Google under 'embeddinggemma-2'. The official Google cloud service sharing this multimodal technology and offering production HTTP REST audio embeddings is Gemini API 'gemini-embedding-2'. Ollama provides model weights but its /api/embed HTTP endpoint currently only accepts string inputs."
+  }
+}

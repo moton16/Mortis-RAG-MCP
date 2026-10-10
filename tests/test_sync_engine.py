@@ -145,3 +145,31 @@ def test_thread_names_and_prefixes():
 
     engine_source = inspect.getsource(sync_engine)
     assert 'thread_name_prefix="vault-emb"' in engine_source, "embedding 线程名前缀 vault-emb 发生改变"
+def test_complete_scan_reconciles_orphan_disk_ids(tmp_path):
+    from mortis_rag_mcp.config import AppConfig, CacheConfig
+    from mortis_rag_mcp.indexer import MarkdownIndexer
+    (tmp_path / "note.md").write_text("# Note\ncurrent content", encoding="utf-8")
+    owner = MarkdownIndexer(tmp_path, AppConfig(cache=CacheConfig(
+        dir=str(tmp_path / "cache"), enabled=True)))
+    owner.sync()
+    current = {c.id for c in owner.all_chunks()}
+    class Backend:
+        def __init__(self):
+            self.ids = current | {"orphan-old-chunker"}
+        def list_ids(self):
+            return list(self.ids)
+        def upsert_vectors(self, vectors):
+            self.ids.update(vectors)
+            return set(vectors)
+        def delete_vectors(self, ids):
+            self.ids.difference_update(ids)
+    backend = Backend()
+    owner._vector_backend = backend
+    owner._vectors_on_disk = True
+    owner._disk_vectors = set(backend.ids)
+    try:
+        owner.sync()
+        assert backend.ids == current
+        assert owner._disk_vectors == current
+    finally:
+        owner.close_document_store()

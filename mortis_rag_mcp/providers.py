@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import hashlib
 import json
@@ -10,6 +10,10 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from .config import EmbeddingConfig, RerankerConfig
+from .embedding_capabilities import (
+    EmbeddingContractError, ResolvedEmbeddingProfile,
+    resolve_embedding_profile, validate_vector,
+)
 
 # 测试注入点：monkeypatch `_sleep` 即可断言退避序列，不必真的等待。
 _sleep = time.sleep
@@ -72,6 +76,25 @@ def _retry_after_seconds(headers: Any) -> float | None:
     return min(seconds, _MAX_BACKOFF)
 
 
+def _is_loopback_endpoint(endpoint: str) -> bool:
+    if not endpoint:
+        return False
+    try:
+        from urllib.parse import urlsplit
+        import ipaddress
+        host = (urlsplit(endpoint).hostname or "").strip().lower()
+        if not host:
+            return False
+        if host in {"127.0.0.1", "localhost", "::1"}:
+            return True
+        try:
+            return ipaddress.ip_address(host).is_loopback
+        except ValueError:
+            return False
+    except Exception:
+        return False
+
+
 class _JsonHttpProvider:
     def __init__(self, endpoint: str, api_key: str = "", timeout: float = 30.0, max_retries: int = 3, retry_backoff: float = 1.0) -> None:
         if not endpoint:
@@ -81,6 +104,18 @@ class _JsonHttpProvider:
         self.timeout = timeout
         self.max_retries = max_retries
         self.retry_backoff = retry_backoff
+        self.request_journal: Any = None
+        self.paid_guard: Any = None
+        self.request_profile = ""
+
+    @property
+    def is_local_free(self) -> bool:
+        return not bool(self.api_key and self.api_key.strip()) and _is_loopback_endpoint(self.endpoint)
+
+    def configure_paid_requests(self, journal: Any, guard: Any, profile_fingerprint: str) -> None:
+        self.request_journal = journal
+        self.paid_guard = guard
+        self.request_profile = profile_fingerprint
 
     def _post(self, payload: dict[str, Any]) -> Any:
         headers = {"Content-Type": "application/json", "Accept": "application/json"}
@@ -93,17 +128,31 @@ class _JsonHttpProvider:
             headers=headers,
             method="POST",
         )
-        for attempt in range(self.max_retries + 1):
+        journal = self.request_journal
+        if journal is None or self.paid_guard is None:
+            if not self.is_local_free:
+                raise ProviderError("PAID_REQUEST_CONTROL_UNAVAILABLE: durable journal required; profile may be revoked")
+        elif not self.paid_guard(self.request_profile):
+            raise ProviderError("PAID_REQUEST_CONTROL_UNAVAILABLE: durable journal required; profile may be revoked")
+
+        if journal is not None:
+            payload_hash = hashlib.sha256(request.data).hexdigest()
+            request_id = journal.before_send(payload_hash, self.endpoint, self.request_profile)
+            try:
+                # Non-idempotent POST: even 429/5xx may already have incurred cost.
+                with urlopen(request, timeout=self.timeout) as response:
+                    result = json.loads(response.read().decode("utf-8"))
+                journal.mark_success(request_id)
+                return result
+            except (HTTPError, URLError, OSError, ValueError, json.JSONDecodeError) as exc:
+                journal.mark_unknown(request_id, "response_unconfirmed")
+                raise ProviderError("SUBMISSION_UNKNOWN: request outcome unknown; automatic retry disabled") from exc
+        else:
             try:
                 with urlopen(request, timeout=self.timeout) as response:
                     return json.loads(response.read().decode("utf-8"))
             except (HTTPError, URLError, OSError, ValueError, json.JSONDecodeError) as exc:
-                delay = self._backoff_seconds(attempt, exc)
-                if delay is None or attempt >= self.max_retries:
-                    raise ProviderError(
-                        f"provider request failed after {attempt + 1} attempts: {exc}"
-                    ) from exc
-                _sleep(delay)
+                raise ProviderError(f"LOCAL_REQUEST_FAILED: request to local endpoint failed: {exc}") from exc
 
     def _backoff_seconds(self, attempt: int, exc: BaseException) -> float | None:
         """返回本次失败应等待的秒数；None 表示不可重试，立即失败。"""
@@ -127,12 +176,16 @@ class _JsonHttpProvider:
 
 
 class ExternalEmbeddingProvider(_JsonHttpProvider):
-    def __init__(self, endpoint: str, model: str = "", api_key: str = "", timeout: float = 30.0, dimension: int | None = None, send_dimensions: bool = True, max_retries: int = 3, retry_backoff: float = 1.0, batch_size: int = 32) -> None:
+    def __init__(self, endpoint: str, model: str = "", api_key: str = "", timeout: float = 30.0, dimension: int | None = None, send_dimensions: bool = True, max_retries: int = 3, retry_backoff: float = 1.0, batch_size: int = 32, *, profile: ResolvedEmbeddingProfile | None = None) -> None:
         super().__init__(endpoint, api_key, timeout, max_retries, retry_backoff)
         self.model = model
         self.dimension = dimension
         self.send_dimensions = send_dimensions
         self.batch_size = batch_size
+        self.profile = profile
+        if profile is not None:
+            self.dimension = profile.effective_dim
+            self.send_dimensions = profile.request_dim is not None
 
     def embed(self, texts: Sequence[str]) -> list[list[float]]:
         if not texts:
@@ -163,21 +216,28 @@ class ExternalEmbeddingProvider(_JsonHttpProvider):
                 f"embedding response returned {len(data)} vectors for {len(batch)} inputs"
             )
         # OpenAI 兼容接口不保证返回顺序，data[i].index 才是权威位置。
-        try:
-            indexes = [
-                int(item["index"]) if isinstance(item, dict) and "index" in item else position
-                for position, item in enumerate(data)
-            ]
-        except (TypeError, ValueError) as exc:
-            raise ProviderError("embedding response contains invalid indexes") from exc
+        indexes = []
+        indexed = [isinstance(item, dict) and "index" in item for item in data]
+        if any(indexed) and not all(indexed):
+            raise ProviderError("embedding response mixes indexed and unindexed items")
+        for position, item in enumerate(data):
+            index = item.get("index", position) if isinstance(item, dict) else None
+            if isinstance(index, bool) or not isinstance(index, int):
+                raise ProviderError("embedding response contains invalid indexes")
+            indexes.append(index)
         if sorted(indexes) != list(range(len(batch))):
             raise ProviderError(
                 f"embedding response indexes {sorted(indexes)} do not match {len(batch)} inputs"
             )
         ordered = [item for _, item in sorted(zip(indexes, data), key=lambda pair: pair[0])]
         try:
-            return [list(item["embedding"]) for item in ordered]
-        except (KeyError, TypeError) as exc:
+            vectors = [list(item["embedding"]) for item in ordered]
+            profile = self.profile
+            if profile is None:
+                dim = self.dimension or (len(vectors[0]) if vectors else 0)
+                profile = ResolvedEmbeddingProfile("legacy-text", "openai", self.model, self.endpoint, "", "", dim, dim, None, "unsupported")
+            return [validate_vector(vector, profile) for vector in vectors]
+        except (KeyError, TypeError, EmbeddingContractError) as exc:
             raise ProviderError("embedding response contains invalid vectors") from exc
 
 
@@ -204,8 +264,11 @@ class ExternalRerankerProvider(_JsonHttpProvider):
 
 
 def create_embedding_provider(config: EmbeddingConfig) -> EmbeddingProvider:
+    profile = resolve_embedding_profile(config)
     if config.mode == "static":
-        return StaticEmbeddingProvider(config.dimension)
+        provider = StaticEmbeddingProvider(config.dimension)
+        provider.profile = profile
+        return provider
     if config.mode == "external":
         return ExternalEmbeddingProvider(
             config.endpoint,
@@ -217,8 +280,76 @@ def create_embedding_provider(config: EmbeddingConfig) -> EmbeddingProvider:
             config.max_retries,
             config.retry_backoff,
             config.batch_size,
+            profile=profile,
         )
     raise ValueError(f"unsupported embedding mode: {config.mode}")
+
+
+def create_media_provider(config: EmbeddingConfig, *, transport: Any = None) -> Any:
+    """受控原生媒体 provider 工厂（E07）。
+
+    - 配置未声明任何媒体模态 → 返回 `None`（该能力不存在，不是错误；文本路径不受影响）。
+    - 声明不完整（modality / alignment_space_id / media preprocess / endpoint revision /
+      MIME / 限额 / 证据引用）→ 抛 `ProviderError`：明确「该 route 不可用」，绝不用
+      文本成功、同维向量或模型名冒充，也绝不自动试端点。
+    - 已声明 adapter 使用合同 transport；注入的 transport 也使用同一 resolved 身份。
+    """
+    declared = tuple(getattr(config, "media_modalities", ()) or ())
+    if not declared:
+        return None
+    from .embedding_capabilities import EmbeddingContractError, resolve_media_connection, resolve_media_profile
+    from .media_providers import NativeMediaEvidence, NativeMediaProvider
+    try:
+        connection = resolve_media_connection(config)
+        profile = resolve_media_profile(config, connection=connection)
+    except EmbeddingContractError as exc:
+        raise ProviderError(f"native media capability unavailable: {exc}") from exc
+    mime = tuple(getattr(config, "media_allowed_mime_types", ()) or ())
+    max_bytes = int(getattr(config, "media_max_input_bytes", 0) or 0)
+    max_batch = int(getattr(config, "media_max_batch_size", 0) or 0)
+    references = tuple(str(getattr(config, name, "") or "") for name in (
+        "media_model_reference", "media_endpoint_fixture_reference",
+        "media_alignment_reference", "media_license_reference"))
+    if not mime:
+        raise ProviderError("native media capability unavailable: allowed MIME types are not declared")
+    if max_bytes <= 0 or max_batch <= 0:
+        raise ProviderError("native media capability unavailable: byte/batch limits are not declared")
+    if not all(references):
+        raise ProviderError("native media capability unavailable: endpoint evidence references are incomplete")
+    if transport is None:
+        adapter_name = connection.adapter
+        if adapter_name == "openai_vl":
+            from .media_providers import HttpMediaTransport
+            transport_type = HttpMediaTransport
+        elif adapter_name in {"gemini", "embeddinggemma2"}:
+            ep = connection.endpoint.lower()
+            local = any(h in ep for h in ("127.0.0.1", "localhost", "::1"))
+            gemma_unverified = (adapter_name == "embeddinggemma2"
+                               and not any(dom in ep for dom in ("googleapis.com", "google", "aiplatform", "gemini")))
+            if local or gemma_unverified:
+                raise ProviderError(
+                    "native media capability unavailable: local inference server (e.g. llama.cpp / Ollama) "
+                    "lacks a verified HTTP REST audio embedding schema on /v1/embeddings. "
+                    "For local EmbeddingGemma 2, run in-process via sentence-transformers/LiteRT; "
+                    "for HTTP REST audio embeddings, route to Google Gemini cloud service 'gemini-embedding-2' "
+                    "with adapter='gemini'."
+                )
+            from .media_providers import GeminiMediaTransport
+            transport_type = GeminiMediaTransport
+        else:
+            raise ProviderError("native media capability unavailable: no declared transport (Q09 protocol missing)")
+        transport = transport_type(
+            endpoint=profile.endpoint, model=profile.model, api_key=connection.api_key,
+            timeout=getattr(config, "timeout", 30.0), dimension=profile.effective_dim,
+            send_dimensions=profile.request_dim is not None, allowed_mime_types=mime,
+            max_input_bytes=max_bytes, max_batch_size=max_batch)
+
+    evidence = NativeMediaEvidence(
+        references[0], references[1], references[2], references[3],
+        profile.fingerprint, profile.alignment_space_id, max_bytes, max_batch, mime,
+        preprocess_version=profile.preprocess_version, endpoint_revision=profile.endpoint_revision,
+    )
+    return NativeMediaProvider(profile, evidence, transport)
 
 
 def create_reranker_provider(config: RerankerConfig) -> ExternalRerankerProvider | None:

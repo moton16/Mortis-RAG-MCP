@@ -170,6 +170,9 @@ class VaultRegistry:
         # Session-only entries used when the registry file can't be written
         # (e.g. read-only home dir): vault keeps working until the process exits.
         self._memory_entries: list[VaultEntry] = []
+        self._last_file_entries: list[VaultEntry] = []
+        self.read_status = "unread"
+        self.read_error = ""
         # add/remove/set_weight 都是 load→改→save 的读改写序列，而后台启动线程
         # 会并发 load()。锁只保证进程内一致（跨进程文件锁不在本轮范围）。
         self._lock = threading.RLock()
@@ -178,22 +181,42 @@ class VaultRegistry:
     # ------------------------------------------------------------------ io
 
     def load(self) -> list[VaultEntry]:
-        """Read the registry; a missing or corrupt file yields an empty list.
-        Session-only (memory) entries are appended at the end."""
+        with self._lock:
+            return self._load_locked()
+
+    def _load_locked(self) -> list[VaultEntry]:
+        """Read known entries; unknown IO/parse state never authorizes overwrite.
+
+        A missing file is a legal empty registry. For compatibility a first
+        corrupt read still returns [], but read_status distinguishes it from
+        known empty; mutations must not replace that unknown file.
+        """
         file_entries: list[VaultEntry] = []
-        if self.path.is_file():
+        self.read_status, self.read_error = "missing", ""
+        try:
+            self.path.stat()
+            present = True
+        except FileNotFoundError:
+            present = False
+        except OSError as exc:
+            present = False
+            self.read_status, self.read_error = "unknown", f"{type(exc).__name__}: {exc}"
+        if present:
             data: dict[str, Any] | None = None
             for attempt in range(4):
                 try:
                     data = read_toml_file(self.path)
                     break
-                except OSError:
+                except OSError as exc:
+                    self.read_status, self.read_error = "unknown", f"{type(exc).__name__}: {exc}"
                     if attempt == 3:
                         break
                     time.sleep(0.015 * (attempt + 1))
-                except Exception:
+                except Exception as exc:
+                    self.read_status, self.read_error = "unknown", f"{type(exc).__name__}: {exc}"
                     break
             if data is not None and isinstance(data, dict):
+                self.read_status, self.read_error = "ok", ""
                 for raw in data.get("vaults", []):
                     if not isinstance(raw, dict):
                         continue
@@ -228,6 +251,12 @@ class VaultRegistry:
                             description=description,
                         )
                     )
+            elif self.read_status != "unknown":
+                self.read_status, self.read_error = "unknown", "invalid registry root"
+        if self.read_status == "unknown":
+            file_entries = list(self._last_file_entries)
+        else:
+            self._last_file_entries = list(file_entries)
         known = {normalize_vault_key(entry.path) for entry in file_entries}
         for entry in self._memory_entries:
             if normalize_vault_key(entry.path) not in known:
@@ -235,7 +264,16 @@ class VaultRegistry:
         return file_entries
 
     def save(self, entries: list[VaultEntry]) -> None:
+        # Direct save() needs the same read-state serialization as mutations.
+        with self._lock, _process_file_lock(self._lock_path):
+            self._save_locked(entries)
+
+    def _save_locked(self, entries: list[VaultEntry]) -> None:
         """Atomic write (tmp + replace) so a killed process can't corrupt it."""
+        # Also protects a fresh instance's direct save(), not only load→mutate.
+        self.load()
+        if self.read_status == "unknown":
+            raise OSError(f"REGISTRY_READ_UNKNOWN: {self.path}: {self.read_error}")
         self.path.parent.mkdir(parents=True, exist_ok=True)
         lines = [f"version = {REGISTRY_VERSION}", ""]
         for entry in entries:
@@ -259,6 +297,8 @@ class VaultRegistry:
         try:
             tmp.write_text("\n".join(lines), encoding="utf-8")
             tmp.replace(self.path)
+            self._last_file_entries = list(entries)
+            self.read_status, self.read_error = "ok", ""
         finally:
             try:
                 if tmp.exists():

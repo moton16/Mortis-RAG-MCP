@@ -1,0 +1,15 @@
+{"id":"en1","category":"english","text":"A small library stores documents and searches their contents. The current index preserves every source line."}
+{"id":"en2","category":"english","text":"Unusually_long_identifiers_and_camelCaseNames make estimation less reliable than counting tokens explicitly."}
+{"id":"en3","category":"english","text":"The query and document templates should add exactly one explicit prefix, or no prefix at all."}
+{"id":"zh1","category":"chinese","text":"这个工具只测量离线分词器与估算器的误差，不下载模型，不更改旧库切块模式。"}
+{"id":"zh2","category":"chinese","text":"知识库中的正文、行号与来源必须一致。表格很长时，切块器也必须保证最小进展并保留所有单元格。"}
+{"id":"zh3","category":"chinese","text":"中文English混合标识符与公式∑x²、符号√和emoji🙂都可能改变估算误差。"}
+{"id":"code1","category":"code","text":"def tokenize_document(text: str) -> list[str]:\n    return [part.strip() for part in text.split(\"\\n\") if part]\n"}
+{"id":"code2","category":"code","text":"SELECT request_id, state FROM request_intents WHERE payload_hash = ? AND state IN ('prepared', 'submission_unknown');"}
+{"id":"code3","category":"code","text":"const result = documents.map((entry, index) => ({ id: entry.id, score: vector[index] ?? 0 }));"}
+{"id":"table1","category":"table","text":"| name | value |\n| --- | --- |\n| alpha | 10 |\n| beta | 20 |\n"}
+{"id":"table2","category":"table","text":"<table><thead><tr><th>名字</th><th>数值</th></tr></thead><tr><td>第一行</td><td>42</td></tr></table>"}
+{"id":"table3","category":"table","text":"<table>\n<tr><td rowspan=\"2\">long cell body</td><td>second cell</td></tr>\n<tr><td>preserve this content</td></tr>\n</table>"}
+{"id":"fence1","category":"fence","text":"```python\nfor i in range(10):\n    print(i * i)\n```\n"}
+{"id":"fence2","category":"fence","text":"````markdown\n```html\n<table><tr><td>sample</td></tr></table>\n```\n````"}
+{"id":"fence3","category":"fence","text":"~~~sql\nSELECT source, COUNT(*) AS total\nFROM documents\nGROUP BY source;\n~~~"}

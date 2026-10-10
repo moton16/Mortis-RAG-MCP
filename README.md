@@ -1,15 +1,25 @@
 # Mortis'RAG MCP
 
 [![CI](https://github.com/moton16/Mortis-RAG-MCP/actions/workflows/ci.yml/badge.svg)](https://github.com/moton16/Mortis-RAG-MCP/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Version: 0.8.1](https://img.shields.io/badge/Version-0.8.1-blue.svg)](CHANGELOG_user.md)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![Version: 0.9.0](https://img.shields.io/badge/Version-0.9.0-blue.svg)](CHANGELOG_user.md)
 
 [English](README_EN.md) | 简体中文
 
 > 面向 Obsidian 与 Markdown 笔记的本地知识库 RAG（检索增强生成）MCP 服务。
-> 笔记完全保留在本地，支持语义检索、精准定向路由、PDF/Office 文档自动解析摄取与跨知识库搜索，开箱即用。
+> 源文件保留在本地，支持语义检索、定向路由和跨库搜索；启用远端 embedding/解析时，相应内容会发送至配置的服务。
 
 ---
+
+## 当前候选：0.9.0（本地准备，尚未发布）
+
+- 文本 `{text}` 模板贯通建库和查询；新库默认 `estimated_tokens`，旧库按已有参数/缓存保留 `legacy_chars`，新增 `.markdown`。显式启用的远端配置正常工作，不增设费用审批流程。
+- PDF/DOCX/PPTX/XLSX 可按配置走本地可选解析器；virtual 为默认解析存储，原文件不改写、不新建镜像；旧镜像仅在逐项来源证据匹配时排除。缺依赖不等于该格式验证成功。
+- `kb_import` 返回 `index_state=empty/rebuilding/unverified/ready`；导入成功不等于索引 ready。`kb_ingest(action="retry", job_id=..., vault_path=...)` 重试 failed/cancelled，unknown 不自动重发。
+- CLI：`--list-requests --vault "库的绝对路径"` 查看未决记录；`--abandon-request REQUEST_ID --vault "库的绝对路径"` 仅放弃本机意图，不取消服务端任务、不重发。
+- **已移除**：音频转录与音频转码能力从本版本整体移除，配置里的 `[audio]` 段与 `audio_enabled` 开关一并消失。旧配置里若还留着这些键会被直接忽略（不报错、不影响其它配置），建议顺手删掉。
+- 16 个工具包含 `kb_read_media`，可按 source/revision/occurrence 获取引用和受预算约束的媒体。**用文字直接检索到知识库里的图片**已在本机验证跑通；**在真实客户端里显示图片，以及付费媒体端点的通用装配尚未验收**；代理图注不是原生媒体的替代。
+- 升级/恢复和可复制操作见 [快速开始 §0.4](QUICKSTART_user.md#04-09-候选升级与恢复)。显式 `--doctor` 可能请求真实端点，Agent 不以缺失 STATUS.md 为由自动运行它。
 
 ## 🌟 核心特性
 
@@ -22,9 +32,9 @@
 - 🔍 **轻量预览与二段式精读（0.7.2）**：支持 `preview=true` 快速返回高光切片与行号，正文配合 `kb_read` 按需精准精读，有效降低上下文冗余。
 - 📄 **纯文本 .txt 原生收录（0.7.2）**：纯文本 `.txt`（小说/分卷/资料）与 Markdown 享有同等索引地位，支持小说章节标题自动识别。
 - 🔍 **Agent 信任锚，免预检开箱即搜（0.7.1）**：一条 `python -m mortis_rag_mcp --doctor` 生成本机环境凭证（`STATUS.md`）。AI 助手读到 ✅ 即**不再做任何环境/依赖/key 预检**，首次提问就直接检索，省掉每次调用前的反复试探；真出问题才提示你跑那一条命令，且失败不会陷入重试死循环。
-- 📄 **文档智能解析与摄取（0.7.0）**：支持将知识库内的 PDF、Word、PPT、Excel 与图片等文件自动转换为 Markdown 纳入搜索；解析文件单独存放，原笔记与源文件零修改、零污染。
+- 📄 **文档解析与摄取**：按配置将 PDF/Office 解析结果纳入搜索，原文件不改写；单独放一张图片直接入库摄取仍未闭合，参见上述候选状态。
 - 🎯 **智能定向路由（0.7.0）**：支持为知识库添加一句话自然语言描述，AI 检索时按意图精准选库，大幅减少无关库干扰，回答更快更准。
-- 📊 **表格排版与完整保护（0.7.0）**：复杂表格与数据表头完整保护，不被生硬切断，检索结果排版清晰美观。
+- 📊 **表格排版**：estimated 模式保留超限 HTML 表格并跳过其向量请求；legacy 极端超长多格行仍有旧版截失问题，为保持旧地址不在升级时静默改写。
 - 🔒 **私密独立库（solo）**：支持注册独立私密库（`kb_init_solo`），默认不参与跨库全局搜索，仅在明确指定时查询，妥善保护个人隐私。
 - ⚡ **混合检索与增量同步**：融合关键词全文检索与语义向量召回，配合自动重排序；支持后台增量同步与只读优先检索，笔记随写随搜。
 - 📦 **轻量纯粹**：核心功能纯标准库实现，无冗余第三方运行时依赖。
@@ -64,7 +74,7 @@ Copy-Item .\config\app.toml.example .\config\app.toml
 1. 打开 `config/app.toml`，在 `[ingest]` 小节将 `enabled = true`。
 2. 配置 MinerU Token（两种方式）：
    - **高精度通道（推荐）**：前往 [mineru.net](https://mineru.net) 免费获取 API Token，设置系统环境变量 `MINERU_API_TOKEN=你的Token`（或在 `config/app.toml` 的 `[ingest]` 中填写 `api_key = "你的Token"`），享受每日 1000 页额度与大文件支持。
-   - **免登试用通道**：留空 `api_key` 即可直接使用（适合 20 页以内的日常小文档体验）。
+   - **免登试用通道**：留空 `api_key` 即可直接使用（适合 20 页以内的日常小文档体验）；该通道**只取回解析出的文字**，不带文档里的图片。
 
 ### 3. 接入 AI 客户端
 
@@ -96,11 +106,11 @@ enabled = true
 
 连接成功后，在对话中对 AI 助手说：
 
-> “帮我用 `kb_init` 注册知识库：`D:\我的笔记`”
+> "帮我用 `kb_init` 注册知识库：`D:\我的笔记`"
 
 知识库即可在后台自动建立索引。之后只需自然提问：
-> “搜一下数电笔记里关于触发器的内容”
-> “查一下知识库里关于项目架构的说明”
+> "搜一下数电笔记里关于触发器的内容"
+> "查一下知识库里关于项目架构的说明"
 
 ---
 
@@ -131,4 +141,6 @@ enabled = true
 
 ## 📄 License
 
-本项目采用 [MIT License](LICENSE) 开源许可。
+本项目自 v0.9.0 起采用 [Apache License 2.0](LICENSE) 开源许可（v0.8.1 及更早版本仍为 MIT，已发布版本的历史授权不受影响）。
+
+可选解析依赖（如 PyMuPDF）由用户自行安装，不在本项目的 Apache-2.0 授权范围内，各自的许可证见 [NOTICE](NOTICE)。

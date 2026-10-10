@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from mortis_rag_mcp.config import AppConfig, CacheConfig, EmbeddingConfig, VectorConfig
+from mortis_rag_mcp.config import AppConfig, CacheConfig, ChunkingConfig, EmbeddingConfig, VectorConfig
 from mortis_rag_mcp.indexer import Chunk, MarkdownIndexer
 from mortis_rag_mcp._indexer.chunking import chunk_file, new_chunk
 from mortis_rag_mcp._indexer.search import _lexical_haystack
@@ -256,15 +256,16 @@ def test_chinese_comma_and_multi_chunk_retrieval(tmp_path: Path):
     assert res[0].metadata["chunk_index"] == 0
 
 
-def test_chunker_version_bump_5_to_6():
-    """断言 _chunks_meta 中 chunker 代际已升级为 6，且全局仅此一处。"""
-    indexer = MarkdownIndexer(Path("."), AppConfig())
+def test_chunker_current_generation(tmp_path):
+    """R2 接续实际 C98 chunker=7；旧 5→6 断言不冒充当前契约。"""
+    indexer = MarkdownIndexer(tmp_path, AppConfig())
     meta = indexer._chunks_meta()
-    assert meta["chunker"] == 6, f"chunker 代际应为 6，实际为: {meta['chunker']}"
+    assert meta["chunker"] == 7
+    indexer.close_document_store()
 
 
-def test_cache_migration_chunker5_to_6_zero_reembedding(tmp_path: Path):
-    """断言从 chunker=5 老缓存升级到 chunker=6 时：文本层自动重建，向量按 id 复用，0 次重新 embedding。"""
+def test_cache_migration_chunker5_to_current_zero_reembedding(tmp_path: Path):
+    """显式 legacy 保既有身份；实际代际升级重建文本、按 ID 复用向量。"""
     vault = tmp_path / "vault"
     vault.mkdir()
     cache_dir = tmp_path / "cache"
@@ -279,6 +280,7 @@ def test_cache_migration_chunker5_to_6_zero_reembedding(tmp_path: Path):
     )
 
     cfg = _create_config(cache_dir)
+    cfg.chunking = ChunkingConfig(mode="legacy_chars", mode_explicit=True)
     provider1 = CountingProvider()
 
     # 模拟旧版环境（chunker=5）先跑一次 sync，生成缓存
@@ -300,17 +302,19 @@ def test_cache_migration_chunker5_to_6_zero_reembedding(tmp_path: Path):
     initial_embed_count = len(provider1.texts)
     assert initial_embed_count == 2, f"初始切块应 embed 2 条文本，实际: {initial_embed_count}"
 
-    # 现在模拟新版环境（chunker=6，使用默认真实代码），新起实例并 sync
+    # 现在使用当前真实 chunker=7，显式保旧 legacy 模式。
     provider2 = CountingProvider()
     indexer_v6 = MarkdownIndexer(vault, cfg, embedding_provider=provider2)
-    assert indexer_v6._chunks_meta()["chunker"] == 6
+    assert indexer_v6._chunks_meta()["chunker"] == 7
 
     chunks_v6 = indexer_v6.sync()
     assert len(chunks_v6) == 2
 
-    # 核心铁律断言：文本层检测到 chunker: 5 != 6 重建了文本，但向量通过 _pending_vectors
+    # 核心铁律断言：文本层检测到 chunker: 5 != 7 重建了文本，但向量通过 _pending_vectors
     # 按不变的 chunk.id 成功全部复用，新 provider 收到 0 次 embed 请求！
-    assert len(provider2.texts) == 0, f"升级 chunker=6 时应 0 次重新 embedding，实际请求了: {provider2.texts}"
+    assert len(provider2.texts) == 0, f"升级 chunker=7 时应 0 次重新 embedding，实际请求了: {provider2.texts}"
+    indexer_v5.close_document_store()
+    indexer_v6.close_document_store()
 
 
 def test_full_mode_aliases_byte_overhead_measurement():

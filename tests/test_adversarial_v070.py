@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 import pytest
 
-from mortis_rag_mcp.config import AppConfig, EmbeddingConfig, IngestConfig
+from mortis_rag_mcp.config import AppConfig, EmbeddingConfig, IngestConfig, ChunkingConfig
 from mortis_rag_mcp.indexer import MarkdownIndexer, SearchFilter
 from mortis_rag_mcp.ingest import IngestManager
 from mortis_rag_mcp.ingest.mineru import MineruError
@@ -71,7 +71,9 @@ def test_gate_4_closed_wide_table_all_chunks_within_size(tmp_path: Path):
     )
     wide = wide.replace("<tr>", "<table>\n<tr>", 1) + "</table>\n"
     (tmp_path / "wide.md").write_text(wide, encoding="utf-8")
-    cfg = AppConfig(embedding=EmbeddingConfig(mode="static", dimension=4), chunk_size=1200)
+    # 此历史字符上限合同验证显式 legacy；estimated 的完整超限表格另有回归。
+    cfg = AppConfig(embedding=EmbeddingConfig(mode="static", dimension=4), chunk_size=1200,
+                    chunking=ChunkingConfig(mode="legacy_chars", mode_explicit=True))
     indexer = MarkdownIndexer(tmp_path, cfg)
     chunks = indexer.sync()
     for c in chunks:

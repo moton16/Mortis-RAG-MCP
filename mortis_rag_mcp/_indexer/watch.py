@@ -99,31 +99,40 @@ def start_watching(
     owner._start_fs_scheduler()
 
 
-def request_refresh(owner: MarkdownIndexer, *, immediate: bool = False) -> bool:
+def request_refresh(owner: MarkdownIndexer, *, immediate: bool = False,
+                    start_scheduler: bool = True, for_read: bool = False) -> bool:
+    """登记一次刷新请求；返回 True 即**确实**保留了 pending（E04-a）。
+
+    `start_scheduler=False` 只登记标志、不拉起调度线程：导入等已持有 mutation
+    锁的调用方在**释放锁之后**用它登记下一轮，避免为"登记"而启动后台 sync。
+    """
     if owner._watch_stop.is_set() or getattr(owner, "_stopping", False):
         return False
     if not Path(owner.vault_path).is_dir():
-        with owner._cache_lock:
-            owner._chunks = {}
-            owner._signatures = {}
         return False
-    _start_fs_scheduler(owner)
+    if start_scheduler:
+        _start_fs_scheduler(owner)
     with owner._fs_debounce_lock:
         now = time.monotonic()
+        # 查询只是机会性刷新：刚完成的索引无需因每次轮询再排一轮。
+        # 文件事件/import/显式请求不走此分支，接受仍等于真实保留 pending。
+        if (for_read and not immediate and not owner._fs_requested
+                and not getattr(owner, "_indexing", False)
+                and getattr(owner, "_sync_state", "idle") == "idle"
+                and not getattr(owner, "_refresh_error", None)
+                and owner.last_sync is not None
+                and time.time() - owner.last_sync < owner._READ_REFRESH_MIN_INTERVAL_SECONDS):
+            return False
         owner._refresh_requested_at = now
         if immediate:
             owner._fs_refresh_immediate = True
-            owner._fs_requested = True
-            owner._fs_pending_since = now
-            owner._fs_debounce_cv.notify_all()
-            return True
-        min_interval = getattr(owner, "_READ_REFRESH_MIN_INTERVAL_SECONDS", 1.0)
-        last_completed = getattr(owner, "_last_refresh_completed_at", 0.0)
-        if (now - last_completed) < min_interval:
-            return True
-        owner._fs_requested = True
+        # E04-a：返回 True 就是"已安排下一轮"的承诺。此前在「最近完成 < min_interval」
+        # 的合并窗口里直接 return True 却**不置 `_fs_requested`**，调用方以为已登记、
+        # 调度器却永远等不到事件——刷新请求被静默丢弃。合并窗口只影响防抖起点，
+        # 不能吞掉请求；真正的合并由调度器的 debounce 完成。
         if owner._fs_pending_since is None:
             owner._fs_pending_since = now
+        owner._fs_requested = True
         owner._fs_debounce_cv.notify_all()
         return True
 
@@ -141,6 +150,67 @@ def refresh_status(owner: MarkdownIndexer) -> dict[str, Any]:
         "indexing_progress": progress_copy,
         "refresh_error": ref_err,
     }
+
+
+INDEX_STATES = ("empty", "rebuilding", "unverified", "ready")
+
+
+def index_state(owner: MarkdownIndexer) -> dict[str, Any]:
+    """Additive 索引状态（E04-b / Q05）：single、fanout、import 共用同一口径。
+
+    * `rebuilding`：还有可重建工作未完成（后台 sync 在跑或刷新已登记）；
+    * `unverified`：无待重建但有隔离事实（exempt/unverified/deleted 文档）；
+      `isolated_facts` 给出数量，**ready 不自动激活这些事实**；
+    * `empty`：既无可见内容也无隔离事实；
+    * `ready`：其余。
+    """
+    status = refresh_status(owner)
+    pending = bool(status.get("indexing_in_progress")) or bool(getattr(owner, "_fs_requested", False))
+    try:
+        visible = len(getattr(owner, "_chunks", {}) or {})
+    except Exception:
+        visible = 0
+    isolated = 0
+    try:
+        store = owner._existing_document_store()
+        if store is not None:
+            isolated = sum(1 for doc in store.list_documents() if str(doc.visibility) != "active")
+    except Exception:
+        isolated = 0
+    if pending:
+        state, action = "rebuilding", "wait for the background sync to finish, then retry"
+    elif isolated:
+        state, action = "unverified", (
+            "isolated parsed facts are kept but not activated; re-parse or verify them, "
+            "or import with trust_parsed_documents after checking the source SHA"
+        )
+    elif visible == 0:
+        state, action = "empty", "run kb_init and a sync to build the index from local sources"
+    else:
+        state, action = "ready", ""
+    media_failures = {
+        source: error for source, error in getattr(owner, "failed_files", {}).items()
+        if str(error).startswith(("media_proxy:", "media_native:"))
+    }
+    if media_failures and state == "ready":
+        state, action = "rebuilding", (
+            "text index remains available; media derivation failed: "
+            + "; ".join(f"{source}: {error}" for source, error in sorted(media_failures.items()))
+            + "; fix the confirmed media failure and sync; unknown requests require explicit resolution"
+        )
+    persistence = getattr(owner, "persistence_status", {})
+    if persistence.get("state") == "failed":
+        failures = "; ".join(
+            f"layer={layer} path={error['path']} errno={error['errno']} error={error['error']} "
+            f"detail={error.get('detail', '')}"
+            for layer, error in sorted(persistence.get("errors", {}).items())
+        )
+        action = (action + "; " if action else "") + (
+            "memory index remains available; cache persistence failed: " + failures +
+            "; restore writable disk space, then save/rebuild the derived cache"
+        )
+    return {"index_state": state, "isolated_facts": isolated,
+            "visible_sources": visible, "next_action": action}
 
 
 def request_ingest_scan(owner: MarkdownIndexer) -> bool:
@@ -495,6 +565,22 @@ def _quick_signatures(owner: MarkdownIndexer) -> dict[str, tuple[int, int]]:
     return out
 
 
+def _join_started_thread(thread: threading.Thread | None, timeout: float = 2.0) -> bool:
+    """join 一个可能「已构造但从未 start」的线程，返回是否已 join 且仍然存活。
+
+    `Thread.join()` 对未 start 的线程抛 `RuntimeError: cannot join thread before
+    it is started`（py3.13 每次退栈都会触发一次）。而 `start_watching` 存在多条
+    提前返回路径（watch_method 不支持、注册表不可用、已 _stopping），线程属性可能
+    刚被构造出来就被 `stop_watching` 收尾；那时 join 会让整个进程以非零码退出，
+    并把 traceback 打到 stderr（stdio 会话断言 "stderr 必须为空" 直接挂）。
+    因此先判 `ident`：只有真正 start 过的线程才 join。
+    """
+    if thread is None or thread.ident is None:
+        return False
+    thread.join(timeout=timeout)
+    return thread.is_alive()
+
+
 def stop_watching(owner: MarkdownIndexer) -> None:
     owner._watch_stop.set()
     # 停止 ingest 扫描 worker
@@ -502,30 +588,29 @@ def stop_watching(owner: MarkdownIndexer) -> None:
     with owner._ingest_lock:
         owner._ingest_dirty = False
         owner._ingest_cv.notify_all()
-    if owner._ingest_worker_thread is not None:
-        owner._ingest_worker_thread.join(timeout=2)
-        if owner._ingest_worker_thread.is_alive():
-            owner._stopping = True
-        else:
-            owner._ingest_worker_thread = None
+    if _join_started_thread(owner._ingest_worker_thread):
+        owner._stopping = True
+    else:
+        owner._ingest_worker_thread = None
 
     with owner._fs_debounce_lock:
         owner._fs_requested = False
         owner._fs_refresh_immediate = False
         owner._fs_pending_since = None
         owner._fs_debounce_cv.notify_all()
-    if owner._fs_scheduler_thread is not None:
-        owner._fs_scheduler_thread.join(timeout=2)
-        if owner._fs_scheduler_thread.is_alive():
-            owner._stopping = True
-        else:
-            owner._fs_scheduler_thread = None
+    if _join_started_thread(owner._fs_scheduler_thread):
+        owner._stopping = True
+    else:
+        owner._fs_scheduler_thread = None
     watcher, owner._fs_watcher = owner._fs_watcher, None
     if watcher is not None:
         watcher.stop()
     if owner._watch_thread is not None:
-        owner._watch_thread.join(timeout=2)
-        if owner._watch_thread.is_alive():
+        if not _join_started_thread(owner._watch_thread):
+            owner._watch_thread = None
+            if owner._fs_scheduler_thread is None and owner._ingest_worker_thread is None:
+                owner._stopping = False
+        elif owner._watch_thread.is_alive():
             # 线程没停就别把引用丢掉：持引用才能让下一次 stop_watching
             # 继续 join，也让 is_alive() 对外如实反映"还在跑"。
             # 丢掉引用会导致 kb_remove→kb_init 同一目录时新旧两个

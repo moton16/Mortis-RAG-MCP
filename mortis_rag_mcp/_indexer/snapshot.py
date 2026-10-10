@@ -1,6 +1,11 @@
 from __future__ import annotations
 
 import io
+import hashlib
+import math
+import mmap
+import tempfile
+import shutil
 import json
 import re
 import sqlite3
@@ -22,8 +27,9 @@ if TYPE_CHECKING:
 # 全量重新 embedding。导入端会按本机 _cache_key() 重命名落地，并对 .bin 里
 # 的 meta 做本地重写（cache key 是路径派生的，跨机器必然不同）。
 _SNAPSHOT_FORMAT = "vault-mcp-snapshot"
-_SNAPSHOT_VERSION = 1
-_SNAPSHOT_MEMBERS = frozenset({"manifest.json", "chunks.bin", "vectors.bin", "vectors.sqlite", "fts.sqlite"})
+_SNAPSHOT_VERSION = 2
+_SNAPSHOT_MEMBERS = frozenset({"manifest.json", "chunks.bin", "vectors.bin", "vectors.sqlite", "fts.sqlite", "docstore.sqlite"})
+_V2_MEMBERS = frozenset({"manifest.json", "chunks.bin", "vectors.bin", "docstore.sqlite"})
 _MB = 1024 * 1024
 # 各成员的字节上限：正常库的缓存不会超过这些量级，超限 = 恶意构造。
 # 上限即「单次导入的驻留内存/磁盘上限」——取 1~2GB 而不是 GB 级的两位数，
@@ -31,13 +37,22 @@ _MB = 1024 * 1024
 # 声明值本身是攻击者可控字段，真正兜底的是这个量级 + 流式读取预算。
 _SNAPSHOT_MEMBER_LIMITS = {
     "manifest.json": 1 * _MB,
+    "docstore.sqlite": 2048 * _MB,
     "chunks.bin": 1024 * _MB,
     "vectors.bin": 1024 * _MB,
     "vectors.sqlite": 2048 * _MB,
     "fts.sqlite": 2048 * _MB,
 }
-# 合计预算：5 个成员各自卡在上限仍能凑出两位数 GB。
-_SNAPSHOT_TOTAL_LIMIT = 4096 * _MB
+# 合计预算：5 个成员各自卡在上限仍能凑出两位数 GB。§20.2：在既有 4GiB 基础上
+# **显式版本化到 6GiB**；导出与导入共用同一常量，manifest 记录预算版本，避免
+# 两侧各写一套数字（此前导出写死 6144、导入写死 4096）。
+_SNAPSHOT_TOTAL_BUDGET_MB = 6144
+_SNAPSHOT_BUDGET_VERSION = "6gib-v1"
+_SNAPSHOT_TOTAL_LIMIT = _SNAPSHOT_TOTAL_BUDGET_MB * _MB
+# 快照成员是固定白名单（≤6 个），成员数与中央目录元数据上限按快照口径收紧：
+# 中央目录准入在构造 ZipFile 之前完成（§20.7C）。
+_SNAPSHOT_MAX_MEMBERS = 64
+_SNAPSHOT_CD_METADATA_BYTES = 2 * _MB
 # zip 头里的 file_size/compress_size 同属攻击者可控：比率门限只挡「小包大解」。
 # 真实缓存里 sqlite 约 2~5x、.bin 自身已 zlib 压缩（≈1x），100 已足够宽松。
 _MAX_COMPRESSION_RATIO = 100
@@ -68,59 +83,15 @@ def _export_snapshot_locked(owner: MarkdownIndexer, out_path: str | Path) -> dic
 
     # 把当前内存态刷进缓存文件再打包，保证快照 = 此刻的索引。
     owner._save_cache()
-
-    vectors_member: str | None = None
-    if owner._vectors_on_disk:
-        if owner._vectors_db_path is not None and owner._vectors_db_path.exists():
-            vectors_member = "vectors.sqlite"
-    elif owner._vectors_cache_path is not None and owner._vectors_cache_path.exists():
-        vectors_member = "vectors.bin"
-
-    vector_count = sum(
-        1 for chunk in owner.all_chunks() if owner._chunk_has_vector(chunk)
-    )
-    manifest = {
-        "format": _SNAPSHOT_FORMAT,
-        "format_version": _SNAPSHOT_VERSION,
-        "cache_key": owner._cache_key(),
-        "chunks_meta": owner._chunks_meta(),
-        "vectors_meta": owner._vectors_meta(),
-        "backend": getattr(owner._vector_backend, "name", owner.config.vector.backend),
-        "stats": {
-            "files": len(owner._chunks),
-            "chunks": len(owner.all_chunks()),
-            "vectors": vector_count,
-        },
-    }
-
-    out = Path(out_path).expanduser()
-    out.parent.mkdir(parents=True, exist_ok=True)
-    tmp = out.with_suffix(out.suffix + ".tmp")
-    try:
-        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zf:
-            zf.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
-            zf.write(owner._chunks_cache_path, "chunks.bin")
-            if vectors_member is not None:
-                source = owner._vectors_db_path if vectors_member == "vectors.sqlite" else owner._vectors_cache_path
-                zf.write(source, vectors_member)
-            if owner._fts is not None and owner._fts_cache_path is not None and owner._fts_cache_path.exists():
-                zf.write(owner._fts_cache_path, "fts.sqlite")
-        tmp.replace(out)
-    finally:
-        if tmp.exists():
-            try:
-                tmp.unlink()
-            except OSError:
-                pass
-    return {
-        "exported": True,
-        "path": str(out),
-        "backend": manifest["backend"],
-        **manifest["stats"],
-    }
+    if getattr(owner, "persistence_status", {}).get("errors", {}).get("chunks"):
+        from ..doc_store import StoreConflict
+        raise StoreConflict("snapshot chunks persistence failed; restore storage before exporting")
+    return _export_v2(owner, out_path)
 
 
-def import_snapshot(owner: MarkdownIndexer, snapshot: str | Path, force: bool = False) -> dict[str, Any]:
+def import_snapshot(owner: MarkdownIndexer, snapshot: str | Path, force: bool = False,
+                    trust_parsed_documents: bool = False, replace: bool = False,
+                    confirm_replace: bool = False) -> dict[str, Any]:
     """从快照恢复索引缓存；随后一次 sync 应当 0 次 embedding API 调用。
 
     安全与兼容：
@@ -138,18 +109,42 @@ def import_snapshot(owner: MarkdownIndexer, snapshot: str | Path, force: bool = 
       信任它等于让投毒正文躲过重读。代价是导入后首次 sync 重读全部文件重算
       签名（内容未变的切片仍按 content_hash 复用快照向量，不产生 embedding）。
     * 成员读取按真实字节数记账：zip 头声明的尺寸是攻击者可控字段，不能当上限。
+    * 构造 ZipFile **之前**先做 EOCD/中央目录准入（§20.7C）：ZIP64/多 disk/
+      声明与真实条目不符/成员数与目录元数据超限一律在分配前拒绝。
+    * 未知来源包默认不 merge、不静默替换本机事实；显式 `replace=True` 且
+      `confirm_replace=True` 才覆盖，被替换 generation 登记为 retained_backup。
 
     前提：本库缓存已启用、目录已注册（先 kb_init 再 kb_import）。
     """
+    for key, value in (("force", force), ("trust_parsed_documents", trust_parsed_documents),
+                       ("replace", replace), ("confirm_replace", confirm_replace)):
+        if type(value) is not bool:
+            raise ValueError(f"{key} must be bool")
+    if replace and not confirm_replace:
+        raise ValueError("replace=true requires explicit confirm_replace=true")
     if owner._chunks_cache_path is None:
         raise ValueError("cache is disabled; enable [cache] before importing a snapshot")
     src = Path(snapshot).expanduser()
     if not src.is_file():
         raise ValueError(f"snapshot not found: {src}")
 
+    declared_members = _preflight_zip(src)
     with zipfile.ZipFile(src) as zf:
+        if len(zf.namelist()) != declared_members:
+            raise ValueError(
+                f"snapshot central directory declares {declared_members} members but "
+                f"ZipFile sees {len(zf.namelist())}"
+            )
         names = set(zf.namelist())
-        unknown = names - _SNAPSHOT_MEMBERS
+        if len(names) != len(zf.namelist()):
+            raise ValueError("snapshot contains duplicate members")
+        version_hint = None
+        try:
+            version_hint = json.loads(_read_member_bytes(zf, "manifest.json")).get("format_version")
+        except Exception:
+            pass
+        allowed = _V2_MEMBERS if version_hint == 2 else frozenset({"manifest.json", "chunks.bin", "vectors.bin", "vectors.sqlite", "fts.sqlite"})
+        unknown = names - allowed
         if unknown:
             raise ValueError(f"snapshot contains unexpected members: {sorted(unknown)}")
         if "manifest.json" not in names or "chunks.bin" not in names:
@@ -183,12 +178,16 @@ def import_snapshot(owner: MarkdownIndexer, snapshot: str | Path, force: bool = 
         if (
             not isinstance(manifest, dict)
             or manifest.get("format") != _SNAPSHOT_FORMAT
-            or manifest.get("format_version") != _SNAPSHOT_VERSION
+            or manifest.get("format_version") not in (1, 2)
         ):
             raise ValueError(
                 f"not a {_SNAPSHOT_FORMAT} v{_SNAPSHOT_VERSION} archive; got "
                 f"format={manifest.get('format')!r} version={manifest.get('format_version')!r}"
             )
+
+        if manifest["format_version"] == 2:
+            return _import_v2(owner, src, zf, manifest, force, trust_parsed_documents,
+                              replace=replace, confirm_replace=confirm_replace)
 
         local_vectors_meta = owner._vectors_meta()
         snapshot_vectors_meta = manifest.get("vectors_meta") or {}
@@ -250,9 +249,602 @@ def import_snapshot(owner: MarkdownIndexer, snapshot: str | Path, force: bool = 
         # kb_search / kb_list_files 排队在 _sync_lock 上，整个 MCP 服务冻结。
         # 导入体本身会在锁内从磁盘重载全部状态，无需外层再持 _cache_lock。
         with owner._sync_lock:
-            return _import_snapshot_locked(
+            result = _import_snapshot_locked(
                 owner, src, zf, vectors_member, skip_vectors, warnings
             )
+        # 释放 mutation 之后才登记刷新（E04-a）。
+        _register_post_import_refresh(owner, result)
+        return result
+
+
+def _register_post_import_refresh(owner: MarkdownIndexer, result: dict[str, Any]) -> None:
+    """导入**释放 mutation 锁之后**登记一次刷新（E04-a）。
+
+    导入不发布包内正文（§20.7F），文本层为空；此前导入路径从不登记刷新，索引
+    会停在「空且无待办」的状态，只有下次外部触发才重建。这里只登记 pending、
+    不拉起后台调度线程（避免为"登记"而启动一次后台 sync）。
+    """
+    from .watch import index_state, request_refresh
+
+    try:
+        accepted = bool(request_refresh(owner, immediate=True, start_scheduler=False))
+    except Exception:
+        accepted = False
+    result["refresh_requested"] = accepted
+    try:
+        # 与单库检索/fanout 同一口径的 additive 状态（E04-b）：导入后必然需要重建。
+        result.update(index_state(owner))
+    except Exception:
+        result["index_state"] = "rebuilding"
+
+
+def _sha_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(_MEMBER_READ_BLOCK), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _preflight_zip(src: Path) -> int:
+    """构造 `ZipFile` **之前**的 EOCD/中央目录准入（§20.7C）。
+
+    复用 mineru 的只读准入（不改 mineru.py）：拒 ZIP64/多 disk/声明≠真实/成员数/
+    目录元数据超限。用 mmap 而非整文件读入内存——快照可达 GiB 级，不能为了一次
+    准入把整个归档驻留内存。返回声明的成员数供构造后核对。
+    """
+    from ..ingest.mineru import MineruError, _inspect_central_directory
+    from ..ingest.models import ResourceLimits
+
+    if src.stat().st_size <= 0:
+        raise ValueError(f"snapshot is empty: {src}")
+    limits = ResourceLimits(
+        max_members=_SNAPSHOT_MAX_MEMBERS,
+        cd_metadata_max_bytes=_SNAPSHOT_CD_METADATA_BYTES,
+    )
+    try:
+        with src.open("rb") as stream:
+            with mmap.mmap(stream.fileno(), 0, access=mmap.ACCESS_READ) as mapped:
+                return _inspect_central_directory(mapped, limits)
+    except MineruError as exc:
+        raise ValueError(f"snapshot archive rejected before reading: {exc}") from exc
+
+
+def _require_free_disk(directory: Path, declared_total: int) -> None:
+    """staging 前的本机磁盘余量预检（§20.2）：解压成员 + 派生物重建留 25% 余量。"""
+    if declared_total <= 0:
+        return
+    try:
+        usage = shutil.disk_usage(directory)
+    except OSError:
+        return
+    needed = int(declared_total * 1.25)
+    if usage.free < needed:
+        raise ValueError(
+            f"insufficient local disk to stage snapshot: need ~{needed} bytes, "
+            f"only {usage.free} free under {directory}"
+        )
+
+
+def _export_v2(owner: MarkdownIndexer, out_path: str | Path) -> dict[str, Any]:
+    from ..doc_store import StoreConflict
+
+    out = Path(out_path).expanduser()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    pin = None
+    store = None
+    try:
+        with tempfile.TemporaryDirectory(prefix="snapshot-", dir=out.parent) as temporary:
+            root = Path(temporary)
+            # _sync_lock is per client, not per cache file. Another client may
+            # atomically replace the live cache even after validation/hashing.
+            # Pin the bytes locally once; validation, hashing and ZIP writing
+            # must all consume this same immutable staging member.
+            chunks_path = root / "chunks.bin"
+            shutil.copyfile(owner._chunks_cache_path, chunks_path)
+            captured = _CacheCodec.load(chunks_path)
+            if captured is None:
+                raise StoreConflict("snapshot chunks cache is unreadable; re-run sync")
+            chunks_meta = captured[0]
+            captured_files = captured[1]
+            vectors_meta = owner._vectors_meta()
+            payloads = {"chunks.bin": chunks_path}
+            captured_ids = {chunk.id for _, chunks in captured_files.values() for chunk in chunks}
+            vectors = owner._vector_backend.get_vectors(captured_ids)
+            if vectors:
+                transport = root / "vectors.bin"
+                _VectorsCodec.dump(transport, vectors_meta, vectors)
+                payloads["vectors.bin"] = transport
+            store = owner._existing_document_store()
+            store_manifest = None
+            if store is not None and store.generation_id:
+                # E04-c：捕获固定版本 handle，导出全程持租，最终发布前再验一次。
+                pin = store.capture_generation_pin()
+                document = root / "docstore.sqlite"
+
+                def _backup_progress(status: int, remaining: int, total: int) -> None:
+                    from ..doc_store import StoreConflict
+
+                    # 长备份按页推进时续租/验租：租约过期即中止，不留下半截备份。
+                    if not store.validate_generation_pin(pin):
+                        raise StoreConflict(
+                            "READ_LEASE_EXPIRED: the pinned generation lease expired during the "
+                            "export backup; the temporary output was discarded"
+                        )
+                    store.renew_generation_pin(pin)
+
+                store.backup_to(document, pages=256, progress=_backup_progress)
+                # Portable backups contain facts, never live task credentials.
+                conn = sqlite3.connect(str(document))
+                try:
+                    if not _backup_matches_pin(conn, pin):
+                        raise StoreConflict("snapshot revision/sequence changed during backup")
+                    _require_export_revisions(chunks_path, conn)
+                    conn.execute("DELETE FROM ingest_jobs")
+                    conn.execute("DELETE FROM ingest_subjobs")
+                    conn.commit()
+                    meta = conn.execute("SELECT schema_version, change_seq, store_uuid FROM store_meta WHERE id=1").fetchone()
+                    store_manifest = {"schema_version": meta[0], "change_seq": meta[1], "store_uuid": meta[2]}
+                finally:
+                    conn.close()
+                payloads["docstore.sqlite"] = document
+            elif any(chunk.metadata.get("revision_id")
+                     for _, chunks in captured_files.values() for chunk in chunks):
+                raise StoreConflict("snapshot revision references have no document store")
+            members = {}
+            for name, path in payloads.items():
+                size = path.stat().st_size
+                if size > _SNAPSHOT_MEMBER_LIMITS[name]:
+                    raise ValueError(f"snapshot {name} exceeds export budget")
+                members[name] = {"size": size, "sha256": _sha_file(path)}
+            if sum(info["size"] for info in members.values()) > _SNAPSHOT_TOTAL_LIMIT:
+                raise ValueError("snapshot exceeds total export budget")
+            manifest = {"format": _SNAPSHOT_FORMAT, "format_version": 2,
+                        "chunks_meta": chunks_meta, "vectors_meta": vectors_meta,
+                        "members": members, "docstore": store_manifest,
+                        "total_budget_bytes": _SNAPSHOT_TOTAL_LIMIT,
+                        "budget_version": _SNAPSHOT_BUDGET_VERSION,
+                        "derived_status": "requires_local_source_verification",
+                        "data_classification": ["parsed_text", "media_originals_and_audio"],
+                        "stats": {"files": len(captured_files),
+                                  "chunks": sum(len(chunks) for _, chunks in captured_files.values()),
+                                  "vectors": len(vectors)}}
+            staged = root / "archive.zip"
+            with zipfile.ZipFile(staged, "w", zipfile.ZIP_DEFLATED) as archive:
+                archive.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False))
+                for name, path in payloads.items():
+                    archive.write(path, name)
+            # 最终 replace 前必须再验一次租（E04-c）：hash/ZIP 期间代可能已被换掉，
+            # 绝不能把旧 chunk 与新 media 拼进同一个包。
+            if pin is not None and not store.validate_generation_pin(pin):
+                raise StoreConflict(
+                    "READ_LEASE_EXPIRED: the pinned generation changed before the export was "
+                    "published; nothing was written"
+                )
+            staged.replace(out)
+    finally:
+        if pin is not None and store is not None:
+            try:
+                store.release_generation_pin(pin)
+            except Exception:
+                pass
+    return {"exported": True, "path": str(out), "format_version": 2,
+            "contains_media": store_manifest is not None, **manifest["stats"]}
+
+
+def _backup_matches_pin(conn: sqlite3.Connection, pin: Any) -> bool:
+    row = conn.execute("SELECT change_seq FROM store_meta WHERE id=1").fetchone()
+    return row is not None and int(row[0]) == pin.change_seq
+
+
+def _require_export_revisions(chunks_path: Path, conn: sqlite3.Connection) -> None:
+    """Every exported virtual chunk must resolve in the captured facts backup."""
+    from ..doc_store import StoreConflict
+
+    # Validate the exact staged bytes, not all_chunks()'s filtered live view.
+    loaded = _CacheCodec.load(chunks_path)
+    if loaded is None:
+        raise StoreConflict("snapshot chunks cache is unreadable; re-run sync")
+    for chunk in (chunk for _, chunks in loaded[1].values() for chunk in chunks):
+        revision = chunk.metadata.get("revision_id")
+        if not revision:
+            continue
+        row = conn.execute(
+            "SELECT 1 FROM document_revisions r JOIN documents d ON d.doc_id=r.doc_id "
+            "WHERE r.revision_id=? AND r.state='committed' AND d.source=?",
+            (revision, chunk.source)).fetchone()
+        if row is None:
+            raise StoreConflict(f"snapshot chunk references absent revision {revision!r}; re-run sync")
+
+
+#: 活跃摄取任务：存在即默认拒绝导入（§20.7F），避免覆盖未完成资产。
+_ACTIVE_JOB_STATES = frozenset({"queued", "parsing", "staged"})
+_ACTIVE_JOB_PHASES = frozenset(
+    {"send_intent", "submitted", "polling", "downloaded", "submission_unknown"}
+)
+
+
+def _require_no_active_ingest(store: Any) -> None:
+    """存在活跃摄取任务 → IMPORT_BUSY，默认不导入（§20.7F）。只走公开读 API。
+
+    E04-c：全队扫描而不是 `list_jobs(limit=500)`——老 job 也可能还活着，
+    只查最近 500 条会漏掉它们。
+    """
+    from ..doc_store import StoreBusy
+
+    try:
+        active = bool(store.has_active_ingest())
+    except Exception as exc:
+        # 读不到队列 ≠ 没有队列：控制库被锁/损坏时旧实现直接当作「无活跃任务」放行，
+        # 属安全门禁 fail-open。导入随后要打开同一个库，所以这里坚持 fail closed。
+        raise StoreBusy(
+            "IMPORT_BUSY: cannot read this vault's ingest queue; refusing to import while the "
+            "queue state is unknown",
+            fix="先确认控制库可读（或修复/恢复控制库）再导入。",
+        ) from exc
+    if active:
+        raise StoreBusy(
+            "IMPORT_BUSY: this vault has active ingestion tasks; refusing to import by "
+            "default so unfinished assets are not overwritten",
+            fix="等待任务终结或人工确认损失清单后再导入。",
+        )
+
+
+def _capture_import_gate(store: Any) -> dict[str, Any]:
+    """导入前在**短**读取里捕获 generation/epoch/change_seq（E04-c）。
+
+    控制库与文档库是两个库，不存在跨库整体 ACID；这里只保证发布前能重核这三项。
+    """
+    from ..doc_store import ControlStore
+
+    ctrl = ControlStore(store.layout)
+    try:
+        ctrl.open(create=False, write=False)
+        state = ctrl.state()
+        return {"generation": str(state.active_document_generation or ""),
+                "epoch": int(state.epoch),
+                "change_seq": int(store.change_seq())}
+    finally:
+        ctrl.close()
+
+
+def _require_import_gate_unchanged(store: Any, gate: dict[str, Any]) -> None:
+    """发布前重核 generation/epoch/change_seq（E04-c）。"""
+    from ..doc_store import ControlStore, StoreConflict
+
+    ctrl = ControlStore(store.layout)
+    try:
+        ctrl.open(create=False, write=False)
+        state = ctrl.state()
+        generation = str(state.active_document_generation or "")
+        epoch = int(state.epoch)
+    except Exception as exc:
+        raise StoreConflict(
+            f"IMPORT_CONFLICT: control plane is unreadable at publish time: {exc}; "
+            "nothing was published"
+        ) from exc
+    finally:
+        ctrl.close()
+    if generation != gate["generation"] or epoch != gate["epoch"]:
+        raise StoreConflict(
+            "IMPORT_CONFLICT: control generation/epoch changed during import; "
+            "nothing was published and existing assets remain readable"
+        )
+    if int(store.change_seq()) != gate["change_seq"]:
+        raise StoreConflict(
+            "IMPORT_CONFLICT: document store changed during import validation; "
+            "nothing was published and existing assets remain readable"
+        )
+
+
+def _next_operation_seq(store: Any) -> int:
+    """本次导入的单调操作序号（E04-c：跨库操作的可审计 token）。"""
+    from ..doc_store import ControlStore
+
+    ctrl = ControlStore(store.layout)
+    try:
+        ctrl.open(create=False, write=True)
+        return int(ctrl.next_operation_seq())
+    finally:
+        ctrl.close()
+
+
+def _active_generation_id(store: Any) -> str | None:
+    """新鲜读取控制面当前活动 generation；**读不到返回 None**。
+
+    `DocumentStore.generation_id` 是惰性缓存字段，异常态下可能是空串或旧值，
+    不能当作「当前活动代」。调用方必须把 None 当「未知」处理，不得据此猜。
+    """
+    from ..doc_store import ControlStore
+
+    ctrl = ControlStore(store.layout)
+    try:
+        ctrl.open(create=False, write=False)
+        return str(ctrl.state().active_document_generation or "")
+    except Exception:
+        return None
+    finally:
+        ctrl.close()
+
+
+def _register_generation_state(store: Any, generation_id: str, state: str) -> None:
+    """改写 generation 注册状态（`retained_backup` / `aborted`）。"""
+    if not generation_id:
+        return
+    from ..doc_store import ControlStore
+
+    ctrl = ControlStore(store.layout)
+    try:
+        ctrl.open(create=False, write=True)
+        ctrl.register_generation(
+            generation_id, store.layout.generations_dir / generation_id, "document", state
+        )
+    finally:
+        ctrl.close()
+
+
+def _live_derived_paths(owner: MarkdownIndexer) -> list[Path]:
+    paths: list[Path] = []
+    for candidate in (
+        owner._chunks_cache_path,
+        owner._vectors_cache_path,
+        owner._vectors_db_path,
+        owner._fts_cache_path,
+    ):
+        if candidate is not None:
+            paths.append(Path(candidate))
+    return paths
+
+
+def _backup_live_derived(owner: MarkdownIndexer, root: Path) -> list[dict[str, Any]]:
+    """发布前把会被覆盖的活派生文件复制到临时目录，失败时据此回滚。"""
+    saved_dir = root / "rollback"
+    saved_dir.mkdir(parents=True, exist_ok=True)
+    entries: list[dict[str, Any]] = []
+    for index, path in enumerate(_live_derived_paths(owner)):
+        entry: dict[str, Any] = {
+            "path": path, "existed": path.exists(), "saved": saved_dir / f"{index}_{path.name}"
+        }
+        if entry["existed"]:
+            try:
+                shutil.copy2(path, entry["saved"])
+            except OSError:
+                entry["existed"] = False
+        entries.append(entry)
+    return entries
+
+
+def _restore_live_derived(owner: MarkdownIndexer, entries: list[dict[str, Any]]) -> None:
+    """回滚：把活派生文件恢复到导入前内容，并让内存态与磁盘一致（§20.2/§20.5）。"""
+    for entry in entries:
+        path: Path = entry["path"]
+        try:
+            if entry["existed"]:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(entry["saved"], path)
+            else:
+                _unlink_quietly(path)
+        except OSError:
+            pass
+    if owner._fts is not None:
+        try:
+            owner._fts.close()
+        except Exception:
+            pass
+        owner._fts = None
+    owner._chunks.clear()
+    owner._signatures.clear()
+    owner._pending_vectors.clear()
+    owner._disk_vectors.clear()
+    owner._load_chunks_cache()
+    owner._load_failed_files()
+    if not owner._vectors_on_disk:
+        owner._load_vectors_cache()
+    else:
+        try:
+            owner._vector_backend = create_vector_backend(
+                owner.config.vector, owner, owner._vectors_db_path
+            )
+            owner._vectors_on_disk = bool(getattr(owner._vector_backend, "on_disk", False))
+        except Exception:
+            pass
+    _recreate_fts(owner)
+    owner._fts_ensure_populated()
+
+
+def _stage_derived_layers(owner: MarkdownIndexer, text_target: Path, vectors: dict,
+                          compatible: bool) -> None:
+    """把已写好的临时派生层原子替换进活文件；调用方负责失败回滚。"""
+    owner._pending_vectors.clear()
+    if compatible:
+        owner._pending_vectors.update(vectors)
+    owner._disk_vectors.clear()
+    text_target.replace(owner._chunks_cache_path)
+    owner._chunks.clear()
+    owner._signatures.clear()
+    if owner._fts is not None:
+        owner._fts.close()
+        owner._fts = None
+    _recreate_fts(owner)
+    owner._fts_ensure_populated()
+    if owner._vectors_on_disk and compatible:
+        owner._vector_backend.delete_vectors(owner._vector_backend.list_ids())
+        owner._vector_backend.upsert_vectors(vectors)
+    elif owner._vectors_cache_path is not None:
+        _VectorsCodec.dump(owner._vectors_cache_path, owner._vectors_meta(), vectors if compatible else {})
+
+
+def _import_v2(owner: MarkdownIndexer, src: Path, archive: zipfile.ZipFile,
+               manifest: dict, force: bool, trusted: bool, *,
+               replace: bool = False, confirm_replace: bool = False) -> dict[str, Any]:
+    from ..doc_store import StoreConflict, normalize_source_path
+    declarations = manifest.get("members")
+    names = set(archive.namelist()) - {"manifest.json"}
+    if not isinstance(declarations, dict) or set(declarations) != names:
+        raise ValueError("snapshot member declarations do not match payloads")
+    parent = owner._chunks_cache_path.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    declared_total = sum(
+        int(info["size"]) for info in declarations.values()
+        if isinstance(info, dict) and isinstance(info.get("size"), int)
+    )
+    _require_free_disk(parent, declared_total)
+
+    # 只读打开本机库：无 active generation 时**不会**创建（item 1 的零状态变化）。
+    existing = owner._existing_document_store()
+    if existing is not None:
+        _require_no_active_ingest(existing)
+
+    with tempfile.TemporaryDirectory(prefix="import-", dir=parent) as temporary:
+        root = Path(temporary)
+        # ---- 1) 校验与 staging 全部在临时目录完成，不改任何活动状态 ----------
+        for name in names:
+            path = root / name
+            size = _stream_member(archive, name, path)
+            declared = declarations[name]
+            if not isinstance(declared, dict) or declared.get("size") != size or declared.get("sha256") != _sha_file(path):
+                raise ValueError(f"snapshot {name} checksum/size mismatch")
+        loaded = _CacheCodec.load(root / "chunks.bin")
+        if loaded is None:
+            raise ValueError("snapshot chunks.bin is corrupt")
+        _meta, files = loaded
+        chunks_mismatch = ({k: v for k, v in manifest.get("chunks_meta", {}).items() if k != "key"} !=
+                           {k: v for k, v in owner._chunks_meta().items() if k != "key"})
+        vectors_mismatch = ({k: v for k, v in manifest.get("vectors_meta", {}).items() if k != "key"} !=
+                            {k: v for k, v in owner._vectors_meta().items() if k != "key"})
+        compatible = not (chunks_mismatch or vectors_mismatch)
+        if not compatible and not force:
+            if chunks_mismatch:
+                raise ValueError(
+                    "snapshot was chunked with different parameters than this machine "
+                    "(chunk_size / chunker / inject_image_captions mismatch); pass force=true "
+                    "to import anyway (next sync will re-chunk and re-embed)"
+                )
+            raise ValueError(
+                "snapshot vectors were built with a different profile than this machine; "
+                "pass force=true to import the text layer only and re-embed"
+            )
+        vectors = {}
+        if "vectors.bin" in names:
+            decoded = _VectorsCodec.load(root / "vectors.bin")
+            if decoded is None:
+                raise ValueError("snapshot vectors.bin is corrupt")
+            vectors = decoded[1]
+            dimension = manifest.get("vectors_meta", {}).get("dimension")
+            chunk_ids = {chunk.id for _signature, chunks in files.values() for chunk in chunks}
+            for key, vector in vectors.items():
+                if key not in chunk_ids or vector is None or len(vector) != dimension or not all(math.isfinite(x) for x in vector):
+                    raise ValueError("snapshot vector key/numeric/dimension contract mismatch")
+        # 包内正文一律**不发布**（与 v1 同口径，§20.7F）：快照来自不可信来源，把包内
+        # chunk 写进活动 chunks cache 等于让投毒正文在下一次本机物理核验之前就能被检索。
+        # 旧实现只在**当前进程**清空 `_chunks`（所以"导入后立即可见性为假"的断言能过），
+        # 但重启或第二个会话调用 `_load_chunks_cache()` 会把包内正文原样载回索引。
+        # 这里仍逐条校验 source 合法性与 chunk 结构（畸形 metadata 会拖垮下游硬索引），
+        # 只用于计数、不落盘；向量仍按 chunk.id 进补挂池，下次 sync 重建可信文本时复用。
+        packaged_files = 0
+        packaged_chunks = 0
+        for source, (_signature, chunks) in files.items():
+            normalize_source_path(source, owner.vault_path)
+            for chunk in chunks:
+                _sanitize_chunk(owner, chunk)
+            packaged_files += 1
+            packaged_chunks += len(chunks)
+        text_target = root / "verified-chunks.bin"
+        _CacheCodec.dump(text_target, owner._chunks_meta(), {})
+
+        # ---- 2) docstore staging（仍不切 active） -----------------------------
+        store = None
+        prepared = None
+        change_seq_before = 0
+        gate: dict[str, Any] = {}
+        operation_seq = 0
+        if "docstore.sqlite" in names:
+            committed = bool(existing is not None and existing.list_documents())
+            if committed and not (replace and confirm_replace):
+                raise StoreConflict(
+                    "IMPORT_CONFLICT: this vault already holds committed parsed documents; "
+                    "refusing to merge an unknown snapshot. Pass replace=true and "
+                    "confirm_replace=true to replace them (the replaced generation is kept "
+                    "as a recoverable retained_backup).",
+                    fix="先展示损失清单，再显式 replace+confirm_replace；默认不静默替换最新事实。",
+                )
+            store = owner.document_store(write=False)
+            change_seq_before = store.change_seq()
+            gate = _capture_import_gate(store)
+            prepared = store.prepare_import(root / "docstore.sqlite", trust_parsed_documents=trusted)
+
+        # ---- 3) 发布阶段：锁内再校验；派生层先落地，最后 publish ---------------
+        with owner._sync_lock:
+            if store is not None:
+                _require_no_active_ingest(store)
+                # E04-c：发布前重核 generation/epoch/change_seq（跨库不是整体 ACID）。
+                _require_import_gate_unchanged(store, gate)
+                if store.change_seq() != change_seq_before:
+                    raise StoreConflict(
+                        "IMPORT_CONFLICT: document store changed during import validation; "
+                        "nothing was published and existing assets remain readable"
+                    )
+            backups = _backup_live_derived(owner, root)
+            published = False
+            try:
+                _stage_derived_layers(owner, text_target, vectors, compatible)
+                if prepared is not None:
+                    prev_generation = str(prepared.get("expected_generation") or "")
+                    from ..doc_store import _mutation_lock
+                    snapshot_digest = _sha_file(src)
+                    # All writers use this existing OS mutex. Recheck immediately
+                    # before CAS, not merely before staging the derived files.
+                    with _mutation_lock(store.layout):
+                        _require_no_active_ingest(store)
+                        _require_import_gate_unchanged(store, gate)
+                        operation_seq = _next_operation_seq(store)
+                        store.publish_import(prepared, snapshot_sha256=snapshot_digest, trusted=trusted)
+                        published = True
+                    _register_generation_state(store, prev_generation, "retained_backup")
+            except BaseException:
+                _restore_live_derived(owner, backups)
+                if prepared is not None:
+                    prev_generation = str(prepared.get("expected_generation") or "")
+                    imported_generation = str(prepared.get("generation_id") or "")
+                    active_now = _active_generation_id(store)
+                    # `published` 只在 `publish_import` **返回**后为真：控制面 CAS 已经
+                    # 提交、随后重新打开失败的窗口里它为假，但活动代其实已经切过去了。
+                    # 用一次新鲜控制面读重判，否则派生层回滚了、docstore 却留在导入代。
+                    actually_published = published or (
+                        active_now is not None and imported_generation != ""
+                        and active_now == imported_generation
+                    )
+                    active_after = active_now
+                    if actually_published and prev_generation:
+                        try:
+                            store.restore_generation(prev_generation)
+                            active_after = prev_generation
+                        except Exception:
+                            active_after = _active_generation_id(store)
+                    # 没有成为活动事实的 staged generation 必须标成 aborted：否则它永远
+                    # 停在 'validated'（看起来像一份可用快照），而且当前没有任何回收
+                    # 路径 —— 每次失败都静默留下这份拷贝。状态登记失败不得掩盖原始异常。
+                    #
+                    # 只给**能确认不再是活动代**的 generation 打标：读不到活动代（None）
+                    # 时不猜，避免把活动事实标成 aborted（标签侧 fail closed）。
+                    if (imported_generation and active_after is not None
+                            and active_after != imported_generation):
+                        try:
+                            _register_generation_state(store, imported_generation, "aborted")
+                        except Exception:
+                            pass
+                raise
+        result = {"imported": True, "path": str(src), "format_version": 2,
+                  "files": 0, "chunks": 0,
+                  "packaged_files": packaged_files, "packaged_chunks": packaged_chunks,
+                  "text_published": False,
+                  "vectors": len(vectors) if compatible else 0, "vectors_imported": compatible,
+                  "parsed_documents_trusted": trusted, "replaced": bool(published and replace),
+                  "operation_seq": operation_seq,
+                  "warnings": ["local source reconciliation required"]}
+        # 释放 mutation 之后才登记刷新（E04-a）。
+        _register_post_import_refresh(owner, result)
+        return result
 
 
 def _import_snapshot_locked(
@@ -267,14 +859,16 @@ def _import_snapshot_locked(
     # chunk 都被判为"已嵌入"永不重嵌（而 vec 库里躺的是旧语料的向量）。
     owner._disk_vectors.clear()
     # 补挂池同样先清空——它是给"文本层将被重建，但向量还能按 id 复用"用的；
-    # 放在这里清而不是放在第 4 步，是为了让文本层的向量导入（第 2 步）能把
+    # 放在这里清而不是放在后面，是为了让文本层的向量导入（第 2 步）能把
     # 导入的向量放进池里（见 _import_vectors_bin_member）。
     owner._pending_vectors.clear()
 
-    # 1) 文本层：解码 -> 按本机 meta 重写 -> 原子落地。
+    # 1) 文本层（v1）：**只解码校验，不发布**（§20.7F）。包内正文来自不可信快照，
+    #    导入即公开等于先公开毒正文再等后台重读——这里一律不落 _chunks/FTS。
     chunk_count, file_count = _import_chunks_member(owner, zf)
 
     # 2) 向量层：.bin 重写 meta；sqlite 原样搬运（关连接 -> 换文件 -> 重开）。
+    #    这一层只落"可复用"状态：向量按 chunk.id 进补挂池，下一次 sync 重建文本后复用。
     vector_count: int | None = None
     if vectors_member is not None and not skip_vectors:
         if vectors_member == "vectors.bin":
@@ -282,26 +876,16 @@ def _import_snapshot_locked(
         else:
             vector_count = _import_vectors_sqlite_member(owner, zf)
 
-    # 3) FTS：能搬就搬；无论搬没搬，都按导入后的 chunk 集对账一次。
-    if "fts.sqlite" in zf.namelist() and owner._fts_cache_path is not None:
-        staged = _stage_member(zf, "fts.sqlite", owner._fts_cache_path)
-        _replace_live_file(owner, owner._fts_cache_path, staged, close_fts=True)
-
-    # 4) 用导入后的缓存文件重建内存态（向量按 id 挂回 chunk）。
-    #    注意 FTS 对账必须放在 _chunks.clear() 与 _load_chunks_cache() 之后：
-    #    此前先执行，用的是导入前的旧 chunk 集，会把旧语料全部 upsert 进
-    #    刚导入的 FTS 库——两套语料混在一起，且后续 sync 因签名未变永不修复。
+    # 3) 文本层与 FTS 一律置空：包内 fts.sqlite（v1 允许）不安装，旧 FTS 也丢弃，
+    #    由下一次 sync 从本机物理源重读重建可信 chunks。chunks cache 写空，
+    #    保证重启后不会把包内投毒正文重新载回索引。
     owner._chunks.clear()
     owner._signatures.clear()
     owner.failed_files.clear()
-    owner._load_chunks_cache()
-    owner._load_failed_files()
-    # 包内 signature 不可信：它是"源机器算好的文件摘要"，而本机 sync 的增量判据
-    # 正是它（run_sync: source in _signatures → 快路径/跳过）。不丢弃的话，构造
-    # 快照的人只要填上目标文件的真实 sha256，投毒正文就能永远躲过重读。清空后
-    # 首次 sync 必然重读全部文件重算签名：内容未变的切片按 content_hash 复用
-    # 快照向量（0 次 embedding 的性质不变），内容对不上的被磁盘真实内容替换。
-    owner._signatures.clear()
+    if owner._chunks_cache_path is not None:
+        _CacheCodec.dump(owner._chunks_cache_path, owner._chunks_meta(), {})  # type: ignore[arg-type]
+    if owner._fts_cache_path is not None:
+        _unlink_quietly(owner._fts_cache_path)
     if not owner._vectors_on_disk:
         owner._load_vectors_cache()
     _recreate_fts(owner)
@@ -311,26 +895,32 @@ def _import_snapshot_locked(
         "imported": True,
         "path": str(src),
         "files": len(owner._chunks),
-        "chunks": chunk_count,
-        "file_count": file_count,
+        "chunks": 0,
+        "packaged_chunks": chunk_count,
+        "file_count": 0,
+        "packaged_files": file_count,
         "vectors": vector_count,
         "vectors_imported": vectors_member is not None and not skip_vectors,
+        "text_published": False,
         "backend": getattr(owner._vector_backend, "name", owner.config.vector.backend),
-        "warnings": warnings or [],
+        "warnings": (warnings or []) + [
+            "snapshot text isolated; re-run sync to rebuild trusted chunks from local sources"
+        ],
     }
 
 
 def _import_chunks_member(owner: MarkdownIndexer, zf: zipfile.ZipFile) -> tuple[int, int]:
+    """解码校验包内文本层，但**不落地**：v1 包内正文一律不公开（§20.7F）。"""
     loaded = _decode_member(owner, zf, "chunks.bin", _CacheCodec.load)
     if loaded is None:
         raise ValueError("snapshot chunks.bin is corrupt")
-    meta, files = loaded
+    _meta, files = loaded
     # chunks 层必须无向量（向量只属于向量层）；导入时不信任包内数据，统一剥离。
+    # 清洗在这里仍执行（结构畸形的 metadata 会拖垮下游硬索引），但结果不落盘。
     clean: dict[str, tuple[str, list[Chunk]]] = {
         source: (signature, [_sanitize_chunk(owner, chunk) for chunk in chunks])
         for source, (signature, chunks) in files.items()
     }
-    _CacheCodec.dump(owner._chunks_cache_path, owner._chunks_meta(), clean)  # type: ignore[arg-type]
     total = sum(len(chunks) for _, chunks in clean.values())
     return total, len(clean)
 

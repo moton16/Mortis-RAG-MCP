@@ -62,6 +62,17 @@ def test_cache_env_inherited_by_subprocess():
     assert out.stdout.strip() == os.environ["MORTIS_RAG_CACHE_DIR"]
 
 
+def test_default_registry_and_subprocess_are_isolated():
+    from mortis_rag_mcp.registry import registry_path
+    path = registry_path()
+    assert path.parent == Path(os.environ["MORTIS_RAG_CACHE_DIR"])
+    code = "from mortis_rag_mcp.registry import registry_path; print(registry_path())"
+    result = subprocess.run([sys.executable, "-B", "-c", code], capture_output=True,
+                            text=True, encoding="utf-8", timeout=30)
+    assert result.returncode == 0
+    assert Path(result.stdout.strip()) == path
+
+
 def test_sessionfinish_guard_never_writes_host_status(monkeypatch):
     """⑤ 守卫仍在：NO_STATUS_HOOK 先短路，绝不调用 doctor.record_test_run。"""
     assert os.environ.get("MORTIS_RAG_NO_STATUS_HOOK") == "1"

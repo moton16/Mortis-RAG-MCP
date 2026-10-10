@@ -18,49 +18,27 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable
 
-try:
-    from ..config import IngestConfig
-except ImportError:
-    from dataclasses import dataclass
-
-    @dataclass(slots=True)
-    class IngestConfig:
-        enabled: bool = False
-        api_key: str = ""
-        model_version: str = "vlm"
-        language: str = "ch"
-        is_ocr: bool = False
-        enable_formula: bool = True
-        enable_table: bool = True
-        poll_interval: float = 3.0
-        poll_timeout: float = 600.0
-        output_dirname: str = ".mortis-parsed"
-        pymupdf_fallback: bool = True
-        convert_small_tables: bool = True
-        table_convert_max_cells: int = 60
-        auto_watch: bool = False
-        max_file_size_mb: int = 20
-
-        def __post_init__(self) -> None:
-            if not isinstance(self.auto_watch, bool):
-                raise ValueError(f"ingest.auto_watch must be a boolean, got {self.auto_watch!r}")
-            if (
-                isinstance(self.max_file_size_mb, bool)
-                or not isinstance(self.max_file_size_mb, int)
-                or self.max_file_size_mb < 0
-            ):
-                raise ValueError(f"ingest.max_file_size_mb must be an integer >= 0, got {self.max_file_size_mb!r}")
-
-        @property
-        def max_file_size_bytes(self) -> int:
-            """Max file size in bytes (1024*1024 per MiB). 0 means unlimited."""
-            return self.max_file_size_mb * 1024 * 1024
+# 真源与历史 worker.IngestConfig 导入别名保持同一对象。
+from ..config import IngestConfig
 
 from .mineru import AGENT_EXTS, MineruClient, MineruError
 from .tables import convert_small_tables
 from ..registry import _process_file_lock
+from .router import DEFAULT_PARSE_BUDGET, ParseBudget, decide_route, upgrade_route_once
+from .local import LocalUnsupported, parse_local, parse_local_volumes
+from .images import (IMAGE_EXTS, IMAGE_ROUTE_UNSUPPORTED, ImageUnsupported, parse_image,
+                     validate_image_source)
 
 INGEST_EXTS = {".pdf", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx"}
+
+
+def _ingest_exts(config: Any) -> set[str]:
+    """**扫描面**的后缀集合：显式提交面（`_validate_safe_source`）比它宽。
+
+    图片（`IMAGE_EXTS`）刻意**不在**扫描面里：E09 只做「用户显式提交的图片源」，
+    不因为支持图片就打开后台全库图片扫描（那会改变既有 auto_watch 语义）。
+    """
+    return INGEST_EXTS
 _STATE_NAME = ".ingest_state.json"
 # review R3：扫描后仍有判稳中的文件或扫描不完整时，扫描循环延时重扫的间隔。
 _SETTLE_RESCAN_SECONDS = 1.0
@@ -92,6 +70,8 @@ def _atomic_write_json(path: Path, payload: dict) -> None:
 def _validate_safe_source(vault_path: Path, rel_path_str: str) -> Path:
     """严格沙箱路径校验 (D1, D12)：
     拒绝绝对路径、.. 穿越；确保解析后位于 vault 内且为存在的文件。
+
+    后缀白名单是**显式提交面**（文档/图片）；扫描面另有 `_ingest_exts`，两者独立。
     """
     rel = Path(rel_path_str)
     if rel.is_absolute() or ".." in rel.parts:
@@ -103,7 +83,7 @@ def _validate_safe_source(vault_path: Path, rel_path_str: str) -> Path:
         raise ValueError(f"source path resolves outside vault: {rel_path_str}")
     if not resolved.is_file():
         raise ValueError(f"not an ingestible document: {rel_path_str}")
-    if resolved.suffix.lower() not in INGEST_EXTS:
+    if resolved.suffix.lower() not in INGEST_EXTS | IMAGE_EXTS:
         raise ValueError(f"not an ingestible document ({resolved.suffix}): {rel_path_str}")
     return resolved
 
@@ -166,6 +146,12 @@ class IngestManager:
     def mark_settling(self, rel: str) -> None:
         """Mark a source as currently being copied/written (forces settle check)."""
         self._settling_files.add(Path(rel).as_posix())
+
+    def stop(self) -> None:
+        """等待进行中的单 job 收尾（幂等）。legacy 路径无租约，只能 join 线程。"""
+        thread = self._worker
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=5.0)
 
 
     def _size_limit_bytes(self) -> int:
@@ -280,7 +266,7 @@ class IngestManager:
                                 entries_to_visit.append(Path(entry.path))
                             elif entry.is_file(follow_symlinks=False):
                                 path = Path(entry.path)
-                                if path.suffix.lower() not in INGEST_EXTS:
+                                if path.suffix.lower() not in _ingest_exts(self.config):
                                     continue
                                 rel = path.relative_to(self.vault_path).as_posix()
                                 st = entry.stat()
@@ -316,9 +302,13 @@ class IngestManager:
     def _validate_safe_source(self, rel: str) -> Path:
         return _validate_safe_source(self.vault_path, rel)
 
-    def submit(self, sources: list[str] | None = None, force: bool = False) -> dict:
+    def submit(self, sources: list[str] | None = None, force: bool = False,
+               caption: str = "") -> dict:
         """提交摄取任务（异步）。sources 为库内相对路径列表；None → scan_pending() 全量。
         支持 force 强制重解析 (D7)；去重 (D11)；参数严格校验 (D1, D12)；尺寸上限统一闸门。
+
+        `caption` 与 virtual 路径同签名（供 `kb_ingest` 统一调用）：legacy 没有 store，
+        图片源在这里就被明确拒绝，因此该参数不参与 legacy 行为。
         """
         if not self.config.enabled:
             raise ValueError(
@@ -346,6 +336,12 @@ class IngestManager:
             validated = []
             for rel in sources:
                 path = _validate_safe_source(self.vault_path, rel)
+                if path.suffix.lower() in IMAGE_EXTS:
+                    # legacy 路径没有 store 媒体出口：明确拒绝，绝不把图片送 MinerU 猜 OCR。
+                    raise ValueError(
+                        f"{IMAGE_ROUTE_UNSUPPORTED}: legacy 摄取路径不发布独立图片源（{rel}）；"
+                        "图片显式摄取需要 ingest.storage=virtual 的 store 媒体出口。"
+                    )
                 st = path.stat()
                 if not self._check_file_size(st.st_size):
                     raise ValueError(f"file size {st.st_size} bytes exceeds limit {limit} bytes: {rel}")
@@ -500,7 +496,7 @@ class IngestManager:
                                 entries_to_visit.append(Path(entry.path))
                             elif entry.is_file(follow_symlinks=False):
                                 path = Path(entry.path)
-                                if path.suffix.lower() not in INGEST_EXTS:
+                                if path.suffix.lower() not in _ingest_exts(self.config):
                                     continue
                                 rel = path.relative_to(self.vault_path).as_posix()
                                 scanned_sources.add(rel)
@@ -731,6 +727,15 @@ class IngestManager:
     def _run_job(self, job: dict) -> None:
         # D1: run_job 入口再次校验沙箱与尺寸上限
         src = _validate_safe_source(self.vault_path, job["source"])
+        if src.suffix.lower() in IMAGE_EXTS:
+            job["state"] = "failed"
+            job["error_code"] = IMAGE_ROUTE_UNSUPPORTED
+            job["error"] = (
+                f"{IMAGE_ROUTE_UNSUPPORTED}: legacy 摄取路径不发布独立图片源"
+                f"（{job['source']}）；请切换到 ingest.storage=virtual。"
+            )
+            job["finished_at"] = time.time()
+            return
         st = src.stat()
         if not self._check_file_size(st.st_size):
             limit = self._size_limit_bytes()
@@ -837,3 +842,831 @@ class IngestManager:
             return "\n\n".join(page.get_text() for page in doc)
         finally:
             doc.close()
+
+
+# =====================================================================================
+# C94：虚拟（store）摄取路径
+# =====================================================================================
+"""虚拟路径与 legacy 路径的差别（都在本文件里，便于对照）：
+
+| 维度 | legacy（默认，兼容 .mortis-parsed/*.md） | virtual（C94） |
+|---|---|---|
+| 账本 | `output_dirname/.ingest_state.json` | `ingest_jobs` / `auto_seen`（按库隔离的 store） |
+| 任务归属 | 进程内 `threading.Lock` + 文件锁 | `owner_token` + `lease_until` 的 SQL CAS（跨进程 fencing） |
+| 发布 | 原子写 `.md` | `stage_revision` → 两次源核验 → `commit_job_revision`（done 与切 active **同事务**） |
+| 媒体 | 落 `*.assets/` 目录 | 逐项 `put_media_blob`（内存有界）→ `attach_occurrences` |
+| 计费重试 | 瞬时错误标 retryable 由用户重试 | 非幂等 POST 的网络失败 → `SUBMISSION_UNKNOWN`，**禁止自动重传** |
+
+为什么 legacy 仍是默认：虚拟文档的**读取**适配器属 C96（Lane C）。在 C96 落地前把默认
+切成 virtual，已摄取文档会变成「写了但读不出来」。故 `ingest.storage` 默认 `legacy`，
+virtual 必须显式配置；这条偏差要在计划卡里显式记录。
+"""
+
+
+class StoreMediaSink:
+    """把媒体**逐项**写进 docstore 的 sink（§13.2：直接写 staged store、释放 RAM）。
+
+    解析期间只做第一阶段（`put_media_blob`，每项写完即释放）；revision 建立后再由
+    worker 调 `attach_occurrences` 挂出现。未被挂上的 blob 由 `gc_unreferenced()` 回收。
+    """
+
+    def __init__(self, store: Any, *, job_id: str = "", owner_token: str = "") -> None:
+        self.store = store
+        self.job_id = job_id
+        self.owner_token = owner_token
+        self.items: list[Any] = []
+
+    def add(self, *, name: str, data: bytes, kind: str, ordinal: int, mime_type: str,
+            page: int | None = None, bbox: Any = None, caption: str = "",
+            ocr: str = "", width: int | None = None, height: int | None = None,
+            t_start_ms: int | None = None, t_end_ms: int | None = None,
+            anchor_start: int | None = None, anchor_end: int | None = None,
+            metadata: dict[str, Any] | None = None) -> str:
+        from ..doc_store import MediaOccurrenceSpec
+
+        blob_id = self.store.put_media_blob(
+            data=data, mime_type=mime_type, width=width, height=height,
+            job_id=self.job_id, owner_token=self.owner_token,
+        )
+        occurrence_id = f"occ-{ordinal:05d}"
+        meta = {"archive_member": name}
+        meta.update(metadata or {})
+        self.items.append(MediaOccurrenceSpec(
+            occurrence_id=occurrence_id,
+            blob_id=blob_id,
+            kind=kind,
+            ordinal=ordinal,
+            mime_type=mime_type,
+            page=page,
+            bbox=bbox,
+            caption=caption,
+            ocr=ocr,
+            width=width,
+            height=height,
+            t_start_ms=t_start_ms,
+            t_end_ms=t_end_ms,
+            # E08-a：正文锚点透传（媒体尺寸走 width/height，绝不冒充 anchor）。
+            anchor_start=anchor_start,
+            anchor_end=anchor_end,
+            metadata=meta,
+        ))
+        return occurrence_id
+
+
+class VirtualIngestWorker:
+    """store 支撑的摄取 worker（C94）：队列/租约/发布 CAS/两次源核验。
+
+    公开面与 `IngestManager` 对齐（`submit` / `status` / `scan_pending` / `auto_submit` /
+    `mark_settling`），使 server 侧与既有 hook 不必区分两条路径。
+    """
+
+    def __init__(
+        self,
+        vault_path: str | Path,
+        config: Any,
+        store_provider: Callable[[], Any],
+        on_job_finished: Callable[[str, str], None] | None = None,
+        ignore_provider: Callable[[], Any] | None = None,
+        parse_budget: ParseBudget | None = None,
+        chunker_fingerprint_provider: Callable[[], str] | None = None,
+        media_provider: Any = None,
+        media_capability_error: str | None = None,
+    ) -> None:
+        self.vault_path = Path(vault_path).expanduser().resolve()
+        self.config = config
+        # §20.7C：进程级**共享**解析预算池。默认注入模块级 `DEFAULT_PARSE_BUDGET`，
+        # 绝不每库/每 job 新建一个冒充全局。它是逻辑预算准入（控制同时在解析的受控缓冲），
+        # 不是 native 库 RSS 硬保证，也不是跨进程统一限额。
+        self.parse_budget = parse_budget or DEFAULT_PARSE_BUDGET
+        self.media_provider = media_provider
+        self.media_capability_error = media_capability_error
+        # 显式提交的图片标题/说明（`kb_ingest submit` 的可选事实）。发布后该说明已写进
+        # occurrence/revision，是持久事实；进程重启发生在发布前则退回文件名（见 `_image_caption`）。
+        self._image_captions: dict[str, str] = {}
+        # C99 接缝：队列 fingerprint 需纳入真实 chunker/profile 指纹。`IngestConfig`
+        # 本身不含 chunking 段，故由上层（server/indexer）注入 provider；未注入时退回
+        # 常量占位并在报告中记为待接线。
+        self._chunker_fingerprint_provider = chunker_fingerprint_provider
+        self._store_provider = store_provider
+        self.on_job_finished = on_job_finished
+        self.ignore_provider = ignore_provider
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._worker: threading.Thread | None = None
+        self._client: MineruClient | None = None
+        self._settling_files: set[str] = set()
+        self._lease_seconds = max(300.0, float(getattr(config, "poll_timeout", 600.0)) + 120.0)
+
+    # ---------------------------------------------------------------- helpers
+
+    def _store(self) -> Any:
+        store = self._store_provider()
+        layout = getattr(store, "layout", None)
+        if layout is not None and not layout.writable:
+            from ..doc_store import VirtualStorageDisabled
+
+            raise VirtualStorageDisabled(
+                f"虚拟摄取不可用：{layout.blocked_reason or '布局不可写'}",
+                fix="按 doctor 的提示修正 cache 归属/placement，或把 ingest.storage 设为 legacy。",
+            )
+        return store
+
+    def _limits(self) -> Any:
+        from .models import ResourceLimits
+
+        return ResourceLimits.from_config(self.config)
+
+    def _size_limit_bytes(self) -> int:
+        cap = getattr(self.config, "max_file_size_bytes", None)
+        if cap is not None:
+            return int(cap)
+        return int(getattr(self.config, "max_file_size_mb", 20)) * 1024 * 1024
+
+    def _check_file_size(self, size_bytes: int) -> bool:
+        limit = self._size_limit_bytes()
+        if limit <= 0:
+            return True
+        return size_bytes <= limit
+
+    def _matcher(self) -> Any:
+        if self.ignore_provider is None:
+            return None
+        matcher = self.ignore_provider()
+        if matcher is None:
+            raise ValueError(
+                "ignore matcher unavailable; 虚拟摄取拒绝在无法判定豁免规则时入队"
+            )
+        return matcher
+
+    def mark_settling(self, rel: str) -> None:
+        self._settling_files.add(Path(rel).as_posix())
+
+    def _assert_network_policy(self, source: str) -> None:
+        path = _validate_safe_source(self.vault_path, source)
+        suffix = path.suffix.lower()
+        if suffix in IMAGE_EXTS:
+            # 显式提交的图片源是本地输入适配，不触发云路由；准入在入队前完成。
+            validate_image_source(path, self._limits())
+            return
+        with self.parse_budget.reserve(min(self._limits().memory_budget_bytes, path.stat().st_size * 4), self._stop.is_set):
+            decide_route(path, self.config, limits=self._limits())
+
+    def _job_view(self, job: Any, *, channel: str = "", error: str = "",
+                  parse_quality: str = "") -> dict[str, Any]:
+        return {
+            "job_id": job.job_id,
+            "source": job.source,
+            "sha256": job.source_sha256,
+            "state": job.state,
+            "phase": job.phase,
+            "attempts": job.attempts,
+            "channel": channel,
+            "error": error or (f"{job.error_code}: {job.error_summary}" if job.error_code else job.error_summary),
+            "parse_quality": parse_quality,
+            "revision_id": job.result_revision,
+            "owner_token": bool(job.owner_token),
+        }
+
+    # ---------------------------------------------------------------- public
+
+    def scan_pending(self) -> list[dict]:
+        """列出待摄取文档（与 auto_seen 账本比对；不写任何状态）。"""
+        store = self._store()
+        seen = {item["source"]: item for item in store.iter_auto_seen()}
+        pending: list[dict] = []
+        if not self.vault_path.exists():
+            return pending
+        matcher = self._matcher()
+        limit = self._size_limit_bytes()
+        out_dirname = str(getattr(self.config, "output_dirname", ".mortis-parsed"))
+        stack = [self.vault_path]
+        while stack:
+            current = stack.pop()
+            try:
+                with os.scandir(current) as entries:
+                    for entry in entries:
+                        try:
+                            if entry.is_dir(follow_symlinks=False):
+                                if _is_excluded_dir_name(entry.name, out_dirname):
+                                    continue
+                                rel_dir = Path(entry.path).relative_to(self.vault_path).as_posix()
+                                if _is_path_ignored(matcher, rel_dir, is_dir=True):
+                                    continue
+                                stack.append(Path(entry.path))
+                            elif entry.is_file(follow_symlinks=False):
+                                path = Path(entry.path)
+                                if path.suffix.lower() not in _ingest_exts(self.config):
+                                    continue
+                                rel = path.relative_to(self.vault_path).as_posix()
+                                if _is_path_ignored(matcher, rel):
+                                    continue
+                                stat = entry.stat()
+                                if not self._check_file_size(stat.st_size):
+                                    pending.append({"source": rel, "sha256": "", "mtime": stat.st_mtime,
+                                                    "size": stat.st_size, "limit_bytes": limit,
+                                                    "reason": "too_large"})
+                                    continue
+                                digest = _sha256(path)
+                                record = seen.get(rel)
+                                if record is None or record.get("source_sha256") != digest:
+                                    pending.append({
+                                        "source": rel,
+                                        "sha256": digest,
+                                        "mtime": stat.st_mtime,
+                                        "size": stat.st_size,
+                                        "reason": "new" if record is None else "changed",
+                                    })
+                        except OSError:
+                            continue
+            except OSError:
+                continue
+        return pending
+
+    def submit(self, sources: list[str] | None = None, force: bool = False,
+               caption: str = "") -> dict:
+        """提交虚拟摄取任务（异步）。校验→入队（store）→ 起 worker。
+
+        `caption`：**显式提交**图片源时的用户标题/说明（仅对 `IMAGE_EXTS` 生效；其他后缀
+        忽略）。发布后该说明写进 occurrence/revision，是持久事实；进程在发布前重启则退回
+        文件名（不猜内容，也不做 OCR/caption 推断）。
+        """
+        if not self.config.enabled:
+            raise ValueError(
+                "ingest disabled: PDF 摄取层默认关闭。请在 config/app.toml 设置 "
+                "[ingest] enabled = true 并重启 MCP 服务后重试。"
+            )
+        if sources is not None:
+            if not isinstance(sources, (list, tuple)):
+                raise TypeError(f"sources must be a list of relative file path strings, got {type(sources).__name__}")
+            for item in sources:
+                if not isinstance(item, str):
+                    raise TypeError(f"each item in sources must be a string, got {type(item).__name__}")
+        store = self._store()
+        matcher = self._matcher()
+        limit = self._size_limit_bytes()
+
+        if sources is None:
+            scanned = self.scan_pending()
+            targets = [t for t in scanned if t.get("reason") != "too_large"]
+            skipped_too_large = len([t for t in scanned if t.get("reason") == "too_large"])
+            skipped_ignored = 0
+            # §13.3：local_only / 未授权云路径必须在**入队前**拒绝（显式分支已在
+            # 上面的循环里逐条校验）。这里做全批量校验：任一目标越云即整体拒绝，
+            # 绝不「先入队、等领取再拦」。
+            for target in targets:
+                self._assert_network_policy(target["source"])
+        else:
+            targets = []
+            skipped_too_large = 0
+            skipped_ignored = 0
+            for rel in sources:
+                path = _validate_safe_source(self.vault_path, rel)
+                if _is_path_ignored(matcher, Path(rel).as_posix()):
+                    skipped_ignored += 1
+                    continue
+                self._assert_network_policy(rel)
+                stat = path.stat()
+                if not self._check_file_size(stat.st_size):
+                    raise ValueError(
+                        f"file size {stat.st_size} bytes exceeds limit {limit} bytes: {rel}"
+                    )
+                rel_posix = Path(rel).as_posix()
+                if caption and path.suffix.lower() in IMAGE_EXTS:
+                    self._image_captions[rel_posix] = str(caption).strip()
+                targets.append({
+                    "source": rel_posix,
+                    "sha256": _sha256(path),
+                    "mtime": stat.st_mtime,
+                    "size": stat.st_size,
+                    "reason": "explicit",
+                })
+
+        jobs: list[dict] = []
+        created = 0
+        for target in targets:
+            job, is_new = store.enqueue_job(
+                source=target["source"],
+                source_sha256=target["sha256"],
+                parser_fingerprint=self._parser_fingerprint(target["source"]),
+                force=force,
+            )
+            created += 1 if is_new else 0
+            jobs.append(self._job_view(job))
+        if store.queue_depth():
+            self._ensure_worker(store)
+        return {
+            "submitted": created,
+            "new_jobs": created,
+            "jobs": jobs,
+            "skipped_too_large": skipped_too_large,
+            "skipped_ignored": skipped_ignored,
+            "storage": "virtual",
+        }
+
+    def auto_submit(self) -> dict:
+        """自动摄取扫描（virtual）：用**两次源核验**替代 legacy 的双采样判稳。
+
+        为什么不做双采样：virtual 的第二次源核验发生在发布前（hash 变化即废弃候选），
+        复制中途的文件必然在发布前被拦下并重新入队；再叠一层采样只会拖慢首摄。
+        """
+        if not (self.config.enabled and self.config.auto_watch):
+            return {"submitted": 0, "new_jobs": 0, "jobs": [], "status": "disabled",
+                    "skipped_too_large": 0, "skipped_ignored": 0, "rescan_after_seconds": 0.0}
+        store = self._store()
+        try:
+            matcher = self._matcher()
+        except ValueError as exc:
+            return {"submitted": 0, "new_jobs": 0, "jobs": [], "status": "fail_closed",
+                    "last_error": str(exc), "rescan_after_seconds": _SETTLE_RESCAN_SECONDS,
+                    "skipped_too_large": 0, "skipped_ignored": 0}
+        pending = self.scan_pending()
+        jobs: list[dict] = []
+        rejected: list[dict] = []
+        created = 0
+        skipped_seen = 0
+        too_large = 0
+        for target in pending:
+            if target.get("reason") == "too_large":
+                too_large += 1
+                continue
+            if _is_path_ignored(matcher, target["source"]):
+                continue
+            try:
+                self._assert_network_policy(target["source"])
+            except ValueError as exc:
+                rejected.append({"source": target["source"],
+                                 "error_code": "NETWORK_POLICY_BLOCKED", "error": str(exc)})
+                continue
+            job, is_new = store.enqueue_job(
+                source=target["source"],
+                source_sha256=target["sha256"],
+                parser_fingerprint=self._parser_fingerprint(target["source"]),
+            )
+            if is_new:
+                created += 1
+            else:
+                skipped_seen += 1
+            jobs.append(self._job_view(job))
+        # auto_seen 已在入队时记录；没有新候选仍须唤醒上次进程留下的 queued。
+        if store.queue_depth():
+            self._ensure_worker(store)
+        return {
+            "submitted": created,
+            "new_jobs": created,
+            "jobs": jobs,
+            "status": ("partial" if jobs else "network_policy_blocked") if rejected else "ok",
+            "rejected": rejected,
+            "skipped_too_large": too_large,
+            "skipped_seen": skipped_seen,
+            "skipped_ignored": 0,
+            "rescan_after_seconds": _SETTLE_RESCAN_SECONDS if self._settling_files else 0.0,
+            "storage": "virtual",
+        }
+
+    def retry(self, job_id: str) -> dict[str, Any]:
+        """显式重试既有任务（E06/E02-b）。
+
+        只转发 `DocumentStore.retry_job` 的 failed/cancelled → queued；**结果未知的远端
+        任务**（SUBMISSION_UNKNOWN / submission phase）保持原状态，返回 remote 事实与
+        next action，绝不强转 queued，也不自动重发。
+        """
+        from ..doc_store import StoreContractError, StoreConflict
+
+        job_id = str(job_id or "").strip()
+        if not job_id:
+            raise ValueError("retry requires job_id")
+        store = self._store()
+        job = store.job_status(job_id)
+        if job is None:
+            raise ValueError(f"unknown job_id: {job_id}")
+        unknown = (str(job.error_code) == "SUBMISSION_UNKNOWN"
+                   or str(job.phase) in {"send_intent", "submitted", "polling", "downloaded",
+                                         "submission_unknown"})
+        if unknown:
+            remote_task_id = ""
+            for row in store.list_subjobs(job_id):
+                if row.ordinal == 0:
+                    remote_task_id = row.remote_task_id
+                    break
+            view = self._job_view(job)
+            view.update(retried=False, retryable=False, reason="SUBMISSION_UNKNOWN",
+                        remote_task_id=remote_task_id,
+                        next_action=("do not resend; query the original remote task for this job "
+                                     "and resolve it explicitly (abandon or accept) before retrying"))
+            return view
+        try:
+            updated = store.retry_job(job_id)
+        except (StoreContractError, StoreConflict) as exc:
+            view = self._job_view(store.job_status(job_id) or job)
+            view.update(retried=False, retryable=False, reason=str(exc),
+                        next_action="only failed/cancelled jobs can be retried")
+            return view
+        view = self._job_view(updated)
+        view.update(retried=True, retryable=True, reason="",
+                    next_action="queued: the worker will pick it up on the next claim")
+        self._ensure_worker(store)
+        return view
+
+    def status(self, job_id: str | None = None) -> dict:
+        store = self._store()
+        if job_id:
+            job = store.job_status(job_id)
+            if job is None:
+                raise ValueError(f"unknown job_id: {job_id}")
+            return {"job": self._job_view(job)}
+        jobs = [self._job_view(job) for job in store.list_jobs(limit=20)]
+        summary: dict[str, int] = {}
+        for record in store.list_jobs(limit=1000):
+            key = record.state
+            if key == "done" and record.phase == "committed":
+                key = "done"
+            summary[key] = summary.get(key, 0) + 1
+        return {"summary": summary, "jobs": jobs, "storage": "virtual",
+                "queue_depth": store.queue_depth()}
+
+    def cancel(self, job_id: str) -> bool:
+        return bool(self._store().cancel_job(job_id))
+
+    def stop(self) -> None:
+        self._stop.set()
+        thread = self._worker
+        if thread is not None:
+            thread.join(timeout=5.0)
+        self._worker = None
+
+    # ---------------------------------------------------------------- worker
+
+    def _chunker_fingerprint(self) -> str:
+        provider = self._chunker_fingerprint_provider
+        value = ""
+        if provider is not None:
+            try:
+                value = str(provider() or "")
+            except Exception:
+                value = ""
+        # 未注入时用显式占位，而不是空串：接入真实 chunker 指纹后自然区分代际。
+        return value or "chunker-fingerprint-unwired"
+
+    def _parser_fingerprint(self, source: str = "") -> str:
+        """入队时的 job 指纹（用于「同源同 SHA 同 parser/profile 合并」，§12.2）。
+
+        通道在领取时才判定，故 `channel="auto"`。**必须**纳入 routing/network_policy
+        与 chunker/profile 指纹：否则同内容不同 profile 会被 `enqueue_job` 误合并成
+        同一 job。真正的解析事实指纹仍由 `parse_structured()`/`parse_local()` 产出并
+        写进 `document_revisions.parser_fingerprint`（本函数不是它）。
+
+        E09：音频任务必须额外纳入**音频处理 profile**（分段/重叠/解码器/转录 adapter）。
+        只对音频源追加，文档源的指纹值保持不变——否则已入库文档会被判成「新 profile」
+        而在下次 submit 时重复入队（可能真实计费）。
+        """
+        from .mineru import ADAPTER_VERSION
+
+        cfg = self.config
+        parts = [
+            "job-v1",
+            "adapter=" + str(ADAPTER_VERSION),
+            "channel=auto",
+            "model=" + str(getattr(cfg, "model_version", "vlm")),
+            "language=" + str(getattr(cfg, "language", "ch")),
+            "ocr=" + ("1" if getattr(cfg, "is_ocr", False) else "0"),
+            "table=" + ("1" if getattr(cfg, "enable_table", True) else "0"),
+            "formula=" + ("1" if getattr(cfg, "enable_formula", True) else "0"),
+            "routing=" + str(getattr(cfg, "routing", "auto")),
+            "network=" + str(getattr(cfg, "network_policy", "configured")),
+            "chunker=" + self._chunker_fingerprint(),
+        ]
+        suffix = Path(source).suffix.lower() if source else ""
+        if suffix in IMAGE_EXTS:
+            parts.append("image=image-source-v1")
+        return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:32]
+
+    def _client_or_make(self) -> MineruClient:
+        if self._client is None:
+            cfg = self.config
+            self._client = MineruClient(
+                cfg.api_key, model_version=cfg.model_version, language=cfg.language,
+                is_ocr=cfg.is_ocr, enable_formula=cfg.enable_formula,
+                enable_table=cfg.enable_table, limits=self._limits(),
+            )
+        return self._client
+
+    def _ensure_worker(self, store: Any) -> None:
+        with self._lock:
+            if self._worker is not None and self._worker.is_alive():
+                return
+            self._worker = threading.Thread(target=self._loop, daemon=True,
+                                            name="ingest-virtual-worker")
+            self._worker.start()
+
+    # ------------------------------------------------------ parse 编排 (E09)
+
+    def _parse_image_job(self, job: Any, src: Path, sink: Any) -> Any:
+        """显式提交的图片源：单项有界 occurrence + 只有用户事实的代理正文（不做 OCR）。"""
+        return parse_image(src, limits=self._limits(), sink=sink,
+                           title=self._image_captions.get(job.source, ""), ordinal=1)
+
+    def _parse_document_job(self, store: Any, job: Any, owner: str, src: Path, sink: Any,
+                            record: Any) -> Any:
+        """文档：E10 决定路由；本地质量复检失败时**最多一次**升级（不重定质量阈值）；
+        本地 PDF 超页数预算时有界内存分卷（不升云、不落临时文件）。"""
+        try:
+            decision = decide_route(src, self.config, limits=self._limits())
+        except LocalUnsupported as exc:
+            result = self._run_local_volumes_or_raise(store, job, owner, src, exc)
+            if result is None:
+                raise
+            return result
+        if decision.route == "local":
+            try:
+                result = parse_local(src, limits=self._limits(),
+                                     max_pages=getattr(self.config, "local_max_pages", 300),
+                                     cancelled=self._stop.is_set)
+            except LocalUnsupported as exc:
+                upgraded = self._upgrade_after_local_failure(decision, exc)
+                if upgraded is not None:
+                    decision = upgraded
+                    result = self._cloud_parse(job, src, sink, record)
+                    result.capabilities["route_decision"] = decision.as_dict()
+                    return result
+                # 页数预算超限（decide_route 的探测会吞掉自己的预算异常，这里兜住
+                # parse_local 的 "page limit exceeded"）→ 有界分卷，不升云。
+                result = self._run_local_volumes_or_raise(store, job, owner, src, exc)
+                if result is None:
+                    raise
+                return result
+        else:
+            result = self._cloud_parse(job, src, sink, record)
+        result.capabilities["route_decision"] = decision.as_dict()
+        return result
+
+    #: 页数预算超限的稳定标记（加密 PDF 不是分卷理由）。
+    _VOLUME_SPLIT_MARKERS = ("local page budget exceeded", "page limit exceeded")
+
+    def _run_local_volumes_or_raise(self, store: Any, job: Any, owner: str, src: Path,
+                                    exc: LocalUnsupported) -> Any | None:
+        """本地 PDF 超页数预算 → 有界分卷（消费 E02 通用子记录）；否则 None 照常失败。"""
+        if not any(marker in str(exc) for marker in self._VOLUME_SPLIT_MARKERS):
+            return None
+        if src.suffix.lower() != ".pdf" or self._stop.is_set():
+            return None
+        resume = self._volume_resume(store, job)
+        result = parse_local_volumes(
+            src, limits=self._limits(),
+            max_pages=getattr(self.config, "local_max_pages", 300),
+            cancelled=self._stop.is_set, resume=resume,
+            source_sha256=str(getattr(job, "source_sha256", "") or ""),
+            checkpoint=lambda ordinal, rng, payload: self._volume_checkpoint(
+                store, job, owner, ordinal, rng, payload))
+        result.capabilities["route_decision"] = {
+            "route": "local", "initial_route": "local", "upgrade_count": 0,
+            "confidence": 0.4, "partial": True, "failed_pages": [],
+            "reasons": ("bounded in-memory volume split of local PDF",),
+            "volumes": result.capabilities.get("volumes_total", 0),
+        }
+        return result
+
+    def _volume_resume(self, store: Any, job: Any) -> dict[int, dict[str, Any]]:
+        """读回已确认卷的 checkpoint（E02 `list_subjobs`；坏记录拒绝静默续跑）。"""
+        reader = getattr(store, "list_subjobs", None)
+        if reader is None:
+            return {}
+        rows = reader(job.job_id)
+        resume: dict[int, dict[str, Any]] = {}
+        for row in rows or []:
+            ordinal = int(getattr(row, "ordinal", 0) or 0)
+            if ordinal < 1 or str(getattr(row, "state", "") or "") != "done":
+                continue
+            raw = getattr(row, "checkpoint", "") or ""
+            if not raw:
+                continue
+            try:
+                payload = json.loads(raw)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"volume checkpoint for ordinal {ordinal} is corrupt; refusing to resume "
+                    "silently (that would redo confirmed volumes)") from exc
+            if not isinstance(payload, dict) or str(payload.get("kind") or "") != "document_pages":
+                continue
+            resume[ordinal] = payload
+        return resume
+
+    @staticmethod
+    def _volume_checkpoint(store: Any, job: Any, owner: str, ordinal: int, rng: tuple[int, int],
+                           payload: dict[str, Any]) -> None:
+        """逐卷写 E02 子记录（`document_pages` 0-based 半开页范围；失败不静默）。"""
+        store.record_subjob(job.job_id, owner, ordinal=int(ordinal),
+                            input_hash=str(payload.get("sha256") or ""),
+                            range={"kind": "document_pages", "start": int(rng[0]),
+                                   "end": int(rng[1])},
+                            state="done", checkpoint=payload)
+
+    def _cloud_parse(self, job: Any, src: Path, sink: Any, record: Any) -> Any:
+        return self._client_or_make().parse_structured(
+            src, poll_interval=float(getattr(self.config, "poll_interval", 3.0)),
+            poll_timeout=float(getattr(self.config, "poll_timeout", 600.0)),
+            sink=sink, intent_recorder=record, request_id=job.job_id)
+
+    #: 本地解析**质量复检**失败 → E10 允许升级的唯一理由标记。取消/预算/加密/依赖缺失
+    #: 不是质量理由：这些必须如实失败，不能被 cloud fallback 掩盖（也不重复上传）。
+    _LOCAL_QUALITY_MARKERS = ("local quality revalidation failed",)
+
+    def _upgrade_after_local_failure(self, decision: Any, exc: Exception) -> Any:
+        """消费 E10 `upgrade_route_once` 的「最多一次」升级；不允许时返回 None。"""
+        if not any(marker in str(exc) for marker in self._LOCAL_QUALITY_MARKERS):
+            return None
+        try:
+            return upgrade_route_once(decision, self.config,
+                                      quality_reasons=("empty_or_garbled",),
+                                      failed_pages=tuple(getattr(decision, "failed_pages", ()) or ()))
+        except LocalUnsupported:
+            return None
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            store = self._store()
+            owner = f"w-{uuid.uuid4().hex[:12]}"
+            job = store.claim_job(owner, lease_seconds=self._lease_seconds)
+            if job is None:
+                return
+            try:
+                self._run_job(store, job, owner)
+            except Exception as exc:  # 单 job 失败不拖垮队列
+                try:
+                    store.fail_job(job.job_id, owner,
+                                   error_code=str(getattr(exc, "code_str", "") or type(exc).__name__),
+                                   error_summary=str(exc)[:500],
+                                   retryable=bool(getattr(exc, "retryable", False)))
+                except Exception:
+                    pass
+    def _run_job(self, store: Any, job: Any, owner: str) -> None:
+        # claim 后、源核验/解析前捕获；发布前不得重取 token，否则会吞掉并发新事实。
+        expected_source_seq = store.source_seq(job.source)
+        src = _validate_safe_source(self.vault_path, job.source)
+        stat_before = src.stat()
+        if not self._check_file_size(stat_before.st_size):
+            raise ValueError(
+                f"file size {stat_before.st_size} bytes exceeds limit {self._size_limit_bytes()} bytes"
+            )
+        # 第一次源核验（解析前）：入队 hash 不符 → 废弃，不上传
+        if _sha256(src) != job.source_sha256:
+            store.fail_job(job.job_id, owner, error_code="SOURCE_CHANGED",
+                           error_summary="source_changed before parse", retryable=False)
+            return
+
+        self._assert_network_policy(job.source)
+        matcher = self._matcher()
+        if matcher is not None and matcher.is_ignored(job.source)[0]:
+            raise ValueError("source exempt before parse")
+        store.renew_lease(job.job_id, owner, lease_seconds=self._lease_seconds)
+        sink = StoreMediaSink(store, job_id=job.job_id, owner_token=owner)
+
+        def _record(kind: str, payload: dict[str, Any]) -> None:
+            store.report_phase(job.job_id, owner, phase=kind,
+                               remote_task_id=str(payload.get("remote_task_id") or ""),
+                               checkpoint=str(payload.get("payload_hash") or ""))
+
+        with self.parse_budget.reserve(self._limits().memory_budget_bytes, self._stop.is_set):
+            suffix = src.suffix.lower()
+            if suffix in IMAGE_EXTS:
+                result = self._parse_image_job(job, src, sink)
+            else:
+                result = self._parse_document_job(store, job, owner, src, sink, _record)
+        self._assert_network_policy(job.source)
+        matcher = self._matcher()
+        if matcher is not None and matcher.is_ignored(job.source)[0]:
+            raise ValueError("source exempt before publication")
+        # 第二次源核验（发布前）：stat 或 hash 变了 → 废弃候选并重新扫描
+        stat_after = src.stat()
+        if (stat_after.st_size, stat_after.st_mtime_ns) != (stat_before.st_size, stat_before.st_mtime_ns):
+            store.fail_job(job.job_id, owner, error_code="SOURCE_CHANGED",
+                           error_summary="source changed while parsing", retryable=False)
+            return
+        if _sha256(src) != job.source_sha256:
+            store.fail_job(job.job_id, owner, error_code="SOURCE_CHANGED",
+                           error_summary="source hash changed while parsing", retryable=False)
+            return
+        # 续租后再发布（跨越长时间解析后的 fencing）
+        store.renew_lease(job.job_id, owner, lease_seconds=self._lease_seconds)
+
+        capabilities = dict(result.capabilities)
+        capabilities["page_spans"] = [
+            {"page": span.page, "char_start": span.char_start, "char_end": span.char_end}
+            for span in result.page_map
+        ]
+        capabilities["warnings"] = list(result.warnings)
+        capabilities["parser_fingerprint"] = result.parser_fingerprint
+        capabilities["duration_ms"] = round(result.duration_ms, 3)
+
+        # E16：媒体 occurrence 原生能力核验 hunk
+        media_items = [it for it in sink.items if getattr(it, "kind", "") in ("image", "audio")]
+        if media_items:
+            if self.media_provider is None:
+                reason = self.media_capability_error or "media_provider not configured"
+                capabilities["warnings"].append(
+                    f"native media capability unavailable: {reason} (falling back to proxy / text recall)"
+                )
+                capabilities["media_route"] = "proxy"
+            else:
+                try:
+                    ability = self.media_provider.ability()
+                    allowed_mimes = set(ability.get("allowed_mime_types", ()))
+                    modalities = set(ability.get("modalities", ()))
+
+                    unsupported: list[str] = []
+                    seen_errs: set[str] = set()
+                    for it in media_items:
+                        kind = getattr(it, "kind", "")
+                        mime = getattr(it, "mime_type", "")
+                        err_msg = ""
+                        if kind not in modalities:
+                            err_msg = f"{kind} modality not supported by media_provider"
+                        elif mime not in allowed_mimes:
+                            err_msg = f"{mime} not in media_provider allowed_mime_types"
+                        if err_msg and err_msg not in seen_errs:
+                            seen_errs.add(err_msg)
+                            unsupported.append(err_msg)
+                    if unsupported:
+                        for err in unsupported:
+                            capabilities["warnings"].append(
+                                f"native media capability unavailable: {err} (falling back to proxy / text recall)"
+                            )
+                        capabilities["media_route"] = "proxy"
+                    else:
+                        capabilities["media_route"] = "native"
+                except Exception as exc:
+                    capabilities["warnings"].append(
+                        f"native media capability verification failed: {exc} (falling back to proxy / text recall)"
+                    )
+                    capabilities["media_route"] = "proxy"
+
+        staged = store.stage_revision(
+            source=job.source,
+            source_sha256=job.source_sha256,
+            render_sha256=_sha256_text(result.markdown),
+            parser_fingerprint=result.parser_fingerprint,
+            markdown=result.markdown,
+            page_map=[span.page for span in result.page_map],
+            quality=result.quality,
+            capabilities=capabilities,
+            source_size=stat_after.st_size,
+            source_mtime_ns=stat_after.st_mtime_ns,
+            job_id=job.job_id,
+            owner_token=owner,
+        )
+        if sink.items:
+            store.attach_occurrences(staged.revision_id, sink.items,
+                                     job_id=job.job_id, owner_token=owner)
+        store.commit_job_revision(
+            job.job_id, owner, staged.revision_id, source_sha256=job.source_sha256,
+            expected_source_seq=expected_source_seq,
+            source_size=stat_after.st_size, source_mtime_ns=stat_after.st_mtime_ns,
+        )
+        store.record_auto_seen(
+            job.source, source_sha256=job.source_sha256, last_job_id=job.job_id,
+            state="done", source_size=stat_after.st_size, source_mtime_ns=stat_after.st_mtime_ns,
+        )
+        if self.on_job_finished is not None:
+            try:
+                self.on_job_finished(job.source, staged.revision_id)
+            except Exception:
+                pass
+
+
+def _sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def make_ingest_manager(
+    vault_path: str | Path,
+    config: Any,
+    *,
+    store_provider: Callable[[], Any] | None = None,
+    on_job_finished: Callable[..., None] | None = None,
+    ignore_provider: Callable[[], Any] | None = None,
+    parse_budget: ParseBudget | None = None,
+    chunker_fingerprint_provider: Callable[[], str] | None = None,
+    media_provider: Any = None,
+    media_capability_error: str | None = None,
+) -> Any:
+    """按 `ingest.storage` 选择摄取实现（唯一的路径分派点）。
+
+    `virtual` 需要 store 可用（门禁在 `DocumentStore.open(write=True)` 与
+    `layout.writable`）；拿不到 store 时**回落 legacy** 并保持可诊断，
+    绝不「半虚拟」地写盘。
+
+    `chunker_fingerprint_provider` 只在 virtual 路径消费（legacy 路径不落 store，
+    图片明确拒绝）。legacy 分支不接该参数也不静默丢弃——它本来就不具备图片出口。
+    """
+    storage = str(getattr(config, "storage", "legacy") or "legacy")
+    if storage == "virtual" and store_provider is not None:
+        return VirtualIngestWorker(
+            vault_path, config, store_provider,
+            on_job_finished=on_job_finished, ignore_provider=ignore_provider,
+            parse_budget=parse_budget,
+            chunker_fingerprint_provider=chunker_fingerprint_provider,
+            media_provider=media_provider,
+            media_capability_error=media_capability_error,
+        )
+    return IngestManager(
+        vault_path, config, on_job_finished=on_job_finished, ignore_provider=ignore_provider
+    )

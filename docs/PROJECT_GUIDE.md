@@ -14,6 +14,19 @@
 
 ---
 
+## 0.9 候选增量：当前实现与验收边界（2026-10-08，editor: moton16, Codex）
+
+本节覆盖下文旧版概览的差异，不将历史记录改成新版本通过。统一施工/状态入口仍是
+`docs/v0.9.0/beta2/UNIFIED_EXECUTION_PLAN_2026-10-08.md`，版本目录按现行规则忽略。
+
+1. 文本配置模板贯穿 provider、索引与查询；新库 estimated_tokens，已有缓存/字符设置兼容 legacy_chars，`.markdown` 原生收录。既有请求 journal 处理 unknown，不新增费用批准平台。
+2. virtual 为文档事实默认落点。`DocumentStore` 的 generation/revision 与 control/job/checkpoint/blob/occurrence 分开；refresh 保留请求，read/export pin 固定版本；import 最终 gate 重核及发布同一 OS mutation lock，沿用原补偿机制。
+3. worker retry 唤醒线程；cancelled 失去 GC 保护的段在 retry 同事务清除，failed 的有效 checkpoint 保留，unknown 不自动回 queued。
+4. sync 捕获固定 revision 的所有 occurrence（不以一页1000当全量）；proxy/native 均有源/渲染 SHA。native ID/key 含媒体 profile；重开时旧 pending 不覆盖新向量；不支持的模态/MIME保留 proxy 文本召回。磁盘派生 orphan 清理不涉及事实 blob GC。
+5. 16 工具包括 `kb_read_media`，实际 request_id 纳入完整 JSON-RPC 预算。媒体内部可注入 transport fixture 已接通；E17 另以零 mock 真实载体跑通「文字查询召回库中图片」（真实 PNG → `HttpMediaTransport` → EG2 Tier2 → native chunk，图片查询自命中 cos>0.999）。普通工厂真实付费端点的通用装配、独立图片摄取与宿主显示仍有缺口，不写成完整生产能力。音频转录 / ffmpeg 解码链路已在 E17 物理清除（见统一入口 §16），音频只保留原生 embedding 与 occurrence 展示出口。
+6. 可选 docs/media 正向格式已本地执行；vec 磁盘后端已在本地两套解释器（PATH python 与仓库 `.venv`）装上 `sqlite-vec` 0.1.9 并跑通 `vec0` KNN 与本地复刻的 CI `extras` lane（E17），远端 CI 仍未 push 故无链接。质量脚本区分 fixture_measured/incomplete，合成资源峰值不是 RSS；真实语料、付费端点、跨模态质量结论与宿主显示仍未验收。
+7. 极端 legacy 超长多格表格仍有历史截失；保持其旧地址兼容，本次不隐式改变 golden。estimated 完整保留超限表格并不发 embedding。
+
 ## 目录
 
 1. [项目定位](#一项目定位)
@@ -36,7 +49,7 @@
 
 ## 一、项目定位
 
-**Mortis'RAG MCP**（Python 包名 `mortis_rag_mcp`，历史包名 `vault_mcp` 保持向后兼容别名）是一个**面向 Obsidian 风格 Markdown 知识库与纯文本 TXT 的本地 RAG 检索服务**，以 **MCP（Model Context Protocol）over stdio** 的形式供 AI Agent（WorkBuddy / Codex / Claude Code / Trae 等）调用。对于 PDF/Office 文档，支持经由可选摄取层（MinerU）解析为 Markdown 镜像存入 `.mortis-parsed/` 目录纳入检索。
+**Mortis'RAG MCP**（Python 包名 `mortis_rag_mcp`，历史包名 `vault_mcp` 保持向后兼容别名）是一个**面向 Obsidian 风格 Markdown 知识库与纯文本 TXT 的本地 RAG 检索服务**，以 **MCP（Model Context Protocol）over stdio** 的形式供 AI Agent（WorkBuddy / Codex / Claude Code / Trae 等）调用。对于 PDF/Office 文档，支持经由可选摄取层（MinerU v4 / Agent 免登 / 本地 PyMuPDF 兜底）解析后纳入检索：v0.9.0 起解析事实默认落在缓存根下的文档库（`cache.dir/<namespace>/doc_store/`），由 `kb_read`/`kb_search` 按 revision 读回，不在知识库内生成镜像；只有显式 `[ingest] storage = "legacy"` 才在库内写 `.mortis-parsed/` 物理镜像。
 
 它解决的核心问题：让 AI 助手能对本地任意一个 Markdown/TXT 笔记夹做「语义 + 关键词」混合检索，拿到结构化的原文切片（chunk）并按需读原文——而不把笔记内容上传给任何第三方（embedding 可选外部 API，检索编排全部本地完成）。
 
@@ -127,7 +140,7 @@
 ┌──────────────────────────────────────────────────────────────────┐
 │ server.py  VaultMcpServer / serve_stdio                          │
 │  ├─ 协议层：initialize / ping / tools/list / tools/call          │
-│  ├─ 15 个工具的分发 + 参数防御性解析 + fan-out 编排               │
+│  ├─ 16 个工具的分发 + 参数防御性解析 + fan-out 编排               │
 │  └─ _indexers: {vault_path → MarkdownIndexer}（双检锁缓存）      │
 └───────┬──────────────────────┬───────────────────────────────────┘
         │                      │
@@ -196,7 +209,7 @@ embedding（static 哈希 / 外部 API，按文件并发）     ←—— 向量
 
 以下按依赖顺序（自底向上）讲解。行数以 v0.5.0 为准。
 
-### 4.1 `config.py`（约 526 行）—— 配置加载与校验
+### 4.1 `config.py`（约 956 行）—— 配置加载与校验
 
 **职责**：把 TOML 配置文件解析成强类型的 dataclass，负责环境变量插值、默认值、类型/范围校验。
 
@@ -232,7 +245,7 @@ embedding（static 哈希 / 外部 API，按文件并发）     ←—— 向量
 * `VAULT_MCP_REGISTRY` 环境变量可重定向注册表路径（测试隔离全靠它）。
 * 并发：进程内 `threading.RLock` 保护读改写序列；**没有跨进程文件锁**（见第十三节）。
 
-### 4.3 `providers.py`（约 230 行）—— embedding / reranker 提供方
+### 4.3 `providers.py`（约 426 行）—— embedding / reranker / media 提供方
 
 **职责**：把"向量化"和"重排"抽象成两个 Protocol，提供静态哈希实现与外部 HTTP 实现。
 
@@ -248,7 +261,7 @@ embedding（static 哈希 / 外部 API，按文件并发）     ←—— 向量
 * `ExternalRerankerProvider`：`rerank()` 抛异常 / `rerank_or_none()` 吞异常返回 None（搜索路径用它，失败回退基础排序）。
 * 工厂：`create_embedding_provider` / `create_reranker_provider`。
 
-### 4.4 `vector.py`（约 367 行）—— 向量存储抽象
+### 4.4 `vector.py`（约 398 行）—— 向量存储抽象
 
 **职责**：定义 `VectorBackend` Protocol，提供 memory / sqlite_vec 两个后端，indexer 通过同一接口驱动，切换只是改配置。
 
@@ -264,7 +277,7 @@ embedding（static 哈希 / 外部 API，按文件并发）     ←—— 向量
   * 任何异常都吞掉返回空结果，但 `upsert_vectors` 失败时**必须返回实际落盘集合**（可能为空集）而不是 None——None 会被 indexer 当成"全部成功"记账，chunk 从此被认为已有向量、永不重嵌。
 * `create_vector_backend`：配置 sqlite_vec 但 import/加载失败 → 静默回退 memory。
 
-### 4.5 `indexer.py`（Facade 入口，约 1253 行）与 `_indexer/` 私有核心包
+### 4.5 `indexer.py`（Facade 入口，约 1695 行）与 `_indexer/` 私有核心包
 
 在 v0.8.0 之前，`indexer.py` 是超过 3400 行的单体大文件。v0.8.0 采用 **私有实现包 + 稳定 Facade** 架构，将切块、扫描、同步引擎、检索、缓存、快照、豁免、监听等子系统彻底拆解至 `mortis_rag_mcp/_indexer/`，`indexer.py` 转变为职责清晰、零破坏向后兼容的 Facade 入口，原位保留薄委托与历史打桩 re-export。
 
@@ -435,7 +448,7 @@ query 为空 → 直接返回（过滤+分页后）的 chunk 列表
 * 长路径兜底：>240 字符的路径加 `\\?\\` 前缀。
 * 所有 Win32 调用带显式 `argtypes/restype`（ctypes 默认推断容易传错指针/句柄）；`use_last_error=True` 保存 GetLastError。
 
-### 4.8 `server.py`（约 1312 行）—— MCP 协议层与编排
+### 4.8 `server.py`（约 2307 行）—— MCP 协议层与编排
 
 * **`VaultMcpServer.__init__`**：加载配置 → 建注册表 → legacy `[vault].path` 自动迁移（注册表文件不存在时）→ 起后台线程**串行**预索引全部注册库（N 个库绝不能并发打爆 embedding API）→ `atexit.register(shutdown)` 释放原生监听句柄（嵌入式用法没有 serve_stdio 的 finally）。
 * **路径解析**（`_resolve_vault_path`）：必须绝对路径 + 必须已在注册表（注册表白名单取代旧的"根库包含"LFI 检查）；`for_registration=True` 时只校验是目录。
@@ -458,7 +471,7 @@ query 为空 → 直接返回（过滤+分页后）的 chunk 列表
 
 `__init__` 导出 `AppConfig / Chunk / MarkdownIndexer / load_config` 等公共 API（可编程嵌入使用）；`__main__` 仅转发 `server.main`，`python -m vault_mcp --serve-mcp-stdio` 即服务。
 
-### 4.10 `doctor.py`（约 711 行）—— 本机环境自检与 Agent 信任锚生成器
+### 4.10 `doctor.py`（约 937 行）—— 本机环境自检与 Agent 信任锚生成器
 
 **职责**：提供一键环境体检与 agent 信任锚（`STATUS.md` / `status.json`）。
 * **零第三方依赖**：探活直接复用 `providers.py`，不引入外部 HTTP 库。
@@ -470,13 +483,13 @@ query 为空 → 直接返回（过滤+分页后）的 chunk 列表
 * **免密端点 fail-closed**：`_is_local_endpoint()` 只认 `localhost` / `host.docker.internal` 白名单与**严格 IP 解析**后的环回地址，绝不做前缀模糊匹配——此前的 `startswith("127.")` 会把 `127.0.0.1.attacker.com` 这类**远端域名**判成本机，远端端点漏配 key 也被信任锚标 ✅，agent 据此跳过预检直到真实调用才撞 401。代价是 `127.1` / 十进制 `2130706433` 等花式 IP 写法不再免密（方向安全）。
 * **启动期不真导入**：`check_optional_deps()` 用 `find_spec` + 发行档案取版本号，不 `import numpy`——本函数跑在与 stdio 握手同期的后台线程，首次导入的数百毫秒会与握手抢 GIL，而它只为报告里一行版本号。
 
-### 4.11 `ingest/` 摄取模块（约 1400 行）—— PDF/Office 文档异步摄取与表格防护
+### 4.11 `ingest/` 摄取模块（约 4842 行）—— PDF/Office 文档异步摄取与表格防护
 
-**职责**：面向 PDF/Word/PPT 等富文档的解析、表格原子防护与 Markdown 镜像生成，包含 `worker.py`、`mineru.py`、`tables.py`。
+**职责**：面向 PDF/Word/PPT 等富文档的解析、表格原子防护与解析事实落盘，包含 `worker.py`、`mineru.py`、`tables.py`，以及 v0.9.0 引入的文档路由与文档库（`mortis_rag_mcp/doc_store.py`）协作面。
 * **`ingest/worker.py`（任务调度与状态机）**：
   - `IngestManager`：单库维护一个管理实例，通过 `.ingest.lock` 文件排他锁防多进程竞争，双检锁保证单例；
-  - 任务生命周期：`queued` → `parsing` → `done` / `failed`。解析产物镜像写入库内 `.mortis-parsed/<source>.md`；
-  - `auto_seen` 持久化账本：在 `.mortis-parsed/.ingest_state.json` 记录已处理文件 sha256 签名、状态与最新 job_id，跨重启防重复上传；历史任务剪枝（>500 条）仅修剪 jobs 列表，永久保留 `auto_seen` 账本凭证；
+  - 任务生命周期：`queued` → `parsing` → `done` / `failed`（另可 `cancelled`）；重试只对 failed/cancelled 生效，并清除已失去 blob 保护的段 checkpoint。解析事实落点由 `[ingest] storage` 决定：`virtual`（v0.9.0 默认）写入缓存根下的文档库 `cache.dir/<namespace>/doc_store/`，由 `kb_read`/`kb_search` 按 revision 读回，不在库内生成镜像；`legacy` 保留库内 `.mortis-parsed/<source>.md` 物理镜像（旧库回退用，不自动迁移、不自动删除旧镜像）。两种模式的状态账本与任务锁都在库内 `<output_dirname>/`（默认 `.mortis-parsed/`）；
+  - `auto_seen` 持久化账本：在 `<output_dirname>/.ingest_state.json` 记录已处理文件 sha256 签名、状态与最新 job_id，跨重启防重复上传；历史任务剪枝（>500 条）仅修剪 jobs 列表，永久保留 `auto_seen` 账本凭证；
   - 统一尺寸上限策略：默认 `max_file_size_mb = 20`（0 为不限），对 manual submit、scan pending、auto watch、recovery 全入口统一双闸门拦截；
   - 源文件防抖与变更校验：0 字节或正在写入的文件采样判稳延后；任务执行前比对源文件当前 sha256，不符时阻断上传并报错 `source_changed`；
   - 完成回调解耦：`on_job_finished(source, out_md)` 支持双参回调（第二参为解析产物 Markdown 路径），通知后台线程唤醒即时索引刷新。
@@ -488,6 +501,18 @@ query 为空 → 直接返回（过滤+分页后）的 chunk 列表
   - `iter_table_blocks`：自动排除代码围栏与长代码块，识别完整 `<table>...</table>` 区间；
   - 表格原子分块保护：小表转 Markdown pipe 表格，超长表格按 2*chunk_size 字符预算动态装箱并切片，杜绝跨表格切碎或破坏 HTML 闭合性；直出物理行号区间。
 * **离线兜底**：集成 PyMuPDF 离线解析兜底（仅针对 PDF 文件且显式 close() 释放句柄），云端异常或免登额度耗尽时保底可用。
+
+**免登通道的协议事实（E17 真实端点实测固定）**：Agent 免登通道**只返回正文 markdown**，不含文档内图片字节，也没有 `content_list.json` / page_map，因此**不能**从中提取图片与正文锚点；需要图片 occurrence/锚点时须走 v4（授权 key）或本地解析。此前 mock 用例名与文档里的「免登通道可提取图片与锚点」属误导表述，已在 E17 撤销并新增 `test_agent_channel_protocol_is_text_only` 固定该事实。
+
+### 4.12 `doc_store.py`（约 4099 行）—— 版本化文档库（v0.9.0 新增）
+
+**职责**：持有 virtual 摄取产生的**解析事实**，并与可重建的派生索引严格分开。
+
+* 概念分离：`generation`（发布代）与 `revision`（固定版本）分开维护，`control` / `job` / `checkpoint` / `blob` / `occurrence` 各自独立；读旧库 checkpoint 时 `audio_frames` / `audio_ms` 等 range kind 只做兼容读取。
+* 写路径：import 的最终 busy/CAS 判定与 generation 发布共用既有 OS mutation lock，沿用原补偿机制；发布后才由 `_indexer/media.py` 按固定 revision 生成 native chunk，不建第二条 embedding pipeline、不重复计算。
+* 读路径：`kb_read` / `kb_export` 在返回前重新校验 revision pin；`kb_search` 只读已发布代。
+* 维护边界：`[doc_store] max_size_mb` 超额时拒绝新提交并提示显式维护，**绝不隐式删除计费资产**；普通清缓存与 `kb_rebuild` 都不触碰文档库，只有显式 purge 授权才清理。
+* 与旧镜像的关系：`storage="legacy"` 时仍读库内 `.mortis-parsed/` 镜像；不自动迁移、不自动删除旧镜像，新旧 writer 不得同时摄取同库。
 
 ---
 
@@ -519,7 +544,7 @@ query 为空 → 直接返回（过滤+分页后）的 chunk 列表
 
 ## 六、MCP 工具 API 参考
 
-`tools/list` 返回 15 个工具。所有 `vault_path` 参数均可省略：仅注册一个库时自动取它（该库为 solo 时 `kb_search` 例外——直接报错，见 4.8）；多个库时必须显式（`kb_search` 例外——缺省触发跨库 fan-out，solo 库除外）。
+`tools/list` 返回 16 个工具。所有 `vault_path` 参数均可省略：仅注册一个库时自动取它（该库为 solo 时 `kb_search` 例外——直接报错，见 4.8）；多个库时必须显式（`kb_search` 例外——缺省触发跨库 fan-out，solo 库除外）。
 
 |工具|参数|语义|
 |-|-|-|
@@ -529,13 +554,14 @@ query 为空 → 直接返回（过滤+分页后）的 chunk 列表
 |`kb_list`|无|0.6.0 更名（原 `kb_vaults`）：列注册表：name/path/weight/**solo**/exists/indexed/files/last_sync|
 |`kb_set_weight`|`vault_path`(必), `weight`(必, (0,100])|库级检索权重，fan-out 分数放大系数，持久化进注册表|
 |`kb_describe`|`vault_path`(必), `description`(必)|设置/更新知识库描述（一句话说明库装什么，供检索路由定向选库用）|
-|`kb_ingest`|`action`(必: submit/status/scan_pending/pending/sources), `source`?, `sources`?, `force`?, `vault_path`?|PDF/Office 异步解析摄取管理（默认关闭，双闸门受 20MiB size 策略保护，MinerU 双通道 / 本地 PyMuPDF 兜底，带 `auto_seen` 账本去重）|
+|`kb_ingest`|`action`(必: submit/status/pending/retry), `source`?, `sources`?, `job_id`?, `force`?, `vault_path`?|PDF/Office 异步解析摄取管理（默认关闭，双闸门受 20MiB size 策略保护，MinerU 双通道 / 本地 PyMuPDF 兜底，带 `auto_seen` 账本去重；`retry` 只对 failed/cancelled 生效，unknown 结果不自动重发）|
 |`kb_export`|`out_path`(必, 绝对路径+.zip), `vault_path`?, `overwrite`?|导出索引快照 zip；已存在须显式 `overwrite=true`|
 |`kb_import`|`snapshot`(必), `force`=false, `vault_path`?|从快照恢复；模型/维度/切块参数不符时拒绝，force 只导文本层并本地重嵌|
 |`kb_rebuild`|`vault_path`?|删缓存强制全量重建。**高危：全量重新 embedding，见 SKILL.md 限流警告**|
 |`kb_list_files`|`vault_path`?, `path_prefix`?, `limit`?, `offset`?|列已索引文件列表，支持按目录前缀过滤与分页切片，返回 `total`, `files`, `next_offset`, `page_truncated`|
 |`kb_search`|`query`(必), `top_k`=10, `use_rerank`=true, `vault_path`?, `vault_paths`?, `path_prefix`?, `tags`?, `mtime_after`?, `mtime_before`?, `offset`?, `limit`?, `group_by_vault`=false, `dedupe`=true, `budget_bytes`?, `exact_terms`?, `compact`=false, `group_offsets`?|核心检索；读优先（不前台阻塞等锁）；支持 `compact=true` 极简四键投影；支持整条 chunk 字节预算控制，首条超限提供 hint，最小 envelope 溢出显式申报 `budget_exceeded`；分组跨库以 `group_next_offsets` 返回各组独立游标，并由 `group_offsets` 同路由无损续页|
 |`kb_read`|`source`? 或 `chunk_id`? (二选一), `expand_lines`=30, `heading`?, `start_line`?, `end_line`?, `start_char`=0, `vault_path`?|读原文（Markdown/TXT）；`start_line/end_line` 越界具名抛错并提示实际物理行数；长单行支持 `start_char` 跨页无损续读；`heading` 基于轻量级源码扫描包含完整子节，同名歧义 fail-closed；`chunk_id` 支持跨库 fail-closed 只读探测（solo 库隐私保密）；超 `read_max_chars` 截断并回显物理行游标|
+|`kb_read_media`|`vault_path`(必), `source`(必), `revision_id`(必), `occurrence_id`(必), `representation`?(`metadata`\|`inline`, 默认 metadata), `variant`?(`preview`\|`original`, 默认 preview), `budget_bytes`?（默认 2097152，上限 8388608）|0.9.0 新增：读取明确库/源/revision 下的媒体 occurrence。默认只返回 metadata，`inline` 才返回标准 MCP 媒体块并遵循完整 JSON 字节预算；引用不足/证据不符时 fail-closed，不猜媒体地址|
 |`kb_stats`|`vault_path`?|files/chunks/exempt_files/failed_files/last_sync/embedding/reranker/cache/use_hybrid/fts_enabled/vector_backend/accel/refresh_status|
 |`kb_exempt`|`action`(必: list/add_pattern/remove_pattern/exempt_file/unexempt_file/check), `pattern`?, `source`?, `method`?(frontmatter\|ignore_file), `vault_path`?|私密/草稿内容豁免管理|
 
@@ -576,6 +602,11 @@ query 为空 → 直接返回（过滤+分页后）的 chunk 列表
 |`max_retries`|3|首败后额外重试次数，[0,10]；每次尝试吃满一个 timeout|
 |`batch_size`|32|单请求最大文本数，<=0 关闭切批|
 |`retry_backoff`|1.0|指数退避基数秒，(0,60]；429 时服务端 Retry-After 优先|
+|`query_template` / `document_template`|`{text}`|查询/文档两侧的文本模板（0.9.0）；非对称端点须显式设置，不按模型名猜前缀|
+|`capability_profile`|空|能力 profile 名（如 `embeddinggemma2`）；空 = 保守纯文本行为，不自动猜模型|
+|`adapter`|`openai_text`|provider 适配器选择|
+|`client_slicing`|false|是否由客户端本地切批（长文本端点用）|
+|`media_*`|空/0|原生媒体（图像/音频）显式声明组：`media_adapter`/`media_endpoint`/`media_model`/`media_dimension`/`media_api_key_env` 以及 `media_modalities`、`media_alignment_space_id`、`media_preprocess_version`、`media_endpoint_revision`、`media_allowed_mime_types`、`media_max_input_bytes`、`media_max_batch_size`、`media_model_reference`、`media_endpoint_fixture_reference`、`media_alignment_reference`、`media_license_reference`。**媒体能力只由这些显式声明决定**：不按 model 名推、不按同维向量推 alignment；缺任一必需声明该 route 判为不可用|
 
 ### `[reranker]`
 
@@ -606,8 +637,15 @@ query 为空 → 直接返回（过滤+分页后）的 chunk 列表
 |`enabled`|false|PDF/Office 摄取总开关（默认关闭；关闭时零云端外发）|
 |`auto_watch`|false|是否自动监听并解析新放置的文档（须 enabled=true 才真正生效；enabled=false 时 auto_watch=true 为合法无害不激活组合）|
 |`max_file_size_mb`|20|单文件尺寸上限（MiB，默认 20；0 表示不限），全入口双闸门拦截|
-|`api_key`|空|MinerU API Token（支持 `${ENV}` 插值）；空时走轻量 Agent 免登通道|
-|`model_version`|空|可选覆盖服务端解析模型版本|
+|`api_key`|空|MinerU API Token（支持 `${ENV}` 插值）；空时走轻量 Agent 免登通道（该通道上游协议**只返回正文 markdown**，不返回文档内图片素材）|
+|`model_version`|`vlm`|v4 模型：`pipeline` / `vlm`|
+|`storage`|`virtual`|解析事实落点：`virtual` = 只写文档库（`document_revisions` + 媒体 blob），不生成 `.mortis-parsed` 物理镜像；`legacy` = 保留旧物理镜像路径（显式回退用，不自动迁移、不自动删旧镜像）|
+|`network_policy`|`configured`|`configured` 允许已授权的云端解析；`local_only` 在**入队前**拒绝一切云路径（不会先上传再报错）|
+|`routing`|`auto`|`auto` / `mineru` / `local`；`local` 永不选云端解析|
+|`pymupdf_fallback`|true|云端通道全失败时本地 PyMuPDF 纯文本兜底（需可选 docs 依赖）|
+|`output_dirname`|`.mortis-parsed`|库内解析目录名（virtual 模式下仍用于放任务状态账本与锁；legacy 模式下放镜像产物）|
+|`archive_max_mb` / `extracted_max_mb` / `markdown_max_mb` / `json_max_mb` / `media_max_mb`|32 / 200 / 16 / 8 / 8|解压/归档安全配额（MiB）；进程内可执行的消费预算，**不是 RSS 保证**；小于 1 的值会被拒绝|
+|`memory_budget_mb` / `queue_limit` / `max_parse_workers`|128 / 1000 / 1|受控缓冲预算、队列容量、同时解析数（当前实现为 1）|
 
 ### `[vector]`
 
@@ -625,6 +663,36 @@ query 为空 → 直接返回（过滤+分页后）的 chunk 列表
 |`namespace`|default|缓存命名空间（多项目/多 Agent 隔离）|
 |`id`|空|显式缓存身份（免疫路径拼写差异），设置后 key=sha256(id)[:16]|
 |`max_age_days`|0|过期缓存清理天数，0 关闭|
+
+### `[chunking]`
+
+|键|默认|说明|
+|-|-|-|
+|`mode`|`estimated_tokens`|`estimated_tokens`（新库默认：纯标准库 Unicode 权重估算，**未离线校准**）/ `legacy_chars`（旧库字符模式）|
+|`target_tokens` / `overlap_tokens` / `hard_limit_tokens`|384 / 64 / 768|目标 tokens、重叠 tokens、硬上限（硬上限不是 embedding 向量维度）|
+|`estimator_profile`|`unicode-estimate-v1`|估算 profile；legacy 别名 `calibrated-v1` 仅为读旧库缓存保留，**不代表已校准**|
+
+已有显式 `chunk_size`/`chunk_overlap` 且未指定新 mode 的库保留 `legacy_chars`；estimated 模式完整保留超硬上限的 HTML 表格并标 `embedding_disabled`，不猜表头、不丢单元格。
+
+### `[doc_store]`
+
+`max_size_mb` = 2048：单库文档库逻辑容量上限（MiB；含 active 版本、上一 committed 版本、staged 候选与媒体 blob）。超额时拒绝新提交并提示显式维护，**绝不隐式删除计费资产**；0 不是「无限制」，配置解析会拒绝小于 1 的值。文档库是**解析事实**而非可重建的派生索引，普通清缓存 / `kb_rebuild` 不会碰它。
+
+### `[media]`
+
+|键|默认|说明|
+|-|-|-|
+|`inline_max_bytes`|8388608|单次 inline 媒体返回字节上限|
+|`refs_limit`|20|单条结果返回的媒体引用条数上限|
+|`preview_enabled` / `preview_max_edge` / `preview_max_bytes`|true / 1600 / 524288|预览图开关、最长边与字节上限|
+
+### `[diag]`
+
+|键|默认|说明|
+|-|-|-|
+|`enabled`|false|结构化 jsonl 诊断日志总开关（严格隐私白名单 10 键，绝不记录 query/正文/路径/密钥）|
+|`dir`|`~/.mortis_rag_mcp`|日志目录（写 `diag.log`，支持 `~` 展开与环境变量）|
+|`max_bytes` / `files` / `retention_days`|1048576 / 2 / 7|单文件上限、轮转保留份数、历史保留天数|
 
 **配置生效语义**：改任何键都不需要重启之外的干预——文本层/向量层 meta 不匹配会自动失效对应层（见 4.5.3）。缓存键未变但语义变了（比如改了切块代码忘了 bump chunker）是唯一危险场景，开发时务必遵守「改切块必 bump 代际」。
 
@@ -651,12 +719,14 @@ query 为空 → 直接返回（过滤+分页后）的 chunk 列表
     └── vault_<key>.failed.json             # 失败文件名单（可观测性）
 
 <vault>/.mcp_cache/                 # placement=vault 时的缓存根（同样按 namespace 分层）
-<vault>/.mortis-parsed/             # 摄取层解析输出目录（PDF/Office 生成的 Markdown 镜像）
-├── <source>.md                     # 转换后 Markdown 正文
-├── <source>_assets/                # 提取的图片与表格素材
+<vault>/.mortis-parsed/             # 摄取层库内目录：任务状态账本与锁常驻；
+├── <source>.md                     # 转换后 Markdown 正文（仅 [ingest] storage="legacy" 时写镜像）
+├── <source>_assets/                # 提取的图片与表格素材（仅 legacy 镜像模式）
 ├── .ingest.lock                    # 跨进程任务锁
 └── .ingest_state.json              # 任务状态持久化账本（含 auto_seen 去重记录，非 chunk 缓存）
 <vault>/.vaultignore                # vault 级豁免规则（gitignore 风格）
+
+<cache.dir>/<namespace>/doc_store/  # v0.9.0 默认解析事实落点（virtual 模式）：document_revisions + 媒体 blob，按 revision 读回
 ```
 
 `<key>` = sha256(normcase(realpath(vault)))[:16]，或 sha256(cache.id)[:16]。所有 `.bin`/`.json`/`.sqlite` 写入都是 tmp+replace 原子替换。
@@ -725,7 +795,7 @@ MCP 工具的参数可能被提示注入的 LLM 操控，项目按「零信任�
 ## 十一、测试体系
 
 ```
-tests/（56 个测试文件；python -m pytest -q 全量回归由 CI 承接，本地按靶向文件单跑，需指定 UTF-8 编码环境）
+tests/（文件数以 collection 为准；默认快层，完整所有层须 -o addopts=；需指定 UTF-8 编码环境）
 ├── conftest.py               # pytest 全局钩子：session 级真实配置隔离 + function 级独立缓存根 + 禁用外部状态写入
 ├── test_doctor.py            # doctor 模块探活、离线容错、状态防假、静默生成单测
 ├── test_path_migration.py    # 路径与配置无损原子迁移（~/.vault_mcp* -> ~/.mortis_rag_mcp*）
@@ -747,15 +817,15 @@ tests/（56 个测试文件；python -m pytest -q 全量回归由 CI 承接，�
 ├── test_facade_freeze.py    # Facade 导出面冻结与子模块反向导入防御
 ├── test_cache_codec_roundtrip.py # 二进制协议 VMCPC/VMCPV 往返兼容性
 ├── test_version_sync.py     # 单一版本真源同步校验
-└── ...（更多包含 test_search_filters, test_dedup, test_failed_files, test_fsnotify, test_snapshot 等 56 个测试文件）
+└── ...（更多包含 test_search_filters, test_dedup, test_failed_files, test_fsnotify, test_snapshot 和 E20 正确性回归）
 ```
 
 约定与技巧：
 
 * 测试经 `VAULT_MCP_REGISTRY` 环境变量把注册表重定向到 pytest 临时目录，绝不碰用户真实注册表；缓存目录用 `tmp_path`。
-* embedding 一律用 `static` 模式或注入 FakeProvider，**测试永不打真实 API**（历史事故：假 key 打到真端点 401）。
+* 默认快层使用 `static` 或显式离线 transport 边界；独立 `real_carrier` 层保留两个不同的真实载体合同，载体缺席记 skip，不用 fake 代替。普通回归不访问付费 API。
 * 退避序列断言靠 monkeypatch `providers._sleep`。
-* sqlite-vec 相关测试在未安装该包时自动 skip（这就是 4 个 skipped 的来源之一）。
+* 可选依赖缺失或非 Windows 平台的用例会自动 skip（sqlite-vec / docs / media 三类）。E17 终态 `.venv` 全量为 **1140 passed / 14 skipped**，这 14 个 skip **全部**属于上面两类原因——skip 不是通过，不能当成对应后端或格式已验证。
 
 ---
 
@@ -771,7 +841,10 @@ python -m pip install --upgrade pip
 python -m pip install -e .                # 报 setuptools 错先 pip install -U pip setuptools wheel
 python -m pip install numpy               # 可选：批量余弦加速
 python -m pip install "mortis-rag-mcp[vec]"  # 可选：磁盘向量后端
-python -m pytest -q                       # 应全绿
+python -m pytest -q                       # 默认快层，排除 slow / real_carrier
+python -m pytest -q -o addopts=           # 完整所有执行层
+python -m pytest -q -o addopts= -m slow
+python -m pytest -q -o addopts= -m real_carrier
 ```
 
 支持 Python 3.10–3.13（3.10 走 fallback TOML 解析器）。本仓库开发机实测：Python 3.10.11 全绿。
@@ -780,7 +853,7 @@ python -m pytest -q                       # 应全绿
 
 * **零运行时依赖是铁律**：新功能必须先用标准库实现；引入第三方依赖需要非常充分的理由，且必须做成"缺失自动回退"的软依赖（参考 numpy / sqlite-vec 的做法）。
 * **注释语言**：中文注释为主（项目惯例），注释写"为什么"（约束、坑、历史 bug），不写"做了什么"。
-* **错误处理哲学**：派生数据（缓存/FTS/监听）的失败一律吞掉降级，绝不拖垮主流程；权威数据的失败要记入 `failed_files` 可观测；对外报错用人类可读的 `ValueError`。
+* **错误处理哲学**：派生失败尽量保留已成功的正文与内存检索，同时明确失败阶段及持久化状态；缓存写失败通过既有 `next_action` 披露 layer/path/errno，不能把内存 ready 冒充写盘成功。权威事实失败仍须显式失败；registry 读状态未知时禁止覆盖写；公共协议/schema 与 revision/epoch 不变量保持。
 * **原子写**：任何落盘文件用 `tmp + replace`。
 * **提交信息**：Conventional Commits（`feat:` / `fix:` / `docs:` / `chore:`），版本变更走 PR。
 
@@ -865,6 +938,13 @@ python -m pytest -q                       # 应全绿
 |0.4.1|2026-08-30|安装兜底指引、Skill 同步|
 |0.5.0|2026-08-31|embedding 重试/切批、failed_files 持久化、过滤/分页/去重、库级权重、图片注入（opt-in）、Windows 原生监听、索引快照迁移；大量并发硬化修复（B0–B6）|
 |0.6.0|2026-09-02|solo 独立库（kb_init_solo、fan-out 排除、excluded_solo、单库拒绝）、工具更名 kb_remove/kb_list/kb_list_files（Breaking）、注册表 v3|
+|0.7.0|2026-09-13|文档摄取层（MinerU 双通道 + PyMuPDF 兜底）、定向检索路由 kb_describe、表格保护与分片、评测 harness|
+|0.7.1|2026-09-17|Agent 信任锚（doctor / STATUS.md）、用户数据目录与包名原子迁移|
+|0.7.2|2026-09-21|库名直呼与多库定向、二段式预览精读、构建进度感知、纯文本 .txt 原生收录|
+|0.7.3|2026-09-22|（补丁）检索与摄取细节修复|
+|0.8.0|2026-09-28|架构解耦（稳定 Facade + 私有核心包）、搜索精读闭环（chunk_id 原地展开 / 双链直读）、预算控制与本地诊断日志、别名与 hard-term 保底|
+|0.8.1|2026-10-07|读优先后台刷新、自动摄取闭环（auto_watch + 20MiB 门禁）、compact 极简投影与整条 chunk 预算、物理行号越界诊断与源码级 heading 章节读取|
+|0.9.0（候选，未发布）|2026-10-09|文本模板与 estimated_tokens/legacy_chars 双模式、virtual 文档库（`doc_store`）成为默认解析事实落点、`kb_read_media` 与跨模态检索、请求意图记录与 `retry`/`index_state`；**音频转录与 ffmpeg 转码链路物理移除（Breaking）**|
 
 ### 14.3 关键不变量（改代码前请自查）
 
@@ -875,6 +955,8 @@ python -m pytest -q                       # 应全绿
 5. 缓存写入必须原子（tmp+replace），且"无变化不写盘"。
 6. 测试永不打真实 embedding API；测试注册表/缓存必须隔离到临时目录。
 7. stdout 只准输出 JSON-RPC（日志走 stderr）。
+8. 文档库（`doc_store.py`）持有的是**解析事实**，不是可重建的派生索引——普通清缓存 / `kb_rebuild` 不得删除它，revision 与 epoch 不得降级，只有显式 purge 授权才清理。
+9. 媒体能力（modality / alignment / MIME / 限额 / 证据引用）只由显式 `media_*` 配置声明决定：不按 model 名推线协议，不按同维向量推跨模态对齐。
 
 ---
 

@@ -386,6 +386,49 @@ def test_auto_method_degrades_to_poll_off_windows_with_ingest_scan(tmp_path: Pat
             indexer.stop_watching()
 
 
+def test_stop_watching_tolerates_threads_that_never_started():
+    """线程「已构造但从未 start」时，stop_watching 不得把 join 的 RuntimeError 抛出去。
+
+    `Thread.join()` 对未 start 的线程抛 `cannot join thread before it is started`
+    （py3.13 每次退栈都会触发），而 `start_watching` 存在多条提前返回路径（监听方
+    式不可用、hook/注册表条件不满足），线程属性可能停在「已构造未启动」。这时
+    stop_watching 抛错会让进程以非零码退出并把 traceback 写进 stderr —— stdio 会话
+    的「stderr 必须为空」合同会崩在最不该崩的收尾阶段。
+    """
+    from types import SimpleNamespace
+
+    from mortis_rag_mcp._indexer import watch as watch_mod
+
+    # 与真实 indexer 一致：`*_lock` 就是 `*_cv` 的底层锁（stop_watching 在 with 块里
+    # 通知），换成各自独立的锁会触发 "cannot notify on un-acquired lock"。
+    ingest_lock = threading.Lock()
+    debounce_lock = threading.Lock()
+    owner = SimpleNamespace(
+        _watch_stop=threading.Event(),
+        _ingest_stopping=False,
+        _ingest_lock=ingest_lock,
+        _ingest_dirty=False,
+        _ingest_cv=threading.Condition(ingest_lock),
+        _ingest_worker_thread=threading.Thread(target=lambda: None),  # 故意不 start
+        _fs_debounce_lock=debounce_lock,
+        _fs_requested=False,
+        _fs_refresh_immediate=False,
+        _fs_pending_since=None,
+        _fs_debounce_cv=threading.Condition(debounce_lock),
+        _fs_scheduler_thread=threading.Thread(target=lambda: None),  # 故意不 start
+        _fs_watcher=None,
+        _watch_thread=threading.Thread(target=lambda: None),  # 故意不 start
+        _stopping=False,
+    )
+
+    watch_mod.stop_watching(owner)  # 修复前：RuntimeError: cannot join thread before it is started
+
+    assert owner._watch_thread is None
+    assert owner._fs_scheduler_thread is None
+    assert owner._ingest_worker_thread is None
+    assert owner._stopping is False
+
+
 def test_ingest_rescan_streak_is_capped(tmp_path: Path, monkeypatch):
     """review R3 补丁：hook 持续要求补扫时必须有上限。
 

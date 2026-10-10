@@ -283,7 +283,7 @@ def test_vault_paths_empty_string_errors(tmp_path):
     assert "vault_paths is empty" in err4["error"]
 
 
-def test_issue2_minimal_reproduction(tmp_path):
+def test_issue2_minimal_reproduction(tmp_path, stdio_polling):
     # 复现 Issue #2：多库环境下（含 solo 库）通过 MCP 传入 vault_path 必须精准命中
     vault_a = tmp_path / "vault_a"
     vault_b = tmp_path / "vault_b"
@@ -295,27 +295,45 @@ def test_issue2_minimal_reproduction(tmp_path):
     config = tmp_path / "app.toml"
     config.write_text('mode = "static"\n', encoding="utf-8")
 
-    requests = [
-        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
-        {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "kb_init", "arguments": {"path": str(vault_a), "name": "vault_a"}}},
-        {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "kb_init_solo", "arguments": {"path": str(vault_b), "name": "vault_b"}}},
-        # 用例 1: 定向查询 solo 库状态，不得误抛 multiple vaults registered
-        {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "kb_stats", "arguments": {"vault_path": "vault_b"}}},
-        # 用例 2: 定向检索 solo 库，不得静默降级为全局盲搜，solo 库不得被加入 excluded_solo
-        {"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": "kb_search", "arguments": {"query": "beta", "vault_path": "vault_b"}}},
-    ]
-    responses = _run_stdio(config, requests)
+    # kb_init 的返回是「后台已开始索引」，一次性喂完 stdin 的批式会话读到的 files /
+    # chunks 取决于后台线程恰好推进到哪一步（CI 上随机器的负载漂移）。这里先轮询到
+    # 索引就绪，再在**同一条会话**里做定向统计与检索。
+    def settled(data):
+        return (
+            data.get("status") != "indexing"
+            and not data.get("indexing_in_progress", False)
+            and data.get("index_state", "ready") == "ready"
+            and bool(data.get("chunks"))
+        )
+
+    session = stdio_polling(
+        config,
+        [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "kb_init", "arguments": {"path": str(vault_a), "name": "vault_a"}}},
+            {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "kb_init_solo", "arguments": {"path": str(vault_b), "name": "vault_b"}}},
+        ],
+        {"jsonrpc": "2.0", "method": "tools/call", "params": {"name": "kb_search", "arguments": {"query": "beta", "vault_path": "vault_b"}}},
+        settled,
+        followup_requests=[
+            # 用例 1: 定向查询 solo 库状态，不得误抛 multiple vaults registered
+            {"jsonrpc": "2.0", "method": "tools/call", "params": {"name": "kb_stats", "arguments": {"vault_path": "vault_b"}}},
+            # 用例 2: 定向检索 solo 库，不得静默降级为全局盲搜，solo 库不得被加入 excluded_solo
+            {"jsonrpc": "2.0", "method": "tools/call", "params": {"name": "kb_search", "arguments": {"query": "beta", "vault_path": "vault_b"}}},
+        ],
+        env_overrides={"VAULT_MCP_REGISTRY": str(config.parent / "vaults.toml")},
+    )
+
+    for resp in session["prefix"] + session["followups"]:
+        assert "error" not in resp, resp.get("error")
+        assert not resp["result"].get("isError", False), resp
 
     # 用例 1 验证
-    r4 = responses[3]["result"]
-    assert r4.get("isError") is not True
-    stats = json.loads(r4["content"][0]["text"])
+    stats = json.loads(session["followups"][0]["result"]["content"][0]["text"])
     assert stats["files"] == 1
 
     # 用例 2 验证：单库命中 b.md，未排除 solo
-    r5 = responses[4]["result"]
-    assert r5.get("isError") is not True
-    search_res = json.loads(r5["content"][0]["text"])
+    search_res = json.loads(session["followups"][1]["result"]["content"][0]["text"])
     chunks = search_res.get("chunks", [])
     assert len(chunks) > 0
     assert all(c["source"] == "b.md" for c in chunks)

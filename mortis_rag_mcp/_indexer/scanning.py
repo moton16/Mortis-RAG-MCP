@@ -11,6 +11,7 @@
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 import fnmatch
 import math
 import os
@@ -151,13 +152,79 @@ def ignored_name(name: str) -> bool:
     """编辑器临时/交换文件名排除（原 MarkdownIndexer._ignored_name 逐字迁移）。"""
     lower = name.lower()
     return name.startswith("~") or lower.endswith(
-        (".tmp.md", ".swp.md", ".swo.md", ".tmp.txt", ".swp.txt", ".swo.txt")
+        (".tmp.md", ".swp.md", ".swo.md", ".tmp.markdown", ".swp.markdown", ".swo.markdown",
+         ".tmp.txt", ".swp.txt", ".swo.txt")
     )
+
+
+def source_compare_key(source: str) -> str:
+    """Platform filesystem comparison only; never rewrite stored source or IDs."""
+    return os.path.normcase(source.replace("\\", "/"))
 
 
 def source_rel(vault_path: Path, path: Path) -> str:
     """库内相对 posix 路径（原 MarkdownIndexer._source 逐字迁移）。"""
     return path.relative_to(vault_path).as_posix()
+
+
+@dataclass(frozen=True, slots=True)
+class ScanResult:
+    found: list[Path]
+    inaccessible: frozenset[str]
+    policy_pruned: frozenset[str]
+    root_available: bool
+    complete: bool
+
+
+def scan_indexable_files(
+    vault_path: Path,
+    matcher: IgnoreMatcher,
+    indexable_exts: frozenset[str],
+) -> ScanResult:
+    paths: list[Path] = []
+    inaccessible: set[str] = set()
+    pruned: set[str] = set()
+    root_available = True
+    stack = [vault_path]
+    visited: set[Path] = set()
+    while stack:
+        directory = stack.pop()
+        rel = source_rel(vault_path, directory)
+        try:
+            real = directory.resolve(strict=True)
+            real.relative_to(vault_path.resolve(strict=True))
+            if real in visited:
+                pruned.add(rel)
+                continue
+            visited.add(real)
+            with os.scandir(directory) as iterator:
+                entries = list(iterator)
+        except (OSError, ValueError):
+            inaccessible.add(rel)
+            if directory == vault_path:
+                root_available = False
+            continue
+        for entry in entries:
+            path = Path(entry.path)
+            source = source_rel(vault_path, path)
+            try:
+                is_dir = entry.is_dir()
+                ignored, _ = matcher.is_ignored(source, is_dir=is_dir)
+                if ignored or ignored_name(entry.name):
+                    pruned.add(source)
+                    continue
+                if is_dir:
+                    stack.append(path)
+                elif path.suffix.lower() in indexable_exts:
+                    path.resolve(strict=True).relative_to(vault_path.resolve(strict=True))
+                    paths.append(path)
+            except (OSError, ValueError):
+                inaccessible.add(source)
+    return ScanResult(
+        sorted(paths, key=lambda item: source_rel(vault_path, item)),
+        frozenset(inaccessible), frozenset(pruned), root_available,
+        root_available and not inaccessible,
+    )
 
 
 def scandir_indexable_files(

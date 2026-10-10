@@ -45,6 +45,40 @@ v0.8.1 进一步强化了检索初筛、章节直读与后台刷新体验：
    - `[ingest] auto_watch` 默认关闭（`false`），绝不未经用户显式配置擅自向云端上传解析文件。
    - 默认单文件上限 `max_file_size_mb = 20`，超过 20MiB 的文件自动跳过，防误传超大文档。
 
+### 0.4 0.9 候选升级与恢复
+
+本候选尚未发布；本地合成升级/备份恢复已测，不代替你的实际旧库、远端 API 或宿主验收。
+
+1. 停止旧服务及摄取 writer，关闭数据库句柄；备份注册表、配置和整个库对应 cache/control，另存 `kb_export` 快照并记录 SHA256。不要让新旧 writer 同时操作同库。
+2. 在临时库/缓存副本试升级。新库默认 `[chunking] mode="estimated_tokens"`；已有字符参数/缓存保留旧模式。需要保旧地址时显式设置 `mode="legacy_chars"`。只有 profile 相容才能复用向量；换模型/模板/切块可能重嵌，不承诺任意升级零费用。
+3. virtual 是默认解析事实落点，不再新写 `.mortis-parsed/`；旧镜像仍按逐项证据兼容。旧二进制读不到 virtual-only 事实，回退应停新 writer、恢复升级前完整副本，再使用旧版；不要原地降 schema 或覆盖现代解析结果。
+4. `kb_import` 的 `index_state` 表示 `empty/rebuilding/unverified/ready`。包内正文/FTS不会自动激活；按返回的 `next_action` 校验源或重解析。只有明确相信包内解析事实时才使用现有 `trust_parsed_documents`，不把导入成功写成 ready。
+5. 音频转录与音频转码能力已从本版本移除，配置里的 `[audio]` 段与 `audio_enabled` 开关不再存在。旧配置里若还留着这些键会被忽略（不报错、不影响其它配置），建议删除以免误以为仍生效。
+
+失败/取消任务的显式重试（工具 `kb_ingest` 参数）：
+```json
+{"action":"retry","job_id":"实际返回的job_id","vault_path":"已注册库名"}
+```
+unknown 表示请求结果不明，先查原任务，不自动重发。请求记录与 ingest job 是两回事；下列 CLI 的 `--vault` 使用**绝对路径**，不是库名：
+```powershell
+python -m mortis_rag_mcp --app-config ".\config\app.toml" --list-requests --vault "C:\YourVault"
+python -m mortis_rag_mcp --app-config ".\config\app.toml" --abandon-request REQUEST_ID --vault "C:\YourVault"
+```
+放弃只改本机意图，不取消远端任务、不上传、不自动重试；随后重新提交可能重复处理。
+
+### 0.5 故障结果与旧数据修复
+
+- 显式配置路径写错或文件缺失会失败；没有指定配置时，内置默认仍是合法行为。注册表拒读不是“尚未注册”：先恢复读取权限，不用空表覆盖现有注册项。
+- 内存检索可用不代表缓存已写盘。`next_action` 若提示 persistence 失败，会给出层、路径与错误号；恢复空间/权限后重建派生缓存，再验证重开后的结果。活动文档数据库缺失或零长度应从完整备份恢复，不能以新建空库代替旧事实。
+- 正文成功、媒体失败会保留正文与已成功的媒体批次。已确认的媒体响应合同失败可在纠正端点/配置后继续恢复；`submission_unknown` 仍须先核实原请求，不自动补发。
+- 旧错误坐标可通过“正文已去 BOM/统一换行后，occurrence 区间是否切出对应媒体锚点”识别；旧图片 SHA 应与完整文件 SHA256 比较，而非只比较头部。修复需要在副本中显式重摄取并产生新 revision，旧 committed 事实不被静默改写；仅 `kb_rebuild` 不能改正已提交 occurrence 坐标。
+- 旧媒体配置身份漂移或错误 ready/缺 native 的派生数据，纠正配置后可显式 `kb_rebuild` 重新对账。未知受理闸门仍生效；不要把重建成功当成真实端点或宿主展示已验收。
+- E20 本地全层中，EG2 `http://127.0.0.1:8000/v1/embeddings` 的两个不同载体合同均通过：真实文本请求配合媒体向量装配、真实图像 transport 往返配合文本查询；不外推其他媒体端点、单独图片摄取或宿主展示。
+
+媒体先通过 `kb_read` 返回的 `media_refs` 选 source/revision/occurrence，再调用 `kb_read_media`；分页沿返回的 revision/offset 继续。**用文字检索到库里的图片**已在本机验证跑通；但真实媒体端点的通用装配、单独放一张图片直接入库、以及在真实客户端里显示图片仍未闭合。文本成功或同维向量不证明跨模态对齐。
+
+`--doctor` 是显式诊断，可能访问真实端点；STATUS.md 缺失不触发 Agent 自动探活。正常查询直接用已有工具，实际报错再按错误/本地状态排查。
+
 ## 1. 安装
 
 ```powershell
@@ -96,8 +130,8 @@ Copy-Item .\config\app.toml.example .\config\app.toml
    - 如需检索 PDF/Office 文档，在 `config/app.toml` 中将 `[ingest] enabled = true`。
    - **配置 MinerU Token**：
      - **推荐（v4 高精度通道）**：前往 [mineru.net](https://mineru.net) 免费获取 API Token，设置系统环境变量 `MINERU_API_TOKEN=<你的Token>`（或在 `[ingest]` 中填写 `api_key = "你的Token"`），享受每日 1000 页额度与大文件支持。
-     - **免登测试**：不填 `api_key` 自动走轻量免登通道（适合单次 20 页内的小文件体验）。
-   - 解析产物自动存放于 `.mortis-parsed/` 独立目录，不会修改或污染原笔记。
+     - **免登测试**：不填 `api_key` 自动走轻量免登通道（适合单次 20 页内的小文件体验）；该通道**只取回解析出的文字**，不带文档里的图片。
+   - 解析结果默认存进本机文档库，不在笔记库里另生成镜像文件，也不会改动或污染原笔记。只有显式选择旧的库内镜像模式，才会在笔记库的 `.mortis-parsed/` 里写出解析出的 Markdown。
 
 ## 3. 接入 MCP 客户端
 

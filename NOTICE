@@ -1,0 +1,29 @@
+Mortis'RAG MCP
+Copyright 2026 Moton
+
+This product includes software developed at
+Mortis'RAG MCP (https://github.com/moton16/Mortis-RAG-MCP).
+
+Licensed under the Apache License, Version 2.0. See the LICENSE file for
+the full license text.
+
+--------------------------------------------------------------------------
+Optional third-party dependencies (NOT part of this distribution)
+--------------------------------------------------------------------------
+The core package has zero runtime dependencies. The following optional
+extras are installed separately by the user and are NOT covered by the
+Apache-2.0 grant above; their own licenses apply:
+
+  [docs]  pymupdf (PyMuPDF)  - AGPL-3.0-or-later / commercial
+          pypdf              - BSD-3-Clause
+          python-docx        - MIT
+          python-pptx        - MIT
+          openpyxl           - MIT
+  [media] Pillow             - HPND
+  [vec]   sqlite-vec         - MIT
+  [accel] numpy              - BSD-3-Clause
+
+Installing an extra does not change the license of this project itself,
+but combining this code with AGPL-licensed components (e.g. PyMuPDF) into
+a single distributed work has licensing consequences that are the
+distributor's own responsibility.

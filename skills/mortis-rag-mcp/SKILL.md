@@ -1,10 +1,10 @@
 ---
 name: mortis-rag-mcp
 description: "调用 Mortis'RAG MCP 检索本地知识库。触发词：搜知识库、查笔记、kb_search、vault 检索、RAG 搜索、mortis rag。"
-version: 5.3.0
+version: 0.9.0
 ---
 
-# mortis-rag-mcp 检索路由（0.8.1）
+# mortis-rag-mcp 检索路由（0.9.0）
 
 连接即读 server 的 `instructions`（路由纪律已内嵌）。本文件只补判定表、检索纪律与反模式。
 
@@ -13,9 +13,18 @@ version: 5.3.0
 本机环境状态由 `~/.mortis_rag_mcp/STATUS.md` 权威记录（`python -m mortis_rag_mcp --doctor` 自动生成）。
 
 - STATUS.md 标注 ✅ 且生成时间在 7 天内：**禁止任何预检**——不查 venv、不点依赖、不验证 key、不跑 kb_stats/kb_list 探活。直接按下方判定表调用工具干活。
-- STATUS.md 缺失/过期/标注 ❌：**不要逐项手查**。运行（或请用户运行）`python -m mortis_rag_mcp --doctor`，一条命令重新探测并重写 STATUS.md。
+- STATUS.md 缺失/过期/标注 ❌：不自动探活、不自动运行 doctor；按已有工具查询，实际报错再核本地配置/状态并报告原因。用户显式要求诊断时才运行 `python -m mortis_rag_mcp --doctor`，该命令可能请求真实端点。
 - **熔断保护**：若运行一次 `--doctor` 后状态依然为 ❌，**禁止反复重试**，直接停止预检并向用户汇报失败项。
-- kb_* 工具实际报错时：报错 > STATUS.md。进入排障，第一步仍是 `--doctor`。
+- kb_* 工具实际报错时：报错 > STATUS.md。依据错误与已有状态排障；不以历史凭证覆盖当前失败，也不默认重发 unknown 请求。
+
+## 0.9 候选增量（尚未发布）
+
+- `kb_import` 的 `index_state=empty/rebuilding/unverified/ready` 与 import 成功分开；沿 `next_action` 核源/重解析，不自动信任包内正文。
+- `kb_ingest(action="retry", job_id="实际ID", vault_path="库名")` 只对 failed/cancelled 重试，unknown 先查询原任务。取消后的重试重做失去 blob 保护的段，不伪称断点都可保留。
+- `--list-requests --vault "绝对路径"` 只读记录；`--abandon-request REQUEST_ID --vault "绝对路径"` 仅放弃本机意图，不取消远端任务、不重发。现有配置启用的远端能力不增设审批系统。
+- compact 仍按 source/行号回读；媒体沿 `kb_read` 的 `media_refs` 及固定 revision/offset 翻页，再用 `kb_read_media(source, revision_id, occurrence_id, vault_path)` 请求 metadata/inline。不要猜媒体地址或把 caption 当原生向量。
+- 原生媒体 provider/index/read 内部路径已接通，且「输入文字直接命中库中图片」已在本机载体上验证；真实媒体端点的通用装配、单独一张图片直接入库、以及宿主客户端里的图片显示尚未验收。proxy 不替代 native。升级/回退见仓库 `QUICKSTART_user.md` §0.4。
+- 音频转录 / 音频转码链路已在 0.9.0 物理移除（含 `[audio]` 段与 `audio_enabled`）；工具面与检索纪律不受影响。
 
 ## 检索路由判定表（按序匹配，命中即执行）
 
@@ -83,11 +92,11 @@ api_key = "${MINERU_API_TOKEN}"
 
 kb_search（检索，支持库名/vault_paths/preview/compact/budget_bytes/exact_terms）/ kb_read（读原文，支持chunk_id/行范围/heading章节）/ kb_list（列库+description）/ kb_describe（设库描述）/
 kb_init / kb_init_solo（独立库）/ kb_remove / kb_list_files / kb_stats（看 skipped_unsupported/failed_files）/
-kb_set_weight / kb_exempt（毫秒级豁免私密）/ kb_rebuild（高危，见上）/ kb_export / kb_import / kb_ingest（PDF 摄取，默认关闭）
+kb_set_weight / kb_exempt（毫秒级豁免私密）/ kb_rebuild（高危，见上）/ kb_export / kb_import / kb_ingest（文档摄取，默认关闭）/ kb_read_media（固定版本媒体读取）
 
 ## 资产格式与管理机制
 
-- **格式支持**：Markdown（`.md`）与纯文本（`.txt` 小说/分卷资料）均为原生一等公民，享受同等分块、章节标题感知与检索待遇；未收录格式在 `kb_stats` 的 `skipped_unsupported` 中透明列出。
+- **格式支持**：Markdown（`.md`/`.markdown`）与纯文本（`.txt` 小说/分卷资料）均原生索引；PDF/DOCX/PPTX/XLSX 本地解析需可选 docs 依赖；未收录格式在 `kb_stats` 的 `skipped_unsupported` 中列出。
 - **混合检索**：FTS5 BM25 + 向量余弦 + bigram 词法三路 RRF + rerank。2 字中文与短英文缩写有兜底。
 - **别名感知**：原生识别笔记 frontmatter 中声明的 `aliases` 别名（支持缩写/简称/中文逗号），无需正文重复提及即可精准检索召回。
 - **配置链**：`--app-config` > `MORTIS_RAG_CONFIG` > `VAULT_MCP_CONFIG` > `~/.mortis_rag_mcp/config.toml` > `~/.vault_mcp/config.toml` > 内置默认。

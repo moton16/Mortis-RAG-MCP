@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 from array import array
+import time
 from pathlib import Path
 import pytest
 
@@ -106,6 +107,14 @@ def test_server_search_dispatch_delegation(test_vault, tmp_path, monkeypatch):
     monkeypatch.setenv("VAULT_MCP_REGISTRY", str(tmp_path / "vaults.toml"))
     server = VaultMcpServer(config)
     server.call_tool("kb_init", {"path": str(test_vault)})
+
+    # kb_init 只把首建丢进后台线程（C66 读优先）：紧随其后的检索会命中冷启动分支
+    # 返回空 chunks，慢机器上就成了偶发红。等到切片真的可见再断言。
+    indexer = server._indexer_for({"vault_path": str(test_vault)})
+    deadline = time.monotonic() + 10.0
+    while not indexer.all_chunks() and time.monotonic() < deadline:
+        time.sleep(0.1)
+        indexer.sync()
 
     res = server.call_tool("kb_search", {"vault_path": str(test_vault), "query": "半导体物理", "top_k": 3})
     assert not res.get("isError", False)

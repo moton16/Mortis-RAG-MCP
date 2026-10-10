@@ -5,9 +5,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mortis-rag-mcp"
-version = "0.8.1"
-license = "MIT"
-license-files = ["LICENSE"]
+version = "0.9.0"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
 description = "Mortis'RAG MCP - registry-based Markdown knowledge base RAG server (MCP over stdio, zero runtime dependencies)"
 requires-python = ">=3.10"
 dependencies = []
@@ -20,6 +20,10 @@ vec = ["sqlite-vec>=0.1.9"]
 # (semantic_rank). Soft dependency — without numpy the code falls back to the
 # scalar loop automatically; never required for correctness.
 accel = ["numpy>=1.24"]
+# PyMuPDF is AGPL/commercial dual-licensed; this extra is NOT covered by the
+# Apache-2.0 grant on the core package. See NOTICE for per-dependency licenses.
+docs = ["pymupdf>=1.24,<2", "pypdf>=4,<7", "python-docx>=1.0,<2", "python-pptx>=1.0,<2", "openpyxl>=3.1,<4"]
+media = ["Pillow>=10,<13"]
 
 [project.scripts]
 mortis-rag-mcp = "mortis_rag_mcp.__main__:main"
@@ -27,6 +31,12 @@ vault-mcp = "mortis_rag_mcp.__main__:main"  # legacy alias kept for existing con
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]
+addopts = '-m "not slow and not real_carrier"'
+markers = [
+    "slow: full production sync/proxy/link integration; select with -o addopts= -m slow",
+    "real_carrier: distinct real embedding-carrier contracts; select with -o addopts= -m real_carrier",
+]
 
 [tool.setuptools.packages.find]
 include = ["mortis_rag_mcp*"]

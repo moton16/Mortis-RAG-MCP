@@ -8,12 +8,14 @@
 """
 from __future__ import annotations
 
+from ..embedding_capabilities import embed_with_profile
+
 from array import array
 from dataclasses import replace
 import re
 from typing import Any, Iterable, TYPE_CHECKING
 
-from .models import Chunk, SearchFilter, _EMB_DTYPE, dedupe_by_content_hash
+from .models import Chunk, SearchFilter, _EMB_DTYPE, dedupe_by_content_hash, dedupe_by_occurrence
 
 if TYPE_CHECKING:
     from mortis_rag_mcp.indexer import MarkdownIndexer
@@ -244,6 +246,7 @@ def search_single_vault(
     dedupe: bool = True,
     *,
     exact_terms: list[str] | None = None,
+    skip_semantic: bool = False,
 ) -> list[Chunk]:
     """单库三路混合检索管线主逻辑。"""
     try:
@@ -274,9 +277,12 @@ def search_single_vault(
             ranked = [chunk for chunk in ranked if all(term in _lexical_haystack(chunk) for term in clean_terms)]
         if dedupe:
             ranked = dedupe_by_content_hash(ranked)
+        # 空 query 路径：媒体 occurrence 也只留一条，避免同一媒体重复占位。
+        ranked = dedupe_by_occurrence(ranked)
         if filters is None:
-            return ranked[: max(0, top_k)]
+            return owner._filter_visible_chunks(ranked)[: max(0, top_k)]
         ranked = [chunk for chunk in ranked if filters.matches(chunk)]
+        ranked = owner._filter_visible_chunks(ranked)
         start, end = filters.page_slice(top_k)
         return ranked[start:end]
 
@@ -336,10 +342,11 @@ def search_single_vault(
 
     semantic_chunks: list[Chunk] = []
     semantic_snapshot: dict[str, float] = {}
-    if owner.config.embedding.mode == "external":
+    if not skip_semantic and owner.config.embedding.mode == "external" and owner._vector_route_allowed():
         try:
             if query_vector is None:
-                query_vector = owner.embedding_provider.embed([query])[0]
+                query_vector = embed_with_profile(owner.embedding_provider, [query],
+                                                  owner._embedding_profile, query=True)[0]
             vec_limit = max(top_k, owner.config.rrf_per_route, owner.config.rerank_cap)
             if filters is not None:
                 vec_limit = max(vec_limit, min(top_k * 20, vec_limit * 8))
@@ -400,8 +407,13 @@ def search_single_vault(
     if dedupe:
         ranked = dedupe_by_content_hash(ranked)
 
+    # E08-d：媒体候选按 occurrence 归并去双计权（proxy 与 native 只留一条）。
+    ranked = dedupe_by_occurrence(ranked)
+
+    ranked = owner._filter_visible_chunks(ranked)
     if use_rerank and owner.reranker_provider and ranked:
         ranked = rerank_chunks(query, ranked, owner.reranker_provider, cap=owner.config.rerank_cap)
+    ranked = owner._filter_visible_chunks(ranked)
 
     if filters is None:
         return ranked[: max(0, top_k)]
@@ -425,6 +437,7 @@ class SearchEngine:
         dedupe: bool = True,
         *,
         exact_terms: list[str] | None = None,
+        skip_semantic: bool = False,
     ) -> list[Chunk]:
         return search_single_vault(
             self.owner,
@@ -435,6 +448,7 @@ class SearchEngine:
             filters=filters,
             dedupe=dedupe,
             exact_terms=exact_terms,
+            skip_semantic=skip_semantic,
         )
 
     @classmethod
@@ -449,6 +463,7 @@ class SearchEngine:
         dedupe: bool = True,
         *,
         exact_terms: list[str] | None = None,
+        skip_semantic: bool = False,
     ) -> list[Chunk]:
         return search_single_vault(
             owner,
@@ -459,4 +474,5 @@ class SearchEngine:
             filters=filters,
             dedupe=dedupe,
             exact_terms=exact_terms,
+            skip_semantic=skip_semantic,
         )

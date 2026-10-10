@@ -96,7 +96,7 @@ def _search_single_vault(
                 preview=preview,
             )
         return res_empty
-    indexer.request_refresh()
+    indexer.request_refresh(for_read=True)
     r_status = indexer.refresh_status()
     is_cold = (
         indexer.last_sync is None
@@ -114,6 +114,10 @@ def _search_single_vault(
         if compact:
             res_cold["vault"] = v_path
             res_cold["vault_name"] = v_name
+        # 与单库/fanout/import 同一口径（E04-b）
+        cold_state = indexer.index_state()
+        res_cold["index_state"] = cold_state["index_state"]
+        res_cold["next_action"] = cold_state["next_action"]
         if budget_bytes is not None:
             res_cold = apply_budget(
                 res_cold,
@@ -144,6 +148,12 @@ def _search_single_vault(
         res_dict["indexing_progress"] = r_status["indexing_progress"]
     if r_status.get("refresh_error"):
         res_dict["indexing_error"] = r_status["refresh_error"]
+    # additive 索引状态（E04-b）：只在非 ready 时附加，ready 的响应字段保持不变。
+    state = indexer.index_state()
+    if state["index_state"] != "ready":
+        res_dict["index_state"] = state["index_state"]
+        res_dict["isolated_facts"] = state["isolated_facts"]
+        res_dict["next_action"] = state["next_action"]
     if budget_bytes is not None:
         res_dict = apply_budget(res_dict, budget_bytes, orig_offset=search_filters.offset, preview=preview)
     return res_dict

@@ -1,0 +1,105 @@
+{
+  "contract_name": "gemini_multimodal_embeddings_v1",
+  "provider": "google_gemini",
+  "sample_endpoint": "https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-2:batchEmbedContents",
+  "auth_header": "x-goog-api-key: <REDACTED_API_KEY>",
+  "supported_modalities": ["image", "audio", "text"],
+  "allowed_mime_types": [
+    "audio/mp3",
+    "audio/mpeg",
+    "audio/wav",
+    "image/png",
+    "image/jpeg",
+    "image/webp"
+  ],
+  "max_input_bytes": 10485760,
+  "max_batch_size": 16,
+  "audio_specifications": {
+    "sample_rate_recommended_hz": 16000,
+    "channels": "mono",
+    "max_duration_seconds": 180,
+    "context_window_tokens": 8192,
+    "token_rate": "25 tokens per second"
+  },
+  "field_mapping": {
+    "request": {
+      "model": "model resource name (e.g. models/gemini-embedding-2)",
+      "requests": "array of EmbedContentRequest objects",
+      "content.parts": "array of part objects with inline_data: {mime_type, data}",
+      "output_dimensionality": "optional reduced dimension (128..3072, default 768)"
+    },
+    "response": {
+      "embeddings": "array of ContentEmbedding objects: embeddings[i].values -> list of float vectors",
+      "error": "error.message / error.code / error.status on 4xx/5xx"
+    }
+  },
+  "sample_request": {
+    "requests": [
+      {
+        "model": "models/gemini-embedding-2",
+        "content": {
+          "parts": [
+            {
+              "inline_data": {
+                "mime_type": "audio/mp3",
+                "data": "SUQzBAAAAAAAI1RTU0UAAAAPAAADTGF2ZjU4Ljc2LjEwMAAAAAAAAAAAAAAA//OEAAAAAAAAAAAAAAAAAAAAAAA="
+              }
+            }
+          ]
+        },
+        "output_dimensionality": 768
+      }
+    ]
+  },
+  "sample_response": {
+    "embeddings": [
+      {
+        "values": [
+          0.0245,
+          -0.0381,
+          0.0119,
+          0.0572,
+          -0.0821,
+          0.0433,
+          -0.0156,
+          0.0612
+        ]
+      }
+    ]
+  },
+  "error_samples": {
+    "rate_limited_429": {
+      "http_status": 429,
+      "headers": {
+        "Retry-After": "5"
+      },
+      "body": {
+        "error": {
+          "code": 429,
+          "message": "Resource has been exhausted (e.g. check quota).",
+          "status": "RESOURCE_EXHAUSTED"
+        }
+      }
+    },
+    "unauthorized_401": {
+      "http_status": 401,
+      "body": {
+        "error": {
+          "code": 401,
+          "message": "API key not valid. Please pass a valid API key.",
+          "status": "UNAUTHENTICATED"
+        }
+      }
+    },
+    "invalid_argument_400": {
+      "http_status": 400,
+      "body": {
+        "error": {
+          "code": 400,
+          "message": "Audio duration exceeds 180 seconds limit.",
+          "status": "INVALID_ARGUMENT"
+        }
+      }
+    }
+  }
+}

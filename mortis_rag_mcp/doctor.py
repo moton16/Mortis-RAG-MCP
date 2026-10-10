@@ -13,6 +13,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import platform
@@ -51,6 +52,13 @@ _LINE_BREAK_RE = re.compile("\r\n|[" + "".join(_UNICODE_LINE_BREAKS) + "\r\n]")
 
 # 自由文本（库名、路径、异常消息）在表格里的长度上限：超出即截断。
 _FREE_TEXT_LIMIT = 160
+
+# **路径**单独给一个更宽的上限：路径的判别信息在**尾部**（`.mortis_rag_mcp/`
+# 还是 `.vault_mcp/`、`cache` 根在哪一侧），按 160 从尾部截会把最难复现、也最需要
+# 分辨的那一段丢掉——深家目录（CI 容器、长用户名、挂到深层的项目目录）实测超过
+# 160 字符，信任锚就又变成"分不清生效的是哪一份"。仍设上限，只是给到足以容纳
+# 合法绝对路径的量级，避免异常超长值把表格撑爆。
+_PATH_TEXT_LIMIT = 1024
 
 # 主机名白名单：RFC1123 的 hostname 字符集（字母/数字/`.`/`-`），额外允许 `_`
 # （Windows 域内主机名常见）。其余字符一律替换为 `?`。
@@ -442,7 +450,7 @@ def check_config(app_config: str | None) -> tuple[dict, object | None]:
         # 一直是完整路径，口径也不一致）。PROJECT_GUIDE 让用户「依据 config.toml
         # 在哪一侧判断」，该信息必须出现在用户/agent 真正会读的文件里。
         detail = (
-            f"{_sanitize_free_text(path) if path else '内置默认'}"
+            f"{_sanitize_free_text(path, _PATH_TEXT_LIMIT) if path else '内置默认'}"
             f"：embedding={_sanitize_free_text(mode)}/{_sanitize_free_text(model)}"
             f"，api_key {status_text}{missing_str}{rr_detail}"
         )
@@ -473,6 +481,29 @@ def check_config(app_config: str | None) -> tuple[dict, object | None]:
                 ingest_str = f"ingest: 未启用(上限{cap_str})"
             detail += f"，{ingest_str}"
 
+        chunking = getattr(cfg, "chunking", None)
+        if chunking is not None:
+            detail += f"，chunking={_sanitize_free_text(getattr(chunking, 'mode', '?'))}"
+            if getattr(chunking, "mode", "") == "legacy_chars" and not getattr(chunking, "mode_explicit", False):
+                detail += "（保留旧分块；显式切换可能重新嵌入计费）"
+        detail += f"，adapter={_sanitize_free_text(getattr(emb, 'adapter', 'openai_text'))}"
+        detail += f"，capability_profile={_sanitize_free_text(getattr(emb, 'capability_profile', '') or 'conservative')}"
+        detail += f"，routing={_sanitize_free_text(getattr(ingest_cfg, 'routing', 'auto'))}"
+        detail += f"，storage={_sanitize_free_text(getattr(ingest_cfg, 'storage', 'legacy'))}"
+        media = getattr(cfg, "media", None)
+        detail += f"，media.inline_max_bytes={getattr(media, 'inline_max_bytes', 8388608)}"
+        detail += f"，media.refs_limit={getattr(media, 'refs_limit', 20)}"
+        media_adapter = str(getattr(emb, "media_adapter", "") or getattr(emb, "media_provider", "") or "")
+        if media_adapter:
+            media_ep = str(getattr(emb, "media_endpoint", "") or "default")
+            media_mod = str(getattr(emb, "media_model", "") or "default")
+            media_dim = getattr(emb, "media_dimension", None)
+            media_dim_str = str(media_dim) if media_dim is not None else "auto"
+            media_key_env = str(getattr(emb, "media_api_key_env", "") or "none")
+            detail += f"，media_provider={_sanitize_free_text(media_adapter)}(endpoint={_sanitize_free_text(media_ep)}, model={_sanitize_free_text(media_mod)}, dim={media_dim_str}, key_env={_sanitize_free_text(media_key_env)})"
+        else:
+            detail += "，media_provider=none"
+
         # 两侧同名配置同时存在：resolve_config_path 新名优先，旧侧那份被静默忽略。
         # 用户继续编辑旧侧的 config.toml 时看不到任何反馈，这里显式点出来。
         try:
@@ -492,6 +523,8 @@ def check_registry() -> dict:
         from .registry import VaultRegistry, registry_path
         reg = VaultRegistry(registry_path())
         vaults = reg.load()
+        if reg.read_status == "unknown":
+            return _section(False, f"注册表加载失败：{_sanitize_free_text(reg.path, _PATH_TEXT_LIMIT)}：{_sanitize_free_text(reg.read_error)}")
         names, missing = [], []
         for v in vaults:
             name = str(getattr(v, "name", getattr(v, "path", "?")))
@@ -522,20 +555,126 @@ def check_cache_dir(cfg: object | None) -> dict:
         d = Path(str(d))
         return _section(
             True,
-            f"{_sanitize_free_text(d)}（{'存在' if d.exists() else '初次索引时自动创建'}）",
+            f"{_sanitize_free_text(d, _PATH_TEXT_LIMIT)}（{'存在' if d.exists() else '初次索引时自动创建'}）",
         )
     except Exception as exc:
         return _section(True, f"缓存目录检查跳过：{_sanitize_free_text(exc)}")
 
 
+def check_doc_store(cfg: object | None) -> dict:
+    """文档库（解析事实）布局归属诊断：只读解析，不建库、不写盘（C91/C92）。
+
+    口径区别（§23.4）：这里只说明「配置上虚拟摄取是否可用、缓存根的真实归属是否
+    落在已注册库内」。它**不**替用户搬动路径、**不**创建文档库、**不**推进 epoch：
+    home 根落在库内时必须报可操作的修复建议（改 `cache.dir` 或显式
+    `cache.placement="vault"`），而不是静默改道。
+    """
+    try:
+        from typing import cast
+
+        from .config import AppConfig
+        from .doc_store import DocStoreError, registered_vault_paths, resolve_storage_layout
+
+        if cfg is None:
+            return _section(True, "跳过：配置未加载")
+        # doctor 各检查统一以 object 收参（本文件多个 check_* 的既有签名），
+        # 布局解析需要 AppConfig：这里显式收敛类型，不做 duck-typing 猜测。
+        app_cfg = cast(AppConfig, cfg)
+        cache = getattr(cfg, "cache", None)
+        enabled = bool(getattr(cache, "enabled", False))
+        placement = str(getattr(cache, "placement", "home"))
+        vaults = registered_vault_paths()
+        if not vaults:
+            return _section(
+                True,
+                f"placement={placement}，缓存 {'启用' if enabled else '关闭'}；未注册知识库（虚拟摄取不可用）",
+            )
+        blocked: list[str] = []
+        roots: set[str] = set()
+        for vault in vaults:
+            try:
+                layout = resolve_storage_layout(app_cfg, vault, registered_vaults=vaults)
+            except DocStoreError as exc:
+                blocked.append(f"{_sanitize_free_text(Path(vault).name)}：{exc.code}")
+                continue
+            roots.add(str(layout.doc_store_dir))
+            if layout.blocked_reason:
+                blocked.append(f"{_sanitize_free_text(Path(vault).name)}：{layout.blocked_reason}")
+        detail = f"placement={placement}，缓存 {'启用' if enabled else '关闭'}"
+        if len(roots) == 1:
+            root = next(iter(roots))
+            exists = "存在" if Path(root).exists() else "首次虚拟摄取时创建"
+            detail += f"，根 {_sanitize_free_text(root, _PATH_TEXT_LIMIT)}（{exists}）"
+        elif roots:
+            detail += f"，{len(roots)} 个库缓存根"
+        if blocked:
+            return _section(False, f"{detail}；虚拟摄取不可用：" + "；".join(blocked))
+        if not enabled:
+            return _section(True, f"{detail}；虚拟摄取需 cache.enabled=true（物理文本不受影响）")
+        return _section(True, f"{detail}；虚拟摄取可用")
+    except Exception as exc:
+        return _section(True, f"文档库检查跳过：{_sanitize_free_text(exc)}")
+
+
+def _configure_probe_paid(provider: object, cfg: object, *, kind: str, fingerprint: str) -> bool:
+    """为 doctor 显式探活装配「仅本次探测」的付费授权（§20.7B）。
+
+    探活是用户显式请求的独立动作：它只授权这一次（guard 只放行精确 fingerprint），
+    并且仍然落一条持久发送意图（响应丢失时按 SUBMISSION_UNKNOWN 处理，不自动重发）。
+    它**不**解除任何库的 pending 重嵌审批，也不写授权表。cache 关闭时无法持久化意图，
+    于是拒绝探活并给出可操作原因（不静默少一次费用记录）。
+    """
+    configure = getattr(provider, "configure_paid_requests", None)
+    if not callable(configure):
+        return True
+    from .config import AppConfig
+    from .doc_store import resolve_storage_layout
+    from .paid_requests import PaidRequestJournal, open_paid_control
+
+    if not isinstance(cfg, AppConfig):
+        # 非 AppConfig（测试桩/自定义对象）无法证明控制面可用：交给调用方按
+        # 「无法持久化意图」处理，绝不为了跑通探测而跳过闸门。
+        return False
+
+    # Provider's existing predicate proves both loopback and absent credential;
+    # never infer free status merely from a model name or unknown custom object.
+    if getattr(provider, "is_local_free", False) is True:
+        return True
+
+    cache_cfg = getattr(cfg, "cache", None)
+    if not bool(getattr(cache_cfg, "enabled", False)):
+        return False
+    vault = Path(str(getattr(cfg, "vault_path", "") or Path.cwd())).expanduser()
+    try:
+        control = open_paid_control(resolve_storage_layout(cfg, vault))
+    except Exception:
+        return False
+    journal = PaidRequestJournal(control, f"doctor-probe-{kind}")
+    configure(journal, lambda profile: profile == fingerprint, fingerprint)
+    return True
+
+
 def probe_embedding(cfg: object) -> dict:
     try:
         from .providers import create_embedding_provider
+        from .embedding_capabilities import resolve_embedding_profile
         emb = getattr(cfg, "embedding", None)
         mode = getattr(emb, "mode", "static")
         if mode != "external":
             return _section(True, f"mode={mode}（非 external，跳过在线探测）")
         provider = create_embedding_provider(emb)
+        try:
+            fingerprint = resolve_embedding_profile(emb).fingerprint
+        except Exception:
+            # 未经验证的 profile（自定义 endpoint）不是探活失败：provider 自己会用空
+            # profile 标识发这一次请求，闸门仍按精确 fingerprint 放行。
+            fingerprint = ""
+        if not _configure_probe_paid(provider, cfg, kind="embed", fingerprint=fingerprint):
+            return _section(
+                False,
+                "付费探活需要可持久化发送意图的本机控制面（[cache] enabled=true）；"
+                "已跳过，未发出任何请求",
+            )
         t0 = time.monotonic()
         vecs = provider.embed(["ping"])
         ms = int((time.monotonic() - t0) * 1000)
@@ -544,7 +683,7 @@ def probe_embedding(cfg: object) -> dict:
             expected_dim = getattr(emb, "dimension", None)
             if expected_dim and actual_dim != expected_dim:
                 return _section(False, f"维度不匹配：模型返回 {actual_dim} 维，配置预期 {expected_dim} 维")
-            return _section(True, f"探活成功，dim={actual_dim}，{ms}ms")
+            return _section(True, f"探活成功，dim={actual_dim}，{ms}ms（本次探活按一次独立授权发送）")
         return _section(False, "探活返回空向量")
     except Exception as exc:
         return _section(False, f"探测失败：{_sanitize_free_text(exc)}")
@@ -557,11 +696,21 @@ def probe_reranker(cfg: object) -> dict:
         if not getattr(rr, "enabled", False):
             return _section(True, "未启用（跳过）")
         provider = create_reranker_provider(rr)
+        fingerprint = hashlib.sha256("|".join((
+            "rerank", str(getattr(rr, "adapter", "openai")), str(getattr(rr, "model", "")),
+            str(getattr(rr, "endpoint", "") or ""),
+        )).encode("utf-8")).hexdigest()
+        if not _configure_probe_paid(provider, cfg, kind="rerank", fingerprint=fingerprint):
+            return _section(
+                False,
+                "重排探活需要可持久化发送意图的本机控制面（[cache] enabled=true）；"
+                "已跳过，未发出任何请求",
+            )
         t0 = time.monotonic()
         # 修正：直接调用 provider 的标准 API rerank(query, documents)
         _ = provider.rerank("ping", ["doc"])
         ms = int((time.monotonic() - t0) * 1000)
-        return _section(True, f"重排可用，{ms}ms")
+        return _section(True, f"重排可用，{ms}ms（本次探活按一次独立授权发送）")
     except Exception as exc:
         return _section(False, f"探测失败：{_sanitize_free_text(exc)}")
 
@@ -608,14 +757,20 @@ def check_ingest(cfg: object | None) -> dict:
             pass
 
         scan_note = f"最近自动扫描: {_sanitize_free_text(last_scan_record)}（报告生成时快照）" if last_scan_record else "最近自动扫描: 无记录（报告生成时快照）"
+        # 解析落点/网络策略必须进报告：否则「为什么库里没有 .mortis-parsed」
+        # 与「为什么云端解析被拒」只能靠猜（§20.4 / §23.4 状态合同）。
+        mode_note = "；".join((
+            f"落点 storage={_sanitize_free_text(str(getattr(ingest_cfg, 'storage', 'virtual')))}",
+            f"network_policy={_sanitize_free_text(str(getattr(ingest_cfg, 'network_policy', 'configured')))}",
+        ))
 
         if not enabled and auto_watch:
-            return _section(True, f"auto_watch=true 但未启用（enabled=false，不生效，上限 {cap_str}）；{scan_note}")
+            return _section(True, f"auto_watch=true 但未启用（enabled=false，不生效，上限 {cap_str}）；{mode_note}；{scan_note}")
         if enabled and auto_watch:
-            return _section(True, f"自动摄取已启用（上限 {cap_str}）；{scan_note}")
+            return _section(True, f"自动摄取已启用（上限 {cap_str}）；{mode_note}；{scan_note}")
         if enabled:
-            return _section(True, f"手动摄取模式（上限 {cap_str}）；{scan_note}")
-        return _section(True, f"未启用（上限 {cap_str}）；{scan_note}")
+            return _section(True, f"手动摄取模式（上限 {cap_str}）；{mode_note}；{scan_note}")
+        return _section(True, f"未启用（上限 {cap_str}）；{mode_note}；{scan_note}")
     except Exception as exc:
         return _section(True, f"摄取检查跳过：{_sanitize_free_text(exc)}")
 
@@ -636,6 +791,7 @@ def render_md(data: dict) -> str:
     labels = {
         "python": "Python", "package": "包导入", "optional_deps": "可选依赖",
         "config": "配置", "registry": "注册表", "cache": "缓存目录",
+        "doc_store": "文档库（解析存储）",
         "ingest": "文档摄取",
         "embedding_api": "embedding API", "reranker_api": "reranker API", "tests": "单元测试（开发观测）",
     }
@@ -690,6 +846,7 @@ def run(full: bool = True, app_config: str | None = None, quiet: bool = False) -
         sections["registry"] = check_registry()
         sections["optional_deps"] = check_optional_deps()
         sections["cache"] = check_cache_dir(cfg)
+        sections["doc_store"] = check_doc_store(cfg)
         sections["ingest"] = check_ingest(cfg)
         if full and cfg is not None:
             sections["embedding_api"] = probe_embedding(cfg)

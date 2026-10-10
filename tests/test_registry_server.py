@@ -130,21 +130,24 @@ def test_stdio_missing_vault_folder_listed_as_not_exists(tmp_path):
     assert str(vault) not in search.get("searched", [])
 
 
-def test_stdio_init_indexes_in_background(tmp_path):
+def test_stdio_init_indexes_in_background(tmp_path, stdio_polling):
     vault = tmp_path / "库"
     vault.mkdir()
     (vault / "a.md").write_text("# A\nhello world", encoding="utf-8")
     config = _make_config(tmp_path)
 
-    responses = _run_stdio(config, [
+    session = stdio_polling(config, prefix_requests=[
         {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
         {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "kb_init", "arguments": {"path": str(vault)}}},
-        {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "kb_stats", "arguments": {}}},
-    ])
-    init = _payload(responses[1])
+    ], poll_request={"jsonrpc": "2.0", "method": "tools/call",
+                     "params": {"name": "kb_stats", "arguments": {}}},
+        is_settled=lambda data: data.get("files") == 1 and not data.get("indexing_in_progress"),
+        env_overrides={"MORTIS_RAG_REGISTRY": str(tmp_path / "vaults.toml"),
+                       "VAULT_MCP_REGISTRY": str(tmp_path / "vaults.toml")})
+    init = _payload(session["prefix"][1])
     assert init["md_files"] == 1
-    # kb_stats triggers its own sync, so the single registered vault is indexed.
-    stats = _payload(responses[2])
+    # stats为读优先；真实客户端等待后台完成，不把批式紧邻调用当同步。
+    stats = session["observed"][-1]
     assert stats["files"] == 1
     assert stats["chunks"] >= 1
 

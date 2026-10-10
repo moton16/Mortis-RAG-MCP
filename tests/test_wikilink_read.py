@@ -193,8 +193,8 @@ def test_wikilink_read_zero_match_retains_original_error(tmp_path: Path):
     indexer = server._indexer_for({"vault_path": "ZeroVault"})
     indexer.sync()
 
-    # 1. 无后缀且不存在：保留原有扩展名不合规报错
-    with pytest.raises(ValueError, match="source must be a Markdown or plain-text file"):
+    # 无后缀没有物理命中也没有virtual事实，按现行virtual合同拒绝。
+    with pytest.raises(ValueError, match="UNAVAILABLE: virtual source 'completely_nonexistent'"):
         server._kb_read({"source": "completely_nonexistent", "vault_path": "ZeroVault"})
 
     # 2. 有合规后缀但不存在：保留原有 FileNotFoundError
@@ -222,8 +222,8 @@ def test_wikilink_read_exempted_file_not_accessible(tmp_path: Path):
     # confidential.md 命中 .vaultignore，未入索引，不进入 _chunks
     assert "secret_folder/confidential.md" not in indexer._chunks
 
-    # 短名寻址无法命中豁免文件，直接落回原有报错
-    with pytest.raises(ValueError, match="source must be a Markdown or plain-text file"):
+    # 短名寻址不得复活豁免文件/虚拟事实。
+    with pytest.raises(ValueError, match="UNAVAILABLE: virtual source 'confidential'"):
         server._kb_read({"source": "confidential", "vault_path": "ExVault"})
 
 

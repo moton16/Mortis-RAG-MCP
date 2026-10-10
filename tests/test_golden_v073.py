@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from mortis_rag_mcp.config import AppConfig, EmbeddingConfig
+from mortis_rag_mcp.config import AppConfig, EmbeddingConfig, ChunkingConfig
 from mortis_rag_mcp.indexer import MarkdownIndexer
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -22,12 +22,15 @@ GOLDEN_FILE = ROOT / "tests" / "golden" / "v073_chunks.json"
 
 def _collect(vault: Path) -> dict[str, list[dict]]:
     indexer = MarkdownIndexer(
-        vault, AppConfig(embedding=EmbeddingConfig(mode="static", dimension=8))
+        vault, AppConfig(embedding=EmbeddingConfig(mode="static", dimension=8),
+                        chunking=ChunkingConfig(mode="legacy_chars", mode_explicit=True))
     )
     snapshot: dict[str, list[dict]] = {}
     for chunk in indexer.sync():
         d = chunk.to_dict()
         d["metadata"].pop("mtime", None)
+        # additive缓存身份不是v073 golden字段；ID/content/旧metadata逐字保留。
+        d["metadata"].pop("embedding_key", None)
         snapshot.setdefault(chunk.source, []).append(d)
     return {k: snapshot[k] for k in sorted(snapshot)}
 

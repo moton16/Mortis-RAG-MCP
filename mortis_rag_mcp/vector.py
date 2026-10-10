@@ -24,6 +24,28 @@ from array import array
 from typing import Any, Iterable, Protocol, runtime_checkable
 
 from .config import VectorConfig
+from .embedding_capabilities import resolve_embedding_profile
+
+
+class VectorSpaceMismatch(RuntimeError):
+    pass
+
+
+def bind_vector_space(conn: sqlite3.Connection, fingerprint: str) -> None:
+    """Legacy or conflicting nonempty stores remain untouched and unavailable."""
+    tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if "vector_space_meta" not in tables:
+        if "vec_ids" in tables and conn.execute("SELECT 1 FROM vec_ids LIMIT 1").fetchone():
+            raise VectorSpaceMismatch("legacy vector space has no fingerprint; reembedding approval required")
+        conn.execute("CREATE TABLE vector_space_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    row = conn.execute("SELECT value FROM vector_space_meta WHERE key='fingerprint'").fetchone()
+    if row is not None and row[0] != fingerprint:
+        raise VectorSpaceMismatch("vector space fingerprint mismatch; keep old space and approve new generation")
+    if row is None:
+        if "vec_ids" in tables and conn.execute("SELECT 1 FROM vec_ids LIMIT 1").fetchone():
+            raise VectorSpaceMismatch("vector space fingerprint missing")
+        conn.execute("INSERT INTO vector_space_meta VALUES ('fingerprint', ?)", (fingerprint,))
+    conn.commit()
 
 
 # 单条 SQL 里 IN(...) 的占位符上限。sqlite 的现代构建默认是 32766，但旧版只有
@@ -133,6 +155,7 @@ class SqliteVecBackend:
     def __init__(self, indexer: Any, db_path: Any) -> None:
         self._indexer = indexer
         self._db_path = db_path
+        self.last_write_error: Exception | None = None
         self._conn: sqlite3.Connection | None = None
         self._serialize = None
         self.available = False
@@ -140,16 +163,21 @@ class SqliteVecBackend:
         # "不可用"可区分，避免 close() 之后的调用被静默当成零结果。
         self._lock = threading.RLock()
         self._closed = False
+        self.space_error = ""
+        conn = None
         try:
             import sqlite_vec  # type: ignore
 
             self._serialize = sqlite_vec.serialize_float32
-            dim = int(indexer.config.embedding.dimension)
+            profile = getattr(indexer, "embedding_profile", None) or resolve_embedding_profile(indexer.config.embedding)
+            self.space_fingerprint = profile.fingerprint
+            dim = profile.effective_dim
             db_path.parent.mkdir(parents=True, exist_ok=True)
             conn = sqlite3.connect(str(db_path), check_same_thread=False)
             conn.enable_load_extension(True)
             sqlite_vec.load(conn)
             conn.enable_load_extension(False)
+            bind_vector_space(conn, self.space_fingerprint)
             conn.execute("PRAGMA journal_mode=MEMORY")
             conn.execute("PRAGMA synchronous=OFF")
             conn.execute(
@@ -162,7 +190,11 @@ class SqliteVecBackend:
             )
             self._conn = conn
             self.available = True
-        except Exception:
+        except Exception as exc:
+            if isinstance(exc, VectorSpaceMismatch):
+                self.space_error = str(exc)
+            if conn is not None:
+                conn.close()
             self._conn = None
 
     @staticmethod
@@ -210,6 +242,7 @@ class SqliteVecBackend:
 
     @_serialized
     def upsert_vectors(self, vectors: dict[str, Any]) -> set[str] | None:
+        self.last_write_error = None
         if not self.available or self._conn is None or not vectors:
             return set()
         try:
@@ -246,9 +279,10 @@ class SqliteVecBackend:
                     )
                     persisted.update(chunk_id for chunk_id, _ in batch if chunk_id in id_map)
             return persisted
-        except Exception:
+        except Exception as exc:
             # 失败时返回已成功落盘的部分（可能为空集），绝不返回 None ——
             # None 会被调用方当成"全部成功"。
+            self.last_write_error = exc
             return set()
 
     @_serialized

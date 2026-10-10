@@ -3,19 +3,37 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sqlite3
 import threading
 import time
 import zipfile
 from array import array
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from .config import AppConfig
+from .embedding_capabilities import normalize_endpoint, resolve_embedding_profile
+from .doc_store import (
+    ControlStore,
+    DocStoreError,
+    DocumentStore,
+    StorageLayout,
+    is_within,
+    resolve_storage_layout,
+    vault_cache_key,
+)
+from .paid_requests import (
+    PaidRequestJournal,
+    UNRESOLVED_INTENT_STATES,
+    open_paid_control,
+    paid_request_guard,
+)
 from .fsnotify import WindowsDirectoryWatcher
 from .fts import FtsIndex
 from .ingest import INGEST_EXTS
 from .ingest.tables import iter_table_blocks, split_table_into_chunks
-from .providers import EmbeddingProvider, ProviderError, RerankerProvider, create_embedding_provider, create_reranker_provider
+from .providers import EmbeddingProvider, ProviderError, RerankerProvider, create_embedding_provider, create_media_provider, create_reranker_provider
 from .vector import create_vector_backend
 # v0.8.0 P2：数据模型与缓存编解码提取至私有包 _indexer/（本文件转为 Facade）。
 # 下方 re-export 保持 `from mortis_rag_mcp.indexer import ...` 公开导入面 100% 不变。
@@ -117,6 +135,7 @@ class MarkdownIndexer:
         config: AppConfig | None = None,
         embedding_provider: EmbeddingProvider | None = None,
         reranker_provider: RerankerProvider | None = None,
+        media_provider: Any = None,
         *,
         load_vectors: bool = True,
     ) -> None:
@@ -125,13 +144,44 @@ class MarkdownIndexer:
         # （残余代价：构造期 FTS 仍可能写盘，见 docs/PROJECT_GUIDE.md 的索引层说明）。
         self.vault_path = Path(vault_path).expanduser()
         self.config = config or AppConfig(vault_path=str(self.vault_path))
+        self._chunking_config = replace(
+            self.config.chunking,
+            legacy_chunk_size=int(self.config.chunk_size),
+            legacy_chunk_overlap=int(self.config.chunk_overlap),
+        )
+        # Programmatic legacy callers may set character parameters after AppConfig().
+        if (not self._chunking_config.mode_explicit
+                and (self.config.chunk_size, self.config.chunk_overlap) != (1200, 0)):
+            self._chunking_config = replace(self._chunking_config, mode="legacy_chars", legacy_explicit=True)
+        self._embedding_profile = resolve_embedding_profile(self.config.embedding)
+        self._paid_profile_requires_approval = False
+        self._paid_profile_error: str | None = None
+        self._chunking_compatibility_notice: str | None = None
+        self._embedding_paused = False
         self.embedding_provider = embedding_provider or create_embedding_provider(self.config.embedding)
+        # E07：原生媒体能力按**显式声明**装配。未声明 → None（无该能力）；声明不完整或
+        # 无已声明 transport（Q09 缺协议）→ 记录「该 route 不可用」，但**不**影响文本路径。
+        self.media_provider: Any = None
+        self._media_capability_error: str | None = None
+        if media_provider is not None:
+            self.media_provider = media_provider
+        else:
+            try:
+                self.media_provider = create_media_provider(self.config.embedding)
+            except Exception as exc:
+                self._media_capability_error = str(exc)
         self.reranker_provider = reranker_provider
         if reranker_provider is None:
             try:
                 self.reranker_provider = create_reranker_provider(self.config.reranker)
             except Exception:
                 self.reranker_provider = None
+        # C100：付费闸门必须在 provider 构造后立即接线，否则外部文本 embedding/rerank
+        # 会被 provider 自身拒绝（`EMBEDDING_PENDING_APPROVAL`），等于既没用上渠道、
+        # 又让人误以为「没配 key」。控制库连接保持惰性，只读探测不建库。
+        self._paid_control: ControlStore | None = None
+        self._paid_lock = threading.Lock()
+        self._configure_paid_providers()
         self._chunks: dict[str, list[Chunk]] = {}
         self._signatures: dict[str, str] = {}
         self._stat_cache: dict[str, tuple[int, int, int]] = {}
@@ -161,6 +211,7 @@ class MarkdownIndexer:
         # 文本后再按 chunk.id 补挂（见 _load_vectors_cache / _attach_pending_vectors）。
         self._pending_vectors: dict[str, Any] = {}
         self.failed_files: dict[str, str] = {}
+        self.persistence_status: dict[str, Any] = {"state": "disabled", "errors": {}}
         self.last_sync: float | None = None
         self._watch_stop = threading.Event()
         self._watch_thread: threading.Thread | None = None
@@ -209,6 +260,12 @@ class MarkdownIndexer:
             "chunks_done": 0,
             "chunks_total": 0,
         }
+        # v0.9.0 Lane A（C91/C92）：版本化文档库（解析事实）与派生索引分离。
+        # 布局只在这里解析路径，store 连接惰性建立——读路径不因为一次查询就建库。
+        self._storage_layout: StorageLayout | None = None
+        self._doc_store: DocumentStore | None = None
+        self._doc_store_write_opened = False
+        self._doc_store_lock = threading.Lock()
         self._chunks_cache_path: Path | None = None
         self._chunks_cache_loaded: bool = False
         self._vectors_cache_path: Path | None = None
@@ -264,12 +321,11 @@ class MarkdownIndexer:
         path (case-insensitive on Windows, symlinks resolved). Either way the key
         is stable across agents and sessions, so a cache built by one agent is
         found by another.
+
+        v0.9.0 C91：实现统一到 `doc_store.vault_cache_key` —— 派生缓存与文档库
+        必须是同一个身份，否则同一个库会分裂出第二份 store 绑定（§12.2）。
         """
-        if self.config.cache.id:
-            return hashlib.sha256(self.config.cache.id.encode("utf-8")).hexdigest()[:16]
-        raw = os.fspath(self.vault_path.resolve())
-        normalized = os.path.normcase(os.path.realpath(raw))
-        return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+        return vault_cache_key(self.config, self.vault_path)
 
     def _init_cache_paths(self, *, load_vectors: bool = True) -> None:
         root = self._cache_root()
@@ -284,7 +340,14 @@ class MarkdownIndexer:
         key = self._cache_key()
         self._chunks_cache_path = chunks_dir / f"vault_{key}.chunks.bin"
         model_hash = hashlib.sha256(self.config.embedding.model.encode("utf-8")).hexdigest()[:8]
-        self._vectors_cache_path = vectors_dir / f"vault_{key}.{model_hash}.{self.config.embedding.dimension}.vec.bin"
+        stem = f"vault_{key}.{model_hash}.{self.config.embedding.dimension}"
+        space = self._embedding_profile.fingerprint
+        legacy_bin = vectors_dir / f"{stem}.vec.bin"
+        self._vectors_cache_path = vectors_dir / f"{stem}.{space}.vec.bin"
+        # Reuse a proven compatible pre-R2 path, never overwrite an incompatible space.
+        legacy = _VectorsCodec.load(legacy_bin) if legacy_bin.exists() else None
+        if legacy and legacy[0] == self._vectors_meta():
+            self._vectors_cache_path = legacy_bin
         self._fts_cache_path = fts_dir / f"vault_{key}.fts.sqlite"
         # sqlite-vec backend keeps its own db (never shares the FTS file).
         # 文件名必须带上 model 与 dimension：vec0 表的维度在建表时就固化了
@@ -292,11 +355,26 @@ class MarkdownIndexer:
         # IF NOT EXISTS 会静默保留旧表，之后所有插入都失败且被 upsert 的
         # except 吞掉 —— 向量库从此语义检索归零且不可自愈。
         self._vectors_db_path = (
-            vectors_dir / f"vault_{key}.{model_hash}.{self.config.embedding.dimension}.vec.sqlite"
+            vectors_dir / f"{stem}.{space}.vec.sqlite"
         )
+        legacy_db = vectors_dir / f"{stem}.vec.sqlite"
+        if legacy_db.exists():
+            try:
+                with sqlite3.connect(legacy_db.resolve().as_uri() + "?mode=ro", uri=True) as conn:
+                    row = conn.execute("SELECT value FROM vector_space_meta WHERE key='fingerprint'").fetchone()
+                if row and row[0] == space:
+                    self._vectors_db_path = legacy_db
+            except sqlite3.Error:
+                pass  # Unknown/mismatched old stores stay untouched.
         # 失败名单：与 chunks/vectors/fts 平级的纯可观测性文件，进程重启后
         # 让 kb_stats 仍能报出上一轮的失败原因。
         self._failed_cache_path = base / f"vault_{key}.failed.json"
+        # 文档库布局（C91）：只解析路径与真实归属，不建目录。归属冲突/路径非法
+        # 不阻断物理文本路径，只让虚拟存储保持不可写（打开 store 时报明确错误）。
+        try:
+            self._storage_layout = resolve_storage_layout(self.config, self.vault_path)
+        except DocStoreError:
+            self._storage_layout = None
         self._load_chunks_cache()
         self._load_failed_files()
         # With the disk-backed sqlite_vec backend, vectors are not loaded into
@@ -306,6 +384,18 @@ class MarkdownIndexer:
             self._load_vectors_cache()
         self._sweep_stale_cache()
 
+    def _protected_cache_subtree(self) -> Path | None:
+        """缓存根下**不得**被 TTL/清理触碰的子树：文档库与 control 所在目录。
+
+        §12.6「TTL 仅明确白名单派生文件，不递归删所有 sqlite」：文档库是解析事实
+        （可能等于已付费的解析全文与媒体），按 TTL 删掉它等于丢资产。
+        """
+        try:
+            layout = self._storage_layout or resolve_storage_layout(self.config, self.vault_path)
+        except DocStoreError:
+            return None
+        return layout.doc_store_dir
+
     def _sweep_stale_cache(self) -> None:
         """Delete cache files older than cache.max_age_days (0 disables)."""
         max_age = self.config.cache.max_age_days
@@ -313,8 +403,11 @@ class MarkdownIndexer:
             return
         cutoff = time.time() - max_age * 86400
         root = self._cache_root()
+        protected = self._protected_cache_subtree()
         for pattern in ("*.bin", "*.sqlite"):
             for cache_file in root.rglob(pattern):
+                if protected is not None and is_within(cache_file, protected):
+                    continue
                 try:
                     if cache_file.stat().st_mtime < cutoff:
                         cache_file.unlink()
@@ -327,26 +420,180 @@ class MarkdownIndexer:
             return Path(self.vault_path).expanduser() / self.config.cache.subdir
         return Path(self.config.cache.dir).expanduser()
 
+    # --------------------------------------------------------- 文档库（C91/C92）
+
+    def document_store(self, *, write: bool = False) -> DocumentStore:
+        """本库的版本化文档库（解析事实）——C92 接缝，连接惰性建立。
+
+        只负责解析布局与打开连接；摄取、对账与发布由 Lane B 起的 worker 调用。
+        读路径不得因为一次查询就建库：`write=False` 走只读语义，库不存在时由
+        store 报出明确错误，这里不 mkdir。归属冲突（home 根落库内等）或
+        `cache.enabled=false` 时由 store 抛 `VirtualStorageDisabled`。
+        """
+        with self._doc_store_lock:
+            store = self._doc_store
+            if store is None:
+                layout = self._storage_layout or resolve_storage_layout(self.config, self.vault_path)
+                self._storage_layout = layout
+                store = DocumentStore(layout, self.config)
+                self._doc_store = store
+                store.open(write=write)
+                self._doc_store_write_opened = write
+            elif write and not self._doc_store_write_opened:
+                # 先被只读路径打开过：补齐写门禁与 generation 解析（open 幂等）。
+                store.open(write=True)
+                self._doc_store_write_opened = True
+            return store
+
+    def _existing_document_store(self) -> DocumentStore | None:
+        with self._doc_store_lock:
+            if self._doc_store is not None:
+                return self._doc_store
+            layout = self._storage_layout or resolve_storage_layout(self.config, self.vault_path)
+            if not layout.control_path.exists():
+                return None
+        return self.document_store()
+
+    def close_document_store(self) -> None:
+        """释放本库文档库连接（幂等）。退出/探测路径必须调用，别留句柄。"""
+        with self._doc_store_lock:
+            store = self._doc_store
+            self._doc_store = None
+            self._doc_store_write_opened = False
+        if store is not None:
+            try:
+                store.close()
+            except Exception:
+                pass
+        with self._paid_lock:
+            control = self._paid_control
+            self._paid_control = None
+        if control is not None:
+            try:
+                control.close()
+            except Exception:
+                pass
+
+    # -------------------------------------------------- 付费请求闸门（C100）
+
+    def _paid_control_store(self) -> ControlStore | None:
+        """惰性打开本机控制库；`[cache] enabled=false` 或控制库不可读时返回 None。"""
+        if not getattr(self.config.cache, "enabled", False):
+            return None
+        with self._paid_lock:
+            if self._paid_control is not None:
+                return self._paid_control
+            try:
+                layout = self._storage_layout or resolve_storage_layout(self.config, self.vault_path)
+                self._storage_layout = layout
+                control = open_paid_control(layout)
+            except Exception:
+                return None
+            self._paid_control = control
+            return control
+
+    def _reranker_profile_fingerprint(self) -> str:
+        config = self.config.reranker
+        material = "|".join(("rerank", str(getattr(config, "adapter", "openai")),
+                             str(getattr(config, "model", "")),
+                             normalize_endpoint(str(getattr(config, "endpoint", "") or ""))))
+        return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+    def _paid_guard_for(self, fingerprint: str, kind: str):
+        def guard(profile_fingerprint: str) -> bool:
+            if profile_fingerprint != fingerprint:
+                # 装配身份不一致仍拒绝，不能把旧空间用于新配置。
+                return False
+            control = self._paid_control_store()
+            if control is None:
+                return False
+            return paid_request_guard(control, profile_fingerprint)
+        return guard
+
+    def has_unresolved_paid_intents(self, control: ControlStore, kind: str,
+                                    profile_fingerprint: str = "") -> bool:
+        """是否还有结果未知（`prepared` / `submission_unknown`）的付费意图。
+
+        这是**整个 profile 级**的暂停判据，不是按载荷拦：外部嵌入按 `batch_size`
+        切片，某批结果未知时同一文件的前导批已发过并计费，而调用方「全有或全无」——
+        只拦失败批会让每轮 sync 都重发前导批却永远完不成（实测每次重计费 1 批）。
+        读不到控制库时返回 True（不能证明安全 → fail closed）。
+        """
+        try:
+            items = control.list_request_intents()
+        except Exception:
+            return True
+        return any(item["kind"] == kind and item["state"] in UNRESOLVED_INTENT_STATES
+                   and (not profile_fingerprint
+                        or item["profile_fingerprint"] == str(profile_fingerprint))
+                   for item in items)
+
+    def unresolved_paid_intents(self) -> list[dict[str, Any]]:
+        """本库当前所有未决付费意图（供 `kb_stats` 观测，不触发任何网络动作）。"""
+        control = self._paid_control_store()
+        if control is None:
+            return []
+        try:
+            items = control.list_request_intents()
+        except Exception:
+            return []
+        return [item for item in items if item["state"] in UNRESOLVED_INTENT_STATES]
+
+    def configure_paid_provider(self, kind: str, provider: Any, profile_fingerprint: str) -> bool:
+        """把持久 journal + 闸门装配到任何 `configure_paid_requests` provider 上。
+
+        媒体等新 provider 必须经此装配（§20.7B 覆盖 media）：
+        返回 False 表示该 provider 不支持付费装配，调用方必须自行拒绝外部请求。
+        """
+        configure = getattr(provider, "configure_paid_requests", None)
+        if not callable(configure):
+            return False
+        configure(PaidRequestJournal(self._paid_control_store, kind),
+                  self._paid_guard_for(profile_fingerprint, kind), profile_fingerprint)
+        return True
+
+    def _configure_paid_providers(self) -> None:
+        self.configure_paid_provider("embed", self.embedding_provider,
+                                     self._embedding_profile.fingerprint)
+        self.configure_paid_provider("rerank", self.reranker_provider,
+                                     self._reranker_profile_fingerprint())
+        # E07：原生媒体 provider 走同一持久 journal/闸门（§20.7B 覆盖 media）。
+        if self.media_provider is not None:
+            self.configure_paid_provider("media", self.media_provider,
+                                         self.media_provider.profile.fingerprint)
+
+    def may_use_paid_profile(self, profile_fingerprint: str, *, kind: str = "embed") -> bool:
+        """统一闸门（§20.7B）：embed_missing / query / fanout / rerank / 媒体 / 转录
+        在发起任何外部请求前都必须先问它；返回 False 时外部请求数必须为 0。"""
+        return bool(self._paid_guard_for(profile_fingerprint, kind)(profile_fingerprint))
+
+    def reembedding_approval_summary(self) -> dict[str, Any] | None:
+        """旧 public 入口保留；R2 不再派生新的费用审批需求。"""
+        return None
+
     # ------------------------------------------------------------------ cache
 
     def _chunks_meta(self) -> dict[str, Any]:
-        # chunker 是文本层的手工失效开关：chunk 元数据每多一个字段就 +1，
-        # 让老缓存重建一次。这里刻意不碰向量层——向量按 chunk.id（sha1 of
-        # source+index+content）匹配，content 不变则 id 不变，所以 bump 之后
-        # 老向量全部命中，不会触发任何重新 embedding（前提是这批向量要能活到
-        # 重建之后，见 _load_vectors_cache 的 _pending_vectors 兜底）。
-        # 元数据每多一个字段就 +1。v0.8.0 F5a 增加 aliases 属性，文本层重建、向量按 id 复用、0 次重新 embedding。
+        profile = self._chunking_config
         return {
             "key": self._cache_key(),
-            "chunk_size": self.config.chunk_size,
-            "chunk_overlap": self.config.chunk_overlap,
+            "chunk_size": profile.legacy_chunk_size,
+            "chunk_overlap": profile.legacy_chunk_overlap,
             # 图片注入会改写 chunk.content（继而改写 chunk.id），必须参与失效
             # 判据。此前漏了它：缓存失效只看文件字节 sha256，翻转这个开关后
             # 文件字节没变 → 存量库既不重切块也不重嵌，CHANGELOG 承诺的
             # 「开启会全量重嵌」实际完全没生效。
             "inject_image_captions": bool(self.config.inject_image_captions),
             "table_guard": True,
-            "chunker": 6,
+            "chunker": 7,
+            "chunking_mode": profile.mode,
+            "target_tokens": profile.target_tokens,
+            "overlap_tokens": profile.overlap_tokens,
+            "hard_limit_tokens": profile.hard_limit_tokens,
+            "estimator_profile": profile.estimator_profile,
+            "structure_guard_version": ("structure-estimated-v2" if profile.mode == "estimated_tokens"
+                                        else "structure-v1"),
+            "proxy_version": "media-proxy-v1",
         }
 
     def _vectors_meta(self) -> dict[str, Any]:
@@ -362,6 +609,7 @@ class MarkdownIndexer:
             # min(len) 截断再算余弦 —— 出来的是毫无意义的相似度。
             "endpoint": self.config.embedding.endpoint,
             "send_dimensions": bool(self.config.embedding.send_dimensions),
+            "space_fingerprint": self._embedding_profile.fingerprint,
         }
 
     def _load_chunks_cache(self) -> None:
@@ -376,6 +624,21 @@ class MarkdownIndexer:
         if not loaded:
             return
         meta, files = loaded
+        if (not self._chunking_config.mode_explicit and not self._chunking_config.legacy_explicit
+                and self.config.chunking.mode != "legacy_chars"):
+            mode = meta.get("chunking_mode", "legacy_chars")
+            if mode in {"legacy_chars", "estimated_tokens"}:
+                values = {"mode": mode}
+                for name in ("target_tokens", "overlap_tokens", "hard_limit_tokens", "estimator_profile"):
+                    if name in meta:
+                        values[name] = meta[name]
+                for cached, effective in (("chunk_size", "legacy_chunk_size"),
+                                          ("chunk_overlap", "legacy_chunk_overlap")):
+                    value = meta.get(cached)
+                    if isinstance(value, int) and not isinstance(value, bool) and value >= (1 if cached == "chunk_size" else 0):
+                        values[effective] = value
+                self._chunking_config = replace(self._chunking_config, **values)
+                self._chunking_compatibility_notice = "Existing library chunking profile retained; explicit mode required to migrate."
         if meta != self._chunks_meta():
             return
         self._chunks_cache_loaded = True
@@ -414,8 +677,8 @@ class MarkdownIndexer:
     def _attach_pending_vectors(self) -> None:
         """把初始化时无处可挂的向量按 chunk.id 补挂到重建出来的 chunk 上。
 
-        命中与否只看 chunk.id，与文本层是否重建无关：内容没变的 chunk id 一定
-        不变，向量也就一定是有效的。
+        文本以稳定 chunk.id 复用；native ID 还含媒体 profile。
+        新一轮已经生成的向量优先，旧缓存不得覆盖它。
         """
         if not self._pending_vectors:
             return
@@ -424,7 +687,7 @@ class MarkdownIndexer:
         for chunks in self._chunks.values():
             for chunk in chunks:
                 vector = pending.get(chunk.id)
-                if vector is not None:
+                if vector is not None and chunk.embedding is None:
                     chunk.embedding = vector
 
     def _load_failed_files(self) -> None:
@@ -450,7 +713,7 @@ class MarkdownIndexer:
         """Persist the failure map so kb_stats stays informative across restarts.
 
         名单为空时直接删文件，不留空壳。缓存 IO 是尽力而为：这里失败绝不能
-        拖垮 sync，所以所有异常都吞掉。
+        拖垮 sync；IO 失败保留可定位诊断，不把内存可用冒充持久化成功。
         """
         if self._failed_cache_path is None:
             return
@@ -458,13 +721,16 @@ class MarkdownIndexer:
             if not self.failed_files:
                 if self._failed_cache_path.exists():
                     self._failed_cache_path.unlink()
+                self._clear_persistence_error("failed_files")
                 return
             payload = json.dumps({"version": 1, "files": dict(self.failed_files)}, ensure_ascii=False)
             tmp = self._failed_cache_path.with_suffix(self._failed_cache_path.suffix + ".tmp")
             tmp.write_text(payload, encoding="utf-8")
             tmp.replace(self._failed_cache_path)
-        except OSError:
-            pass
+        except OSError as exc:
+            self._record_persistence_error("failed_files", self._failed_cache_path, exc)
+        else:
+            self._clear_persistence_error("failed_files")
 
     def _save_cache(self) -> None:
         """Persist both layers under a single lock; failures degrade gracefully."""
@@ -472,6 +738,22 @@ class MarkdownIndexer:
             self._save_chunks_cache()
             self._save_vectors_cache()
             self._save_failed_files()
+            self.persistence_status["state"] = (
+                "failed" if self.persistence_status["errors"] else
+                "ready" if self._chunks_cache_path is not None else "disabled"
+            )
+
+    def _record_persistence_error(self, layer: str, path: Path, exc: Exception) -> None:
+        self.persistence_status["errors"][layer] = {
+            "path": str(path), "errno": getattr(exc, "errno", None), "error": type(exc).__name__,
+            "detail": str(exc)[:160],
+        }
+        self.persistence_status["state"] = "failed"
+
+    def _clear_persistence_error(self, layer: str) -> None:
+        self.persistence_status["errors"].pop(layer, None)
+        if not self.persistence_status["errors"]:
+            self.persistence_status["state"] = "ready" if self._chunks_cache_path is not None else "disabled"
 
     def _save_chunks_cache(self) -> None:
         if self._chunks_cache_path is None:
@@ -492,8 +774,10 @@ class MarkdownIndexer:
                 # （或全部豁免）后，旧 chunks.bin 原封不动留在磁盘上，
                 # 下次启动会把已删除的笔记重新载回索引。
                 self._chunks_cache_path.unlink()
-        except OSError:
-            pass
+        except OSError as exc:
+            self._record_persistence_error("chunks", self._chunks_cache_path, exc)
+        else:
+            self._clear_persistence_error("chunks")
 
     @staticmethod
     def _strip_embedding(chunk: Chunk) -> Chunk:
@@ -518,8 +802,10 @@ class MarkdownIndexer:
                 # 同上：全库删空后旧 .bin 必须一起清掉，否则重启会把陈旧
                 # 向量重新挂回来（向量 meta 还可能与新配置不符）。
                 self._vectors_cache_path.unlink()
-        except OSError:
-            pass
+        except OSError as exc:
+            self._record_persistence_error("vectors", self._vectors_cache_path, exc)
+        else:
+            self._clear_persistence_error("vectors")
 
     # ------------------------------------------------------------------ sync
 
@@ -709,6 +995,12 @@ class MarkdownIndexer:
         return False
 
     def _sync_locked(self) -> list[Chunk]:
+        # 「索引在飞」必须在这里置位：这是所有真同步的共同内层。修复前只有监听线程
+        # 的包装（_run_sync_quietly）会置 _indexing，于是经 try_sync_with_guard 进入
+        # 的同步对 kb_search / kb_stats 完全不可见——客户端会把同步期间返回的部分
+        # 结果当成终态，C66 读优先契约出现静默漏洞。保存/恢复旧值以支持嵌套调用。
+        previous_indexing = self._indexing
+        self._indexing = True
         self._sync_state = "scanning"
         self._sync_progress = {
             "phase": "scanning",
@@ -722,6 +1014,7 @@ class MarkdownIndexer:
         finally:
             self._sync_state = "idle"
             self._sync_progress["phase"] = "idle"
+            self._indexing = previous_indexing
 
     def _sync_locked_impl(self) -> list[Chunk]:
         return _sync_engine.run_sync(self)
@@ -766,6 +1059,9 @@ class MarkdownIndexer:
 
     def _chunk_has_vector(self, chunk: Chunk) -> bool:
         return _sync_engine.chunk_has_vector(self, chunk)
+
+    def _stamp_embedding_keys(self) -> None:
+        return _sync_engine._stamp_embedding_keys(self)
 
     def _reuse_vectors_by_content_hash(self) -> int:
         return _sync_engine.reuse_vectors_by_content_hash(self)
@@ -812,13 +1108,19 @@ class MarkdownIndexer:
 
     def _source(self, path: Path) -> str:
         return _scanning.source_rel(self.vault_path, path)
-    def _chunk_file(self, source: str, text: str, mtime: float | None = None) -> list[Chunk]:
+    def _chunk_file(self, source: str, text: str, mtime: float | None = None,
+                    virtual_identity: dict[str, str] | None = None) -> list[Chunk]:
+        # 必须传**捕获的**切块配置（`_chunking_config`，可能来自旧库 meta 保留），
+        # 而不是现场读 self.config.chunking：否则旧库的 mode/参数在一次
+        # `[chunking] mode` 未被显式声明时被本机默认值覆盖，等于静默换算法。
         return _chunking.chunk_file(
             source,
             text,
             self.config,
             mtime=mtime,
             inject_image_notes_fn=_inject_image_notes,
+            chunking_config=self._chunking_config,
+            virtual_identity=virtual_identity,
         )
 
     @staticmethod
@@ -891,6 +1193,55 @@ class MarkdownIndexer:
             source_pdf=source_pdf,
         )
 
+    def _derived_profile_key(self) -> str:
+        # §20.7A：派生映射必须按「捕获的 space + chunker profile」分代，不能只按
+        # model/dimension —— 同一模型换切块代际（384/64/hard768 vs 旧字符参数）
+        # 会产出完全不同的 chunk 邻接，混在一个 derived generation 里就是错的映射。
+        return (f"{self._cache_key()}:{self._embedding_profile.fingerprint}:"
+                f"{self._chunker_fingerprint()}")
+
+    def _chunker_fingerprint(self) -> str:
+        """实际驱动切块的 profile 指纹（含 legacy 字符参数），不是 cache 代际标记 `chunker: 7`。"""
+        from ._indexer.token_chunking import chunker_fingerprint
+        return chunker_fingerprint(self._chunking_config)
+
+    def resolve_virtual_source(self, source: str, *, revision_id: str = "") -> dict[str, Any]:
+        """发布前核验库归属/当前 revision/物理源 SHA；返回地址事实（含 markdown）。"""
+        return _reading.resolve_virtual_source(self, source, revision_id=revision_id)
+
+    def _ingest_mirror_prefix(self) -> str:
+        """旧镜像目录前缀（库内相对 posix，带尾斜杠），用于**逐条来源精确排除**。
+
+        只排除「已由文档库承载同一 source」的具体镜像路径；绝不整目录忽略
+        `.mortis-parsed/`——未迁移镜像与用户自建内容必须继续可见（§20.1）。
+        """
+        name = str(getattr(self.config.ingest, "output_dirname", ".mortis-parsed") or "").strip("/\\ ")
+        if not name or any(part in ("", ".", "..") for part in name.split("/")):
+            name = ".mortis-parsed"
+        return name + "/"
+
+    def _vector_route_allowed(self) -> bool:
+        try:
+            store = self._existing_document_store()
+            generation = store.get_derived_generation(self._derived_profile_key()) if store else None
+        except Exception:
+            return False
+        return generation is None or generation.status not in {"stale", "failed"}
+
+    def _filter_visible_chunks(self, chunks: list[Chunk]) -> list[Chunk]:
+        try:
+            store = self._existing_document_store()
+            documents = {doc.source: doc for doc in store.list_documents()} if store else {}
+        except Exception:
+            documents = {}
+            chunks = [chunk for chunk in chunks if not chunk.metadata.get("revision_id")]
+        matcher = self._ignore_matcher()
+        return [chunk for chunk in chunks
+                if not matcher.is_ignored(chunk.source)[0]
+                and (chunk.source not in documents or documents[chunk.source].visibility == "active")
+                and (not chunk.metadata.get("revision_id") or chunk.source in documents
+                     and documents[chunk.source].active_revision == chunk.metadata["revision_id"])]
+
     def all_chunks(self) -> list[Chunk]:
         """全部 chunk 的快照。
 
@@ -903,11 +1254,11 @@ class MarkdownIndexer:
         """
         for attempt in range(4):
             try:
-                return [
+                return self._filter_visible_chunks([
                     chunk
                     for source in sorted(self._chunks)
                     for chunk in self._chunks.get(source, [])
-                ]
+                ])
             except RuntimeError:
                 if attempt == 3:
                     raise
@@ -924,6 +1275,7 @@ class MarkdownIndexer:
         dedupe: bool = True,
         *,
         exact_terms: list[str] | None = None,
+        skip_semantic: bool = False,
     ) -> list[Chunk]:
         return _search.search_single_vault(
             self,
@@ -934,6 +1286,7 @@ class MarkdownIndexer:
             filters=filters,
             dedupe=dedupe,
             exact_terms=exact_terms,
+            skip_semantic=skip_semantic,
         )
 
     @staticmethod
@@ -990,7 +1343,39 @@ class MarkdownIndexer:
         max_chars: int | None = None,
         expected_sha256: str | None = None,
         chunk_id_hint: str | None = None,
+        allow_stale: bool = False,
+        expected_revision_id: str | None = None,
+        expected_render_sha256: str | None = None,
+        media_refs_offset: int = 0,
     ) -> _reading.ReadResult:
+        if type(allow_stale) is not bool:
+            raise ValueError("allow_stale must be a boolean")
+        if type(media_refs_offset) is not int or media_refs_offset < 0:
+            raise ValueError("media_refs_offset must be an integer >= 0")
+        virtual = bool(expected_revision_id) or Path(source).suffix.lower() not in self._READABLE_SUFFIXES
+        if not virtual:
+            store = self._existing_document_store()
+            active = store.get_active(source, include_hidden=True) if store is not None else None
+            if store is not None and active is None:
+                key = _scanning.source_compare_key(source)
+                matches = [doc.source for doc in store.list_documents() if doc.active_revision
+                           and _scanning.source_compare_key(doc.source) == key]
+                if len(matches) > 1:
+                    raise ValueError("multiple virtual sources refer to the same filesystem path")
+                if matches:
+                    active = store.get_active(matches[0], include_hidden=True)
+                    if active is not None:
+                        source = matches[0]
+            virtual = active is not None
+        if virtual:
+            return _reading.read_virtual_result(
+                self, source, start_line, end_line, heading=heading,
+                start_char=start_char, max_chars=max_chars, allow_stale=allow_stale,
+                expected_revision_id=expected_revision_id,
+                expected_sha256=expected_sha256,
+                expected_render_sha256=expected_render_sha256,
+                chunk_id_hint=chunk_id_hint,
+            )
         path = self._safe_path(source)
         return _reading.read_file_result(
             path,
@@ -1005,7 +1390,19 @@ class MarkdownIndexer:
         )
 
     def list_files(self) -> list[dict[str, Any]]:
-        return [{"source": source, "title": chunks[0].title if chunks else Path(source).stem, "chunks": len(chunks)} for source, chunks in sorted(self._chunks.items())]
+        visible = {chunk.source for chunk in self.all_chunks()}
+        try:
+            store = self._existing_document_store()
+            hidden = {doc.source for doc in store.list_documents()
+                      if doc.visibility != "active"} if store else set()
+        except Exception:
+            hidden = {source for source, chunks in self._chunks.items()
+                      if any(chunk.metadata.get("revision_id") for chunk in chunks)}
+        matcher = self._ignore_matcher()
+        return [{"source": source, "title": chunks[0].title if chunks else Path(source).stem,
+                 "chunks": len(chunks)} for source, chunks in sorted(self._chunks.items())
+                if source in visible or not chunks and source not in hidden
+                and not matcher.is_ignored(source)[0]]
 
     def stats(self) -> dict[str, Any]:
         exempt_count = 0
@@ -1049,7 +1446,7 @@ class MarkdownIndexer:
                             exempt_count += 1
                         continue
                     if suffix in _INDEXABLE_TEXT_EXTS:
-                        if suffix == ".md":
+                        if suffix in {".md", ".markdown"}:
                             try:
                                 raw = path.read_bytes()
                                 lines = raw.decode("utf-8-sig", errors="ignore").splitlines()
@@ -1119,6 +1516,10 @@ class MarkdownIndexer:
 
         Returns True when both cache files are gone afterwards. Safe to call
         when caching is disabled (returns False, nothing to purge).
+
+        v0.9.0（C92）：这里只删**派生**文件。文档库（doc_store/）是解析事实，
+        普通清理与 kb_rebuild 一律不碰它——清除解析资产需要独立的
+        `purge_documents` 显式授权并提示重新解析费用（§20.3）。
         """
         removed = True
         with self._cache_lock:
@@ -1159,7 +1560,11 @@ class MarkdownIndexer:
         return removed
 
     def rebuild(self) -> list[Chunk]:
-        """Drop both cache layers and the in-memory index, then rebuild from scratch."""
+        """Drop both cache layers and the in-memory index, then rebuild from scratch.
+
+        v0.9.0（C92）：重建的是**派生**层。文档库（doc_store/）与账本保留，
+        因此重建不会重新调用 MinerU 计费解析（§12.6「rebuild 只重建派生」）。
+        """
         with self._cache_lock:
             for cache_file in (
                 self._chunks_cache_path,
@@ -1218,8 +1623,13 @@ class MarkdownIndexer:
     def _export_snapshot_locked(self, out_path: str | Path) -> dict[str, Any]:
         return _snapshot._export_snapshot_locked(self, out_path)
 
-    def import_snapshot(self, snapshot: str | Path, force: bool = False) -> dict[str, Any]:
-        return _snapshot.import_snapshot(self, snapshot, force=force)
+    def import_snapshot(self, snapshot: str | Path, force: bool = False,
+                        trust_parsed_documents: bool = False, replace: bool = False,
+                        confirm_replace: bool = False) -> dict[str, Any]:
+        return _snapshot.import_snapshot(
+            self, snapshot, force=force, trust_parsed_documents=trust_parsed_documents,
+            replace=replace, confirm_replace=confirm_replace,
+        )
 
     def _import_snapshot_locked(
         self,
@@ -1298,11 +1708,15 @@ class MarkdownIndexer:
     def stop_watching(self) -> None:
         return _watch.stop_watching(self)
 
-    def request_refresh(self, *, immediate: bool = False) -> bool:
-        return _watch.request_refresh(self, immediate=immediate)
+    def request_refresh(self, *, immediate: bool = False, for_read: bool = False) -> bool:
+        return _watch.request_refresh(self, immediate=immediate, for_read=for_read)
 
     def refresh_status(self) -> dict[str, Any]:
         return _watch.refresh_status(self)
+
+    def index_state(self) -> dict[str, Any]:
+        """additive `index_state=empty/rebuilding/unverified/ready` + `next_action`（E04-b）。"""
+        return _watch.index_state(self)
 
     def request_ingest_scan(self) -> bool:
         return _watch.request_ingest_scan(self)

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import hashlib
+
 import pytest
 
 from mortis_rag_mcp.config import AppConfig, CacheConfig, EmbeddingConfig, VectorConfig
-from mortis_rag_mcp.indexer import MarkdownIndexer
+from mortis_rag_mcp.indexer import MarkdownIndexer, _VectorsCodec
 
 pytest.importorskip("sqlite_vec", reason="pip install sqlite-vec to test the disk backend")
 
@@ -25,8 +27,9 @@ class TargetProvider:
             if "目标" in text:
                 out.append(list(TARGET))
             else:
-                h = hash(text) % 97
-                out.append([float((h >> i) & 1) for i in range(self.dimension)])
+                # 不依赖 PYTHONHASHSEED；首维为零与 TARGET 正交，其余维保证非零。
+                digest = hashlib.sha256(text.encode("utf-8")).digest()
+                out.append([0.0] + [float(byte + 1) for byte in digest[:self.dimension - 1]])
         return out
 
 
@@ -57,6 +60,20 @@ def test_disk_backend_keeps_vectors_off_ram(tmp_path):
     assert any("目标" in chunk.content for chunk in results)
 
 
+def test_complete_scan_removes_orphans_after_cache_rebuild(tmp_path):
+    (tmp_path / "a.md").write_text("# A\n目标 current", encoding="utf-8")
+    indexer = MarkdownIndexer(tmp_path, _disk_config(tmp_path), embedding_provider=TargetProvider())
+    try:
+        indexer.sync()
+        current = {c.id for c in indexer.all_chunks()}
+        indexer._vector_backend.upsert_vectors({"orphan-old-chunker": TARGET})
+        indexer._disk_vectors.add("orphan-old-chunker")
+        indexer.sync()
+        assert set(indexer._vector_backend.list_ids()) == current
+    finally:
+        indexer.close_document_store()
+
+
 def test_disk_backend_migrates_from_bin_without_reembed(tmp_path):
     (tmp_path / "a.md").write_text("# A\n目标 内容", encoding="utf-8")
     (tmp_path / "b.md").write_text("# B\n其他内容", encoding="utf-8")
@@ -67,14 +84,30 @@ def test_disk_backend_migrates_from_bin_without_reembed(tmp_path):
         cache=CacheConfig(dir=str(tmp_path / "cache"), enabled=True),
     )
     provider1 = TargetProvider()
-    MarkdownIndexer(tmp_path, mem_config, embedding_provider=provider1).sync()
+    first = MarkdownIndexer(tmp_path, mem_config, embedding_provider=provider1)
+    first.sync()
     assert provider1.calls > 0
+    assert first.failed_files == {}
+    cached = _VectorsCodec.load(first._vectors_cache_path)
+    assert cached is not None
+    vectors = cached[1]
+    assert set(vectors) == {chunk.id for chunk in first.all_chunks()}
+    assert all(len(vector) == TargetProvider.dimension
+               and sum(value * value for value in vector) > 0 for vector in vectors.values())
+    first.close_document_store()
 
     # Switch to the disk backend: migration must reuse .bin, zero re-embeds.
     provider2 = TargetProvider()
     indexer = MarkdownIndexer(tmp_path, _disk_config(tmp_path), embedding_provider=provider2)
     indexer.sync()
     assert provider2.calls == 0
+    assert indexer.failed_files == {}
+    chunk_ids = {chunk.id for chunk in indexer.all_chunks()}
+    assert set(indexer._vector_backend.list_ids()) == chunk_ids
+    disk_vectors = indexer._vector_backend.get_vectors(chunk_ids)
+    assert set(disk_vectors) == chunk_ids
+    assert all(len(vector) == TargetProvider.dimension
+               and sum(value * value for value in vector) > 0 for vector in disk_vectors.values())
     assert indexer._vector_backend.count() == len(indexer.all_chunks())
     assert indexer.search("目标", top_k=5, use_rerank=False)
 

@@ -47,14 +47,43 @@ def test_doctor_record_test_run_does_not_forge_valid_when_empty(tmp_path, monkey
     assert "tests" in data["sections"]
 
 
-def test_probe_reranker_api_contract():
+def test_probe_reranker_api_contract(monkeypatch):
     mock_cfg = MagicMock()
     mock_cfg.reranker.enabled = True
     mock_provider = MagicMock()
+    # 本用例只验证 provider 调用契约；付费闸门装配由 C100 的专项用例覆盖
+    # （tests/test_paid_request_journal.py），这里显式放行。
+    monkeypatch.setattr(doctor, "_configure_probe_paid", lambda *a, **k: True)
     with patch("mortis_rag_mcp.providers.create_reranker_provider", return_value=mock_provider):
         res = doctor.probe_reranker(mock_cfg)
         assert res["ok"] is True
         mock_provider.rerank.assert_called_once_with("ping", ["doc"])
+
+
+def test_probe_paid_requires_durable_journal(monkeypatch, tmp_path):
+    """cache 关闭时不得静默发出付费探活请求（§20.7B 独立授权动作）。"""
+    from mortis_rag_mcp.config import AppConfig
+    cfg = AppConfig()
+    cfg.cache.enabled = False
+    cfg.embedding.mode = "external"
+    cfg.embedding.endpoint = "https://example.invalid/v1/embeddings"
+    cfg.embedding.model = "bge-m3"
+    cfg.embedding.dimension = 1024
+    called: list[int] = []
+
+    class _Provider:
+        def configure_paid_requests(self, journal, guard, fingerprint):
+            raise AssertionError("闸门未就绪时不得装配付费 provider")
+
+        def embed(self, texts):
+            called.append(1)
+            raise AssertionError("不得发出请求")
+
+    monkeypatch.setattr("mortis_rag_mcp.providers.create_embedding_provider", lambda emb: _Provider())
+    res = doctor.probe_embedding(cfg)
+    assert res["ok"] is False
+    assert "cache" in res["detail"]
+    assert called == []
 
 
 def test_doctor_run_quiet_and_write(tmp_path, monkeypatch):
@@ -117,12 +146,14 @@ def test_doctor_check_config_local_endpoint_hosts():
             assert "免密/本地" in res["detail"]
 
 
-def test_probe_embedding_dimension_mismatch():
+def test_probe_embedding_dimension_mismatch(monkeypatch):
     mock_cfg = MagicMock()
     mock_cfg.embedding.mode = "external"
     mock_cfg.embedding.dimension = 1024
     mock_provider = MagicMock()
     mock_provider.embed.return_value = [[0.1] * 1536]
+    # 同上：本用例验证维度核对，付费闸门装配单独覆盖。
+    monkeypatch.setattr(doctor, "_configure_probe_paid", lambda *a, **k: True)
     with patch("mortis_rag_mcp.providers.create_embedding_provider", return_value=mock_provider):
         res = doctor.probe_embedding(mock_cfg)
         assert res["ok"] is False
@@ -474,6 +505,34 @@ def test_doctor_check_config_reports_full_path_and_flags_shadowed_old_config(tmp
     assert str(new_dir / "config.toml") in res["detail"], "必须输出解析到的完整路径"
     assert f"`{new_dir / 'config.toml'}`" in res["detail"], "自由文本需反引号包裹"
     assert "已被忽略" in res["detail"] and "vault_mcp/config.toml" in res["detail"]
+
+
+def test_doctor_check_config_keeps_full_path_when_home_root_is_deep(tmp_path, monkeypatch):
+    """家目录很深时也必须输出**完整**路径：路径的判别信息在尾部。
+
+    按自由文本 160 字符上限截断会把正好需要区分的那一段（`.mortis_rag_mcp` 还是
+    `.vault_mcp`）丢掉，而 CI/容器/挂载到深层的项目目录实测会超过这个长度。这里
+    构造一条确定超过 160 字符的家目录，pin「路径不受自由文本上限影响」。
+    """
+    deep = tmp_path
+    for segment in ("deep-home-segment-one", "deep-home-segment-two", "deep-home-segment-three"):
+        deep = deep / segment
+    (deep / ".mortis_rag_mcp").mkdir(parents=True)
+    (deep / ".mortis_rag_mcp" / "config.toml").write_text('[embedding]\nmode = "static"\n', encoding="utf-8")
+
+    _stub_home(deep, monkeypatch)
+    mock_cfg = MagicMock()
+    mock_cfg.embedding.mode = "static"
+    mock_cfg.embedding.model = ""
+    mock_cfg.embedding.endpoint = ""
+    mock_cfg.embedding.api_key = ""
+    mock_cfg.reranker.enabled = False
+    with patch("mortis_rag_mcp.config.load_config", return_value=mock_cfg):
+        res, _ = doctor.check_config(None)
+
+    target = str(deep / ".mortis_rag_mcp" / "config.toml")
+    assert len(target) > doctor._FREE_TEXT_LIMIT, f"用例前提：路径必须超过自由文本上限（实际 {len(target)}）"
+    assert f"`{target}`" in res["detail"], "深路径也必须原样给出完整值"
 
 
 def test_doctor_check_config_omits_shadow_notice_when_only_one_side_exists(tmp_path, monkeypatch):

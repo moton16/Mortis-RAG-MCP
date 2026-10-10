@@ -137,7 +137,7 @@ def test_txt_indexing_and_chapter_headings(tmp_path, stdio_polling):
             assert "这里有句号" not in guard_heading
 
 
-def test_txt_equal_length_incremental_update(tmp_path):
+def test_txt_equal_length_incremental_update(tmp_path, stdio_polling):
     vault = tmp_path / "txt_vault"
     vault.mkdir()
     txt_file = vault / "data.txt"
@@ -151,8 +151,12 @@ def test_txt_equal_length_incremental_update(tmp_path):
         {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "kb_init", "arguments": {"path": str(vault), "name": "TxtVault"}}},
         {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "kb_search", "arguments": {"query": "AAAA", "vault_path": "TxtVault"}}},
     ]
-    resp1 = _run_stdio(config, requests1)
-    r3 = json.loads(resp1[2]["result"]["content"][0]["text"])
+    registry = str(tmp_path / "vaults.toml")
+    env = {"MORTIS_RAG_REGISTRY": registry, "VAULT_MCP_REGISTRY": registry}
+    first = stdio_polling(config, prefix_requests=requests1[:2],
+                          poll_request=requests1[2], is_settled=_is_search_settled,
+                          env_overrides=env)
+    r3 = first["observed"][-1]
     assert len(r3["chunks"]) > 0
 
     # 等长替换: "AAAA BBBB CCCC" -> "ZZZZ BBBB CCCC" (14 字符等长)
@@ -163,12 +167,12 @@ def test_txt_equal_length_incremental_update(tmp_path):
         {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
         {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "kb_search", "arguments": {"query": "ZZZZ", "vault_path": "TxtVault"}}},
     ]
-    resp2 = _run_stdio(config, requests2)
-    r_update = json.loads(resp2[1]["result"]["content"][0]["text"])
-    if r_update.get("status") == "indexing" or len(r_update.get("chunks", [])) == 0:
-        time.sleep(0.5)
-        resp2 = _run_stdio(config, requests2)
-        r_update = json.loads(resp2[1]["result"]["content"][0]["text"])
+    updated = stdio_polling(config, prefix_requests=requests2[:1],
+                            poll_request=requests2[1],
+                            is_settled=lambda data: _is_search_settled(data) and
+                            any("ZZZZ" in c["content"] for c in data.get("chunks", [])),
+                            env_overrides=env)
+    r_update = updated["observed"][-1]
     assert len(r_update["chunks"]) > 0
     assert "ZZZZ" in r_update["chunks"][0]["content"]
 

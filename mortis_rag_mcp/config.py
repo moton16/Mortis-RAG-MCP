@@ -3,7 +3,8 @@ from __future__ import annotations
 import math
 import os
 import re
-from dataclasses import dataclass, field
+import sys
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -26,6 +27,16 @@ def resolve_api_key(explicit: str = "") -> str:
     return ""
 
 
+def resolve_media_auth(explicit_media: str = "", explicit_generic: str = "", env_name: str = "") -> str:
+    """Media precedence shared by the TOML loader and programmatic factory.
+
+    Text keeps its historical global fallback; media must compare the raw explicit
+    generic value before choosing the dedicated environment or global fallback.
+    """
+    return (explicit_media or explicit_generic or os.environ.get(env_name, "")
+            or resolve_api_key())
+
+
 @dataclass(slots=True)
 class EmbeddingConfig:
     mode: str = "static"
@@ -45,6 +56,128 @@ class EmbeddingConfig:
     batch_size: int = 32
     # Base seconds for the exponential backoff between retries.
     retry_backoff: float = 1.0
+    capability_profile: str = ""
+    adapter: str = "openai_text"
+    client_slicing: bool = False
+    query_template: str = "{text}"
+    document_template: str = "{text}"
+    model_revision: str = ""
+    endpoint_revision: str = ""
+    preprocess_version: str = "text-v1"
+    # ---- Native media declarations (E07)。全部留空 = 本配置不声明任何原生媒体能力。
+    # 媒体能力只由这些**显式字段**决定：不按 model 名推、不按维度推 alignment。
+    media_modalities: tuple[str, ...] = ()
+    media_alignment_space_id: str = ""
+    media_preprocess_version: str = ""
+    media_endpoint_revision: str = ""
+    media_allowed_mime_types: tuple[str, ...] = ()
+    media_max_input_bytes: int = 0
+    media_max_batch_size: int = 0
+    media_model_reference: str = ""
+    media_endpoint_fixture_reference: str = ""
+    media_alignment_reference: str = ""
+    media_license_reference: str = ""
+    # ---- Media provider connection keys (E16)
+    media_adapter: str = ""
+    media_endpoint: str = ""
+    media_model: str = ""
+    media_dimension: int | None = None
+    media_api_key_env: str = ""
+    media_api_key: str = ""
+
+    def __post_init__(self) -> None:
+        from .embedding_capabilities import validate_media_modalities, validate_text_template
+        validate_text_template(self.query_template)
+        validate_text_template(self.document_template)
+        for name in ("model_revision", "endpoint_revision", "preprocess_version",
+                     "media_alignment_space_id", "media_preprocess_version", "media_endpoint_revision",
+                     "media_model_reference", "media_endpoint_fixture_reference",
+                     "media_alignment_reference", "media_license_reference",
+                     "media_adapter", "media_endpoint", "media_model",
+                     "media_api_key_env", "media_api_key"):
+            if not isinstance(getattr(self, name), str):
+                raise ValueError(f"embedding.{name} must be a string")
+        if self.media_dimension is not None:
+            if isinstance(self.media_dimension, bool) or not isinstance(self.media_dimension, int) or self.media_dimension < 1:
+                raise ValueError("embedding.media_dimension must be an integer >= 1 or None")
+        for name in ("media_modalities", "media_allowed_mime_types"):
+            value = getattr(self, name)
+            if isinstance(value, str) or not isinstance(value, tuple):
+                raise ValueError(f"embedding.{name} must be a tuple of strings")
+            if any(not isinstance(item, str) or not item for item in value):
+                raise ValueError(f"embedding.{name} must contain non-empty strings")
+        if self.media_modalities:
+            validate_media_modalities(("text", *self.media_modalities))
+        for name in ("media_max_input_bytes", "media_max_batch_size"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"embedding.{name} must be a non-negative integer")
+        if not isinstance(self.client_slicing, bool):
+            raise ValueError("embedding.client_slicing must be a boolean")
+        if not isinstance(self.capability_profile, str) or not isinstance(self.adapter, str) or not self.adapter:
+            raise ValueError("embedding profile and adapter must be strings; adapter must not be empty")
+
+
+def _positive_fields(config: Any, prefix: str, names: tuple[str, ...]) -> None:
+    for name in names:
+        value = getattr(config, name)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError(f"{prefix}.{name} must be an integer >= 1")
+
+
+@dataclass(slots=True)
+class ChunkingConfig:
+    mode: str = "estimated_tokens"
+    target_tokens: int = 384
+    overlap_tokens: int = 64
+    hard_limit_tokens: int = 768
+    #: 估算器真实名称。`unicode-estimate-v1` 是当前实现（纯标准库 Unicode 权重估算，
+    #: **未离线校准**）；`calibrated-v1` 只是旧库缓存里遗留的别名，读旧库时原样保留、
+    #: 不触发重嵌，也不据此宣称「已校准」。
+    estimator_profile: str = "unicode-estimate-v1"
+    mode_explicit: bool = False
+    legacy_explicit: bool = False
+    #: 实际驱动 legacy 字符切块的参数（由 Facade 从 config.chunk_size/overlap 注入），
+    #: 只参与切块身份指纹，不进缓存 meta，避免既有库被判失效。
+    legacy_chunk_size: int = 0
+    legacy_chunk_overlap: int = 0
+
+    def __post_init__(self) -> None:
+        if self.mode == "legacy":
+            self.mode = "legacy_chars"
+        if self.mode not in {"legacy_chars", "estimated_tokens"}:
+            raise ValueError("chunking.mode must be legacy_chars or estimated_tokens")
+        _positive_fields(self, "chunking", ("target_tokens", "hard_limit_tokens"))
+        if isinstance(self.overlap_tokens, bool) or not isinstance(self.overlap_tokens, int):
+            raise ValueError("chunking.overlap_tokens must be an integer")
+        if not 0 <= self.overlap_tokens < self.target_tokens <= self.hard_limit_tokens:
+            raise ValueError("chunking requires 0 <= overlap_tokens < target_tokens <= hard_limit_tokens")
+        if self.estimator_profile not in {"unicode-estimate-v1", "calibrated-v1"}:
+            raise ValueError("chunking.estimator_profile must be unicode-estimate-v1")
+        if not isinstance(self.mode_explicit, bool):
+            raise ValueError("chunking.mode_explicit must be a boolean")
+        if not isinstance(self.legacy_explicit, bool):
+            raise ValueError("chunking.legacy_explicit must be a boolean")
+        for name in ("legacy_chunk_size", "legacy_chunk_overlap"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"chunking.{name} must be a non-negative integer")
+
+
+@dataclass(slots=True)
+class MediaConfig:
+    inline_max_bytes: int = 8 * 1024 * 1024
+    refs_limit: int = 20
+    preview_enabled: bool = True
+    preview_max_edge: int = 1600
+    preview_max_bytes: int = 524288
+
+    def __post_init__(self) -> None:
+        _positive_fields(self, "media", ("inline_max_bytes", "refs_limit", "preview_max_edge", "preview_max_bytes"))
+        if self.refs_limit > 100:
+            raise ValueError("media.refs_limit must be in [1, 100]")
+        if not isinstance(self.preview_enabled, bool):
+            raise ValueError("media.preview_enabled must be a boolean")
 
 
 @dataclass(slots=True)
@@ -97,6 +230,49 @@ def resolve_default_cache_dir() -> str:
 DEFAULT_CACHE_DIR = os.path.join(os.path.expanduser("~"), ".mortis_rag_mcp_cache")
 
 
+_WINDOWS_RESERVED_NAMES = (
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{index}" for index in range(1, 10)}
+    | {f"LPT{index}" for index in range(1, 10)}
+)
+
+
+def is_windows_reserved_segment(segment: str) -> bool:
+    """路径段是否为 Windows 设备名（`NUL`、`CON`、`aux.txt`…）。
+
+    Win32 下这些名字不能作为普通文件/目录名：`vault/NUL` 之类会解析到设备而不是
+    库内文件，让「库内相对路径」的沙箱归属判断失去意义。POSIX 上 `aux.pdf` 是
+    合法文件名，因此只在 Windows 生效。
+    """
+    if os.name != "nt":
+        return False
+    stem = segment.split(".", 1)[0].rstrip(" ").upper()
+    return stem in _WINDOWS_RESERVED_NAMES
+
+
+def unsafe_cache_subdir(value: str) -> bool:
+    """`cache.subdir` 违反「安全相对子树」约束（§11.2，C91）。
+
+    绝对路径、盘符、UNC、NUL、`.`/`..`、Windows 设备名会让「显式 vault 的库内
+    缓存」逃出库根或落到与笔记同层：此时 cache 子树的 ignore/exempt 豁免、watch
+    的跳过判断全部失准——等于把库内持久缓存写进未声明的目录。校验必须发生在
+    配置加载期，而不是等到写盘时。
+    """
+    text = str(value).replace("\\", "/")
+    if not text or "\x00" in text:
+        return True
+    if text.startswith("/"):              # POSIX 绝对路径，以及 UNC 的 //host/share
+        return True
+    if ":" in text.split("/", 1)[0]:      # Windows 盘符（C:\ 与 C:\x 均含冒号）
+        return True
+    parts = [part for part in text.split("/") if part and part != "."]
+    if not parts or any(part == ".." for part in parts):
+        return True
+    if any(is_windows_reserved_segment(part) for part in parts):
+        return True
+    return False
+
+
 @dataclass(slots=True)
 class CacheConfig:
     # Programmatically constructed configs (e.g. unit tests) default to disabled;
@@ -121,6 +297,50 @@ class CacheConfig:
     # 0 disables the sweep.
     max_age_days: int = 0
 
+    def __post_init__(self) -> None:
+        # 库内缓存的子目录必须是**安全相对子树**（§11.2）。AppConfig 也会校验一次
+        # （唯一被 load_config/服务消费的入口），这里让 dataclass 自身也不可被塞进
+        # 逃逸值：否则 `vault/.mcp_cache` 的子树豁免、watch 跳过判断会全部失准。
+        if self.placement == "vault" and unsafe_cache_subdir(self.subdir):
+            raise ValueError(
+                "cache.subdir must be a safe relative sub-tree "
+                f"(no absolute path, drive letter, NUL or '..'): {self.subdir!r}"
+            )
+
+
+@dataclass(slots=True)
+class DocStoreConfig:
+    """版本化文档库（解析事实）的容量策略（v0.9.0 C92，§12.3 / §17.4）。
+
+    文档库不是可随时重建的派生索引：删掉它等于丢弃已付费的解析全文与媒体
+    （§11.2「删除它可能重新产生解析费用」）。因此这里只表达**逻辑容量上限**，
+    超额时拒绝新的提交；隐式清理被明确禁止，真正的资产清除必须走显式
+    `purge_documents` 授权（C97 落地）。
+    """
+
+    # 单库文档库逻辑容量上限（MiB）：含 active revision、上一 committed 版本、
+    # staged 候选与媒体 blob。0 **不是**「无限制」——关闭限额等于让计费资产无声
+    # 撑爆磁盘，所以配置解析直接拒绝 <1（§17.4「0不得关闭安全限制」同口径）。
+    max_size_mb: int = 2048
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.max_size_mb, bool)
+            or not isinstance(self.max_size_mb, int)
+            or self.max_size_mb < 1
+        ):
+            raise ValueError(
+                f"doc_store.max_size_mb must be an integer >= 1, got {self.max_size_mb!r}"
+            )
+
+    @property
+    def max_size_bytes(self) -> int:
+        return self.max_size_mb * 1024 * 1024
+
+
+_INGEST_STORAGE_VALUES = {"legacy", "virtual"}
+_INGEST_NETWORK_POLICY_VALUES = {"configured", "local_only"}
+
 
 @dataclass(slots=True)
 class IngestConfig:
@@ -139,8 +359,30 @@ class IngestConfig:
     table_convert_max_cells: int = 60
     auto_watch: bool = False             # 自动摄取（默认关闭：需显式授权）
     max_file_size_mb: int = 20           # 单文件尺寸上限（MiB，默认20；0表示不限）
+    # --- v0.9.0 C93/C94 新增（§17.4）------------------------------------------------
+    # storage：解析事实落点。C96 落地后默认改为 **virtual**：虚拟文档已通过
+    # server/indexer 读取适配器按 revision/SHA 可读，不再依赖物理镜像；仍保留
+    # `storage = "legacy"` 作为回退（旧物理镜像路径继续工作，不自动迁移/删除）。
+    storage: str = "virtual"             # legacy | virtual
+    network_policy: str = "configured"   # configured | local_only（local_only 在入队前拒云路径）
+    archive_max_mb: int = 32             # 压缩响应上限（安全配额，0 不关闭限制）
+    extracted_max_mb: int = 200          # 累计解压上限
+    markdown_max_mb: int = 16            # 单 markdown 上限
+    json_max_mb: int = 8                 # 单 JSON 上限
+    media_max_mb: int = 8                # 单媒体上限
+    memory_budget_mb: int = 128          # 全局受控缓冲预算（不是 RSS 承诺）
+    queue_limit: int = 1000              # 队列容量上限
+    max_parse_workers: int = 1           # 同时解析数（本 Lane 只实现 1）
+    routing: str = "auto"
 
     def __post_init__(self) -> None:
+        if self.routing == "cloud":
+            self.routing = "mineru"
+        if self.routing not in {"auto", "mineru", "local"}:
+            raise ValueError("ingest.routing must be auto, mineru or local")
+        for name in ("enabled", "auto_watch", "is_ocr", "enable_formula", "enable_table", "pymupdf_fallback", "convert_small_tables"):
+            if not isinstance(getattr(self, name), bool):
+                raise ValueError(f"ingest.{name} must be a boolean")
         if not isinstance(self.auto_watch, bool):
             raise ValueError(f"ingest.auto_watch must be a boolean, got {self.auto_watch!r}")
         if (
@@ -149,6 +391,15 @@ class IngestConfig:
             or self.max_file_size_mb < 0
         ):
             raise ValueError(f"ingest.max_file_size_mb must be an integer >= 0, got {self.max_file_size_mb!r}")
+        if self.storage not in _INGEST_STORAGE_VALUES:
+            raise ValueError(
+                f"ingest.storage must be one of {sorted(_INGEST_STORAGE_VALUES)}, got {self.storage!r}"
+            )
+        if self.network_policy not in _INGEST_NETWORK_POLICY_VALUES:
+            raise ValueError(
+                "ingest.network_policy must be one of "
+                f"{sorted(_INGEST_NETWORK_POLICY_VALUES)}, got {self.network_policy!r}"
+            )
 
     @property
     def max_file_size_bytes(self) -> int:
@@ -209,9 +460,12 @@ class AppConfig:
     reranker: RerankerConfig = field(default_factory=RerankerConfig)
     vector: VectorConfig = field(default_factory=VectorConfig)
     cache: CacheConfig = field(default_factory=CacheConfig)
+    doc_store: DocStoreConfig = field(default_factory=DocStoreConfig)
     ingest: IngestConfig = field(default_factory=IngestConfig)
     index: IndexConfig = field(default_factory=IndexConfig)
     diag: DiagConfig = field(default_factory=DiagConfig)
+    chunking: ChunkingConfig = field(default_factory=ChunkingConfig)
+    media: MediaConfig = field(default_factory=MediaConfig)
     # 混合检索开关：true（默认）用 FTS5 BM25 + 向量余弦 + bigram 词法三路 RRF
     # 融合；false 完整还原旧的「词法软信号 + 余弦」行为。
     use_hybrid: bool = True
@@ -245,6 +499,9 @@ class AppConfig:
 
     def __post_init__(self) -> None:
         self.vault_path = os.fspath(self.vault_path)
+        if (not self.chunking.mode_explicit and not self.chunking.legacy_explicit
+                and (self.chunk_size, self.chunk_overlap) != (1200, 0)):
+            self.chunking = replace(self.chunking, mode="legacy_chars", legacy_explicit=True)
         if self.embedding.mode not in {"static", "external"}:
             raise ValueError("embedding.mode must be 'static' or 'external'")
         if self.embedding.dimension < 1:
@@ -265,6 +522,11 @@ class AppConfig:
             raise ValueError("cache.placement must be 'home' or 'vault'")
         if not self.cache.subdir:
             raise ValueError("cache.subdir must not be empty")
+        if self.cache.placement == "vault" and unsafe_cache_subdir(self.cache.subdir):
+            raise ValueError(
+                "cache.subdir must be a safe relative sub-tree "
+                f"(no absolute path, drive letter, NUL or '..'): {self.cache.subdir!r}"
+            )
         if not self.cache.namespace:
             raise ValueError("cache.namespace must not be empty")
         if self.cache.max_age_days < 0:
@@ -298,6 +560,34 @@ class AppConfig:
             or self.ingest.max_file_size_mb < 0
         ):
             raise ValueError(f"ingest.max_file_size_mb must be an integer >= 0, got {self.ingest.max_file_size_mb!r}")
+        if self.ingest.storage not in _INGEST_STORAGE_VALUES:
+            raise ValueError(
+                f"ingest.storage must be one of {sorted(_INGEST_STORAGE_VALUES)}, got {self.ingest.storage!r}"
+            )
+        if self.ingest.network_policy not in _INGEST_NETWORK_POLICY_VALUES:
+            raise ValueError(
+                "ingest.network_policy must be one of "
+                f"{sorted(_INGEST_NETWORK_POLICY_VALUES)}, got {self.ingest.network_policy!r}"
+            )
+        for _key in (
+            "archive_max_mb",
+            "extracted_max_mb",
+            "markdown_max_mb",
+            "json_max_mb",
+            "media_max_mb",
+            "memory_budget_mb",
+            "queue_limit",
+            "max_parse_workers",
+        ):
+            _value = getattr(self.ingest, _key, None)
+            if isinstance(_value, bool) or not isinstance(_value, int) or _value < 1:
+                raise ValueError(
+                    f"ingest.{_key} must be an integer >= 1, got {_value!r}"
+                )
+        if self.ingest.max_parse_workers != 1:
+            raise ValueError(
+                "ingest.max_parse_workers 目前只支持 1（进程级资源池在 C100 才引入多并发）"
+            )
         if self.diag.max_bytes < 1:
             raise ValueError("diag.max_bytes must be positive")
         if self.diag.files < 1:
@@ -321,6 +611,25 @@ def _env(value: Any) -> Any:
     return value
 
 
+def _without_toml_comment(line: str) -> str:
+    """Strip comments only outside TOML basic/literal strings (Python 3.10)."""
+    quote = ""
+    escaped = False
+    for index, char in enumerate(line):
+        if quote:
+            if escaped:
+                escaped = False
+            elif quote == '"' and char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = ""
+        elif char in "\"'":
+            quote = char
+        elif char == "#":
+            return line[:index].rstrip()
+    return line
+
+
 def _fallback_toml(text: str) -> dict[str, Any]:
     """Small TOML subset for Python 3.10 when tomli is not installed."""
     import ast
@@ -328,7 +637,7 @@ def _fallback_toml(text: str) -> dict[str, Any]:
     result: dict[str, Any] = {}
     section: dict[str, Any] = result
     for raw in text.splitlines():
-        line = raw.strip()
+        line = _without_toml_comment(raw).strip()
         if not line or line.startswith("#"):
             continue
         # [[array-of-table]]: append a fresh dict to the named list.
@@ -348,7 +657,6 @@ def _fallback_toml(text: str) -> dict[str, Any]:
         if "=" not in line:
             continue
         key, raw_value = (part.strip() for part in line.split("=", 1))
-        raw_value = raw_value.split(" #", 1)[0].strip()
         if raw_value.lower() in {"true", "false"}:
             value: Any = raw_value.lower() == "true"
         elif raw_value.startswith("[") and raw_value.endswith("]"):
@@ -363,10 +671,15 @@ def _fallback_toml(text: str) -> dict[str, Any]:
 
 
 def _read_toml(path: Path) -> dict[str, Any]:
-    data = path.read_bytes()
+    # Windows 编辑器（记事本 / PowerShell `Set-Content -Encoding utf8`）默认写 UTF-8 BOM。
+    # 带 BOM 时首个 `[section]` 头不再被识别为段：该段整体丢失，段内键泄漏到顶层，随后
+    # 被 flat-legacy 别名读成**另一套配置**（实测：`[cache] enabled = true` 的顶层 `enabled`
+    # 被当成 `reranker.enabled`，doctor 直接判 ❌ BROKEN）。这是静默错误配置，比解析失败更危险，
+    # 因此统一按 `utf-8-sig` 解码剥掉 BOM。
+    text = path.read_bytes().decode("utf-8-sig")
     if tomllib is not None:
-        return tomllib.loads(data.decode("utf-8"))
-    return _fallback_toml(data.decode("utf-8"))
+        return tomllib.loads(text)
+    return _fallback_toml(text)
 
 
 def read_toml_file(path: str | os.PathLike[str]) -> dict[str, Any]:
@@ -380,13 +693,16 @@ def resolve_config_path(explicit: str | os.PathLike[str] | None = None) -> Path 
     """
     if explicit is not None:
         candidate = Path(explicit).expanduser()
-        return candidate if candidate.is_file() else None
+        if not candidate.is_file():
+            raise FileNotFoundError(f"Explicit configuration file not found: {candidate}")
+        return candidate
     env_path = (os.getenv("MORTIS_RAG_CONFIG", "").strip()
                 or os.getenv("VAULT_MCP_CONFIG", "").strip())
     if env_path:
         candidate = Path(env_path).expanduser()
-        if candidate.is_file():
-            return candidate
+        if not candidate.is_file():
+            raise FileNotFoundError(f"Environment configuration file not found: {candidate}")
+        return candidate
     candidates = [
         Path.home() / ".mortis_rag_mcp" / "config.toml",
         Path.home() / ".vault_mcp" / "config.toml",
@@ -436,6 +752,63 @@ def _numeric(
     return value
 
 
+def _boolean(section: Mapping[str, Any], key: str, default: bool) -> bool:
+    value = section.get(key, default)
+    if not isinstance(value, bool):
+        raise ValueError(f"config key '{key}' must be a boolean, got {value!r}")
+    return value
+
+
+def _string_tuple(section: Mapping[str, Any], key: str) -> tuple[str, ...]:
+    """读取字符串数组配置（TOML array），单项字符串按单元素处理；其余类型报错。"""
+    if key not in section or section[key] is None:
+        return ()
+    value = section[key]
+    if isinstance(value, str):
+        value = (value,)
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(f"config key '{key}' must be an array of strings, got {value!r}")
+    result: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not item:
+            raise ValueError(f"config key '{key}' must contain non-empty strings, got {item!r}")
+        result.append(item)
+    return tuple(result)
+
+
+def _string(section: Mapping[str, Any], key: str, default: str = "") -> str:
+    value = section.get(key, default)
+    if not isinstance(value, str):
+        raise ValueError(f"config key '{key}' must be a string, got {value!r}")
+    return value
+
+
+def _nonnegative(section: Mapping[str, Any], key: str, default: int = 0) -> int:
+    value = section.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"config key '{key}' must be a non-negative integer, got {value!r}")
+    return value
+
+
+def _load_chunking(data: Mapping[str, Any], index: Mapping[str, Any]) -> ChunkingConfig:
+    section = _section(data, "chunking")
+    alias_present = "legacy_chunking" in section or "legacy_chunking" in index or "legacy_chunking" in data
+    alias_data = {**data, **index, **section}
+    alias = _boolean(alias_data, "legacy_chunking", False)
+    mode = str(section.get("mode", "legacy_chars" if alias or any(key in index or key in data for key in ("chunk_size", "chunk_overlap")) else "estimated_tokens"))
+    if alias_present and "mode" in section and ((mode in {"legacy", "legacy_chars"}) != alias):
+        raise ValueError("chunking.mode conflicts with legacy_chunking")
+    return ChunkingConfig(
+        mode=mode,
+        target_tokens=_numeric(section, {}, "target_tokens", int, 384, 1),
+        overlap_tokens=_numeric(section, {}, "overlap_tokens", int, 64, 0),
+        hard_limit_tokens=_numeric(section, {}, "hard_limit_tokens", int, 768, 1),
+        estimator_profile=str(section.get("estimator_profile", "unicode-estimate-v1")),
+        mode_explicit=("mode" in section or alias_present),
+        legacy_explicit=alias_present or any(key in index or key in data for key in ("chunk_size", "chunk_overlap")),
+    )
+
+
 def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
     """Load app.toml while accepting both flat and grouped configuration keys."""
     data = _read_toml(Path(path)) if path is not None else {}
@@ -444,20 +817,49 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
     reranker = {**data, **_section(data, "reranker")}
     vector = {**data, **_section(data, "vector")}
     cache = {**data, **_section(data, "cache")}
+    doc_store = {**data, **_section(data, "doc_store")}
     index = _section(data, "index")
 
     vault_path = _env(data.get("vault_path", vault.get("path", "")))
+    explicit_api_key = str(_env(embedding.get("api_key", "")))
+    explicit_media_api_key = str(_env(embedding.get("media_api_key", "")))
+    media_api_key_env = _string(embedding, "media_api_key_env")
     emb = EmbeddingConfig(
         mode=str(embedding.get("mode", "static")).lower(),
         endpoint=str(_env(embedding.get("endpoint", ""))),
         model=str(_env(embedding.get("model", ""))),
-        api_key=resolve_api_key(str(_env(embedding.get("api_key", "")))),
+        api_key=resolve_api_key(explicit_api_key),
         timeout=_numeric(embedding, data, "timeout", float, 30.0, 0.0, 300.0),
         dimension=_numeric(embedding, data, "dimension", int, 384, 1),
         send_dimensions=bool(embedding.get("send_dimensions", True)),
         max_retries=_numeric(embedding, data, "max_retries", int, 3, 0, 10),
         batch_size=_numeric(embedding, data, "batch_size", int, 32, 0),
         retry_backoff=_numeric(embedding, data, "retry_backoff", float, 1.0, 0.0, 60.0),
+        capability_profile=str(embedding.get("capability_profile", "")),
+        adapter=str(embedding.get("adapter", "openai_text")),
+        client_slicing=_boolean(embedding, "client_slicing", False),
+        query_template=embedding.get("query_template", "{text}"),
+        document_template=embedding.get("document_template", "{text}"),
+        model_revision=embedding.get("model_revision", ""),
+        endpoint_revision=embedding.get("endpoint_revision", ""),
+        preprocess_version=embedding.get("preprocess_version", "text-v1"),
+        media_modalities=_string_tuple(embedding, "media_modalities"),
+        media_alignment_space_id=_string(embedding, "media_alignment_space_id"),
+        media_preprocess_version=_string(embedding, "media_preprocess_version"),
+        media_endpoint_revision=_string(embedding, "media_endpoint_revision"),
+        media_allowed_mime_types=_string_tuple(embedding, "media_allowed_mime_types"),
+        media_max_input_bytes=_nonnegative(embedding, "media_max_input_bytes"),
+        media_max_batch_size=_nonnegative(embedding, "media_max_batch_size"),
+        media_model_reference=_string(embedding, "media_model_reference"),
+        media_endpoint_fixture_reference=_string(embedding, "media_endpoint_fixture_reference"),
+        media_alignment_reference=_string(embedding, "media_alignment_reference"),
+        media_license_reference=_string(embedding, "media_license_reference"),
+        media_adapter=_string(embedding, "media_adapter") if "media_adapter" in embedding else _string(embedding, "media_provider"),
+        media_endpoint=str(_env(embedding.get("media_endpoint", ""))),
+        media_model=str(_env(embedding.get("media_model", ""))),
+        media_dimension=_numeric(embedding, data, "media_dimension", int, 0, 1) if ("media_dimension" in embedding and embedding["media_dimension"] is not None) else None,
+        media_api_key_env=media_api_key_env,
+        media_api_key=resolve_media_auth(explicit_media_api_key, explicit_api_key, media_api_key_env),
     )
     rer = RerankerConfig(
         enabled=bool(reranker.get("enabled", False)),
@@ -483,21 +885,32 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
     if not isinstance(raw_auto_watch, bool):
         raise ValueError(f"config key 'auto_watch' must be a boolean, got {raw_auto_watch!r}")
     ing = IngestConfig(
-        enabled=bool(ingest.get("enabled", False)),
+        enabled=_boolean(ingest, "enabled", False),
+        routing=str(ingest.get("routing", "auto")),
         api_key=str(_env(ingest.get("api_key", ""))),
         model_version=str(_env(ingest.get("model_version", "vlm"))),
         language=str(_env(ingest.get("language", "ch"))),
-        is_ocr=bool(ingest.get("is_ocr", False)),
-        enable_formula=bool(ingest.get("enable_formula", True)),
-        enable_table=bool(ingest.get("enable_table", True)),
+        is_ocr=_boolean(ingest, "is_ocr", False),
+        enable_formula=_boolean(ingest, "enable_formula", True),
+        enable_table=_boolean(ingest, "enable_table", True),
         poll_interval=_numeric(ingest, data, "poll_interval", float, 3.0, 0.1, 60.0),
         poll_timeout=_numeric(ingest, data, "poll_timeout", float, 600.0, 1.0, 7200.0),
         output_dirname=str(_env(ingest.get("output_dirname", ".mortis-parsed"))),
-        pymupdf_fallback=bool(ingest.get("pymupdf_fallback", True)),
-        convert_small_tables=bool(ingest.get("convert_small_tables", True)),
+        pymupdf_fallback=_boolean(ingest, "pymupdf_fallback", True),
+        convert_small_tables=_boolean(ingest, "convert_small_tables", True),
         table_convert_max_cells=_numeric(ingest, data, "table_convert_max_cells", int, 60, 1),
         auto_watch=raw_auto_watch,
         max_file_size_mb=_numeric(ingest, data, "max_file_size_mb", int, 20, 0),
+        storage=str(ingest.get("storage", "virtual")).strip().lower() or "virtual",
+        network_policy=str(ingest.get("network_policy", "configured")).strip().lower() or "configured",
+        archive_max_mb=_numeric(ingest, data, "archive_max_mb", int, 32, 1),
+        extracted_max_mb=_numeric(ingest, data, "extracted_max_mb", int, 200, 1),
+        markdown_max_mb=_numeric(ingest, data, "markdown_max_mb", int, 16, 1),
+        json_max_mb=_numeric(ingest, data, "json_max_mb", int, 8, 1),
+        media_max_mb=_numeric(ingest, data, "media_max_mb", int, 8, 1),
+        memory_budget_mb=_numeric(ingest, data, "memory_budget_mb", int, 128, 1),
+        queue_limit=_numeric(ingest, data, "queue_limit", int, 1000, 1),
+        max_parse_workers=_numeric(ingest, data, "max_parse_workers", int, 1, 1),
     )
     raw_exclude_patterns = index.get("exclude_patterns", data.get("exclude_patterns", DEFAULT_EXCLUDE_PATTERNS))
     if isinstance(raw_exclude_patterns, str):
@@ -546,9 +959,20 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
         reranker=rer,
         vector=VectorConfig(backend=str(vector.get("backend", "memory")).lower()),
         cache=cch,
+        doc_store=DocStoreConfig(
+            max_size_mb=_numeric(doc_store, data, "max_size_mb", int, 2048, 1)
+        ),
         ingest=ing,
         index=IndexConfig(read_max_chars=read_max_chars),
         diag=dg,
+        chunking=_load_chunking(data, index),
+        media=MediaConfig(
+            inline_max_bytes=_numeric(_section(data, "media"), {}, "inline_max_bytes", int, 8388608, 1),
+            refs_limit=_numeric(_section(data, "media"), {}, "refs_limit", int, 20, 1, 100),
+            preview_enabled=_boolean(_section(data, "media"), "preview_enabled", True),
+            preview_max_edge=_numeric(_section(data, "media"), {}, "preview_max_edge", int, 1600, 1),
+            preview_max_bytes=_numeric(_section(data, "media"), {}, "preview_max_bytes", int, 524288, 1),
+        ),
         use_hybrid=bool(index.get("use_hybrid", data.get("use_hybrid", True))),
         chunk_size=_numeric(index, data, "chunk_size", int, 1200, 1),
         chunk_overlap=_numeric(index, data, "chunk_overlap", int, 0, 0),
