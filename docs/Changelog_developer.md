@@ -1545,3 +1545,39 @@ Codex 主流程（2026-10-09 / America_New_York）。代码候选93c39a50b09ec61
 
 - 根因 4（P4：`kb_rebuild` 双重全量 + 逐文件 FTS 事务）按 §6 排在最后一批，本批未动。
 - 未改版本号；未 push、未开 PR、未打 tag / Release、未发 PyPI。
+
+### [FIX-issue15-P4] — moton16,2026-10-10,CodeBuddy,Hy4-Preview — perf(rebuild): `kb_rebuild` 只做一次全量 + FTS 单事务回填（GitHub issue #15 根因 4）
+
+> **涵盖提交**：`1b5ef0f`
+
+**代码改动概况**
+
+1. **P4-a（消除双重全量）** `mortis_rag_mcp/server.py::_kb_rebuild`：改为
+   `stop_watching()` → `rebuild()` → `start_watching()`（`try/finally` 保证一定拉起）。
+   此前 `_indexer_for` 对尚未加载的库会先 `start_watching()`，而监听线程启动即跑一次
+   首轮全量 sync（`watch.py`「没有这一句就永远等不到第一次索引」），紧接着 `rebuild()`
+   清空缓存再全量重建——两次全量在 `_sync_lock` 上串行，派生层被完整构建两遍。
+   走的是调研报告 §5 P4-a 的**方案 1**（最小改动，且 `stop/start_watching` 的线程收放
+   已有 `tests/test_concurrency_hardening.py:95/124` 钉住）。
+2. **P4-b（FTS 批量事务）** `mortis_rag_mcp/fts.py` 新增 `FtsIndex.upsert_sources(mapping)`：
+   一个 `with conn:` 内先按传入顺序删完全部 source、再按同一顺序 `executemany` 插回。
+   source 在 dict 里唯一，故与逐个 `upsert_source` 的结果**逐条一致**（顺序敏感的
+   `tests/test_snapshot_import_safety.py:198/223/240` 因此不受影响）。
+   `indexer.py`：`rebuild()` 末尾改调它，137 个 source 从 137 个事务降为 1 个；
+   `_fts_upsert` 改为委托给新增的 `_fts_upsert_many`（单个 source 仍是一个事务，
+   同步路径行为不变）。
+
+**验证**
+
+- 反向确认（两条新用例修复前均红）：
+  * `test_issue15_perf.py::test_kb_rebuild_runs_a_single_full_build` —— 监听收放顺序修复前是 `['rebuild']`（红），修复后 `['stop', 'rebuild', 'start']`（绿），并断言 `stats["files"] >= 1`。
+  * `test_issue15_perf.py::test_rebuild_writes_fts_in_one_transaction` —— 整批回填事务数修复前 **0**（红，逐 source 事务照旧发生），修复后 **1**，且 `upsert_source` 调用数为 **0**；同时钉住 `idx._fts.count() == len(idx.all_chunks())`（`test_hybrid.py:166/171` 的口径）。
+- 靶向（逐文件跑，全部通过）：`test_hybrid` 10、`test_subvaults` 5、`test_snapshot` 14、`test_snapshot_import_safety` 6、`test_failed_files` 6、`test_concurrency_hardening` 8、`test_watch_integration` 17、`test_virtual_sync` 25、`test_dedup` 8、`test_index_state` 5、`test_import_refresh` 5、`test_read_stale` 8、`test_exempt` 7、`test_e20_media_outcome` 42、`test_paid_request_journal` 20、`test_scoped_search` 14、`test_kb_read_chunkid` 21、`test_multivault` 9、`test_e15_service_contracts` 22、`test_ingest_server` 12、`test_issue15_perf` 6。
+- §9「最脆」钉子：`test_hybrid.py:166/171`（FTS 条数）与 `test_snapshot_import_safety.py`（rollback 前后逐条相等且顺序敏感）本批直接相关，均通过。
+
+**未做（明确不声称已修）**
+
+- **冷启动残余**：`kb_rebuild` 打在**尚未加载**的库上时，`_indexer_for` 已经先把监听拉起，若后台首轮 sync 此刻已在飞行，`stop_watching()` 会等它跑完，`rebuild()` 之后仍是一次全量——即「两次全量」在这一条时序下只是被串行化而非消除。彻底消除需要方案 2（`start_watching` 增加「跳过首轮 sync」开关，由 `_kb_rebuild` 传入）或方案 3（改为向调度器登记一次 immediate refresh）。**方案 1 是计划指定的默认，残余如实申报。**
+- `_fts_ensure_populated`（1083 行附近）与同步路径的逐 source FTS 写入未改批量：计划只点名 `rebuild()` 末尾，且这两处的写入规模通常是增量级。
+- 全量 pytest 与 §7.3 性能基准留到整合窗口。
+- 未改版本号；未 push、未开 PR、未打 tag / Release、未发 PyPI。
