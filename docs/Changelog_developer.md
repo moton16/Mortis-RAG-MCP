@@ -1368,3 +1368,10 @@ Codex 主流程（2026-10-09 / America_New_York）。代码候选93c39a50b09ec61
 - `83394d8`：记轮 5–7 的失败/修复对应关系与 7/7 全绿结论，并写明未声称已修的遗留冷启动竞态（见上条末尾）。
 - `54e3e7c`、`8bec8ae`：本文档此前被写成 `editor:moton16，agent:codebuddy` 的两段散文、且**追加在 E20 之后但无规范头**；先改为带 `— 用户名,日期,Agent,模型` 头并列出涵盖提交的条目，再纠正位置——本文档主体是**升序**、最新的更新在**最底部**（此前误搬到文件顶部），并改回按 commit 逐条。
 - `eb8fbbb`：存量 0.9.0 条目补规范头（统一 `moton16,<日期>,Codex,GPT-6.1-Sol`）：`## E20 运维缺陷与诊断（2026-10-09 / America_New_York）` 降为三级条目并补头；`### v0.9.0 集中 review（第三窗口…）` 补 `— moton16,2026-10-08,Codex,GPT-6.1-Sol`；`### E20 ...` 系列 10 条统一补 `— moton16,2026-10-09,Codex,GPT-6.1-Sol`；并把原堆在文件最顶部的三条 0.9.0 条目（beta2 第四批 → E17 → E18，按提交时间升序）归位到文件末尾区域、E20 系列之前，同时清掉搬动产生的重复 `---` 分隔行。
+
+### FIX-v090-ci-flake — moton16,2026-10-09,CodeBuddy,Hy4-Preview — test(exact_terms): 改为对检索响应轮询，并把响应体带进断言消息
+
+- 背景：v0.9.0 合并进 main 后（`4c07b1f`）的 push run 在 ubuntu py3.10 红在 `tests/test_exact_terms.py::test_exact_terms_combined_with_budget_bytes`（`assert 0 >= 1`）；原样重跑该 job 即通过（main 随后为绿），属既有竞态而非产品缺陷——本仓库近期多次出现「本地/分支绿、某个 job 偶发红」的同类现象。
+- 此前该用例只等「索引就绪」（`_kb_init_ready`：`kb_init` + 重试 `sync()` 直到切片可见），但 C66 之后 `kb_search` 自身会顺带请求一次后台刷新，检索仍可能与刷新并发而拿到空 `chunks`。改为对**检索响应本身**轮询到命中（上限 10s），断言口径一条未放宽。
+- 四条断言补上响应体作为失败消息，下次再出现可直接看出是冷启动、`budget_exceeded` 还是路由空集，不必再靠重跑猜。
+- 验证：`tests/test_exact_terms.py` 本地连跑三遍 13 passed ×3；main 上该 job 重跑通过。
