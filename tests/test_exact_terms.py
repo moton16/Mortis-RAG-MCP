@@ -387,18 +387,26 @@ def test_exact_terms_combined_with_budget_bytes(exact_terms_vault, tmp_path, mon
     server = VaultMcpServer(config_path)
     _kb_init_ready(server, exact_terms_vault, "ExactVault")
 
-    res = server.call_tool(
-        "kb_search",
-        {
-            "vault_path": "ExactVault",
-            "query": "芯片",
-            "exact_terms": ["PROJECT_NEBULA_X99"],
-            "budget_bytes": 1500,
-        },
-    )
-    data = json.loads(res["content"][0]["text"])
-    assert "chunks" in data
-    assert len(data["chunks"]) >= 1
-    assert "project_nebula_x99" in data["chunks"][0]["content"].lower()
-    assert "truncated" in data
+    # 索引就绪不等于这次**检索**一定有结果：C66 之后 kb_search 会顺带请求一次后台
+    # 刷新，检索可能与刷新并发（本用例在 CI 上两次拿到空 chunks）。对响应本身轮询到
+    # 命中即可，断言口径不放宽；超时仍失败时把整包响应带进断言消息，便于定位是
+    # 冷启动、预算截断还是路由空集。
+    arguments = {
+        "vault_path": "ExactVault",
+        "query": "芯片",
+        "exact_terms": ["PROJECT_NEBULA_X99"],
+        "budget_bytes": 1500,
+    }
+    deadline = time.monotonic() + 10.0
+    while True:
+        res = server.call_tool("kb_search", arguments)
+        data = json.loads(res["content"][0]["text"])
+        if data.get("chunks") or time.monotonic() > deadline:
+            break
+        time.sleep(0.2)
+
+    assert "chunks" in data, data
+    assert len(data["chunks"]) >= 1, data
+    assert "project_nebula_x99" in data["chunks"][0]["content"].lower(), data
+    assert "truncated" in data, data
 
