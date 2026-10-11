@@ -1098,8 +1098,11 @@ class MarkdownIndexer:
         try:
             total = len(self.all_chunks())
             if total and self._fts.count() != total:
-                for source, chunks in self._chunks.items():
-                    self._fts_upsert(source, chunks)
+                # issue #15 根因 4 的同型未修点：此前逐 source 一个事务（DELETE +
+                # executemany），而这条路径被**每次进程启动**的 warm-cache 分支与
+                # kb_import 三条路径（snapshot.py）调用。整批一个事务；写入顺序与
+                # 「逐 source 先删后插」语义由 `FtsIndex.upsert_sources` 保证。
+                self._fts_upsert_many(list(self._chunks.items()))
         except Exception:
             self._fts = None
 

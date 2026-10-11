@@ -426,6 +426,51 @@ def test_rebuild_writes_fts_in_one_transaction(tmp_path, monkeypatch):
         idx.close_document_store()
 
 
+def test_fts_warm_cache_populate_uses_one_transaction(tmp_path, monkeypatch):
+    """P4 同型：进程启动的 warm-cache 回填（`_fts_ensure_populated`）必须单事务。
+
+    现状（修复前）：逐 source 一个 `with conn:` 事务。这条路径被**每次进程启动**的
+    warm-cache 分支（无文件变动时 sync 什么都不写，由它补回填）与 `kb_import` 的三条
+    路径（`snapshot.py`）调用，与 P4-b 已消除的 rebuild 末尾模式同型（issue #15
+    根因 4）。
+    """
+    from mortis_rag_mcp.fts import FtsIndex
+
+    idx = _plain_indexer(tmp_path)
+    try:
+        idx.sync()
+        assert idx._fts is not None
+        assert len(idx._chunks) >= 3
+        calls = {"batch": 0, "single": 0, "sources": 0}
+        real_single, real_batch = FtsIndex.upsert_source, FtsIndex.upsert_sources
+
+        def counting_single(self, source, chunks):
+            calls["single"] += 1
+            return real_single(self, source, chunks)
+
+        def counting_batch(self, mapping):
+            items = list(mapping)
+            calls["batch"] += 1
+            calls["sources"] = len(items)
+            return real_batch(self, items)
+
+        monkeypatch.setattr(FtsIndex, "upsert_source", counting_single)
+        monkeypatch.setattr(FtsIndex, "upsert_sources", counting_batch)
+        # 造出「行数陈旧」的启动态：索引行被清空但内存 chunks 仍在，等价于
+        # warm-cache 命中、没有任何文件变动的下一次进程启动。
+        idx._fts.clear()
+        assert idx._fts.count() == 0
+        idx._fts_ensure_populated()
+        assert calls["batch"] == 1, f"回填事务数为 {calls['batch']}（应为 1）"
+        assert calls["single"] == 0, (
+            f"仍有 {calls['single']} 次逐 source 事务（修复前 = source 数）")
+        assert calls["sources"] == len(idx._chunks) >= 3
+        assert idx._fts.count() == len(idx.all_chunks())
+    finally:
+        idx.stop_watching()
+        idx.close_document_store()
+
+
 def test_read_refresh_does_not_mark_a_ready_vault_as_rebuilding(tmp_path):
     """P2：watcher 在线时，读路径的机会性刷新不得把一个就绪库判成 rebuilding。
 
