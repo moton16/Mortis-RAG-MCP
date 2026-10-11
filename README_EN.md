@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/moton16/Mortis-RAG-MCP/actions/workflows/ci.yml/badge.svg)](https://github.com/moton16/Mortis-RAG-MCP/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-[![Version: 0.9.0](https://img.shields.io/badge/Version-0.9.0-blue.svg)](CHANGELOG_user.md)
+[![Version: 0.9.1](https://img.shields.io/badge/Version-0.9.1-blue.svg)](CHANGELOG_user.md)
 
 English | [简体中文](README.md)
 
@@ -11,7 +11,18 @@ English | [简体中文](README.md)
 
 ---
 
-## 🚀 Current Release: v0.9.0 (Major Milestone Release)
+## 🚀 Current Release: v0.9.1 (Fix & Performance Patch)
+
+v0.9.1 fixes local zero-cost inference endpoints being wrongly blocked by the paid-request gate (which could stall indexing for a long time) and substantially improves search and rebuild performance on large vaults. The fail-closed gate for paid endpoints is unchanged.
+
+- 🛡️ **Zero-cost endpoints are no longer blocked**: an endpoint on a loopback address (e.g. `127.0.0.1`) with no API credential is no longer recorded in the paid ledger, nor dragged down by historical unresolved intents; the fail-closed side guarding real billing is untouched.
+- 🔓 **Unresolved requests no longer freeze indexing forever**: a failed ledger write gets one compensating retry; a `prepared` intent on a zero-cost endpoint is released after its lease, while `submission_unknown` still requires manual reconciliation.
+- 🔎 **Observable blockage**: `kb_stats` gains `paid_route_blocked`, naming the one intent actually blocking each request kind (present only when something is genuinely blocked).
+- ⚡ **Faster and cheaper**: document reads per search drop from 3 to 1 (measured 0 once sync is warm). On the same machine and script, median `kb_search` went 36.1 ms → 20.3 ms on 2,892 documents / 9,316 chunks — a probe-relative record, not a cross-environment guarantee; one `kb_rebuild` now runs a single full sync round (cold 3 → 1, warm 2 → 1).
+
+---
+
+## 🏁 Previous Milestone: v0.9.0 (Major Feature Release)
 
 v0.9.0 marks a comprehensive architectural leap and officially relicenses under the business-friendly **Apache License 2.0**, bringing the following core advancements:
 

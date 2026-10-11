@@ -1,4 +1,4 @@
-# 媒体与虚拟文档按需参考（main v0.9.0）
+# 媒体与虚拟文档按需参考（main v0.9.1）
 
 仅在读取图片、判断跨模态召回、摄取外部文档或恢复任务时加载；实际调用以当前服务 schema 为准。
 本页区分“已发布解析事实”“派生索引可用”“原生媒体向量”和“宿主展示”，不以其中一项代替其余验收。
@@ -89,7 +89,7 @@ metadata 默认不读取完整 blob；inline 返回标准 text + image/audio con
 ```
 - 仅兼容且仍有效的完成 checkpoint 可复用；cancelled 重试会清理失去 blob 保护的 checkpoint，不保证零重复解析。
 - `SUBMISSION_UNKNOWN` 或远端 submission 阶段结果不明，即使 state=failed/cancelled 也不重排、不自动补发；先核原任务。
-- job_id 与请求台账 request_id 是两套身份；台账的 `prepared`/`submission_unknown` 未决意图会阻止同身份重发。
+- job_id 与请求台账 request_id 是两套身份；台账的 `prepared`/`submission_unknown` 未决意图会阻止同身份重发。例外：零成本端点（回环地址 + transport 未配凭据）不落台账；付费端点上超租约（5 分钟）的 `prepared` 仍只由人工 `--abandon-request` 放行。
 - CLI `--list-requests --vault "C:\YourVault"` 只读本机台账；`--vault` 用绝对路径，不是注册库名。
 - 显式 `--abandon-request REQUEST_ID --vault "C:\YourVault"` 只放弃该本机意图，不取消远端、不变成功、不自动 retry。
 - 放弃后再提交可能重复处理/计费；放弃 request 也不自动解除 ingest job 的 unknown，按返回 `next_action` 处理。

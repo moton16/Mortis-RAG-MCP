@@ -1,4 +1,4 @@
-# 管理、迁移与恢复（v0.9.0，按需读取）
+# 管理、迁移与恢复（v0.9.1，按需读取）
 
 仅在注册、排除、维护、迁移或诊断任务中读本页；正常检索沿入口及检索/媒体参考执行。
 只执行用户指定库、动作与写入范围；查询不授权上传/改配置，注销不授权清事实，迁移不授权覆盖。不另建审批系统。
@@ -61,7 +61,7 @@
 - 模型、endpoint/revision、维度、query/document template、预处理参与空间身份；同名/同维不代表可混用。模板各须且仅须一个完整 `{text}`。
 - 普通变更/少量失败用增量补缺；换空间/切块则改有效配置、重启后 sync 按新身份对账，确需全量清派生层才 rebuild。
 - rebuild 可重算全库 embedding，但不重新调用 MinerU、不改 committed 正文/occurrence。正常配置不为 profile 漂移新增审批；旧 pending 标志不阻塞，保留的 `--approve-reembedding` 不是必经步骤。
-- 控制面不可用、revoked 或未决请求仍阻断相关外发；不清账本/换 cache 身份绕过。
+- 控制面不可用、revoked 或未决请求仍阻断相关外发；不清账本/换 cache 身份绕过。零成本端点（回环地址 + transport 未配凭据，含媒体 route）不产生费用，既不落意图，也不受历史未决意图牵连。
 
 ## 配置、STATUS 与诊断
 - 配置优先级：`--app-config` > `MORTIS_RAG_CONFIG` > `VAULT_MCP_CONFIG` > `~/.mortis_rag_mcp/config.toml` > `~/.vault_mcp/config.toml` > 默认；不合并所有文件。
@@ -73,8 +73,10 @@
 
 ## 请求 journal：unknown 不自动重试
 - job_id 与 request_id 分开；`prepared/submission_unknown` 保留记录、查原远端任务，不自动重放。`attempt` 增长不是重发许可。
-- `pending_paid_requests/embedding_paused_reason` 是索引批量暂停，不是坏向量或所有查询都停。
-- `--list-requests` 只读；用户决定放弃才 `--abandon-request`，只改本机意图，不取消远端/标 success/重发；再次提交可能重复计费。
+- 零成本端点（回环地址 + transport 未配凭据）不落意图：本机推理后端不受付费台账与历史未决意图牵连；面向付费端点的 fail-closed 闸门不变。
+- 零成本端点上超租约（5 分钟）的 `prepared` 属落账泄漏，不再阻塞路由；付费端点的 `prepared` 即便超期仍需人工确认，`submission_unknown` 永不适用租约。
+- `pending_paid_requests/embedding_paused_reason` 是索引批量暂停，不是坏向量或所有查询都停；`paid_route_blocked` 才指出每个 kind 当前真正被哪一条卡住（`pending_paid_requests` 另带 `age_seconds/stale/endpoint_is_loopback` 供判断）。
+- `--list-requests` 只读且脱敏（`request_id/kind/state/attempt/next_action`）；用户决定放弃才 `--abandon-request`，只改本机意图，不取消远端/标 success/重发；再次提交可能重复计费。
 ```powershell
 python -m mortis_rag_mcp --app-config "C:\Config\app.toml" --list-requests --vault "C:\Notes"
 python -m mortis_rag_mcp --app-config "C:\Config\app.toml" --abandon-request REQUEST_ID --vault "C:\Notes"

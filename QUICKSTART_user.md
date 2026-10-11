@@ -79,6 +79,15 @@ python -m mortis_rag_mcp --app-config ".\config\app.toml" --abandon-request REQU
 
 `--doctor` 是显式诊断，可能访问真实端点；STATUS.md 缺失不触发 Agent 自动探活。正常查询直接用已有工具，实际报错再按错误/本地状态排查。
 
+### 0.6 0.9.1 补丁速查
+
+0.9.1 是修复与性能补丁，不改变数据布局、配置项与工具签名，升级不需要额外步骤。
+
+1. **零成本端点不再被付费闸门拦下**：回环地址（如 `127.0.0.1`）且未配置 API 凭据的端点被判定为零成本，不再进入付费请求台账，也不会被历史未决请求牵连——此前本机推理后端一次网络抖动就可能让整条索引长时间冻结。面向付费端点的 fail-closed 闸门行为不变。
+2. **未决请求不再永久冻死索引路由**：结果落账失败会补位重试一次（救回「请求已成功、只是没记上」的 `prepared`）；指向零成本端点的 `prepared` 超过 5 分钟租约后不再阻塞路由；可能已计费的 `submission_unknown` 永不适用租约，仍需人工对账。
+3. **用 `kb_stats` 看真实堵点**：`pending_paid_requests` 现在带 `age_seconds` / `stale` / `endpoint_is_loopback`；确有堵点时会多出 `paid_route_blocked`，指出每个请求类型当前被哪一条真正卡住。`--list-requests` 的脱敏口径不变（仍只给 request_id / kind / state / attempt / next_action）。
+4. **性能提升**：单次检索读库次数由 3 次降至 1 次（同步预热后实测 0 次）；一次 `kb_rebuild` 只跑一轮全量同步；索引回填由「每来源一个事务」改为整批单事务。已有索引与向量缓存 100% 继承。这些是结构性计数，不承诺在别的机器/语料上复现同样的墙钟倍率。
+
 ## 1. 安装
 
 ```powershell

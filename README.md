@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/moton16/Mortis-RAG-MCP/actions/workflows/ci.yml/badge.svg)](https://github.com/moton16/Mortis-RAG-MCP/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-[![Version: 0.9.0](https://img.shields.io/badge/Version-0.9.0-blue.svg)](CHANGELOG_user.md)
+[![Version: 0.9.1](https://img.shields.io/badge/Version-0.9.1-blue.svg)](CHANGELOG_user.md)
 
 [English](README_EN.md) | 简体中文
 
@@ -11,7 +11,18 @@
 
 ---
 
-## 🚀 当前版本：v0.9.0（重大里程碑发布）
+## 🚀 当前版本：v0.9.1（修复与性能补丁）
+
+v0.9.1 修复了「本机零成本推理端点被付费闸门误拦、导致索引长时间停摆」的问题，并显著提升大知识库下的检索与重建性能。面向付费端点的安全闸门行为保持不变。
+
+- 🛡️ **零成本端点不再被误拦**：指向回环地址（如 `127.0.0.1`）且未配置 API 凭据的端点不再进入付费台账，也不会被历史未决请求牵连；已计费风险一侧的 fail-closed 闸门一字未动。
+- 🔓 **未决请求不再永久冻死索引**：结果落账失败会补位重试一次；零成本端点上的 `prepared` 请求超过租约后自动放行，可能已计费的 `submission_unknown` 仍需人工对账。
+- 🔎 **堵点可观测**：`kb_stats` 新增 `paid_route_blocked`，指出每个请求类型当前被哪一条真正卡住（确有堵点时才出现）。
+- ⚡ **更快更省**：单次检索的读库次数由 3 次降至 1 次（同步预热后实测 0 次）。本机同一脚本对照下，2,892 文档 / 9,316 切片规模 `kb_search` 中位耗时 36.1 ms → 20.3 ms（探针相对口径，非跨环境保证）；一次 `kb_rebuild` 只执行一轮全量同步（冷启动 3 → 1、温启动 2 → 1）。
+
+---
+
+## 🏁 上一里程碑：v0.9.0（重大功能发布）
 
 v0.9.0 迎来了架构级的全面跃迁，正式切换至商业友好的 **Apache-2.0** 开源许可，并带来以下核心突破：
 
