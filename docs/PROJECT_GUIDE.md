@@ -6,7 +6,9 @@
 
 ## 在这里，你才需要详细描述每次commit的代码逻辑、技术框架的更改，请标明提交commit人员的GitHub账户名，如果是agent执行的，请一并标出是什么agent处理的。如editor:moton16,codex.
 
-> **版本**：对应 v0.8.1（2026-10-07）。v0.8.1 变更：读优先架构（后台刷新不等锁）、自动摄取完整闭环（auto_watch 与 size 上限门禁）、跨库 chunk 寻址 fail-closed 加固、compact 极简投影与整条 chunk 预算、物理行号越界诊断与源码级 heading 章节读取。
+> **版本**：对应 v0.9.1（2026-10-10，补丁）。v0.9.1 变更：零成本回环端点不受付费闸门管辖（补齐媒体 route）、`prepared` 意图落账补位与租约回收 + `kb_stats.paid_route_blocked`、检索可见性过滤与 `.vaultignore` 匹配器缓存、`kb_rebuild` 单轮全量 + FTS 单事务回填、读路径不再抢跑全量同步。
+>
+> **上一里程碑**：v0.9.0（2026-10-09）。文本模板与 estimated_tokens/legacy_chars 双模式、virtual 文档库（`doc_store`）成为默认解析事实落点、`kb_read_media` 与跨模态检索、请求意图记录与 `retry`/`index_state`；音频转录与 ffmpeg 转码链路物理移除（Breaking）。
 >
 > ⚠️ **数据目录与包名迁移说明（v0.7.1+）**：Python 包目录为 `mortis_rag_mcp`（历史包名 `vault_mcp` 保持只读兼容别名），数据根目录为 `~/.mortis_rag_mcp`（缓存 `~/.mortis_rag_mcp_cache`）与环境变量 `MORTIS_RAG_*`，保持对旧路径 `~/.vault_mcp*` 与 `VAULT_MCP_*` 的零破坏原子迁移与只读回退支持。
 > **读者**：任何要查阅、二次开发或改进本项目的开发者。读完本文应能：理解项目全貌与每个模块的职责、独立搭建开发环境、按本文的 how-to 完成常见改动、知道改动会牵动哪些缓存/测试/文档。
@@ -40,6 +42,16 @@
 不按模型品牌或同维向量推定。导入 `index_state/next_action`、unknown 请求台账、取消重试
 checkpoint 边界、旧切块兼容与存档续页均保留在对应参考。宿主图片展示与具体外部端点质量
 仍需单独验证，配套 Skill 更新本身不是这些验证。
+
+## 0.9.1 增量：付费闸门与热路径（2026-10-10）
+
+补丁版本，无工具 schema / 配置键 / 文档库 schema / 数据布局变更；改动集中在付费闸门与检索、重建热路径。
+
+1. **零成本端点不受付费闸门管辖（issue #12/#13）**：`providers._is_loopback_endpoint` 加 transport 无凭据判定为 `is_local_free`。文本嵌入路径 v0.9.0 已有该判据；本版补齐两处——`media_providers.NativeMediaProvider.is_local_free`（媒体 route 不再落意图，也不受历史未决意图牵连）与 `sync_engine._paid_embedding_allowed` 的零成本早退。付费端点一侧的 fail-closed（控制面不可用 / revoked / 未决意图）一字未动。
+2. **`prepared` 意图的补位与租约**：`PaidRequestJournal._mark` 对控制库可重试冲突补位一次（`_MARK_RETRY_DELAY`，只对 `retryable` 异常生效）；`INTENT_LEASE_SECONDS = 300` + `is_stale_prepared` 只放宽「零成本端点 + 超租约」的 `prepared`，付费端点的 `prepared` 与 `submission_unknown` 永不适用租约。
+3. **堵点可观测**：`kb_stats.pending_paid_requests` 增 `age_seconds / stale / endpoint_is_loopback`，并新增 `paid_route_blocked` 指出每个 kind 真正被哪一条卡住（该 key 仅在确有 kind 被堵时出现）；CLI `--list-requests` 保持既有脱敏合同（不输出 endpoint / payload_hash）。
+4. **检索与重建热路径**：可见性过滤复用 `documents` 映射与 `.vaultignore` 匹配器（`documents_epoch` 纪元 + 文件签名缓存；单次检索读库 3 → 1，`tests/test_issue15_perf.py` 断言 `== 1`，同步预热后实测 0）；`kb_rebuild` 冷/温均单轮全量（`start_watching(skip_initial_sync=True)`）；FTS 回填改单事务（`FtsIndex.upsert_sources`）；虚拟源物理校验接入 Fast-Stat 缓存；原生 watcher 在线时读路径不自排全量 sync，轮询/降级面按既有 `watch_fallback_interval` 限流。**墙钟数字（36.1 → 20.3 ms）只来自 `.runtime/issue15/` 探针，无测试断言**——`tests/` 只钉与硬件无关的调用次数，任何墙钟/倍率口径都不写成跨环境保证。
+5. **本版未改**：`.gitignore` / `docs/` 忽略与白名单口径、工具清单、配置键、`doc_store` schema、`CHANGELOG_user.md` 的既有版本条目。
 
 ## 目录
 
@@ -958,7 +970,8 @@ python -m pytest -q -o addopts= -m real_carrier
 |0.7.3|2026-09-22|（补丁）检索与摄取细节修复|
 |0.8.0|2026-09-28|架构解耦（稳定 Facade + 私有核心包）、搜索精读闭环（chunk_id 原地展开 / 双链直读）、预算控制与本地诊断日志、别名与 hard-term 保底|
 |0.8.1|2026-10-07|读优先后台刷新、自动摄取闭环（auto_watch + 20MiB 门禁）、compact 极简投影与整条 chunk 预算、物理行号越界诊断与源码级 heading 章节读取|
-|0.9.0（候选，未发布）|2026-10-09|文本模板与 estimated_tokens/legacy_chars 双模式、virtual 文档库（`doc_store`）成为默认解析事实落点、`kb_read_media` 与跨模态检索、请求意图记录与 `retry`/`index_state`；**音频转录与 ffmpeg 转码链路物理移除（Breaking）**|
+|0.9.0|2026-10-09|文本模板与 estimated_tokens/legacy_chars 双模式、virtual 文档库（`doc_store`）成为默认解析事实落点、`kb_read_media` 与跨模态检索、请求意图记录与 `retry`/`index_state`；**音频转录与 ffmpeg 转码链路物理移除（Breaking）**|
+|0.9.1|2026-10-10|（补丁）零成本回环端点不受付费闸门管辖（补齐媒体 route）、`prepared` 意图落账补位与租约回收 + `kb_stats.paid_route_blocked`、可见性过滤与 `.vaultignore` 匹配器缓存、`kb_rebuild` 单轮全量 + FTS 单事务回填、读路径不再抢跑全量同步|
 
 ### 14.3 关键不变量（改代码前请自查）
 

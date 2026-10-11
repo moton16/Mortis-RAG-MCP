@@ -625,7 +625,7 @@ class VaultMcpServer:
         listed = "\n".join(f"  - {entry.path} ({entry.name})" for entry in entries)
         raise ValueError(f"multiple vaults registered; pass an explicit vault_path:\n{listed}")
 
-    def _indexer_for(self, arguments: dict[str, Any]) -> MarkdownIndexer:
+    def _indexer_for(self, arguments: dict[str, Any], *, autostart: bool = True) -> MarkdownIndexer:
         raw = str(
             arguments.get("vault_path")
             or arguments.get("vault")
@@ -662,7 +662,12 @@ class VaultMcpServer:
                 # provider 拿不到 indexer，auto_submit 会在无法判定豁免规则的窗口里
                 # 提交本应被 .vaultignore/exclude 排除的文档。
                 self._indexers[key] = indexer
-                indexer.start_watching()
+                # issue #15 / P4-a：`autostart=False` 只登记不启动监听，供
+                # `_kb_rebuild` 用——它要在 `rebuild()` **之后**才拉起监听，
+                # 否则监听线程的首轮全量与前台 rebuild 会串行跑两次全量。
+                # 「先发布再启动」的顺序契约在两条路径下都保持（这里已经发布）。
+                if autostart:
+                    indexer.start_watching()
         return indexer
 
     def _list_vaults(self) -> dict[str, Any]:
@@ -934,6 +939,10 @@ class VaultMcpServer:
             fp = getattr(getattr(provider, "profile", None), "fingerprint", "")
             if indexer is not None:
                 indexer.configure_paid_provider("media", provider, fp)
+            elif getattr(provider, "is_local_free", False) is True:
+                # 未建 indexer 的旁路装配：零成本端点同样不进台账（issue #12），
+                # 与 indexer.configure_paid_provider 保持同一判据。
+                return provider, None
             else:
                 control = self._paid_control_store_for(vault_path)
                 if control is not None:
@@ -1196,8 +1205,20 @@ class VaultMcpServer:
         entry = self.registry.set_weight(vault_path, weight)
         return {"path": entry.path, "name": entry.name, "weight": entry.weight}
     def _kb_rebuild(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        indexer = self._indexer_for(arguments)
-        indexer.rebuild()
+        # issue #15 根因 4：此前 `_indexer_for` 对尚未加载的库会先 `start_watching()`，
+        # 而监听线程启动即跑一次首轮全量 sync（watch.py「没有这一句就永远等不到第一次
+        # 索引」）；紧接着 `rebuild()` 又清空缓存全量重建一次——两次全量在 `_sync_lock`
+        # 上串行，派生层被完整构建两遍。修复分两步，缺一不可：
+        #   1. `autostart=False`：本次只登记、不启动监听，冷路径根本没有后台首轮；
+        #   2. 重建后再 `start_watching(skip_initial_sync=True)`：消掉重建后那次
+        #      近空转的首轮 sync（此时索引已是最新，该轮基本不做任何事）。
+        # 结果是冷/温两条路径都只剩前台 `rebuild()` 那一次全量。
+        indexer = self._indexer_for(arguments, autostart=False)
+        indexer.stop_watching()
+        try:
+            indexer.rebuild()
+        finally:
+            indexer.start_watching(skip_initial_sync=True)
         return indexer.stats()
 
     def _kb_export(self, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -1866,9 +1887,22 @@ class VaultMcpServer:
             # 结果未知的付费请求必须可观测，否则「嵌入静默暂停」看起来像坏了。
             stats["pending_paid_requests"] = [
                 {"request_id": item["request_id"], "kind": item["kind"],
-                 "state": item["state"], "attempt": item["attempt"]}
+                 "state": item["state"], "attempt": item["attempt"],
+                 "age_seconds": item.get("age_seconds"),
+                 "stale": bool(item.get("stale")),
+                 "endpoint_is_loopback": bool(item.get("endpoint_is_loopback"))}
                 for item in unresolved_intents
             ]
+            # 真正在冻结路由的那一条（其余只是历史堆积）：此前两者混在同一个列表里，
+            # 运维只能靠比对后端日志计数反推是否被冻（issue #13）。
+            blocked: dict[str, str] = {}
+            for item in unresolved_intents:
+                if (item.get("stale") and item.get("endpoint_is_loopback")
+                        and item["state"] == "prepared"):
+                    continue
+                blocked.setdefault(item["kind"], item["request_id"])
+            if blocked:
+                stats["paid_route_blocked"] = blocked
         if getattr(indexer, "_embedding_paused", False):
             stats["embedding_paused"] = True
             stats["embedding_paused_reason"] = (
@@ -2184,6 +2218,11 @@ def list_requests(*, vault_path: str | Path, config_path: str | Path | None = No
         rows = control.list_request_intents()
     finally:
         control.close()
+    # 脱敏口径（既有合同，见 tests/test_management_recovery.py）：只暴露
+    # request_id / kind / state / attempt / next_action，端点与 payload_hash 不外露。
+    # issue #13 提出的「把 endpoint / profile_fingerprint 加进本命令」属口径取舍，
+    # 未在此擅自放宽；存活时长与「是否零成本」改由 kb_stats 的
+    # pending_paid_requests / paid_route_blocked 提供。
     requests = [{"request_id": str(row["request_id"]), "kind": str(row["kind"]),
                  "state": str(row["state"]), "attempt": int(row["attempt"] or 0),
                  "next_action": _request_next_action(str(row["state"]))} for row in rows]

@@ -51,6 +51,7 @@ def start_watching(
     owner: MarkdownIndexer,
     interval: float = 0.25,
     debounce_seconds: float | None = None,
+    skip_initial_sync: bool = False,
 ) -> None:
     if getattr(owner, "_stopping", False):
         if owner._watch_thread is not None:
@@ -79,6 +80,12 @@ def start_watching(
     # kb_init 返回的 "indexing: started in background" 是假的 —— 请求会
     # 阻塞到整个库索引 + embedding 完成（大库是分钟到小时级），客户端往往
     # 直接超时。首轮 sync 交给下面起的监听线程去做。
+    #
+    # issue #15 / P4-a：`skip_initial_sync=True` 让监听线程**跳过首轮全量
+    # sync**，供 `_kb_rebuild` 在 rebuild 之后拉起监听时使用（rebuild 本身已
+    # 是一次全量，重建后立刻再跑一轮基本是空转）。标志一次性消费：只有紧接
+    # 这一次启动跳过，之后（含降级回退到轮询）恢复正常首轮。
+    owner._watch_skip_initial_sync = bool(skip_initial_sync)
     owner._watch_stop.clear()
     method = owner.config.watch_method
     # auto：平台支持就用原生；native：优先原生（比如想在非 Windows 上显式
@@ -114,15 +121,43 @@ def request_refresh(owner: MarkdownIndexer, *, immediate: bool = False,
         _start_fs_scheduler(owner)
     with owner._fs_debounce_lock:
         now = time.monotonic()
-        # 查询只是机会性刷新：刚完成的索引无需因每次轮询再排一轮。
+        # 查询只是机会性刷新：刚完成的索引无需因每次轮询再排一轮；原生 watcher
+        # 在线时更是连轮询兜底都不需要（真实变动由 watcher 事件入队）。
         # 文件事件/import/显式请求不走此分支，接受仍等于真实保留 pending。
         if (for_read and not immediate and not owner._fs_requested
                 and not getattr(owner, "_indexing", False)
                 and getattr(owner, "_sync_state", "idle") == "idle"
                 and not getattr(owner, "_refresh_error", None)
-                and owner.last_sync is not None
-                and time.time() - owner.last_sync < owner._READ_REFRESH_MIN_INTERVAL_SECONDS):
-            return False
+                and owner.last_sync is not None):
+            # issue #15 根因 2：只要距上次同步超过 1 秒，读路径的机会性刷新就会
+            # 真的登记一轮全量 sync —— 于是**一个完全就绪的静态库**被它自己发起的
+            # 刷新判成 `rebuilding`，每次 kb_search / kb_stats / kb_list_files 都排
+            # 一轮（抑制窗口只有 1 s，之后每查必排）。
+            #
+            # 但读路径的兜底只在「没有事件源」时才需要：原生 watcher 在线且存活
+            # 时，真实文件变动由 watcher 事件入队，读路径不需要再自排一轮。故此处
+            # 收窄「刷新已登记」的适用面（方案 A，见调研报告 §5 P2）：watcher 在线
+            # 即直接返回 False；只有**完全没有监听循环**（冷启动/已停监听）时才保留
+            # 原来的 1 秒抑制窗口。
+            watcher = getattr(owner, "_fs_watcher", None)
+            if watcher is not None and bool(getattr(watcher, "is_alive", lambda: False)()):
+                return False
+            # P2（非原生面）：Linux/macOS / 显式 `watch_method="poll"` / 原生 watcher 降级
+            # 三种情形没有原生事件源，但 `_watch_loop` 仍在按 interval 轮询签名，**真实文本
+            # 变动照旧即时入列**。读路径因此只需要兜住签名轮询看不见的变动（`.vaultignore`、
+            # 权限/ACL 翻转等），按**低频对账周期**（`watch_fallback_interval`，与原生模式的
+            # 兜底全量同一口径，默认 30s）限流即可。
+            # 修复前这里没有这一层：抑制窗口只有 1 秒，于是轮询模式下**每查排一轮全量
+            # sync**，并把自己判成 `rebuilding`（issue #15 根因 2 的未修面）。
+            # `watch_fallback_interval<=0` 是「显式关闭周期对账」：读路径不得自行兜底，
+            # 否则等于把这个开关变成「每查一次」。
+            thread = getattr(owner, "_watch_thread", None)
+            if thread is not None and bool(getattr(thread, "is_alive", lambda: False)()):
+                interval = float(owner.config.watch_fallback_interval)
+                if interval <= 0 or time.time() - owner.last_sync < interval:
+                    return False
+            if time.time() - owner.last_sync < owner._READ_REFRESH_MIN_INTERVAL_SECONDS:
+                return False
         owner._refresh_requested_at = now
         if immediate:
             owner._fs_refresh_immediate = True
@@ -488,8 +523,8 @@ def _native_watch_loop(owner: MarkdownIndexer, interval: float, debounce: float)
     # 启动请求一次 ingest 扫描（处理启动时既有的待摄取文档）
     owner.request_ingest_scan()
     # 首轮全量 sync：watch_fallback_interval=0 时兜底循环一次都不会跑，
-    # 没有这一句就永远等不到第一次索引。
-    if not owner._watch_stop.is_set():
+    # 没有这一句就永远等不到第一次索引。`skip_initial_sync` 供 kb_rebuild 用。
+    if not owner._watch_stop.is_set() and not _consume_skip_initial_sync(owner):
         owner._run_sync_quietly()
     while not owner._watch_stop.is_set():
         if owner._fs_watcher is None or not owner._fs_watcher.is_alive():
@@ -519,8 +554,10 @@ def _watch_loop(owner: MarkdownIndexer, interval: float, debounce: float) -> Non
     # 落盘的改动会被当成已同步而从此丢失——线程刚启动时这个窗口最大（主线程
     # 往往在 watcher 线程第一次扫描前就写完了文件）。先取基线再 sync，两者
     # 之间出现的改动由随后的 sync 补上，之后的改动才由轮询发现。
+    # 注意：跳过首轮 sync 时**仍然**要取基线，否则这段窗口的改动会丢失。
     previous = owner._quick_signatures()
-    owner._run_sync_quietly()
+    if not _consume_skip_initial_sync(owner):
+        owner._run_sync_quietly()
 
     poll_ingest_interval = (
         owner.config.watch_fallback_interval
@@ -563,6 +600,17 @@ def _quick_signatures(owner: MarkdownIndexer) -> dict[str, tuple[int, int]]:
             continue  # 文件刚被删：跳过，下一轮自然消失
         out[owner._source(path)] = (stat.st_mtime_ns, stat.st_size)
     return out
+
+
+def _consume_skip_initial_sync(owner: MarkdownIndexer) -> bool:
+    """读取并清除「跳过首轮 sync」标志（issue #15 / P4-a）。
+
+    一次性语义：`_kb_rebuild` 在 rebuild 之后拉起监听时置位，监听线程只跳过紧接
+    这一次的首轮全量；之后（含原生 watcher 降级回退到轮询）恢复正常首轮。
+    """
+    skip = bool(getattr(owner, "_watch_skip_initial_sync", False))
+    owner._watch_skip_initial_sync = False
+    return skip
 
 
 def _join_started_thread(thread: threading.Thread | None, timeout: float = 2.0) -> bool:

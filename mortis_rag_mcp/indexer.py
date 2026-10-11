@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import stat
 import threading
 import time
 import zipfile
@@ -17,6 +18,7 @@ from .embedding_capabilities import normalize_endpoint, resolve_embedding_profil
 from .doc_store import (
     ControlStore,
     DocStoreError,
+    DocumentRecord,
     DocumentStore,
     StorageLayout,
     is_within,
@@ -24,8 +26,11 @@ from .doc_store import (
     vault_cache_key,
 )
 from .paid_requests import (
+    INTENT_LEASE_SECONDS,
     PaidRequestJournal,
     UNRESOLVED_INTENT_STATES,
+    intent_age,
+    is_stale_prepared,
     open_paid_control,
     paid_request_guard,
 )
@@ -33,7 +38,7 @@ from .fsnotify import WindowsDirectoryWatcher
 from .fts import FtsIndex
 from .ingest import INGEST_EXTS
 from .ingest.tables import iter_table_blocks, split_table_into_chunks
-from .providers import EmbeddingProvider, ProviderError, RerankerProvider, create_embedding_provider, create_media_provider, create_reranker_provider
+from .providers import EmbeddingProvider, ProviderError, RerankerProvider, _is_loopback_endpoint, create_embedding_provider, create_media_provider, create_reranker_provider
 from .vector import create_vector_backend
 # v0.8.0 P2：数据模型与缓存编解码提取至私有包 _indexer/（本文件转为 Facade）。
 # 下方 re-export 保持 `from mortis_rag_mcp.indexer import ...` 公开导入面 100% 不变。
@@ -185,6 +190,11 @@ class MarkdownIndexer:
         self._chunks: dict[str, list[Chunk]] = {}
         self._signatures: dict[str, str] = {}
         self._stat_cache: dict[str, tuple[int, int, int]] = {}
+        # 虚拟源（已摄取文档的物理源）上一轮实测出来的 raw_sha，键与失效判据与
+        # _stat_cache 完全同源（issue #15 / P1-d）：此前每个虚拟文档每轮都要全量
+        # 读盘重算 SHA-256，2,892 个虚拟文档就是每轮数十 MB~数 GB 的读盘。命中
+        # 时零读盘，未命中时行为与加缓存前逐字一致。
+        self._virtual_sha_cache: dict[str, str] = {}
         # 记录每个 source 的 (mtime_ns, size, ctime_ns) 签名是在哪个进程时钟时刻通过
         # 内容级验证（read + sha256）的。快速路径判据要求文件 mtime 严格早于该时刻
         # 减去安全余量（余量从实际时间戳刻度推导，见 _effective_margin_ns）才信任
@@ -202,6 +212,11 @@ class MarkdownIndexer:
         self._mtime_tick_probed = False
         # 非 None 表示快速路径已被整体禁用（探测到粗刻度），值为可读的原因。
         self._fast_path_disabled_reason: str | None = None
+        # issue #15 / P3-b：读路径 `_filter_visible_chunks` 的跨调用缓存。
+        # 命中键是 (DocumentStore 实例, store.documents_epoch)，避免复用别的库/
+        # 别的代次的映射；matcher 命中键是 (config 模式, `.vaultignore` 文件签名)。
+        self._visible_docs_cache: tuple[DocumentStore, int, dict[str, DocumentRecord]] | None = None
+        self._ignore_matcher_cache: tuple[tuple[Any, ...], IgnoreMatcher] | None = None
         # 快速路径的观测性告警（source -> 说明），如「mtime 停在未来、复核够次数后
         # 按稳定条目接受」。与 failed_files 同类：只是诊断数据，不影响检索结果。
         self.fast_path_warnings: dict[str, str] = {}
@@ -215,6 +230,10 @@ class MarkdownIndexer:
         self.last_sync: float | None = None
         self._watch_stop = threading.Event()
         self._watch_thread: threading.Thread | None = None
+        # issue #15 / P4-a：一次性「跳过首轮 sync」标志，由 start_watching 置位、
+        # 监听线程消费（`_consume_skip_initial_sync`）。供 kb_rebuild 在 rebuild
+        # 之后拉起监听时避免重建后的近空转全量。
+        self._watch_skip_initial_sync = False
         # native 监听（Windows ReadDirectoryChangesW）：watcher 本体 + 防抖状态。
         # 防抖定时器到点后做一次全量 sync；事件密集时不断顺延但受
         # _FS_MAX_DEBOUNCE_WAIT 封顶（见 _on_fs_events）。
@@ -518,18 +537,29 @@ class MarkdownIndexer:
         切片，某批结果未知时同一文件的前导批已发过并计费，而调用方「全有或全无」——
         只拦失败批会让每轮 sync 都重发前导批却永远完不成（实测每次重计费 1 批）。
         读不到控制库时返回 True（不能证明安全 → fail closed）。
+
+        例外：指向零成本 loopback 端点、且已超租约的 `prepared` 不再计入（详见
+        `is_stale_prepared`）—— 它是落账失败或进程中断留下的泄漏记录，继续让它
+        阻塞等于把整条路由永久冻死（issue #13）。
         """
         try:
             items = control.list_request_intents()
         except Exception:
             return True
+        now = time.time()
         return any(item["kind"] == kind and item["state"] in UNRESOLVED_INTENT_STATES
                    and (not profile_fingerprint
                         or item["profile_fingerprint"] == str(profile_fingerprint))
+                   and not is_stale_prepared(item, now)
                    for item in items)
 
     def unresolved_paid_intents(self) -> list[dict[str, Any]]:
-        """本库当前所有未决付费意图（供 `kb_stats` 观测，不触发任何网络动作）。"""
+        """本库当前所有未决付费意图（供 `kb_stats` 观测，不触发任何网络动作）。
+
+        附带三个派生字段：`age_seconds`（存活时长）、`stale`（已超租约，需人工
+        处理）、`endpoint_is_loopback`（零成本端点，可安全 abandon）。运维据此能
+        区分「正在冻结路由」与「历史堆积」——此前两者混在一个列表里无法分辨。
+        """
         control = self._paid_control_store()
         if control is None:
             return []
@@ -537,17 +567,30 @@ class MarkdownIndexer:
             items = control.list_request_intents()
         except Exception:
             return []
-        return [item for item in items if item["state"] in UNRESOLVED_INTENT_STATES]
+        now = time.time()
+        rows = [item for item in items if item["state"] in UNRESOLVED_INTENT_STATES]
+        for item in rows:
+            item["age_seconds"] = round(intent_age(item, now), 1)
+            item["stale"] = item["age_seconds"] >= INTENT_LEASE_SECONDS
+            item["endpoint_is_loopback"] = _is_loopback_endpoint(str(item.get("endpoint") or ""))
+        return rows
 
     def configure_paid_provider(self, kind: str, provider: Any, profile_fingerprint: str) -> bool:
         """把持久 journal + 闸门装配到任何 `configure_paid_requests` provider 上。
 
         媒体等新 provider 必须经此装配（§20.7B 覆盖 media）：
         返回 False 表示该 provider 不支持付费装配，调用方必须自行拒绝外部请求。
+        返回 True 表示已接线，**或**该 provider 是零成本端点（loopback + 无凭据），
+        无需台账即可直发。
         """
         configure = getattr(provider, "configure_paid_requests", None)
         if not callable(configure):
             return False
+        # 零成本端点不进付费台账：它不产生费用，装配 journal 只会让控制面的一次
+        # 抖动把整条路由冻死（issue #12）。跳过装配后 provider 自身按「无 journal
+        # + 本地直发」处理，真实的网络故障仍会报 LOCAL_REQUEST_FAILED。
+        if getattr(provider, "is_local_free", False) is True:
+            return True
         configure(PaidRequestJournal(self._paid_control_store, kind),
                   self._paid_guard_for(profile_fingerprint, kind), profile_fingerprint)
         return True
@@ -1025,10 +1068,17 @@ class MarkdownIndexer:
     def _flush_vectors_to_disk(self) -> None:
         _sync_engine.flush_vectors_to_disk(self)
     def _fts_upsert(self, source: str, chunks: list[Chunk]) -> None:
+        self._fts_upsert_many(((source, chunks),))
+
+    def _fts_upsert_many(self, mapping: Iterable[tuple[str, list[Chunk]]]) -> None:
+        """一次事务内写入多个 source（issue #15 根因 4：rebuild 末尾的逐 source 事务）。
+
+        单个 source 走 `_fts_upsert` 仍是「一个 source 一个事务」，与历史行为一致。
+        """
         if self._fts is None:
             return
         try:
-            self._fts.upsert_source(source, chunks)
+            self._fts.upsert_sources(list(mapping))
         except Exception:
             # A broken FTS index must never take the sync down; degrade to off.
             try:
@@ -1048,8 +1098,11 @@ class MarkdownIndexer:
         try:
             total = len(self.all_chunks())
             if total and self._fts.count() != total:
-                for source, chunks in self._chunks.items():
-                    self._fts_upsert(source, chunks)
+                # issue #15 根因 4 的同型未修点：此前逐 source 一个事务（DELETE +
+                # executemany），而这条路径被**每次进程启动**的 warm-cache 分支与
+                # kb_import 三条路径（snapshot.py）调用。整批一个事务；写入顺序与
+                # 「逐 source 先删后插」语义由 `FtsIndex.upsert_sources` 保证。
+                self._fts_upsert_many(list(self._chunks.items()))
         except Exception:
             self._fts = None
 
@@ -1080,10 +1133,31 @@ class MarkdownIndexer:
     @staticmethod
     def _embed_one_file(source: str, chunks: list[Chunk], provider: EmbeddingProvider) -> None:
         _sync_engine.embed_one_file(source, chunks, provider)
-    def _load_ignore_patterns(self) -> list[str]:
+    def _config_ignore_patterns(self) -> tuple[str, ...]:
+        """来自配置（非 `.vaultignore` 文件）的豁免模式，顺序即匹配顺序。"""
         patterns = list(self.config.exclude_patterns)
         if self.config.cache.placement == "vault" and self.config.cache.subdir:
             patterns.append(self.config.cache.subdir + "/")
+        return tuple(patterns)
+
+    def _ignore_file_signature(self) -> tuple[int, int, int] | None:
+        """`.vaultignore` 的 `(mtime_ns, size, ctime_ns)`；缺失/非普通文件时为 None。
+
+        issue #15 / P3-b：豁免规则文件的内容一变，`_ignore_matcher` 必须重新解析
+        （`tests/test_virtual_sync.py::test_ignore_final_filter_with_broken_store`
+        钉住「rerank 期间新写的 `.vaultignore` 必须被后一次过滤看到」）。用一次
+        stat 代替整文件重读 + 正则重建。
+        """
+        try:
+            info = os.stat(self.vault_path / self.config.ignore_file)
+        except OSError:
+            return None
+        if not stat.S_ISREG(info.st_mode):
+            return None
+        return (int(info.st_mtime_ns), int(info.st_size), int(info.st_ctime_ns))
+
+    def _load_ignore_patterns(self) -> list[str]:
+        patterns = list(self._config_ignore_patterns())
 
         ignore_file_path = self.vault_path / self.config.ignore_file
         if ignore_file_path.exists() and ignore_file_path.is_file():
@@ -1097,7 +1171,19 @@ class MarkdownIndexer:
         return patterns
 
     def _ignore_matcher(self) -> IgnoreMatcher:
-        return IgnoreMatcher(self._load_ignore_patterns())
+        """豁免匹配器，按「配置模式 + `.vaultignore` 文件签名」做跨调用缓存（P3-b）。
+
+        单次检索会过滤三轮，此前每轮都重读 `.vaultignore` 并重建正则（issue #15
+        根因 3 的一部分，`.vaultignore` 重解析实测 0.29 ms/次）。文件签名变化
+        （含删除/新建）或配置变化即重建，语义与不缓存逐字一致。
+        """
+        key = (self._config_ignore_patterns(), self._ignore_file_signature())
+        cached = self._ignore_matcher_cache
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        matcher = IgnoreMatcher(self._load_ignore_patterns())
+        self._ignore_matcher_cache = (key, matcher)
+        return matcher
 
     def _markdown_files(self) -> Iterable[Path]:
         return _scanning.scandir_indexable_files(self.vault_path, self._ignore_matcher(), _INDEXABLE_TEXT_EXTS)
@@ -1228,19 +1314,66 @@ class MarkdownIndexer:
             return False
         return generation is None or generation.status not in {"stale", "failed"}
 
-    def _filter_visible_chunks(self, chunks: list[Chunk]) -> list[Chunk]:
+    def _visible_documents(self) -> dict[str, DocumentRecord]:
+        """`source -> DocumentRecord` 映射，带跨调用缓存（issue #15 / P3-b）。
+
+        单次检索会走三轮 `_filter_visible_chunks`，此前每轮都跑一次
+        `store.list_documents()`（实测 4.8 ms / 2,892 行）。缓存失效键是
+        `DocumentStore.documents_epoch`——它由**任何**改变 `documents` 行的写入推进，
+        包括 `set_visibility` / `invalidate_source`（两者都不 bump `change_seq`，
+        所以 `change_seq` 不能当这个键）。
+
+        为什么单次检索内仍然「三轮各自调用」：`filters.matches` /
+        `rerank_chunks` 是调用方可注入的钩子，既有用例钉住「钩子期间改掉的可见性
+        必须被后一次过滤看到」。这里靠 epoch 在钩子改可见性后自然失配来满足它，
+        而不是共享一次快照。
+
+        库不可读/损坏时按现状返回空映射且**不缓存**，让下一次重试（
+        `tests/test_virtual_sync.py::test_ignore_final_filter_with_broken_store`
+        钉住这条路径）。
+        """
+        cache = self._visible_docs_cache
         try:
             store = self._existing_document_store()
-            documents = {doc.source: doc for doc in store.list_documents()} if store else {}
         except Exception:
-            documents = {}
-            chunks = [chunk for chunk in chunks if not chunk.metadata.get("revision_id")]
+            return {}
+        if store is None:
+            return {}
+        epoch = store.documents_epoch
+        if cache is not None and cache[0] is store and cache[1] == epoch:
+            return cache[2]
+        try:
+            documents = {doc.source: doc for doc in store.list_documents()}
+        except Exception:
+            return {}
+        # 读得前后各取一次纪元：与并发写入交错时宁可放弃这一次缓存，也不要把更旧
+        # 的映射挂到更新的纪元上（generation 切换也会在这里体现）。
+        if store.documents_epoch == epoch:
+            self._visible_docs_cache = (store, epoch, documents)
+        return documents
+
+    def _filter_visible_chunks(self, chunks: list[Chunk]) -> list[Chunk]:
+        # issue #15 根因 3：`is_ignored` **按 chunk 调**（issue 环境 9,270 次而非
+        # 137 个 source）。这里按 `chunk.source` 记忆化；documents 映射与 matcher
+        # 的跨调用缓存分别由 `_visible_documents` / `_ignore_matcher` 负责（P3-b）。
+        documents = self._visible_documents()
         matcher = self._ignore_matcher()
-        return [chunk for chunk in chunks
-                if not matcher.is_ignored(chunk.source)[0]
-                and (chunk.source not in documents or documents[chunk.source].visibility == "active")
-                and (not chunk.metadata.get("revision_id") or chunk.source in documents
-                     and documents[chunk.source].active_revision == chunk.metadata["revision_id"])]
+        ignored: dict[str, bool] = {}
+        visible: list[Chunk] = []
+        for chunk in chunks:
+            source = chunk.source
+            if source not in ignored:
+                ignored[source] = matcher.is_ignored(source)[0]
+            if ignored[source]:
+                continue
+            document = documents.get(source)
+            if document is not None and document.visibility != "active":
+                continue
+            revision_id = chunk.metadata.get("revision_id")
+            if revision_id and (document is None or document.active_revision != revision_id):
+                continue
+            visible.append(chunk)
+        return visible
 
     def all_chunks(self) -> list[Chunk]:
         """全部 chunk 的快照。
@@ -1537,9 +1670,13 @@ class MarkdownIndexer:
             # 缓存整体丢弃，失败名单也随之作废（它只是缓存的附属观测数据）。
             self.failed_files.clear()
             self._stat_cache.clear()
+            self._virtual_sha_cache.clear()
             self._stat_seen_ns.clear()
             self._stat_confirmations.clear()
             self.fast_path_warnings.clear()
+            # 读路径的跨调用缓存（P3-b）与派生缓存同生命周期。
+            self._visible_docs_cache = None
+            self._ignore_matcher_cache = None
         # FTS index + optional sqlite-vec backend share the cache lifecycle.
         if self._fts is not None:
             try:
@@ -1588,10 +1725,13 @@ class MarkdownIndexer:
             self._chunks.clear()
             self._signatures.clear()
             self._stat_cache.clear()
+            self._virtual_sha_cache.clear()
             self._stat_seen_ns.clear()
             self._stat_confirmations.clear()
             self.fast_path_warnings.clear()
             self.failed_files.clear()
+            self._visible_docs_cache = None
+            self._ignore_matcher_cache = None
             self._disk_vectors.clear()
             if self._vectors_on_disk:
                 try:
@@ -1609,8 +1749,10 @@ class MarkdownIndexer:
                 except Exception:
                     self._fts = None
                 if self._fts is not None:
-                    for source, chunks in self._chunks.items():
-                        self._fts_upsert(source, chunks)
+                    # issue #15 根因 4：此前逐 source 各开一个事务（137 个 source =
+                    # 137 个事务）。整批一个事务；写入顺序与「逐 source 先删后插」
+                    # 语义由 FtsIndex.upsert_sources 保证。
+                    self._fts_upsert_many(list(self._chunks.items()))
             return result
 
     _READABLE_SUFFIXES = {".md", ".markdown", ".txt"}
@@ -1678,8 +1820,10 @@ class MarkdownIndexer:
             raise ValueError("source must stay inside the vault")
         return candidate
 
-    def start_watching(self, interval: float = 0.25, debounce_seconds: float | None = None) -> None:
-        return _watch.start_watching(self, interval=interval, debounce_seconds=debounce_seconds)
+    def start_watching(self, interval: float = 0.25, debounce_seconds: float | None = None,
+                       skip_initial_sync: bool = False) -> None:
+        return _watch.start_watching(self, interval=interval, debounce_seconds=debounce_seconds,
+                                     skip_initial_sync=skip_initial_sync)
 
     def _start_fs_scheduler(self) -> None:
         return _watch._start_fs_scheduler(self)

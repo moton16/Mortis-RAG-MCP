@@ -11,7 +11,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from .embedding_capabilities import ResolvedEmbeddingProfile, validate_profile, validate_vector
-from .providers import ProviderError
+from .providers import ProviderError, _is_loopback_endpoint
 
 _MAX_RESPONSE_BYTES = 10 * 1024 * 1024  # 10 MiB response body limit
 
@@ -444,6 +444,17 @@ class NativeMediaProvider:
         self.request_journal = journal
         self.paid_guard = guard
 
+    @property
+    def is_local_free(self) -> bool:
+        """零成本端点：loopback 地址 + 传输层未配凭据 → 不产生费用，无需付费台账。
+
+        凭据只挂在 transport 上（profile 只描述能力与端点），所以两处都要看：
+        缺任一侧都不能判定为「零成本」。
+        """
+        endpoint = str(getattr(self.profile, "endpoint", "") or "")
+        api_key = str(getattr(self._transport, "api_key", "") or "")
+        return not bool(api_key.strip()) and _is_loopback_endpoint(endpoint)
+
     def ability(self) -> dict[str, Any]:
         """只报告**声明**事实（不是已测能力，也不代表真实端点可用），供 E08 消费。"""
         return {
@@ -475,18 +486,30 @@ class NativeMediaProvider:
                 raise ProviderError("native media input exceeds verified byte limit")
             if hashlib.sha256(item.data).hexdigest() != item.media_hash:
                 raise ProviderError("native media input hash mismatch")
-        if self.request_journal is None or self.paid_guard is None or not self.paid_guard(self.profile.fingerprint):
+        # 零成本端点不受付费台账管辖：既不落意图、也不受历史未决意图牵连
+        # （issue #12/#13）。付费路径的结构一条未动。
+        local_free = self.is_local_free
+        journal = self.request_journal
+        if journal is None or self.paid_guard is None:
+            if not local_free:
+                raise ProviderError("EMBEDDING_PENDING_APPROVAL: native media request blocked")
+        elif not (local_free or self.paid_guard(self.profile.fingerprint)):
             raise ProviderError("EMBEDDING_PENDING_APPROVAL: native media request blocked")
         material = repr([(item.request_id, item.modality, item.mime_type, item.media_hash) for item in items])
         payload_hash = hashlib.sha256(material.encode()).hexdigest()
-        request_id = self.request_journal.before_send(payload_hash, self.profile.endpoint, self.profile.fingerprint)
+        request_id = None if local_free else journal.before_send(
+            payload_hash, self.profile.endpoint, self.profile.fingerprint)
         try:
             response = list(self._transport(items))
         except MediaResponseError as exc:
-            self.request_journal.mark_response_failed(request_id, exc.reason)
+            if request_id is not None:
+                journal.mark_response_failed(request_id, exc.reason)
             raise
         except Exception as exc:
-            self.request_journal.mark_unknown(request_id, "response_unconfirmed")
+            if request_id is None:
+                raise ProviderError(
+                    f"LOCAL_MEDIA_REQUEST_FAILED: request to local endpoint failed: {exc}") from exc
+            journal.mark_unknown(request_id, "response_unconfirmed")
             raise ProviderError("SUBMISSION_UNKNOWN: native media outcome unknown") from exc
         # Receipt is not success. Validate every item before the durable success CAS.
         try:
@@ -495,7 +518,9 @@ class NativeMediaProvider:
             mapped = map_media_response(response, ids)
             vectors = [validate_vector(mapped[item_id], self.profile) for item_id in ids]
         except Exception:
-            self.request_journal.mark_response_failed(request_id)
+            if request_id is not None:
+                journal.mark_response_failed(request_id)
             raise
-        self.request_journal.mark_success(request_id)
+        if request_id is not None:
+            journal.mark_success(request_id)
         return vectors

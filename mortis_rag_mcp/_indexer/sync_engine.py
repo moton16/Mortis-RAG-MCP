@@ -112,6 +112,11 @@ def _paid_embedding_allowed(owner: MarkdownIndexer) -> bool:
     该暂停**不**施加到查询期嵌入（单次、载荷唯一、不重放）。
     Facade 未提供该方法时按「不可用」处理（fail closed）。
     """
+    # 零成本端点（loopback + 无凭据）不产生费用，既不需要授权也不受历史未决意图
+    # 牵连：让它继续走付费暂停判据，等于本机推理后端一次抖动就冻死整条索引
+    # （issue #12）。
+    if getattr(getattr(owner, "embedding_provider", None), "is_local_free", False) is True:
+        return True
     may = getattr(owner, "may_use_paid_profile", None)
     if not callable(may):
         return False
@@ -406,8 +411,9 @@ def embed_missing(owner: MarkdownIndexer) -> bool:
 def revoke_source(owner: MarkdownIndexer, source: str, *, reason: str) -> bool:
     chunks = owner._chunks.pop(source, [])
     ids = {chunk.id for chunk in chunks}
-    for state in (owner._signatures, owner._stat_cache, owner._stat_seen_ns,
-                  owner._stat_confirmations, owner.fast_path_warnings, owner.failed_files):
+    for state in (owner._signatures, owner._stat_cache, getattr(owner, "_virtual_sha_cache", {}),
+                  owner._stat_seen_ns, owner._stat_confirmations, owner.fast_path_warnings,
+                  owner.failed_files):
         state.pop(source, None)
     for chunk_id in ids:
         owner._pending_vectors.pop(chunk_id, None)
@@ -490,11 +496,17 @@ def media_native_route(owner: MarkdownIndexer) -> Any:
 
 
 def media_native_for_revision(owner: MarkdownIndexer, store: Any, source: str, revision_id: str,
-                              occurrences: list[Any], *, reuse_only: bool = False) -> list[Chunk]:
+                              occurrences: list[Any], *, reuse_only: bool = False,
+                              unresolved_paid: Any = None) -> list[Chunk]:
     """从**已验证 blob** 读受限 bytes 并消费 E07 `embed_media`，产出原生媒体向量 chunk。
 
     route 不可用（无 provider / 未声明 alignment / 无受限读取能力）时返回空列表——
     明确该 route 不可用，纯词法 proxy 仍可用，但**不**把 proxy 冒充 native。
+
+    `unresolved_paid`（issue #15 / P1-b）：由调用方给出的「当前是否存在未决付费
+    意图」，可以是 bool，也可以是返回 bool 的零参回调（回调形式允许调用方在本轮
+    内真的发过一次付费请求后重新求值，避免用陈旧值放行第二次计费）。缺省 None 时
+    按现状自行查询。
     """
     from ..media_providers import EmbeddingInput
     from .media import MediaStageError
@@ -572,8 +584,19 @@ def media_native_for_revision(owner: MarkdownIndexer, store: Any, source: str, r
             pending.append(item)
     if not pending or reuse_only:
         return chunks
-    control = owner._paid_control_store()
-    if control is not None and owner.has_unresolved_paid_intents(control, "media", provider.profile.fingerprint):
+    # issue #15 / P1-c：零成本（loopback 无凭据）媒体 route 连意图库都不该碰。此前
+    # `owner._paid_control_store()` 与「媒体未决意图」探查排在 `is_local_free` 之前，
+    # 结果每轮都被后置的短路丢弃——纯浪费，且破坏了「零成本端点完全不触意图库」
+    # 这条性质。判序改为先看成本，付费路径一行未动。
+    local_free = bool(getattr(provider, "is_local_free", False))
+    control = None if local_free else owner._paid_control_store()
+    unresolved = False
+    if not local_free:
+        unresolved = unresolved_paid() if callable(unresolved_paid) else unresolved_paid
+        if unresolved is None:
+            unresolved = owner.has_unresolved_paid_intents(
+                control, "media", provider.profile.fingerprint)
+    if control is not None and unresolved:
         raise MediaStageError("PAID_REQUEST_UNRESOLVED: native media outcome unknown; automatic retry disabled", chunks)
     for start in range(0, len(pending), batch):
         batch_inputs = pending[start:start + batch]
@@ -758,6 +781,27 @@ def run_sync(owner: MarkdownIndexer) -> list[Chunk]:
     # 探测的余量做跳过决定。
     owner._finalize_mtime_tick_probe(mtime_samples)
 
+    # issue #15 / P1-a + P1-b：未决付费意图判据只依赖 (kind, profile_fingerprint)，
+    # **与 source 无关**。此前它在下面的虚拟文档循环内逐 source 调用，而每次调用都
+    # 要对 request_intents 做一次全表扫描（无 WHERE 过滤 + 跨进程 OS 锁），实测
+    # 16.33 ms/次；2,870 个 source 就是 46.9 s/轮，超过 30 s 重排间隔 → 后台线程
+    # 永远追不上、GIL 被焊死，同进程内其它库的前台检索一起被拖慢。
+    #
+    # 判据输入逐 source 完全相同，所以整轮只求值一次即**逐 source 等价**。唯一需要
+    # 重新求值的情形是**本轮内真的发过一次付费请求且结果未知**（此时判据由 False 翻
+    # 转为 True）；若沿用陈旧值，同一轮里后续 source 会重复计费。故缓存带失效标记，
+    # 只在本轮媒体阶段落败时失效，命中时零成本。
+    media_route = media_native_route(owner)
+    media_fingerprint = media_route.profile.fingerprint if media_route is not None else ""
+    _media_probe: dict[str, Any] = {"value": False, "fresh": media_route is None}
+
+    def unresolved_media() -> bool:
+        if not _media_probe["fresh"]:
+            _media_probe["value"] = owner.has_unresolved_paid_intents(
+                owner._paid_control_store(), "media", media_fingerprint)
+            _media_probe["fresh"] = True
+        return _media_probe["value"]
+
     for document in documents:
         source = document.source
         if document.visibility != "active" or not document.active_revision:
@@ -775,16 +819,45 @@ def run_sync(owner: MarkdownIndexer) -> list[Chunk]:
             normalize_source_path(source, owner.vault_path)
             path = owner.vault_path / source
             stat = path.stat()
-            digest = hashlib.sha256()
-            with path.open("rb") as stream:
-                for block in iter(lambda: stream.read(1024 * 1024), b""):
-                    digest.update(block)
-            raw_sha = digest.hexdigest()
-            after = path.stat()
-            if (stat.st_mtime_ns, stat.st_size, stat.st_ctime_ns) != (
-                after.st_mtime_ns, after.st_size, after.st_ctime_ns
-            ):
-                raise ValueError("source changed during verification")
+            # issue #15 / P1-d：虚拟文档分支此前**没有**文本路径那种零读盘短路，
+            # 每轮对每个虚拟源全量读盘重算 SHA-256（issue 环境 2,892 个已摄取虚拟
+            # 文档 = 每轮数十 MB~数 GB 读盘，与根因 1 的 46.9 s 叠加成「后台永远
+            # 追不上」）。这里**照抄**文本路径已论证过的判据，不另发明余量逻辑：
+            #   命中 = 签名三元组 (mtime_ns, size, ctime_ns) 与上次内容级验证时登记
+            #   的完全一致 + `_fast_path_is_trustworthy`（mtime 严格早于「上次内容级
+            #   验证时刻 - _effective_margin_ns()」，余量由实际文件系统刻度推导）。
+            # 未命中（含首次、racily clean、快速路径被整体禁用）时下面的行为与加
+            # 缓存前逐字一致：全量读盘 + 读前读后双 stat 的 TOCTOU 复核。
+            fast_sig = (int(stat.st_mtime_ns), int(stat.st_size), int(stat.st_ctime_ns))
+            cached_sha = owner._virtual_sha_cache.get(source)
+            if (cached_sha is not None and owner._stat_cache.get(source) == fast_sig
+                    and owner._fast_path_is_trustworthy(source, int(stat.st_mtime_ns))):
+                # 跳过的是**读盘取内容**，不是「物理源仍然可读」这条判据本身：
+                # `test_virtual_sync.py::test_virtual_root_offline_retains_committed_fact`
+                # 钉住「stat 成功但 open 被拒（脱机/ACL）时必须把已提交事实降为
+                # unverified」。所以这里仍要开一次文件（open+close、不读一个字节，
+                # 开销是 ~µs 级系统调用，而不是整文件的 GB 级读盘）。
+                with path.open("rb"):
+                    pass
+                raw_sha = cached_sha
+            else:
+                digest = hashlib.sha256()
+                with path.open("rb") as stream:
+                    for block in iter(lambda: stream.read(1024 * 1024), b""):
+                        digest.update(block)
+                raw_sha = digest.hexdigest()
+                after = path.stat()
+                if (stat.st_mtime_ns, stat.st_size, stat.st_ctime_ns) != (
+                    after.st_mtime_ns, after.st_size, after.st_ctime_ns
+                ):
+                    raise ValueError("source changed during verification")
+                # 可信时刻在读盘之后取：此后若文件再被写入，新 mtime 必晚于该时刻，
+                # 签名随之失配、自动重读（与文本路径同一论证）。登记进 _stat_cache
+                # 的是**读盘前**的 fast_sig，不重新 stat——否则可能把「新 mtime +
+                # 旧哈希」固化进缓存（理由同文本路径）。
+                owner._virtual_sha_cache[source] = raw_sha
+                owner._stat_cache[source] = fast_sig
+                owner._stat_seen_ns[source] = time.time_ns()
             active = store.get_active(source, include_hidden=True)
             if active is None:
                 revoked = revoke_source(owner, source, reason="visibility") or revoked
@@ -792,8 +865,6 @@ def run_sync(owner: MarkdownIndexer) -> list[Chunk]:
             revision = active.revision
             if raw_sha != revision.source_sha256:
                 raise ValueError("source SHA differs from committed revision")
-            media_route = media_native_route(owner)
-            media_fingerprint = media_route.profile.fingerprint if media_route is not None else ""
             signature = f"virtual:{revision.revision_id}:{raw_sha}:{revision.render_sha256}:media:{media_fingerprint}"
             missing_native = any(c.metadata.get("kind") == "media_native" and not chunk_has_vector(owner, c)
                                  for c in owner._chunks.get(source, ()))
@@ -801,8 +872,7 @@ def run_sync(owner: MarkdownIndexer) -> list[Chunk]:
                 continue
             if (owner._signatures.get(source) == signature and not missing_native
                     and source in media_failures and media_route is not None
-                    and owner.has_unresolved_paid_intents(
-                        owner._paid_control_store(), "media", media_fingerprint)):
+                    and unresolved_media()):
                 # A settled source with an unknown send stays failed without
                 # regenerating identical caches or replaying successful batches.
                 continue
@@ -842,9 +912,15 @@ def run_sync(owner: MarkdownIndexer) -> list[Chunk]:
             try:
                 native_chunks = media_native_for_revision(
                     owner, owner.document_store(write=True), source, revision.revision_id, occurrences,
-                    reuse_only=proxy_failed)
+                    reuse_only=proxy_failed, unresolved_paid=unresolved_media)
                 chunks.extend(native_chunks)
             except Exception as exc:
+                # 本轮媒体阶段落败：付费意图可能刚被置为未决，缓存判据失效，
+                # 下一个 source 必须重新求值（否则同一轮内可能重复计费）。
+                # nit（issue #15 / P1）：先失效判据、再把失败前缀并回。今天不可达
+                # （`MediaStageError.chunks` 恒为 list），纯粹是语义顺序——任何异常
+                # 对象都不该让「未决判据仍新鲜」活过本轮。
+                _media_probe["fresh"] = False
                 chunks.extend(getattr(exc, "chunks", ()))
                 media_failures[source] = f"media_native: {exc}"
             # Successful prefixes are native too; never embed their proxies as text.
@@ -856,9 +932,7 @@ def run_sync(owner: MarkdownIndexer) -> list[Chunk]:
                     chunk.metadata["embedding_disabled"] = True
             for chunk in chunks:
                 chunk.metadata.update(source_sha256=raw_sha, render_sha256=revision.render_sha256)
-            changed.append((source, signature, chunks,
-                            (int(stat.st_mtime_ns), int(stat.st_size), int(stat.st_ctime_ns)),
-                            time.time_ns()))
+            changed.append((source, signature, chunks, fast_sig, time.time_ns()))
         except FileNotFoundError as exc:
             writable = owner.document_store(write=True)
             if scan.complete:

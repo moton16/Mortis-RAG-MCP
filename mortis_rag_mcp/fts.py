@@ -87,6 +87,27 @@ class FtsIndex:
                     "INSERT INTO chunks_fts(source, chunk_id, content) VALUES (?, ?, ?)", rows
                 )
 
+    def upsert_sources(self, mapping: Any) -> None:
+        """Replace rows for many sources inside **one** transaction.
+
+        issue #15 根因 4：`upsert_source` 是每个 source 一个 `with conn:` 事务
+        （DELETE + executemany），issue 环境 137 个 source = 137 个事务。这里只开
+        一个事务，但保持**同样的写入顺序与「逐 source 先删后插」语义**——先按传入
+        顺序删完全部 source，再按同一顺序插回（source 在 dict 里唯一，故与逐个调用
+        的结果逐条一致）。
+        """
+        items = list(mapping.items()) if hasattr(mapping, "items") else list(mapping)
+        with self._lock:
+            conn = self._connect()
+            with conn:
+                for source, _chunks in items:
+                    conn.execute("DELETE FROM chunks_fts WHERE source = ?", (source,))
+                for source, chunks in items:
+                    conn.executemany(
+                        "INSERT INTO chunks_fts(source, chunk_id, content) VALUES (?, ?, ?)",
+                        [(source, chunk.id, chunk.content) for chunk in chunks],
+                    )
+
     def delete_source(self, source: str) -> None:
         with self._lock:
             try:

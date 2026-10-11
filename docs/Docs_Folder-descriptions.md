@@ -9,3 +9,4 @@
 - 总体任务状态只在 `UNIFIED_EXECUTION_PLAN_2026-10-08.md`；四份 tracked 开发文档维护实际架构和技术流水，不建立第二份总计划。
 - 文档分工：面向用户的能力与升级说明在根目录 `README.md` / `README_EN.md` / `QUICKSTART_user.md` / `CHANGELOG_user.md`（只讲功能增减与体验，不写技术细节）；技术流水与实现细节只在 `Changelog_developer.md` 与 `PROJECT_GUIDE.md`。
 - 离线评测使用说明在 `tests/eval/README.md`，运行证据/候选包位于被忽略的 `.runtime/`，均不应混进发布包。
+- 2026-10-10 v0.9.1 为补丁版本，未新增版本目录；`docs/` 结构与上述口径不变，四份 tracked 开发文档照常随代码 commit。

@@ -60,5 +60,5 @@
 - 后台首次构建的空结果与真实未命中不同；`status="indexing"` 看 `progress/retry_after`，不要无间隔探测。已有索引可在刷新中返回，检查 `indexing_error/index_state/next_action`，不把局部结果当作全库已完备。
 - `kb_read` 是原文直读，不调用 embedding、不主动同步；已知 source 可直接读，不必先等待搜索索引 ready。
 - 源已变更使 chunk_id 失效时重新搜索；物理文本可按 source/heading 读当前正文。virtual 的旧存档只有任务明确需要时才 `allow_stale=true`，并标明存档而非当前源。
-- `kb_stats` 可查看 `failed_files/skipped_unsupported/pending_paid_requests` 等实际状态，但不是每次查询的前置探活，也不通过紧密反复调用它修复失败。
+- `kb_stats` 可查看 `failed_files/skipped_unsupported/pending_paid_requests/paid_route_blocked` 等实际状态，但不是每次查询的前置探活，也不通过紧密反复调用它修复失败。
 - 回答引用库 + source + 行号；virtual 补 revision，原生媒体补 occurrence。区分原文、摘要/图注、推断与尚未读取的内容。

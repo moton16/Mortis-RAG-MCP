@@ -449,3 +449,55 @@ def test_review_c02_prefix_requires_all_five_cached_identity_fields(tmp_path, mo
         assert derived(idx).status == "failed"
     finally:
         close(idx)
+
+
+def _loopback_media_config():
+    return media_config(media_endpoint="http://127.0.0.1:8000/v1/embeddings", media_api_key="")
+
+
+def test_local_free_media_endpoint_bypasses_the_paid_ledger(tmp_path):
+    """issue #12：零成本媒体端点既不落意图，也不受付费闸门管辖。"""
+    idx = make_indexer(tmp_path, _loopback_media_config(), valid)
+    commit_media(idx)
+    try:
+        assert idx.media_provider.is_local_free is True
+        assert idx.media_provider.request_journal is None, "零成本端点不得进付费台账"
+        idx.sync()
+        assert native(idx), "零成本媒体端点应当直发并产出原生向量"
+        assert media_intents(idx) == [], "不产生费用就不该留下待人工清账的意图"
+        assert derived(idx).status == "ready"
+    finally:
+        close(idx)
+
+
+def test_local_free_media_endpoint_is_not_frozen_by_a_leftover_intent(tmp_path):
+    """issue #13：遗留一条未决意图不得冻住零成本媒体路由。"""
+    idx = make_indexer(tmp_path, _loopback_media_config(), valid)
+    commit_media(idx)
+    control = idx._paid_control_store()
+    fingerprint = idx.media_provider.profile.fingerprint
+    control.record_send_intent(
+        "rid-leftover", kind="media", payload_hash="h",
+        endpoint="http://127.0.0.1:8000/v1/embeddings",
+        profile_fingerprint=fingerprint, attempt=None, reject_unresolved=True)
+    assert idx.has_unresolved_paid_intents(control, "media", fingerprint) is True
+    try:
+        idx.sync()
+        assert native(idx), "零成本路由不得被历史未决意图冻住"
+        assert idx.failed_files == {}
+    finally:
+        close(idx)
+
+
+def test_paid_media_endpoint_still_uses_the_paid_ledger(tmp_path):
+    """对照：付费媒体端点的一切照旧（落意图 + 受闸门管辖）。"""
+    idx = make_indexer(tmp_path, media_config(), valid)
+    commit_media(idx)
+    try:
+        assert idx.media_provider.is_local_free is False
+        assert idx.media_provider.request_journal is not None
+        idx.sync()
+        assert native(idx)
+        assert [i["state"] for i in media_intents(idx)] == ["success"]
+    finally:
+        close(idx)
