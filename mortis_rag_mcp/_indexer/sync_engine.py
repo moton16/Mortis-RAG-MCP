@@ -208,9 +208,14 @@ class _TemplatingProvider:
         return embed_with_profile(self._provider, texts, self._profile)
 
     def embed_batch_once(self, texts, *, request_context=None):
-        """后台单批入口：模板仍只在这里应用一次，且恰好一个物理 POST。"""
-        return embed_with_profile(self._provider, texts, self._profile,
-                                 request_context=request_context, single_batch=True)
+        """后台单批入口：模板**只在这里应用一次**，且恰好一个物理 POST。
+
+        计划层（续算组件身份）用的是同一模板后的文本做身份计算，但传给本方法的
+        是原始正文 —— 绝不能两端各格式化一次。
+        """
+        template = getattr(self._profile, "document_template", "{text}") or "{text}"
+        formatted = [template.format(text=text) for text in texts]
+        return self._provider.embed_batch_once(formatted, request_context=request_context)
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._provider, name)
@@ -432,6 +437,8 @@ def _pending_components(owner: MarkdownIndexer, pending: dict[str, list[Chunk]])
             signature = ""
         for chunk in chunks:
             embedding_key = _reuse_key(chunk) or hashlib.sha256(chunk.content.encode("utf-8")).hexdigest()
+            # 身份用**模板后**文本（真实 wire 输入）；发送给 provider 的仍是正文，
+            # 由 _TemplatingProvider 统一模板化一次。
             exact_input = _document_input(owner, chunk.content)
             key = component_key(purpose_family_name=family, profile_fingerprint=profile_fingerprint,
                                 embedding_key=embedding_key,
@@ -449,7 +456,8 @@ def _pending_components(owner: MarkdownIndexer, pending: dict[str, list[Chunk]])
                 "source_sha256": signature,
                 "revision_id": str(chunk.metadata.get("revision_id") or ""),
                 "chunk_id": chunk.id,
-                "text": exact_input,
+                # 原始正文：模板由 _TemplatingProvider 应用，避免二次格式化。
+                "text": chunk.content,
                 "chunks": [chunk],
             }
     return components
@@ -661,7 +669,12 @@ def embed_missing(owner: MarkdownIndexer) -> bool:
         return False
     owner._embedding_paused = False
 
-    if owner.config.embedding.mode == "external" and _bounded_resume_mode(owner):
+    # 零成本端点（loopback + 无凭据）不产生费用，也不进续算台账：继续走旧的
+    # 按文件分组路径，避免把本机推理后端接进付费占用逻辑（issue #12 纪律）。
+    if (owner.config.embedding.mode == "external" and _bounded_resume_mode(owner)
+            and not getattr(owner.embedding_provider, "is_local_free", False)
+            and str(owner.config.embedding.endpoint or "").strip()):
+        # 没有端点就无法标识路由，续算不可用 → 继续走旧的按文件分组路径。
         return _embed_missing_bounded(owner, pending, pending_chunks, failed_before, reused)
 
     if owner.config.embedding.mode != "external":

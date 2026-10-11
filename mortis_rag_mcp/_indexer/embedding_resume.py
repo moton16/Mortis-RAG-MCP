@@ -242,7 +242,7 @@ def recover_interrupted_batches(control: ControlStore, *, layout: StorageLayout,
                     control.record_embedding_outcome(
                         batch_id, owner, "response_invalid",
                         reason="recover:complete-artifact-missing",
-                        component_state="held_result_missing")
+                        component_state="held_result_missing", from_states=("complete",))
                     summary["held_complete"] += 1
         except Exception as exc:  # noqa: BLE001
             summary["errors"].append(f"{batch_id}:{exc}")

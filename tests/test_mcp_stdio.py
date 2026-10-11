@@ -211,10 +211,11 @@ def test_stdio_candidate_smoke(tmp_path):
     # 2. ping 检查
     assert responses[1]["result"] == {}
 
-    # 3. 16 工具列表与新参数检查（含 kb_read_media）
+    # 3. 17 工具列表与新参数检查（含 kb_read_media / kb_request_control）
     tools = {t["name"]: t for t in responses[2]["result"]["tools"]}
-    assert len(tools) == 16
+    assert len(tools) == 17
     assert "kb_read_media" in tools
+    assert "kb_request_control" in tools
     search_props = tools["kb_search"]["inputSchema"]["properties"]
     assert "compact" in search_props
     assert "group_offsets" in search_props

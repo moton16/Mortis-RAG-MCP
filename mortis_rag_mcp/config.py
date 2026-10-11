@@ -482,7 +482,9 @@ class RequestControlConfig:
     * `paused_profiles` 是明确的暂停清单（精确 fingerprint），不是审批清单。
     """
 
-    mode: str = "legacy_profile"
+    #: P4 联合验收通过后切换为目标默认：组件级占用 + 持久 unknown hold。
+    #: `legacy_profile` 只作为临时回滚兼容模式保留。
+    mode: str = "bounded_resume"
     background_embedding: str = "enabled"
     background_max_posts_per_round: int = 32
     query_max_posts: int = 8
@@ -1067,7 +1069,7 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
 
 def _load_request_control(data: Mapping[str, Any]) -> RequestControlConfig:
     section = _section(data, "request_control")
-    raw_mode = str(section.get("mode", "legacy_profile")).strip().lower()
+    raw_mode = str(section.get("mode", "bounded_resume")).strip().lower()
     raw_background = str(section.get("background_embedding", "enabled")).strip().lower()
     raw_paused = section.get("paused_profiles", ())
     if isinstance(raw_paused, str):

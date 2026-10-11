@@ -638,9 +638,9 @@ class MarkdownIndexer:
         return True
 
     def _configure_paid_providers(self) -> None:
+        # 模式**只**装配到本实例持有的 provider 上，不改全局默认：全局默认值属于
+        # 未装配 provider（如测试直接构造）的兼容口径，进程级改动会造成跨库串味。
         mode = self.request_control_mode()
-        # 全局默认跟随本实例配置：让未显式装配的 provider/doctor 路径行为一致。
-        request_lifecycle.set_request_control_mode(mode)
         self.configure_paid_provider("embed", self.embedding_provider,
                                      self._embedding_profile.fingerprint, mode=mode)
         self.configure_paid_provider("rerank", self.reranker_provider,

@@ -11,7 +11,7 @@ import time
 from argparse import ArgumentParser
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from . import __version__
 from .config import load_config, resolve_config_path
@@ -238,9 +238,24 @@ def _tool_definitions() -> list[dict[str, Any]]:
         },
         {
             "name": "kb_rebuild",
-            "description": "删除指定知识库的磁盘缓存并强制全量重建索引（首次建库或内容大改后用）。",
+            "description": "删除指定知识库的磁盘缓存并强制全量重建索引（首次建库或内容大改后用）。外部付费库缺 confirm_cost 时只返回预览，不清缓存、不启动监听、不发送请求。",
             "inputSchema": {"type": "object", "properties": {
                 "vault_path": {"type": "string", "description": vault_path_hint},
+                "confirm_cost": {"type": "boolean", "default": False, "description": "确认外部全量重算的重复计费风险；外部模式必需"},
+            }},
+        },
+        {
+            "name": "kb_request_control",
+            "description": "只读查看或显式处置本机外部请求控制状态（未知结果 hold / 明确暂停 / 旧记录迁移）。必须显式传 vault_path；所有变更默认 dry_run，需显式 dry_run=false。不联网、不安排刷新、不启动监听。",
+            "inputSchema": {"type": "object", "required": ["vault_path", "action"], "properties": {
+                "vault_path": {"type": "string", "description": "**必填**：目标知识库绝对路径（防止恢复错库）"},
+                "action": {"type": "string", "enum": ["list", "inspect", "retry", "abandon", "pause_route", "resume_route", "resolve_legacy"],
+                           "description": "list/inspect 只读；retry 需 confirm_repeat_cost；abandon 退出自动续算；pause_route/resume_route 改明确暂停；resolve_legacy 处置列出的旧记录"},
+                "batch_id": {"type": "string", "description": "inspect / retry / abandon 的目标批次"},
+                "profile_fingerprint": {"type": "string", "description": "pause_route / resume_route 的目标 profile 精确指纹"},
+                "request_ids": {"type": "array", "items": {"type": "string"}, "description": "resolve_legacy 要处置的旧 request_id 列表"},
+                "confirm_repeat_cost": {"type": "boolean", "default": False, "description": "确认可能重复计费（retry / resolve_legacy 必需）"},
+                "dry_run": {"type": "boolean", "default": True, "description": "默认 true：只预览；显式 false 才落库"},
             }},
         },
         {
@@ -1102,6 +1117,7 @@ class VaultMcpServer:
         "kb_ingest": "_kb_ingest",
         "kb_set_weight": "_kb_set_weight",
         "kb_rebuild": "_kb_rebuild",
+        "kb_request_control": "_kb_request_control",
         "kb_export": "_kb_export",
         "kb_import": "_kb_import",
         "kb_search": "_kb_search",
@@ -1214,12 +1230,77 @@ class VaultMcpServer:
         #      近空转的首轮 sync（此时索引已是最新，该轮基本不做任何事）。
         # 结果是冷/温两条路径都只剩前台 `rebuild()` 那一次全量。
         indexer = self._indexer_for(arguments, autostart=False)
+        # v0.9.2 §9：外部全量重算必须先确认。缺确认时只返回预览——不清缓存、
+        # 不停止/启动监听、不发送任何请求。
+        external = str(getattr(indexer.config.embedding, "mode", "")) == "external"
+        local_free = bool(getattr(indexer.embedding_provider, "is_local_free", False))
+        if external and not local_free and not bool(arguments.get("confirm_cost", False)):
+            from ._indexer import embedding_resume
+            control = indexer._paid_control_store()
+            held = 0
+            if control is not None:
+                try:
+                    summary = embedding_resume.held_summary(control)
+                    held = int(summary.get("held_components") or 0)
+                except Exception:
+                    held = -1
+            pending_items = 0
+            for chunks in getattr(indexer, "_chunks", {}).values():
+                for chunk in chunks:
+                    if chunk.metadata.get("embedding_disabled"):
+                        continue
+                    if not indexer._chunk_has_vector(chunk):
+                        pending_items += 1
+            return {
+                "rebuild": "preview",
+                "applied": False,
+                "vault_path": str(indexer.vault_path),
+                "profile_fingerprint": getattr(indexer._embedding_profile, "fingerprint", ""),
+                "pending_items_estimate": pending_items,
+                "estimated_posts": "unknown (depends on batch_size and dedup)",
+                "held_components": held,
+                "requires": "confirm_cost=true",
+                "note": "external rebuild repeats paid embedding; held components are never "
+                        "replayed and MinerU parsing is not re-run",
+            }
         indexer.stop_watching()
         try:
             indexer.rebuild()
         finally:
             indexer.start_watching(skip_initial_sync=True)
         return indexer.stats()
+
+    def _kb_request_control(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        """精确查看/处置外部请求控制状态；必须显式 vault_path，默认 dry_run。"""
+        vault_path = str(arguments.get("vault_path", "")).strip()
+        if not vault_path:
+            raise ValueError("vault_path is required for kb_request_control")
+        action = str(arguments.get("action", "")).strip()
+        if action not in REQUEST_CONTROL_ACTIONS:
+            raise ValueError(
+                f"action must be one of {list(REQUEST_CONTROL_ACTIONS)} for kb_request_control")
+        dry_run = arguments.get("dry_run", True)
+        if not isinstance(dry_run, bool):
+            raise ValueError("dry_run must be a boolean")
+        confirm = arguments.get("confirm_repeat_cost", False)
+        if not isinstance(confirm, bool):
+            raise ValueError("confirm_repeat_cost must be a boolean")
+        request_ids = arguments.get("request_ids") or ()
+        if not isinstance(request_ids, (list, tuple)) or any(
+                not isinstance(item, str) or not item for item in request_ids):
+            raise ValueError("request_ids must be a list of non-empty strings")
+        if action in {"retry", "abandon"} and not str(arguments.get("batch_id", "")).strip():
+            raise ValueError(f"batch_id is required for action={action}")
+        if action in {"pause_route", "resume_route"} and not str(
+                arguments.get("profile_fingerprint", "")).strip():
+            raise ValueError(f"profile_fingerprint is required for action={action}")
+        if action == "resolve_legacy" and not request_ids:
+            raise ValueError("request_ids is required for action=resolve_legacy")
+        return request_control_action(
+            vault_path=vault_path, action=action,
+            batch_id=str(arguments.get("batch_id", "")),
+            profile_fingerprint=str(arguments.get("profile_fingerprint", "")),
+            request_ids=request_ids, confirm_repeat_cost=confirm, dry_run=dry_run)
 
     def _kb_export(self, arguments: dict[str, Any]) -> dict[str, Any]:
         indexer = self._indexer_for(arguments)
@@ -1912,6 +1993,33 @@ class VaultMcpServer:
                 "paid embedding requires explicit approval for the current profile "
                 "(run --approve-reembedding <profile_fingerprint>)"
             )
+        # v0.9.2 §9：请求控制结构化诊断。只读，不安排刷新、不启动监听、不联网。
+        try:
+            from ._indexer import embedding_resume as _resume
+            mode = indexer.request_control_mode()
+            control = indexer._paid_control_store()
+            held = _resume.held_summary(control) if control is not None else {
+                "available": False, "held_batches": 0, "held_components": 0, "updated_at": 0.0}
+            rc = getattr(indexer.config, "request_control", None)
+            limit = int(getattr(rc, "background_max_posts_per_round", 32) or 32)
+            used = int(getattr(indexer, "_post_budget_used", 0) or 0)
+            stats["request_control"] = {
+                "mode": mode,
+                "background_state": ("paused" if getattr(indexer, "_embedding_paused", False)
+                                     else "manual" if str(getattr(rc, "background_embedding", "enabled")) == "manual"
+                                     else "deferred" if used >= limit else "enabled"),
+                "effective_paid_workers": 1 if indexer.config.embedding.mode == "external" else 0,
+                "posts_used": used,
+                "posts_limit": limit,
+                "held_batches": int(held.get("held_batches") or 0),
+                "held_components": int(held.get("held_components") or 0),
+                "paused_routes": sorted(indexer.paused_route_fingerprints()),
+                "audit_write_errors": int(getattr(indexer.embedding_provider, "audit_write_errors", 0) or 0),
+                "legacy_migration_pending": len(_legacy_migration_pending(control)) if control is not None else 0,
+                "resume_store_available": bool(held.get("available", False)),
+            }
+        except Exception:
+            stats["request_control"] = {"mode": "unknown", "resume_store_available": False}
         if getattr(indexer, "_paid_profile_requires_approval", False):
             stats["pending_reembedding_approval"] = True
             try:
@@ -2270,6 +2378,144 @@ def abandon_request(request_id: str, *, vault_path: str | Path,
                         "repeat work that was already processed (and billed) before")}
 
 
+#: `kb_request_control` 的合法动作（v0.9.2 §9）。
+REQUEST_CONTROL_ACTIONS = ("list", "inspect", "retry", "abandon", "pause_route",
+                           "resume_route", "resolve_legacy")
+
+
+def _legacy_migration_pending(control: Any) -> list[dict[str, Any]]:
+    """旧 journal 中**无法可靠映射到组件**的相关记录（保守边界，不猜映射）。
+
+    * `prepared` / `submission_unknown`：可能根本没发出，也可能已计费；
+    * `success`：可能来自向量校验前记账，或落到 cache 之前崩溃；
+    * `abandoned`：人工放弃不证明未收费，也不自动授予重算许可。
+
+    只有当该旧记录已有可信映射（存在 `operation_id="legacy:<request_id>"` 的迁移
+    批次）时才不列入。列入 → 相关旧路由进入一次性迁移暂停，直到显式处置。
+    """
+    from ._indexer import embedding_resume
+    try:
+        intents = control.list_request_intents()
+    except Exception:
+        return []
+    mapped: set[str] = set()
+    try:
+        for batch in embedding_resume.list_embedding_work(control):
+            operation = str(batch.get("operation_id") or "")
+            if operation.startswith("legacy:"):
+                mapped.add(operation[len("legacy:"):])
+    except Exception:
+        mapped = set()
+    pending = []
+    for row in intents:
+        request_id = str(row.get("request_id") or "")
+        state = str(row.get("state") or "")
+        if state not in {"prepared", "submission_unknown", "success", "abandoned"}:
+            continue
+        if request_id in mapped:
+            continue
+        pending.append({"request_id": request_id, "kind": str(row.get("kind") or ""),
+                        "state": state, "reason": str(row.get("reason") or ""),
+                        "profile_fingerprint": str(row.get("profile_fingerprint") or "")})
+    return pending
+
+
+def request_control_action(*, vault_path: str | Path, action: str, batch_id: str = "",
+                          profile_fingerprint: str = "", request_ids: Sequence[str] = (),
+                          confirm_repeat_cost: bool = False, dry_run: bool = True,
+                          config_path: str | Path | None = None) -> dict[str, Any]:
+    """精确恢复/暂停的业务函数：MCP 工具与管理 CLI 共用同一份实现。
+
+    * 必须显式给 `vault_path`（防止恢复错库）；
+    * 所有变更默认 dry_run=True，必须显式 `dry_run=false` 才落库；
+    * 只读动作（list/inspect）不安排 refresh、不启动 watch、不联网；
+    * `retry` 必须 `confirm_repeat_cost=true`，且拒绝仍活跃的 sending 批次；
+    * `abandon` 只转 `manual_only`（退出自动续算），**不**释放组件让 watch 重发。
+    """
+    from .doc_store import ControlStore
+    from ._indexer import embedding_resume
+
+    if not str(vault_path or "").strip():
+        return {"applied": False, "error": "VAULT_PATH_REQUIRED",
+                "hint": "kb_request_control requires an explicit vault_path"}
+    if action not in REQUEST_CONTROL_ACTIONS:
+        return {"applied": False, "error": "UNSUPPORTED_ACTION",
+                "supported": list(REQUEST_CONTROL_ACTIONS)}
+    read_only = action in {"list", "inspect"}
+    write = not read_only and not dry_run
+    layout = _control_for(vault_path, config_path)
+    control = ControlStore(layout)
+    try:
+        try:
+            control.open(create=False, write=write)
+        except Exception as exc:
+            return {"applied": False, "error": "CONTROL_STORE_UNAVAILABLE",
+                    "detail": str(exc)[:200], "vault_path": str(vault_path)}
+        legacy = _legacy_migration_pending(control)
+        try:
+            work = embedding_resume.list_embedding_work(
+                control, batch_id=str(batch_id or ""))
+        except Exception as exc:
+            work = []
+            work_error = str(exc)[:200]
+        else:
+            work_error = ""
+        base = {"vault_path": str(Path(vault_path).expanduser()), "action": action,
+                "dry_run": bool(dry_run), "legacy_migration_pending": legacy,
+                "resume_store_error": work_error,
+                "work": [{"batch_id": b["batch_id"], "state": b["state"],
+                          "outcome": b.get("outcome", ""),
+                          "purpose_family": b.get("purpose_family", ""),
+                          "profile_fingerprint": b.get("profile_fingerprint", ""),
+                          "reason": b.get("reason", ""),
+                          "components": len(b.get("components") or ())} for b in work]}
+        if read_only:
+            base["applied"] = False
+            base["read_only"] = True
+            return base
+        if action in {"retry", "abandon"} and not str(batch_id or "").strip():
+            return {**base, "applied": False, "error": "BATCH_ID_REQUIRED"}
+        if action in {"pause_route", "resume_route"} and not str(profile_fingerprint or "").strip():
+            return {**base, "applied": False, "error": "PROFILE_FINGERPRINT_REQUIRED"}
+        if action == "resolve_legacy" and not list(request_ids or ()):
+            return {**base, "applied": False, "error": "REQUEST_IDS_REQUIRED"}
+        if dry_run:
+            return {**base, "applied": False, "preview": True,
+                    "hint": "set dry_run=false to apply"}
+        if action == "pause_route":
+            control.revoke_paid_authorization(str(profile_fingerprint))
+            return {**base, "applied": True, "route_paused": str(profile_fingerprint)}
+        if action == "resume_route":
+            # 只解除**明确暂停**；绝不解除 batch hold。
+            control.authorize_paid_profile(str(profile_fingerprint), scope="resume_route",
+                                           note="explicit route resume (does not release batch holds)")
+            return {**base, "applied": True, "route_resumed": str(profile_fingerprint)}
+        if action == "resolve_legacy":
+            if not confirm_repeat_cost:
+                return {**base, "applied": False,
+                        "error": "RESOLVE_LEGACY_NEEDS_CONFIRMATION",
+                        "hint": "confirm_repeat_cost=true is required; legacy records may "
+                                "already have been charged"}
+            dispositions = []
+            for request_id in request_ids:
+                record = next((row for row in legacy if row["request_id"] == str(request_id)), None)
+                if record is None:
+                    dispositions.append({"request_id": str(request_id), "applied": False,
+                                         "error": "NOT_IN_PENDING_SET"})
+                    continue
+                control.mark_intent(str(request_id), "abandoned",
+                                    reason="resolve_legacy: confirmed repeat-cost disposition",
+                                    expected_states=("prepared", "submission_unknown"))
+                dispositions.append({"request_id": str(request_id), "applied": True})
+            return {**base, "applied": True, "dispositions": dispositions}
+        result = embedding_resume.resolve_embedding_work(
+            control, str(batch_id), action=action, confirm_repeat_cost=confirm_repeat_cost,
+            note="operator via kb_request_control")
+        return {**base, **result}
+    finally:
+        control.close()
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = ArgumentParser(prog="mortis-rag-mcp")
     parser.add_argument("--serve-mcp-stdio", action="store_true")
@@ -2285,6 +2531,13 @@ def main(argv: list[str] | None = None) -> int:
                         help="只读列出本机付费请求意图（需 --vault；不发起请求）")
     parser.add_argument("--abandon-request", default=None, metavar="REQUEST_ID",
                         help="放弃一条未决付费请求意图（需 --vault；只改本机记录，不重发、不授权）")
+    parser.add_argument("--request-control", default=None, metavar="ACTION",
+                        help="请求控制管理入口（需 --vault）：list|inspect|retry|abandon|pause_route|resume_route|resolve_legacy")
+    parser.add_argument("--batch-id", default=None, metavar="BATCH_ID")
+    parser.add_argument("--profile-fingerprint", default=None, metavar="FINGERPRINT")
+    parser.add_argument("--request-ids", default=None, metavar="ID[,ID...]")
+    parser.add_argument("--confirm-repeat-cost", action="store_true",
+                        help="确认可能重复计费（retry / resolve_legacy 必需；--request-control 需配合 --apply 才落库）")
     parser.add_argument("--vault", default=None, help="管理操作（--approve-reembedding / --migrate-ingest / --list-requests / --abandon-request）的目标库路径")
     parser.add_argument("--quiet", action="store_true", help="静默模式，禁止输出到 stdout")
     args = parser.parse_args(argv)
@@ -2296,11 +2549,12 @@ def main(argv: list[str] | None = None) -> int:
         ("--approve-reembedding", args.approve_reembedding is not None),
         ("--list-requests", args.list_requests),
         ("--abandon-request", args.abandon_request is not None),
+        ("--request-control", args.request_control is not None),
     ) if value]
     if len(selected) > 1:
         parser.error("management actions are mutually exclusive: " + ", ".join(selected))
-    if args.apply and not args.migrate_ingest:
-        parser.error("--apply is only valid with --migrate-ingest")
+    if args.apply and not (args.migrate_ingest or args.request_control is not None):
+        parser.error("--apply is only valid with --migrate-ingest or --request-control")
     if not selected and not args.serve_mcp_stdio:
         parser.error("--serve-mcp-stdio is required")
     if selected and "--serve-mcp-stdio" not in selected:
@@ -2320,6 +2574,17 @@ def main(argv: list[str] | None = None) -> int:
     if args.abandon_request is not None:
         result = abandon_request(args.abandon_request, vault_path=args.vault,
                                  config_path=args.app_config)
+        if not args.quiet:
+            sys.stdout.write(json.dumps(result, ensure_ascii=False) + "\n")
+        return 0
+    if args.request_control is not None:
+        ids = tuple(part.strip() for part in str(args.request_ids or "").split(",") if part.strip())
+        result = request_control_action(
+            vault_path=args.vault, action=str(args.request_control).strip(),
+            batch_id=str(args.batch_id or ""),
+            profile_fingerprint=str(args.profile_fingerprint or ""),
+            request_ids=ids, confirm_repeat_cost=bool(args.confirm_repeat_cost),
+            dry_run=not args.apply, config_path=args.app_config)
         if not args.quiet:
             sys.stdout.write(json.dumps(result, ensure_ascii=False) + "\n")
         return 0

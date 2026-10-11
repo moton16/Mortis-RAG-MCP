@@ -1534,7 +1534,9 @@ class ControlStore:
 
     def record_embedding_outcome(self, batch_id: str, owner_token: str, outcome: str, *,
                                  http_status: int | None = None, reason: str = "",
-                                 component_state: str = "") -> bool:
+                                 component_state: str = "",
+                                 from_states: Sequence[str] = ("reserved", "sending",
+                                                               "result_pending")) -> bool:
         """记录一次发送结果：组件与批次在**同一事务**内推进。
 
         `succeeded` 只置 `result_pending`（还未经检查点确认）；未知结果一律转
@@ -1554,19 +1556,20 @@ class ControlStore:
         now = time.time()
         with self.mutation() as conn:
             self._ensure_resume_schema(conn)
+            placeholders = ",".join("?" for _ in from_states)
             cursor = conn.execute(
                 "UPDATE embedding_batches SET state = ?, outcome = ?, http_status = ?, reason = ?, "
-                "updated_at = ? WHERE batch_id = ? AND owner_token = ? "
-                "AND state IN ('reserved','sending','result_pending')",
+                f"updated_at = ? WHERE batch_id = ? AND owner_token = ? "
+                f"AND state IN ({placeholders})",
                 (batch_state, str(outcome), http_status, str(reason)[:400], now,
-                 batch_id, owner_token),
+                 batch_id, owner_token, *from_states),
             )
             if cursor.rowcount != 1:
                 self._rollback_quietly(conn)
                 return False
             conn.execute(
                 "UPDATE embedding_components SET state = ? WHERE batch_id = ? "
-                "AND state IN ('reserved','sending','result_pending')", (target, batch_id))
+                f"AND state IN ({placeholders})", (target, batch_id, *from_states))
             conn.commit()
         return True
 
