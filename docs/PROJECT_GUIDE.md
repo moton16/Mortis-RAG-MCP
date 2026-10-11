@@ -624,6 +624,7 @@ query 为空 → 直接返回（过滤+分页后）的 chunk 列表
 |`endpoint` / `model` / `api_key`|空|api_key 支持 `${ENV}` 插值，空则回退 `VAULT_MCP_API_KEY`|
 |`dimension`|384|向量维度（须与模型输出一致）|
 |`send_dimensions`|true|是否在请求体传 `dimensions`（MRL 模型 true；bge-m3 必须 false）|
+|`input_modality_declaration`|`none`|文本 input 模态声明：`none` 保持标准 OpenAI 兼容裸字符串数组；仅当对端要求显式声明时改为 `typed`（`{"text": ...}`）或 `hint`（`input_modality="text"`）|
 |`timeout`|30|秒，(0, 300]|
 |`max_retries`|3|首败后额外重试次数，[0,10]；每次尝试吃满一个 timeout|
 |`batch_size`|32|单请求最大文本数，<=0 关闭切批|

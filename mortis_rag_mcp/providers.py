@@ -176,12 +176,13 @@ class _JsonHttpProvider:
 
 
 class ExternalEmbeddingProvider(_JsonHttpProvider):
-    def __init__(self, endpoint: str, model: str = "", api_key: str = "", timeout: float = 30.0, dimension: int | None = None, send_dimensions: bool = True, max_retries: int = 3, retry_backoff: float = 1.0, batch_size: int = 32, *, profile: ResolvedEmbeddingProfile | None = None) -> None:
+    def __init__(self, endpoint: str, model: str = "", api_key: str = "", timeout: float = 30.0, dimension: int | None = None, send_dimensions: bool = True, max_retries: int = 3, retry_backoff: float = 1.0, batch_size: int = 32, *, input_modality_declaration: str = "none", profile: ResolvedEmbeddingProfile | None = None) -> None:
         super().__init__(endpoint, api_key, timeout, max_retries, retry_backoff)
         self.model = model
         self.dimension = dimension
         self.send_dimensions = send_dimensions
         self.batch_size = batch_size
+        self.input_modality_declaration = input_modality_declaration
         self.profile = profile
         if profile is not None:
             self.dimension = profile.effective_dim
@@ -202,7 +203,12 @@ class ExternalEmbeddingProvider(_JsonHttpProvider):
         return vectors
 
     def _embed_batch(self, batch: list[str]) -> list[list[float]]:
-        payload = {"model": self.model, "input": batch}
+        request_input: list[str] | list[dict[str, str]] = batch
+        if self.input_modality_declaration == "typed":
+            request_input = [{"text": text} for text in batch]
+        payload: dict[str, Any] = {"model": self.model, "input": request_input}
+        if self.input_modality_declaration == "hint":
+            payload["input_modality"] = "text"
         if self.dimension and self.send_dimensions:
             payload["dimensions"] = self.dimension
         response = self._post(payload)
@@ -280,6 +286,7 @@ def create_embedding_provider(config: EmbeddingConfig) -> EmbeddingProvider:
             config.max_retries,
             config.retry_backoff,
             config.batch_size,
+            input_modality_declaration=config.input_modality_declaration,
             profile=profile,
         )
     raise ValueError(f"unsupported embedding mode: {config.mode}")

@@ -37,6 +37,9 @@ def resolve_media_auth(explicit_media: str = "", explicit_generic: str = "", env
             or resolve_api_key())
 
 
+_INPUT_MODALITY_DECLARATION_VALUES = {"none", "typed", "hint"}
+
+
 @dataclass(slots=True)
 class EmbeddingConfig:
     mode: str = "static"
@@ -49,6 +52,8 @@ class EmbeddingConfig:
     # (Qwen3-Embedding series) accept it; fixed-dimension models (bge-m3) reject
     # it with HTTP 400, so set this to false for those.
     send_dimensions: bool = True
+    # Endpoint-specific opt-in; "none" preserves the OpenAI-compatible contract.
+    input_modality_declaration: str = "none"
     # Extra attempts after the first failure (0 keeps the old fail-fast behavior).
     max_retries: int = 3
     # Max texts per embedding HTTP request. <=0 disables batching and sends
@@ -89,6 +94,12 @@ class EmbeddingConfig:
         from .embedding_capabilities import validate_media_modalities, validate_text_template
         validate_text_template(self.query_template)
         validate_text_template(self.document_template)
+        if self.input_modality_declaration not in _INPUT_MODALITY_DECLARATION_VALUES:
+            raise ValueError(
+                "embedding.input_modality_declaration must be one of "
+                f"{sorted(_INPUT_MODALITY_DECLARATION_VALUES)}, got "
+                f"{self.input_modality_declaration!r}"
+            )
         for name in ("model_revision", "endpoint_revision", "preprocess_version",
                      "media_alignment_space_id", "media_preprocess_version", "media_endpoint_revision",
                      "media_model_reference", "media_endpoint_fixture_reference",
@@ -832,6 +843,9 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
         timeout=_numeric(embedding, data, "timeout", float, 30.0, 0.0, 300.0),
         dimension=_numeric(embedding, data, "dimension", int, 384, 1),
         send_dimensions=bool(embedding.get("send_dimensions", True)),
+        input_modality_declaration=str(
+            embedding.get("input_modality_declaration", "none")
+        ).lower(),
         max_retries=_numeric(embedding, data, "max_retries", int, 3, 0, 10),
         batch_size=_numeric(embedding, data, "batch_size", int, 32, 0),
         retry_backoff=_numeric(embedding, data, "retry_backoff", float, 1.0, 0.0, 60.0),
