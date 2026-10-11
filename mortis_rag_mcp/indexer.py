@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import stat
 import threading
 import time
 import zipfile
@@ -17,6 +18,7 @@ from .embedding_capabilities import normalize_endpoint, resolve_embedding_profil
 from .doc_store import (
     ControlStore,
     DocStoreError,
+    DocumentRecord,
     DocumentStore,
     StorageLayout,
     is_within,
@@ -210,6 +212,11 @@ class MarkdownIndexer:
         self._mtime_tick_probed = False
         # 非 None 表示快速路径已被整体禁用（探测到粗刻度），值为可读的原因。
         self._fast_path_disabled_reason: str | None = None
+        # issue #15 / P3-b：读路径 `_filter_visible_chunks` 的跨调用缓存。
+        # 命中键是 (DocumentStore 实例, store.documents_epoch)，避免复用别的库/
+        # 别的代次的映射；matcher 命中键是 (config 模式, `.vaultignore` 文件签名)。
+        self._visible_docs_cache: tuple[DocumentStore, int, dict[str, DocumentRecord]] | None = None
+        self._ignore_matcher_cache: tuple[tuple[Any, ...], IgnoreMatcher] | None = None
         # 快速路径的观测性告警（source -> 说明），如「mtime 停在未来、复核够次数后
         # 按稳定条目接受」。与 failed_files 同类：只是诊断数据，不影响检索结果。
         self.fast_path_warnings: dict[str, str] = {}
@@ -1119,10 +1126,31 @@ class MarkdownIndexer:
     @staticmethod
     def _embed_one_file(source: str, chunks: list[Chunk], provider: EmbeddingProvider) -> None:
         _sync_engine.embed_one_file(source, chunks, provider)
-    def _load_ignore_patterns(self) -> list[str]:
+    def _config_ignore_patterns(self) -> tuple[str, ...]:
+        """来自配置（非 `.vaultignore` 文件）的豁免模式，顺序即匹配顺序。"""
         patterns = list(self.config.exclude_patterns)
         if self.config.cache.placement == "vault" and self.config.cache.subdir:
             patterns.append(self.config.cache.subdir + "/")
+        return tuple(patterns)
+
+    def _ignore_file_signature(self) -> tuple[int, int, int] | None:
+        """`.vaultignore` 的 `(mtime_ns, size, ctime_ns)`；缺失/非普通文件时为 None。
+
+        issue #15 / P3-b：豁免规则文件的内容一变，`_ignore_matcher` 必须重新解析
+        （`tests/test_virtual_sync.py::test_ignore_final_filter_with_broken_store`
+        钉住「rerank 期间新写的 `.vaultignore` 必须被后一次过滤看到」）。用一次
+        stat 代替整文件重读 + 正则重建。
+        """
+        try:
+            info = os.stat(self.vault_path / self.config.ignore_file)
+        except OSError:
+            return None
+        if not stat.S_ISREG(info.st_mode):
+            return None
+        return (int(info.st_mtime_ns), int(info.st_size), int(info.st_ctime_ns))
+
+    def _load_ignore_patterns(self) -> list[str]:
+        patterns = list(self._config_ignore_patterns())
 
         ignore_file_path = self.vault_path / self.config.ignore_file
         if ignore_file_path.exists() and ignore_file_path.is_file():
@@ -1136,7 +1164,19 @@ class MarkdownIndexer:
         return patterns
 
     def _ignore_matcher(self) -> IgnoreMatcher:
-        return IgnoreMatcher(self._load_ignore_patterns())
+        """豁免匹配器，按「配置模式 + `.vaultignore` 文件签名」做跨调用缓存（P3-b）。
+
+        单次检索会过滤三轮，此前每轮都重读 `.vaultignore` 并重建正则（issue #15
+        根因 3 的一部分，`.vaultignore` 重解析实测 0.29 ms/次）。文件签名变化
+        （含删除/新建）或配置变化即重建，语义与不缓存逐字一致。
+        """
+        key = (self._config_ignore_patterns(), self._ignore_file_signature())
+        cached = self._ignore_matcher_cache
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        matcher = IgnoreMatcher(self._load_ignore_patterns())
+        self._ignore_matcher_cache = (key, matcher)
+        return matcher
 
     def _markdown_files(self) -> Iterable[Path]:
         return _scanning.scandir_indexable_files(self.vault_path, self._ignore_matcher(), _INDEXABLE_TEXT_EXTS)
@@ -1267,25 +1307,49 @@ class MarkdownIndexer:
             return False
         return generation is None or generation.status not in {"stale", "failed"}
 
-    def _filter_visible_chunks(self, chunks: list[Chunk]) -> list[Chunk]:
-        # issue #15 根因 3：`is_ignored` **按 chunk 调**（issue 环境 9,270 次而非
-        # 137 个 source）。这里按 `chunk.source` 记忆化——纯**调用内**优化，不做任
-        # 何跨调用缓存。
-        #
-        # 为什么不做跨调用缓存：`DocumentStore.set_visibility` 只改 `visibility` /
-        # `updated_at`、**不 bump `change_seq`**（只有 `mark_deleted` 会 bump），
-        # 所以任何以 `change_seq` 为失效键的跨调用缓存都收不到豁免/撤销的变更，会
-        # 打破 `tests/test_virtual_sync.py::test_empty_query_filters_recheck_
-        # visibility`。同理，单次检索内的三次过滤也不能共用 documents/matcher：
-        # `filters.matches` 与 `rerank_chunks` 都是调用方可注入的钩子，既有用例钉住
-        # 「钩子期间改掉的可见性 / 新写的 `.vaultignore` 必须被后一次过滤看到」。
-        # 跨调用缓存必须先补一个由 `set_visibility` / `invalidate_source` /
-        # `mark_deleted` 共同 bump 的可见性纪元（P3-b，本批不做）。
+    def _visible_documents(self) -> dict[str, DocumentRecord]:
+        """`source -> DocumentRecord` 映射，带跨调用缓存（issue #15 / P3-b）。
+
+        单次检索会走三轮 `_filter_visible_chunks`，此前每轮都跑一次
+        `store.list_documents()`（实测 4.8 ms / 2,892 行）。缓存失效键是
+        `DocumentStore.documents_epoch`——它由**任何**改变 `documents` 行的写入推进，
+        包括 `set_visibility` / `invalidate_source`（两者都不 bump `change_seq`，
+        所以 `change_seq` 不能当这个键）。
+
+        为什么单次检索内仍然「三轮各自调用」：`filters.matches` /
+        `rerank_chunks` 是调用方可注入的钩子，既有用例钉住「钩子期间改掉的可见性
+        必须被后一次过滤看到」。这里靠 epoch 在钩子改可见性后自然失配来满足它，
+        而不是共享一次快照。
+
+        库不可读/损坏时按现状返回空映射且**不缓存**，让下一次重试（
+        `tests/test_virtual_sync.py::test_ignore_final_filter_with_broken_store`
+        钉住这条路径）。
+        """
+        cache = self._visible_docs_cache
         try:
             store = self._existing_document_store()
-            documents = {doc.source: doc for doc in store.list_documents()} if store else {}
         except Exception:
-            documents = {}
+            return {}
+        if store is None:
+            return {}
+        epoch = store.documents_epoch
+        if cache is not None and cache[0] is store and cache[1] == epoch:
+            return cache[2]
+        try:
+            documents = {doc.source: doc for doc in store.list_documents()}
+        except Exception:
+            return {}
+        # 读得前后各取一次纪元：与并发写入交错时宁可放弃这一次缓存，也不要把更旧
+        # 的映射挂到更新的纪元上（generation 切换也会在这里体现）。
+        if store.documents_epoch == epoch:
+            self._visible_docs_cache = (store, epoch, documents)
+        return documents
+
+    def _filter_visible_chunks(self, chunks: list[Chunk]) -> list[Chunk]:
+        # issue #15 根因 3：`is_ignored` **按 chunk 调**（issue 环境 9,270 次而非
+        # 137 个 source）。这里按 `chunk.source` 记忆化；documents 映射与 matcher
+        # 的跨调用缓存分别由 `_visible_documents` / `_ignore_matcher` 负责（P3-b）。
+        documents = self._visible_documents()
         matcher = self._ignore_matcher()
         ignored: dict[str, bool] = {}
         visible: list[Chunk] = []
@@ -1603,6 +1667,9 @@ class MarkdownIndexer:
             self._stat_seen_ns.clear()
             self._stat_confirmations.clear()
             self.fast_path_warnings.clear()
+            # 读路径的跨调用缓存（P3-b）与派生缓存同生命周期。
+            self._visible_docs_cache = None
+            self._ignore_matcher_cache = None
         # FTS index + optional sqlite-vec backend share the cache lifecycle.
         if self._fts is not None:
             try:
@@ -1656,6 +1723,8 @@ class MarkdownIndexer:
             self._stat_confirmations.clear()
             self.fast_path_warnings.clear()
             self.failed_files.clear()
+            self._visible_docs_cache = None
+            self._ignore_matcher_cache = None
             self._disk_vectors.clear()
             if self._vectors_on_disk:
                 try:

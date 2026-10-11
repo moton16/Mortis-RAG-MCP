@@ -193,16 +193,24 @@ def _plain_indexer(tmp_path):
 
 
 def test_single_search_does_not_recompute_visibility_per_chunk(tmp_path, monkeypatch):
-    """P3：`is_ignored` 必须按 source 记忆化，不能按 chunk 重算。
+    """P3 / P3-b：单次检索的可见性过滤必须复用 documents 映射与 `.vaultignore`。
 
-    现状（修复前）：`_filter_visible_chunks` 对**每个 chunk** 调一次
-    `matcher.is_ignored`，而单次检索要过滤三轮（`all_chunks()` + 融合排序前后各
-    一次）——issue 环境 9,270 次而不是 137 个 source（issue #15 根因 3）。
+    修复前：`_filter_visible_chunks` 对**每个 chunk** 调一次 `matcher.is_ignored`
+    （issue 环境 9,270 次而非 137 个 source），而且单次检索的三轮过滤
+    （`all_chunks()` + 融合排序前后各一次）各自 `list_documents()` 一次
+    （issue #15 根因 3）。
 
-    注意本卡**只做调用内优化**：三次过滤仍必须各自重读文档库与 `.vaultignore`
-    （`test_empty_query_filters_recheck_visibility` 与
-    `test_ignore_final_filter_with_broken_store` 两条既有合同钉住），故上界是
-    3 × source 数而不是 1 ×。
+    P3 做了按 source 记忆化；P3-b 用 `DocumentStore.documents_epoch`——任何改变
+    `documents` 行的写入（stage / commit / `set_visibility` / `invalidate_source` /
+    `mark_deleted`）都推进它，而不是 `change_seq`（后者收不到纯可见性翻转）——作
+    跨调用缓存失效键，把单次检索的读库次数从 **3 降到 1**；`.vaultignore` 则按
+    `(mtime_ns, size, ctime_ns)` 文件签名缓存。
+
+    两条钩子护栏仍必须绿（改动的正确性就靠它们）：
+    `test_virtual_sync.py::test_empty_query_filters_recheck_visibility`（钩子里
+    `set_visibility('exempt')` → epoch 推进 → 后一次过滤重读）与
+    `::test_ignore_final_filter_with_broken_store`（钩子里直写 `.vaultignore` →
+    文件签名变化 → matcher 重建）。
     """
     from mortis_rag_mcp._indexer.scanning import IgnoreMatcher
 
@@ -231,9 +239,9 @@ def test_single_search_does_not_recompute_visibility_per_chunk(tmp_path, monkeyp
 
         monkeypatch.setattr(IgnoreMatcher, "is_ignored", counting_ignored)
         idx.search("shared needle", use_rerank=False)
-        # 三轮过滤仍各自读库（见 docstring），不在这里断言次数收敛；只读库次数本身
-        # 不得因为记忆化而变多。
-        assert len(listed) == 3, f"单次检索读库 {len(listed)} 次，与修复前口径应一致（3 次）"
+        assert len(listed) == 1, (
+            f"单次检索读库 {len(listed)} 次：P3-b 后应为 1 次（修复前为 3 次，"
+            f"三轮过滤各自重读一次 documents 映射）")
         assert len(ignored_calls) <= 3 * len(sources), (
             f"is_ignored 调了 {len(ignored_calls)} 次：应按 source 记忆化，"
             f"上界为 3×{len(sources)}（共 {total_chunks} 个 chunk，修复前约 3×chunk 数）")

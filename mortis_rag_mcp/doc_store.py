@@ -1625,12 +1625,35 @@ class DocumentStore:
         self._tls = threading.local()
         # 跨库归属检测只做一次（写门禁），避免每条 mutation 都读宿主注册表。
         self._registry_checked = False
+        # issue #15 / P3-b：进程内单调推进的「documents 映射」纪元，供读路径
+        # `_filter_visible_chunks` 做跨调用缓存失效（见 documents_epoch）。
+        self._documents_epoch = 0
 
     # ------------------------------------------------------------------ 连接
 
     @property
     def generation_id(self) -> str:
         return self._generation_id
+
+    @property
+    def documents_epoch(self) -> int:
+        """进程内单调推进的「documents 映射」纪元（issue #15 / P3-b）。
+
+        `_filter_visible_chunks` 用它作跨调用 `source -> DocumentRecord` 映射缓存的
+        失效键。**不能**复用 `change_seq`：它只被 `commit_revision` / `mark_deleted`
+        推进（`set_visibility` / `invalidate_source` 不 bump），而且同时驱动派生层
+        陈旧判定——为了让可见性缓存失效去 bump `change_seq` 会误判派生层 `stale`
+        而触发重嵌（重新计费）。这里任何会改变 `documents` 行的写入都推进本计数：
+        stage / commit / 可见性翻转 / tombstone / generation 切换。
+
+        口径：这是**进程内**计数。跨进程改可见性（同一库的两个 MCP 服务进程）不会
+        推进它，缓存陈旧窗口因此被限定为「本进程下一次自身 documents 写入」——与
+        issue #15 既有的「跨进程陈旧窗口 = 一轮 sync」同级，见 changelog。
+        """
+        return self._documents_epoch
+
+    def _bump_documents_epoch(self) -> None:
+        self._documents_epoch += 1
 
     def _store_path(self, gen_id: str) -> Path:
         return self.layout.generations_dir / gen_id / "docstore.sqlite"
@@ -1807,6 +1830,9 @@ class DocumentStore:
         if gen != self._generation_id:
             self.close()
             self._generation_id = gen
+            # generation 切换（import / 保留代次切换）意味着 `documents` 映射换了一份，
+            # 读路径的跨调用缓存必须失效（issue #15 / P3-b）。
+            self._bump_documents_epoch()
         return gen
 
     # ------------------------------------------------------------------ lifecycle
@@ -2227,6 +2253,7 @@ class DocumentStore:
                 (doc_id, revision_id),
             )
             conn.commit()
+            self._bump_documents_epoch()
             return StagedRevision(doc_id=doc_id, revision_id=revision_id, created_at=now)
 
     def append_media(self, revision_id: str, items: Sequence[MediaSpec], *,
@@ -2483,6 +2510,7 @@ class DocumentStore:
                 policy_version=policy_version,
             )
             conn.commit()
+            self._bump_documents_epoch()
             return seq
 
     def commit_job_revision(
@@ -2553,6 +2581,7 @@ class DocumentStore:
                     (state, job_id, now, source),
                 )
             conn.commit()
+            self._bump_documents_epoch()
             return seq
 
     def _commit_locked(
@@ -3473,6 +3502,7 @@ class DocumentStore:
                 (visibility, time.time(), rel),
             )
             conn.commit()
+            self._bump_documents_epoch()
 
     def invalidate_source(self, source: str) -> None:
         """标 unverified，**保留** active_revision 与解析事实（§12.6 权限/离线不误删）。"""
@@ -3486,6 +3516,7 @@ class DocumentStore:
                 (time.time(), rel),
             )
             conn.commit()
+            self._bump_documents_epoch()
 
     def mark_deleted(self, source: str) -> int:
         """原子删除 tombstone + change_seq/CAS + 旧任务 fencing；保留 committed 事实。"""
@@ -3517,6 +3548,7 @@ class DocumentStore:
             conn.execute("UPDATE store_meta SET change_seq=? WHERE id=1", (seq + 1,))
             conn.execute("UPDATE derived_generations SET status='stale'")
             conn.commit()
+            self._bump_documents_epoch()
             return seq + 1
 
     # ------------------------------------------------------------------ 维护/恢复
@@ -3872,6 +3904,8 @@ class DocumentStore:
                     raise StoreQuotaExceeded("Imported logical assets exceed local quota")
                 store_uuid = str(target.execute("SELECT store_uuid FROM store_meta WHERE id=1").fetchone()[0])
                 target.commit()
+                # import 重写了 documents.visibility（unverified→active），读路径缓存必须失效。
+                self._bump_documents_epoch()
                 target.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             finally:
                 incoming.close()
