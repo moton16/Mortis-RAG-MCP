@@ -584,13 +584,19 @@ def media_native_for_revision(owner: MarkdownIndexer, store: Any, source: str, r
             pending.append(item)
     if not pending or reuse_only:
         return chunks
-    control = owner._paid_control_store()
-    unresolved = unresolved_paid() if callable(unresolved_paid) else unresolved_paid
-    if unresolved is None:
-        unresolved = owner.has_unresolved_paid_intents(control, "media", provider.profile.fingerprint)
-    if (control is not None
-            and not getattr(provider, "is_local_free", False)
-            and unresolved):
+    # issue #15 / P1-c：零成本（loopback 无凭据）媒体 route 连意图库都不该碰。此前
+    # `owner._paid_control_store()` 与「媒体未决意图」探查排在 `is_local_free` 之前，
+    # 结果每轮都被后置的短路丢弃——纯浪费，且破坏了「零成本端点完全不触意图库」
+    # 这条性质。判序改为先看成本，付费路径一行未动。
+    local_free = bool(getattr(provider, "is_local_free", False))
+    control = None if local_free else owner._paid_control_store()
+    unresolved = False
+    if not local_free:
+        unresolved = unresolved_paid() if callable(unresolved_paid) else unresolved_paid
+        if unresolved is None:
+            unresolved = owner.has_unresolved_paid_intents(
+                control, "media", provider.profile.fingerprint)
+    if control is not None and unresolved:
         raise MediaStageError("PAID_REQUEST_UNRESOLVED: native media outcome unknown; automatic retry disabled", chunks)
     for start in range(0, len(pending), batch):
         batch_inputs = pending[start:start + batch]

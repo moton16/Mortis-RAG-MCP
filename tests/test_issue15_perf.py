@@ -360,3 +360,43 @@ def test_read_refresh_does_not_mark_a_ready_vault_as_rebuilding(tmp_path):
     finally:
         idx.stop_watching()
         idx.close_document_store()
+
+
+@pytest.mark.usefixtures("offline")
+def test_local_free_media_route_does_not_probe_the_intent_store(tmp_path, monkeypatch):
+    """P1-c：零成本（loopback、无凭据）媒体 route 连意图库都不该碰。
+
+    现状（修复前）：`media_native_for_revision` 里 `owner._paid_control_store()` 与
+    「媒体未决意图」探查排在 `is_local_free` 短路**之前**，于是零成本媒体 route 只要
+    有媒体工作就每轮白探一次意图库，结果又被后置短路丢弃（纯浪费，且破坏「零成本
+    端点完全不触意图库」这条性质）。修复后媒体探查应为 0 次。
+
+    本用例同时钉住「跳过探查不得顺手把工作也跳掉」：零成本 media 仍必须产出原生
+    媒体向量（走本地直发分支）。
+    """
+    def valid(items):
+        return [{"index": i, "embedding": [0, 1]} for i, _ in enumerate(items)]
+
+    cfg = media_config(media_endpoint="http://127.0.0.1:8000/v1/embeddings", media_api_key="")
+    idx = make_indexer(tmp_path, cfg, valid)
+    try:
+        assert idx.media_provider.is_local_free is True
+        _commit_virtual_source(idx, 0)
+        probes = []
+        original = idx.has_unresolved_paid_intents
+
+        def counting(store, kind, profile_fingerprint=""):
+            probes.append(kind)
+            return original(store, kind, profile_fingerprint)
+
+        monkeypatch.setattr(idx, "has_unresolved_paid_intents", counting)
+        idx.sync()
+        media_probes = [kind for kind in probes if kind == "media"]
+        assert media_probes == [], (
+            f"零成本媒体 route 仍探查了 {len(media_probes)} 次未决意图；应为 0 次"
+            f"（判序修复前 `unresolved_paid()` 排在 `is_local_free` 之前）")
+        assert [chunk for chunk in idx._chunks["doc-0.pdf"]
+                if chunk.metadata.get("kind") == "media_native"], (
+            "零成本 media 必须仍然产出原生媒体向量，不能被「跳过探查」顺带跳过")
+    finally:
+        close(idx)
