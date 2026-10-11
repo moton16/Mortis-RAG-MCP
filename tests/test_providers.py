@@ -1,5 +1,6 @@
 ﻿from __future__ import annotations
 
+from io import BytesIO
 import json
 from urllib.error import HTTPError
 from urllib.request import Request
@@ -161,8 +162,56 @@ class _JsonResponse:
 ENDPOINT = "https://embedding.test/v1/embeddings"
 
 
-def _http_error(code: int, headers: dict | None = None) -> HTTPError:
-    return HTTPError(ENDPOINT, code, "error", headers or {}, None)
+def _http_error(
+    code: int, headers: dict | None = None, body: bytes = b""
+) -> HTTPError:
+    return HTTPError(ENDPOINT, code, "error", headers or {}, BytesIO(body))
+
+
+def test_paid_embedding_error_includes_http_body_without_retry(monkeypatch):
+    def fail(request, timeout):
+        raise _http_error(
+            400,
+            body=b'{"error":{"message":"input was misclassified as image"}}',
+        )
+
+    monkeypatch.setattr("mortis_rag_mcp.providers.urlopen", fail)
+    provider = ExternalEmbeddingProvider(endpoint=ENDPOINT, model="embed-model")
+
+    with pytest.raises(ProviderError) as excinfo:
+        provider.embed(["hello"])
+
+    message = str(excinfo.value)
+    assert "SUBMISSION_UNKNOWN" in message
+    assert "HTTP 400" in message
+    assert "input was misclassified as image" in message
+
+
+def test_local_embedding_error_includes_bounded_http_body(monkeypatch):
+    detail = "invalid text input " + ("x" * 400)
+
+    def fail(request, timeout):
+        raise _http_error(
+            422,
+            body=json.dumps({"error": {"message": detail}}).encode("utf-8"),
+        )
+
+    monkeypatch.setattr("mortis_rag_mcp.providers.urlopen", fail)
+    provider = ExternalEmbeddingProvider(
+        endpoint="http://127.0.0.1:8000/v1/embeddings",
+        model="embed-model",
+    )
+    provider.request_journal = None
+    provider.paid_guard = None
+
+    with pytest.raises(ProviderError) as excinfo:
+        provider.embed(["hello"])
+
+    message = str(excinfo.value)
+    assert "LOCAL_REQUEST_FAILED" in message
+    assert "HTTP 422" in message
+    assert "invalid text input" in message
+    assert detail not in message
 
 
 def test_embedding_429_is_unknown_without_automatic_retry(monkeypatch):

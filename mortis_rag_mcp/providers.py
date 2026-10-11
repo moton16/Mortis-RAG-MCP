@@ -22,10 +22,46 @@ _MAX_BACKOFF = 30.0
 # 退避抖动幅度（向上浮动 0~50%）：多个 worker 拿到同一个 Retry-After 时
 # 会同时醒来、同时重发，再次撞上限流（thundering herd）。
 _JITTER_RATIO = 0.5
+_HTTP_ERROR_READ_LIMIT = 1024
+_HTTP_ERROR_DETAIL_LIMIT = 200
 
 
 class ProviderError(RuntimeError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        http_status: int | None = None,
+        response_detail: str = "",
+    ) -> None:
+        super().__init__(message)
+        self.http_status = http_status
+        self.response_detail = response_detail[:_HTTP_ERROR_DETAIL_LIMIT]
+
+
+def _request_failure_summary(exc: BaseException) -> tuple[str, int | None, str]:
+    if not isinstance(exc, HTTPError):
+        return str(exc)[:_HTTP_ERROR_DETAIL_LIMIT], None, ""
+    err_text = ""
+    try:
+        err_text = exc.read(_HTTP_ERROR_READ_LIMIT).decode("utf-8", errors="replace")
+    except Exception:
+        pass
+    detail = ""
+    if err_text:
+        try:
+            err_json = json.loads(err_text)
+            error = err_json.get("error") if isinstance(err_json, dict) else None
+            detail = error.get("message", "") if isinstance(error, dict) else str(error or "")
+        except Exception:
+            detail = err_text
+    detail = str(detail)[:_HTTP_ERROR_DETAIL_LIMIT]
+    status = int(exc.code) if exc.code is not None else None
+    reason = str(exc.reason)[:_HTTP_ERROR_DETAIL_LIMIT]
+    summary = f"HTTP {status}: {reason}"
+    if detail:
+        summary += f" - {detail}"
+    return summary, status, detail
 
 
 class EmbeddingProvider(Protocol):
@@ -145,14 +181,25 @@ class _JsonHttpProvider:
                 journal.mark_success(request_id)
                 return result
             except (HTTPError, URLError, OSError, ValueError, json.JSONDecodeError) as exc:
-                journal.mark_unknown(request_id, "response_unconfirmed")
-                raise ProviderError("SUBMISSION_UNKNOWN: request outcome unknown; automatic retry disabled") from exc
+                summary, status, detail = _request_failure_summary(exc)
+                journal.mark_unknown(request_id, f"response_unconfirmed: {summary}")
+                raise ProviderError(
+                    "SUBMISSION_UNKNOWN: request outcome unknown; automatic retry disabled; "
+                    f"{summary}",
+                    http_status=status,
+                    response_detail=detail,
+                ) from exc
         else:
             try:
                 with urlopen(request, timeout=self.timeout) as response:
                     return json.loads(response.read().decode("utf-8"))
             except (HTTPError, URLError, OSError, ValueError, json.JSONDecodeError) as exc:
-                raise ProviderError(f"LOCAL_REQUEST_FAILED: request to local endpoint failed: {exc}") from exc
+                summary, status, detail = _request_failure_summary(exc)
+                raise ProviderError(
+                    f"LOCAL_REQUEST_FAILED: request to local endpoint failed: {summary}",
+                    http_status=status,
+                    response_detail=detail,
+                ) from exc
 
     def _backoff_seconds(self, attempt: int, exc: BaseException) -> float | None:
         """返回本次失败应等待的秒数；None 表示不可重试，立即失败。"""
