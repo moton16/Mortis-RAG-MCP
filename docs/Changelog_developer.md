@@ -1809,3 +1809,35 @@ issue #12/#13 付费闸门与 issue #15 性能四条根因的修复随本补丁�
 - wheel/sdist 构建、隔离安装、MCP 冒烟与 GitHub Release 附件属发版窗口的发布动作，证据（含附件哈希）登记在发布说明，不写进本流水。
 - 仍未验证：非 Windows 平台端到端、issue 量级（3,475 md + 2,892 虚拟文档）的稳态单轮墙钟、P3-b 跨进程陈旧窗口；与 issue #15 各条目遗留项一致，未因发版而消失。
 - 未做：PyPI 发布（仓库无发布流程与凭证）。
+
+### [FIX-issue15-ci-isolation] — moton16,2026-10-10,CodeBuddy,Hy4-Preview — fix(test): 类级计数桩按「本库」收窄（PR #16 CI py3.13 红）
+
+> **涵盖提交**：本条目所在提交（仅 `tests/test_issue15_perf.py` 测试改动 + 本条目）。
+
+**现象与定位**
+
+`tests/test_issue15_perf.py::test_single_search_does_not_recompute_visibility_per_chunk` 在 PR #16 的 `pytest (ubuntu-latest, py3.13)` job 报红：`is_ignored` 实际调用 **10** 次 > 上界 `3×3 = 9`，且混入的 source 是 `note1.md`——本用例的 fixture 只有 `a.md/b.md/c.md`。
+
+**根因**
+
+桩挂在**类**上（`monkeypatch.setattr(IgnoreMatcher, "is_ignored", ...)`），于是同一进程里任何别的库的可见性过滤都会打进这个桩。`note1.md` 属于前面已跑完的文件（`test_diaglog.py` / `test_aliases.py`）——它们遗留的后台索引线程在本用例的检索窗口内又跑了一轮过滤，把计数从 9 推到 10。同一类泄漏在别处用例的 `run_sync` 计数上此前已被发现并处理（按 `owner.vault_path` 过滤桩），本用例漏用了同一手法。py3.10/3.11/3.12 与 Windows 三个 job 恰好没撞上，所以只在 py3.13 红——属于「本地绿 ≠ CI 绿」的时序面。
+
+**修复（仅测试改动）**
+
+- `is_ignored` 桩改为只统计**本库当前缓存的那个 matcher 实例**（`idx._ignore_matcher_cache[1] is self`；`_filter_visible_chunks` 每次都从 `idx._ignore_matcher()` 取实例，见 `indexer.py:_ignore_matcher`）。并新增 `set(ignored_calls) == sources` 护栏，防止收窄过头后上界断言形同虚设。
+- 同文件另两个**类级**桩按同一口径收窄：`Path.open`（加 `idx.vault_path in self.parents` + `.pdf` 后缀判据）与 `FtsIndex.upsert_source` / `upsert_sources`（改判 `self is idx._fts`）。`FtsIndex` 两处需注意 `rebuild()` 会把 `_fts` 换成新实例，故按**调用时刻**比较而非预先捕获。
+
+**验证**
+
+- 两个独立探针（`.runtime/ship-v091/probe_stub_scope.py` 与 `probe_stub_scope2.py`，均在被忽略的 `.runtime/` 下）：前者造出「另一个库先跑一轮过滤」的泄漏场景——旧桩计数 6 且含 `note1.md`，新桩计数 5 且只有本库三个 source；后者逐项证实 `Path.open` 与 `FtsIndex.upsert_sources` 的收窄**排除外部库**（外部计数增量 0）且**仍统计本库**（本库 1 次），即没有收窄过头。
+- `tests/test_issue15_perf.py` 单文件 → **11 passed**（62.13 s）。
+- 全量（同解释器，`--basetemp .runtime/ship-v091/full-03`）→ **1315 passed / 14 skipped / 3 deselected**（257.44 s）。
+- 本机无 py3.13 解释器（只有 3.10.11），py3.13 面最终以 PR #16 的 CI 结论为准。
+
+**顺带观察到的既有抖动（未修，如实登记）**
+
+同一批三次全量里有一次红在 `tests/test_kb_read_chunkid.py::test_chunk_id_zero_hit_reports_unprobed_vaults`（单独复跑 1.20 s 通过；该文件本轮未改动、也不在 issue #15 改动面内），与既有「依赖后台首建抢跑」的老用例同类。仍建议单开一卡做全仓测试隔离改造；本轮只修实际报红、且属于本批新增的用例。
+
+**仍未验证**
+
+- 非 Windows 平台端到端；本机的类级桩收窄只靠探针 + 本机全量佐证，真实 py3.13 时序由 CI 判定。

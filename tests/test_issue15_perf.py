@@ -153,7 +153,10 @@ def test_virtual_source_is_not_reread_on_every_sync(tmp_path, monkeypatch):
 
         def counting(self, mode="r", *args, **kwargs):
             stream = real_open(self, mode, *args, **kwargs)
-            if "r" in mode and self.suffix == ".pdf":
+            # 只统计**本库**的虚拟源读盘：`Path.open` 是类级替换，别处用例遗留的
+            # 监听线程读它自己库里的 `.pdf` 也会打到同一个桩上（与 `is_ignored`
+            # 同一类泄漏，CI py3.13 已实测到过）。
+            if "r" in mode and self.suffix == ".pdf" and idx.vault_path in self.parents:
                 return _CountingStream(stream)
             return stream
 
@@ -256,7 +259,15 @@ def test_single_search_does_not_recompute_visibility_per_chunk(tmp_path, monkeyp
         real_ignored = IgnoreMatcher.is_ignored
 
         def counting_ignored(self, rel_path, is_dir=False):
-            ignored_calls.append(rel_path)
+            # `IgnoreMatcher.is_ignored` 是**类级**替换，而同一进程里可能还有别的库
+            # 的过滤在跑——上一条用例遗留的后台监听线程就会打到同一个桩上（实测
+            # `test_diaglog.py` 的 `note1.md`）。CI py3.13 上正是它把计数从 9 推到
+            # 10 而误报红。只统计**本库当前缓存的那一个 matcher 实例**：
+            # `_filter_visible_chunks` 每次都从 `idx._ignore_matcher()` 取实例
+            # （indexer.py `_ignore_matcher`），所以本库调用必然命中该缓存。
+            cached = idx._ignore_matcher_cache
+            if cached is not None and self is cached[1]:
+                ignored_calls.append(rel_path)
             return real_ignored(self, rel_path, is_dir)
 
         monkeypatch.setattr(IgnoreMatcher, "is_ignored", counting_ignored)
@@ -264,6 +275,9 @@ def test_single_search_does_not_recompute_visibility_per_chunk(tmp_path, monkeyp
         assert len(listed) == 1, (
             f"单次检索读库 {len(listed)} 次：P3-b 后应为 1 次（修复前为 3 次，"
             f"三轮过滤各自重读一次 documents 映射）")
+        assert set(ignored_calls) == sources, (
+            f"本库 source 未全部经过可见性过滤（只统计到 {sorted(set(ignored_calls))}）："
+            f"桩必须确实覆盖本库的三轮过滤，否则下面的上界断言会形同虚设")
         assert len(ignored_calls) <= 3 * len(sources), (
             f"is_ignored 调了 {len(ignored_calls)} 次：应按 source 记忆化，"
             f"上界为 3×{len(sources)}（共 {total_chunks} 个 chunk，修复前约 3×chunk 数）")
@@ -408,13 +422,18 @@ def test_rebuild_writes_fts_in_one_transaction(tmp_path, monkeypatch):
         real_single, real_batch = FtsIndex.upsert_source, getattr(FtsIndex, "upsert_sources", None)
 
         def counting_single(self, source, chunks):
-            calls["single"] += 1
+            # 只统计**本库**：`FtsIndex` 的方法同样是类级替换，别处用例遗留的监听
+            # 线程会在它自己的库上跑回填并打到同一个桩上。`idx.rebuild()` 会把
+            # `_fts` 换成新实例，所以按**调用时刻**的 `idx._fts` 比较。
+            if self is idx._fts:
+                calls["single"] += 1
             return real_single(self, source, chunks)
 
         def counting_batch(self, mapping):
             items = list(mapping)
-            calls["batch"] += 1
-            calls["sources"] = len(items)
+            if self is idx._fts:
+                calls["batch"] += 1
+                calls["sources"] = len(items)
             if real_batch is None:
                 return None
             return real_batch(self, items)
@@ -452,13 +471,17 @@ def test_fts_warm_cache_populate_uses_one_transaction(tmp_path, monkeypatch):
         real_single, real_batch = FtsIndex.upsert_source, FtsIndex.upsert_sources
 
         def counting_single(self, source, chunks):
-            calls["single"] += 1
+            # 同 `test_rebuild_writes_fts_in_one_transaction`：类级替换必须按本库
+            # 的 fts 实例收窄，否则别处遗留监听线程的回填会混进来。
+            if self is idx._fts:
+                calls["single"] += 1
             return real_single(self, source, chunks)
 
         def counting_batch(self, mapping):
             items = list(mapping)
-            calls["batch"] += 1
-            calls["sources"] = len(items)
+            if self is idx._fts:
+                calls["batch"] += 1
+                calls["sources"] = len(items)
             return real_batch(self, items)
 
         monkeypatch.setattr(FtsIndex, "upsert_source", counting_single)
