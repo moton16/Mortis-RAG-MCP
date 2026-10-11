@@ -134,13 +134,28 @@ def request_refresh(owner: MarkdownIndexer, *, immediate: bool = False,
             # 刷新判成 `rebuilding`，每次 kb_search / kb_stats / kb_list_files 都排
             # 一轮（抑制窗口只有 1 s，之后每查必排）。
             #
-            # 但读路径的轮询兜底只在「没有事件源」时才需要：原生 watcher 在线且存活
+            # 但读路径的兜底只在「没有事件源」时才需要：原生 watcher 在线且存活
             # 时，真实文件变动由 watcher 事件入队，读路径不需要再自排一轮。故此处
             # 收窄「刷新已登记」的适用面（方案 A，见调研报告 §5 P2）：watcher 在线
-            # 即直接返回 False；watcher 不在线（轮询/降级）或冷启动维持原判据。
+            # 即直接返回 False；只有**完全没有监听循环**（冷启动/已停监听）时才保留
+            # 原来的 1 秒抑制窗口。
             watcher = getattr(owner, "_fs_watcher", None)
             if watcher is not None and bool(getattr(watcher, "is_alive", lambda: False)()):
                 return False
+            # P2（非原生面）：Linux/macOS / 显式 `watch_method="poll"` / 原生 watcher 降级
+            # 三种情形没有原生事件源，但 `_watch_loop` 仍在按 interval 轮询签名，**真实文本
+            # 变动照旧即时入列**。读路径因此只需要兜住签名轮询看不见的变动（`.vaultignore`、
+            # 权限/ACL 翻转等），按**低频对账周期**（`watch_fallback_interval`，与原生模式的
+            # 兜底全量同一口径，默认 30s）限流即可。
+            # 修复前这里没有这一层：抑制窗口只有 1 秒，于是轮询模式下**每查排一轮全量
+            # sync**，并把自己判成 `rebuilding`（issue #15 根因 2 的未修面）。
+            # `watch_fallback_interval<=0` 是「显式关闭周期对账」：读路径不得自行兜底，
+            # 否则等于把这个开关变成「每查一次」。
+            thread = getattr(owner, "_watch_thread", None)
+            if thread is not None and bool(getattr(thread, "is_alive", lambda: False)()):
+                interval = float(owner.config.watch_fallback_interval)
+                if interval <= 0 or time.time() - owner.last_sync < interval:
+                    return False
             if time.time() - owner.last_sync < owner._READ_REFRESH_MIN_INTERVAL_SECONDS:
                 return False
         owner._refresh_requested_at = now

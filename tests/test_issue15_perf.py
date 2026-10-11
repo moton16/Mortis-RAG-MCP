@@ -9,6 +9,7 @@
 import hashlib
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 from urllib.error import URLError
 
@@ -170,7 +171,13 @@ def test_virtual_source_is_not_reread_on_every_sync(tmp_path, monkeypatch):
 
 
 class _LiveWatcher:
-    """原生 watcher 在线且存活的替身（CI 的 Linux/非 Windows 平台无原生监听）。"""
+    """原生 watcher / 监听线程「在线且存活」的替身。
+
+    CI 的 Linux/非 Windows 平台无原生监听；`_watch_thread` 替身还需要 `ident`
+    （`stop_watching` 的 `_join_started_thread` 靠它判断是否真的 start 过）。
+    """
+
+    ident = None
 
     def is_alive(self):
         return True
@@ -494,6 +501,58 @@ def test_read_refresh_does_not_mark_a_ready_vault_as_rebuilding(tmp_path):
         # 真实变动仍然必须排得进去：显式请求不被收窄。
         assert watch.request_refresh(idx, start_scheduler=False) is True
         assert idx.refresh_status()["refresh_pending"] is True
+    finally:
+        idx.stop_watching()
+        idx.close_document_store()
+
+
+def test_read_refresh_is_throttled_without_a_native_watcher(tmp_path):
+    """P2（非原生面）：轮询/降级模式下读路径的兜底必须按低频对账周期限流。
+
+    修复前：抑制窗口只有 `_READ_REFRESH_MIN_INTERVAL_SECONDS=1.0` 秒，于是
+    Linux/macOS / 显式 `watch_method="poll"` / 原生 watcher 降级三种情形下，读路径
+    仍会在 1 秒后**每查排一轮全量 sync**，并把自己判成 `rebuilding`（issue #15
+    根因 2 的未修面）。修复后按 `watch_fallback_interval`（默认 30s，与原生模式的
+    兜底全量同一口径）限流，同时保住「签名轮询看不见的变动」（`.vaultignore` 等）
+    的有界新鲜度。
+    """
+    idx = _plain_indexer(tmp_path)
+    try:
+        idx.sync()
+        assert idx.index_state()["index_state"] == "ready"
+        # 非原生：没有 `_fs_watcher`，只有在线且存活的轮询/降级监听线程。
+        idx._fs_watcher = None
+        idx._watch_thread = _LiveWatcher()
+        idx.last_sync = time.time() - 5.0  # 让 1 秒抑制窗口失效（修复前正是这里开始每查必排）
+        assert watch.request_refresh(idx, for_read=True, start_scheduler=False) is False, (
+            "轮询模式下距上次同步 5 秒仍登记了全量 sync（修复前抑制窗口只有 1 秒）")
+        assert idx.refresh_status()["refresh_pending"] is False
+        assert idx.index_state()["index_state"] == "ready", (
+            "轮询模式下的就绪库被读路径自己的机会性刷新判成了 rebuilding")
+
+        # 兜底仍然在，只是按对账周期：超过 `watch_fallback_interval` 后必须能排进去。
+        idx.last_sync = time.time() - (float(idx.config.watch_fallback_interval) + 1.0)
+        assert watch.request_refresh(idx, for_read=True, start_scheduler=False) is True
+        assert idx.refresh_status()["refresh_pending"] is True
+    finally:
+        idx.stop_watching()
+        idx.close_document_store()
+
+
+def test_read_refresh_fallback_disabled_never_schedules_from_reads(tmp_path):
+    """`watch_fallback_interval<=0`（显式关闭周期对账）时读路径不得自行兜底。"""
+    idx = _plain_indexer(tmp_path)
+    try:
+        idx.sync()
+        config = replace(idx.config, watch_fallback_interval=0.0)
+        idx.config = config
+        idx._fs_watcher = None
+        idx._watch_thread = _LiveWatcher()
+        idx.last_sync = time.time() - 3600.0
+        assert watch.request_refresh(idx, for_read=True, start_scheduler=False) is False, (
+            "关掉周期对账后读路径仍每查排一轮全量，等于把开关变成「每查一次」")
+        # 显式请求（非 for_read）不受影响。
+        assert watch.request_refresh(idx, start_scheduler=False) is True
     finally:
         idx.stop_watching()
         idx.close_document_store()
