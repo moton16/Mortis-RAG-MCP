@@ -915,11 +915,14 @@ def run_sync(owner: MarkdownIndexer) -> list[Chunk]:
                     reuse_only=proxy_failed, unresolved_paid=unresolved_media)
                 chunks.extend(native_chunks)
             except Exception as exc:
-                chunks.extend(getattr(exc, "chunks", ()))
-                media_failures[source] = f"media_native: {exc}"
                 # 本轮媒体阶段落败：付费意图可能刚被置为未决，缓存判据失效，
                 # 下一个 source 必须重新求值（否则同一轮内可能重复计费）。
+                # nit（issue #15 / P1）：先失效判据、再把失败前缀并回。今天不可达
+                # （`MediaStageError.chunks` 恒为 list），纯粹是语义顺序——任何异常
+                # 对象都不该让「未决判据仍新鲜」活过本轮。
                 _media_probe["fresh"] = False
+                chunks.extend(getattr(exc, "chunks", ()))
+                media_failures[source] = f"media_native: {exc}"
             # Successful prefixes are native too; never embed their proxies as text.
             native_occurrences = {c.metadata["occurrence_id"] for c in chunks
                                   if c.metadata.get("kind") == "media_native"}
