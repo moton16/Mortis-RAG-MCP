@@ -1777,3 +1777,35 @@ Codex 主流程（2026-10-09 / America_New_York）。代码候选93c39a50b09ec61
 2. **issue 量级（3,475 md + 2,892 虚拟文档）的稳态单轮墙钟**：未跑。本窗口只有缩尺 fixture（2,892 虚拟文档的检索路径探针）与 30 文件级 rebuild 探针；不声称达到 issue 的 15~20 倍。
 3. **跨进程可见性陈旧窗口**（P3-b 残余）：同一库两个服务进程时，改可见性的陈旧窗口 = 本进程下一次自身 `documents` 写入；未做跨进程实测。
 4. 未改版本号；未 push、未开 PR、未打 tag / Release、未发 PyPI；未改 `.gitignore`；未 force-add `docs/`。
+
+### [release-v0.9.1] — moton16,2026-10-10,CodeBuddy,Hy4-Preview — chore(release): 版本号 0.9.1 + 用户文档与配套 Skill 同步
+
+> **涵盖提交**：本条目所在的补丁发版提交（版本号与文档同步）。被本补丁发版覆盖的 22 个功能/修复提交是 origin/main `697ffc2` 之上的 issue #12/#13/#15 各条目，均已单独登记，本条目只记发版本身的改动面。
+
+**发版范围**
+
+issue #12/#13 付费闸门与 issue #15 性能四条根因的修复随本补丁首次进入用户可见版本（此前只在本机 `main` 本地提交）。工具 schema、配置键、`doc_store` schema、数据布局与 `docs/` 忽略口径均未改。
+
+**版本号与文档改动概况**
+
+- `pyproject.toml` & `mortis_rag_mcp/__init__.py`：版本号 `0.9.0` → `0.9.1`；包顶层 `__version__` 是单一真源，`server.SERVER_INFO` 与 `diaglog.PACKAGE_VERSION` 均从它取。
+- `README.md` / `README_EN.md`：Version badge 同步 `0.9.1`；首页「当前版本」区块改写为 0.9.1（修复与性能补丁，含零成本端点脱离闸门、`prepared` 租约、`paid_route_blocked`、检索与重建实测数字），原 v0.9.0 内容降级为「上一里程碑」保留。
+- `CHANGELOG_user.md`：顶部新增 `## [0.9.1] - 2026-10-10`，按 Fixed / Changed & Improved / Upgrade Guide 写用户可感知内容。
+- `QUICKSTART_user.md`：新增 §0.6「0.9.1 补丁速查」（零成本端点豁免、两套意图回收、`kb_stats` 看堵点、性能数字与「缓存 100% 继承」）。
+- `skills/mortis-rag-mcp/`：`SKILL.md` frontmatter `version` 与标题版本标注改 `0.9.1`；`references/maintenance.md` 补「零成本端点不落意图」例外、`prepared` 租约（5 分钟，仅零成本端点）与 `paid_route_blocked` / `pending_paid_requests` 新字段口径；`references/media-and-ingest.md` 补同身份重发的零成本例外；`references/retrieval.md` 的 `kb_stats` 字段补 `paid_route_blocked`；三份参考页标题版本一并同步。
+- `docs/PROJECT_GUIDE.md`：头部版本口径改为 v0.9.1（v0.9.0 降为「上一里程碑」）；新增「0.9.1 增量：付费闸门与热路径」（豁免接入点、租约常量、可观测字段、热路径缓存与纪元、明确未改项）；§14.2 版本历史速览订正 0.9.0 的「候选，未发布」并新增 0.9.1 行。
+- `docs/Quick-start_developer.md`：新增 §1.2「0.9.1 补丁范围」，给开发者三条易踩点（豁免不得扩大到有凭据/非回环端点、`prepared` 两套回收、派生缓存新增时须同步登记清理点）。
+- `docs/Docs_Folder-descriptions.md`：登记 0.9.1 为补丁版、未新增版本目录，`docs/` 结构与四份 tracked 文档口径不变。
+
+**验证**
+
+- 靶向（仓库 `.venv` 解释器，`--basetemp .runtime/ship-v091/targeted`）：`test_version_sync`、`test_diaglog`、`test_mcp_stdio`、`test_paid_request_journal`、`test_e20_media_outcome`、`test_issue15_perf` → **100 passed**（76.24 s）。
+- 全量（同解释器，`--basetemp .runtime/ship-v091/full-01`）→ **1315 passed / 14 skipped / 3 deselected**（213.43 s），与发版前基线（同数）逐项一致，无新增失败。14 条 skip 仍是 `.venv` 缺 `pymupdf`/`docx`/`pptx`/`openpyxl`/`PIL`/`fitz` 由 `pytest.importorskip` 跳过。
+- 版本一致性由 `tests/test_version_sync.py` 锁住六处：`__version__`、`pyproject.toml`、`SERVER_INFO`、`diaglog.PACKAGE_VERSION`、README 双 badge、`SKILL.md` 标题与 frontmatter。
+- 发版前对本文档与用户文档的技术断言做了一轮独立子代理证伪（全新上下文、只读、要求逐条回源码）：`_is_loopback_endpoint` / `is_local_free`（文本与媒体两侧）、`_paid_embedding_allowed` 早退、`INTENT_LEASE_SECONDS` / `is_stale_prepared` / `_mark` 补位、`kb_stats` 新字段与 `paid_route_blocked`、CLI 脱敏字段、`skip_initial_sync`、`FtsIndex.upsert_sources`、`watch_fallback_interval` 复用、以及「媒体/批量豁免为本批新增而文本路径 v0.9.0 已有」共 10 条，均与 HEAD 代码一致；证伪出一处**夸大并已改正**——`kb_search` 的 36.1 → 20.3 ms 是 `.runtime/issue15/` 一次性探针记录，`tests/` 中**没有任何墙钟断言**（`test_issue15_perf.py` 开篇即声明只钉与硬件无关的调用次数），原先在 `README.md` / `README_EN.md` / `CHANGELOG_user.md` / `QUICKSTART_user.md` / `PROJECT_GUIDE.md` 里以绝对值头条呈现，现统一改为「本机同一脚本相对口径记录，非跨环境保证」；读库次数改按测试断言表述（`== 1`，同步预热后实测 0，不再写「不超过 1 次」）。
+
+**未在本条目内完成 / 遗留风险**
+
+- wheel/sdist 构建、隔离安装、MCP 冒烟与 GitHub Release 附件属发版窗口的发布动作，证据（含附件哈希）登记在发布说明，不写进本流水。
+- 仍未验证：非 Windows 平台端到端、issue 量级（3,475 md + 2,892 虚拟文档）的稳态单轮墙钟、P3-b 跨进程陈旧窗口；与 issue #15 各条目遗留项一致，未因发版而消失。
+- 未做：PyPI 发布（仓库无发布流程与凭证）。

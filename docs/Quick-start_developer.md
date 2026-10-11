@@ -45,6 +45,20 @@ Mortis'RAG MCP 是一个**本地 Markdown 知识库 RAG 服务器**，通过 MCP
 中途仅相关单文件，全量在整合末或 CI。不要写默认 `%TEMP%`，不要共用 basetemp。
 本地完成检查后只 `git add -- 明确路径` 并及时 commit，保留 hooks，不自动远端操作。
 
+### 1.2 0.9.1 补丁范围（2026-10-10）
+
+补丁版本：无工具 schema / 配置键 / 文档库 schema / 数据布局变更。改动面与不变量见
+`PROJECT_GUIDE.md` 的「0.9.1 增量」；逐 commit 技术流水见 `Changelog_developer.md` 的
+issue #12/#13/#15 条目。动手前注意三条：
+
+- **付费闸门新增一条豁免**：`is_local_free`（回环端点 + transport 无凭据）既不落意图，
+  也不受历史未决意图牵连；媒体 route 与 `sync_engine._paid_embedding_allowed` 都已接入。
+  付费端点一侧的 fail-closed 不变，不要把豁免扩到「有凭据」或「非回环」端点。
+- **`prepared` 意图有两套回收**：`_mark` 的补位重试（仅 `retryable` 冲突）与
+  `INTENT_LEASE_SECONDS` 租约（仅零成本端点）；`submission_unknown` 永不适用租约。
+- **热路径改动都带缓存/纪元**：可见性过滤靠 `documents_epoch` + `.vaultignore`
+  文件签名缓存，`revoke_source` 必须同时清 `_virtual_sha_cache`；新增派生缓存时同步登记清理点。
+
 ## 2. 仓库地图
 
 ```
