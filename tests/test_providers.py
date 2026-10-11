@@ -117,18 +117,19 @@ def test_external_reranker_request_has_expected_json(monkeypatch):
 
 
 def test_reranker_failure_degrades_to_original_order(monkeypatch):
-    sleeps = []
+    calls: list[Request] = []
 
-    def fail(*args, **kwargs):
+    def fail(request, timeout=None):
+        calls.append(request)
         raise OSError("offline")
 
     monkeypatch.setattr("mortis_rag_mcp.providers.urlopen", fail)
-    # 重试会退避等待，这里只记录不真睡，保持测试秒级完成。
-    monkeypatch.setattr("mortis_rag_mcp.providers._sleep", sleeps.append)
     provider = ExternalRerankerProvider(endpoint="https://rerank.test")
 
     assert provider.rerank_or_none("q", ["a", "b"]) is None
-    assert sleeps == []  # R2/C100: no implicit repeat of unknown paid POST.
+    # v0.9.2：一次物理 POST，零自动重发；网络失败按 transport_unknown 分类。
+    assert len(calls) == 1
+    assert provider.audit_write_errors == 0
 
 
 def test_static_embedding_does_not_call_llm(monkeypatch):
@@ -216,27 +217,28 @@ def test_local_embedding_error_includes_bounded_http_body(monkeypatch):
 
 def test_embedding_429_is_unknown_without_automatic_retry(monkeypatch):
     calls: list[Request] = []
-    sleeps: list[float] = []
 
     def fake_urlopen(request, timeout):
         calls.append(request)
         if len(calls) == 1:
-            raise _http_error(429)
+            raise _http_error(429, {"Retry-After": "1"})
         return _JsonResponse({"data": [{"embedding": [0.3, 0.4]}]})
 
     monkeypatch.setattr("mortis_rag_mcp.providers.urlopen", fake_urlopen)
-    monkeypatch.setattr("mortis_rag_mcp.providers._sleep", sleeps.append)
     provider = ExternalEmbeddingProvider(endpoint=ENDPOINT, model="embed-model")
 
-    with pytest.raises(ProviderError, match="SUBMISSION_UNKNOWN"):
+    with pytest.raises(ProviderError) as excinfo:
         provider.embed(["hello"])
+    # 收到响应 ≠ 可以重发：429 必须是 http_error 且远端影响未知。
     assert len(calls) == 1
-    assert sleeps == []
+    assert excinfo.value.outcome == "http_error"
+    assert excinfo.value.response_received is True
+    assert excinfo.value.remote_effect_unknown is True
+    assert excinfo.value.http_status == 429
 
 
 def test_embedding_500_is_unknown_without_automatic_retry(monkeypatch):
     calls: list[Request] = []
-    sleeps: list[float] = []
 
     def fake_urlopen(request, timeout):
         calls.append(request)
@@ -245,13 +247,11 @@ def test_embedding_500_is_unknown_without_automatic_retry(monkeypatch):
         return _JsonResponse({"data": [{"embedding": [1.0]}]})
 
     monkeypatch.setattr("mortis_rag_mcp.providers.urlopen", fake_urlopen)
-    monkeypatch.setattr("mortis_rag_mcp.providers._sleep", sleeps.append)
     provider = ExternalEmbeddingProvider(endpoint=ENDPOINT, model="embed-model")
 
     with pytest.raises(ProviderError, match="SUBMISSION_UNKNOWN"):
         provider.embed(["hello"])
     assert len(calls) == 1
-    assert sleeps == []
 
 
 def test_embedding_does_not_retry_on_404(monkeypatch):
@@ -271,73 +271,19 @@ def test_embedding_does_not_retry_on_404(monkeypatch):
 
 def test_embedding_max_retries_does_not_authorize_unknown_resend(monkeypatch):
     calls: list[Request] = []
-    sleeps: list[float] = []
 
     def fake_urlopen(request, timeout):
         calls.append(request)
         raise _http_error(429)
 
     monkeypatch.setattr("mortis_rag_mcp.providers.urlopen", fake_urlopen)
-    monkeypatch.setattr("mortis_rag_mcp.providers._sleep", sleeps.append)
     provider = ExternalEmbeddingProvider(endpoint=ENDPOINT, model="embed-model", max_retries=2)
 
     with pytest.raises(ProviderError) as excinfo:
         provider.embed(["hello"])
+    # max_retries 只保留解析兼容：它绝不能变成「再发一次」的授权。
     assert len(calls) == 1
     assert "SUBMISSION_UNKNOWN" in str(excinfo.value)
-    assert sleeps == []
-
-
-def test_embedding_backoff_grows_exponentially(monkeypatch):
-    sleeps: list[float] = []
-
-    def fake_urlopen(request, timeout):
-        raise _http_error(500)
-
-    monkeypatch.setattr("mortis_rag_mcp.providers.urlopen", fake_urlopen)
-    monkeypatch.setattr("mortis_rag_mcp.providers._sleep", sleeps.append)
-    provider = ExternalEmbeddingProvider(
-        endpoint=ENDPOINT, model="embed-model", max_retries=3, retry_backoff=1.0
-    )
-
-    sleeps = [provider._backoff_seconds(i, _http_error(500)) for i in range(3)]
-    # 退避带向上抖动，只断言量级与单调性。
-    assert 1.0 <= sleeps[0] <= 1.5
-    assert 2.0 <= sleeps[1] <= 3.0
-    assert 4.0 <= sleeps[2] <= 6.0
-    assert sleeps[0] < sleeps[1] < sleeps[2]
-
-
-def test_embedding_honors_retry_after_header(monkeypatch):
-    sleeps: list[float] = []
-
-    def fake_urlopen(request, timeout):
-        raise _http_error(429, {"Retry-After": "5"})
-
-    monkeypatch.setattr("mortis_rag_mcp.providers.urlopen", fake_urlopen)
-    monkeypatch.setattr("mortis_rag_mcp.providers._sleep", sleeps.append)
-    provider = ExternalEmbeddingProvider(endpoint=ENDPOINT, model="embed-model", max_retries=2)
-
-    sleeps = [provider._backoff_seconds(i, _http_error(429, {"Retry-After": "5"})) for i in range(2)]
-    assert all(5.0 <= seconds <= 7.5 for seconds in sleeps)
-
-
-def test_embedding_ignores_non_numeric_retry_after_header(monkeypatch):
-    sleeps: list[float] = []
-
-    def fake_urlopen(request, timeout):
-        raise _http_error(429, {"Retry-After": "Wed, 21 Oct 2015 07:28:00 GMT"})
-
-    monkeypatch.setattr("mortis_rag_mcp.providers.urlopen", fake_urlopen)
-    monkeypatch.setattr("mortis_rag_mcp.providers._sleep", sleeps.append)
-    provider = ExternalEmbeddingProvider(endpoint=ENDPOINT, model="embed-model", max_retries=2)
-
-    sleeps = [provider._backoff_seconds(i, _http_error(429, {"Retry-After": "Wed, 21 Oct 2015 07:28:00 GMT"}))
-              for i in range(2)]
-    # HTTP-date 形式不解析，退回指数退避。
-    assert len(sleeps) == 2
-    assert 1.0 <= sleeps[0] <= 1.5
-    assert 2.0 <= sleeps[1] <= 3.0
 
 
 def test_embedding_splits_requests_by_batch_size(monkeypatch):
@@ -425,57 +371,84 @@ def test_embedding_retry_settings_reject_invalid_values(overrides):
 
 
 # --------------------------------------------------------------------------
-# B0 止血：退避上限与响应校验（单批路径此前完全裸奔）
+# v0.9.2：故障分类必须区分「收到响应 / 产物可用 / 允许自动重算」三件事
 # --------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("raw", ["inf", "Infinity", "1e999", "nan"])
-def test_retry_after_non_finite_values_are_ignored(monkeypatch, raw):
-    sleeps: list[float] = []
+def test_retry_after_is_diagnostic_only(monkeypatch, raw):
+    """Retry-After 只作诊断：它既不授权重发，也不改变分类。"""
+    calls: list[Request] = []
 
     def fake_urlopen(request, timeout):
+        calls.append(request)
         raise _http_error(429, {"Retry-After": raw})
 
     monkeypatch.setattr("mortis_rag_mcp.providers.urlopen", fake_urlopen)
-    monkeypatch.setattr("mortis_rag_mcp.providers._sleep", sleeps.append)
-    provider = ExternalEmbeddingProvider(endpoint=ENDPOINT, model="m", max_retries=1)
+    provider = ExternalEmbeddingProvider(endpoint=ENDPOINT, model="m")
 
-    sleeps = [provider._backoff_seconds(0, _http_error(429, {"Retry-After": raw}))]
-    # 关键：绝不能出现 inf/nan —— time.sleep(inf) 会把线程永久挂死。
-    assert len(sleeps) == 1
-    assert sleeps[0] == sleeps[0]  # 非 nan
-    assert sleeps[0] <= providers._MAX_BACKOFF
-
-
-def test_retry_after_is_capped_by_max_backoff(monkeypatch):
-    sleeps: list[float] = []
-
-    def fake_urlopen(request, timeout):
-        raise _http_error(429, {"Retry-After": "86400"})
-
-    monkeypatch.setattr("mortis_rag_mcp.providers.urlopen", fake_urlopen)
-    monkeypatch.setattr("mortis_rag_mcp.providers._sleep", sleeps.append)
-    provider = ExternalEmbeddingProvider(endpoint=ENDPOINT, model="m", max_retries=2)
-
-    sleeps = [provider._backoff_seconds(i, _http_error(429, {"Retry-After": "86400"})) for i in range(2)]
-    # 服务端让等一天，本地只等到上限：持有锁的线程不能睡死。
-    assert all(seconds <= providers._MAX_BACKOFF for seconds in sleeps)
+    with pytest.raises(ProviderError) as excinfo:
+        provider.embed(["hello"])
+    assert len(calls) == 1
+    assert excinfo.value.outcome == "http_error"
+    assert providers._retry_after_seconds({"Retry-After": raw}) is None
 
 
-def test_backoff_jitters_to_avoid_thundering_herd(monkeypatch):
-    sleeps: list[float] = []
+def test_rejected_4xx_are_not_transport_unknown(monkeypatch):
+    calls: list[Request] = []
 
     def fake_urlopen(request, timeout):
-        raise _http_error(429, {"Retry-After": "10"})
+        calls.append(request)
+        raise _http_error(401, body=b'{"error":{"message":"bad key"}}')
 
     monkeypatch.setattr("mortis_rag_mcp.providers.urlopen", fake_urlopen)
-    monkeypatch.setattr("mortis_rag_mcp.providers._sleep", sleeps.append)
-    provider = ExternalEmbeddingProvider(endpoint=ENDPOINT, model="m", max_retries=4)
+    provider = ExternalEmbeddingProvider(endpoint=ENDPOINT, model="m")
 
-    sleeps = [provider._backoff_seconds(i, _http_error(429, {"Retry-After": "10"})) for i in range(4)]
-    # 同一个 Retry-After 下多次等待不应完全相同，否则 6 个 worker 同时醒来。
-    assert len(set(sleeps)) > 1
-    assert all(10.0 <= seconds <= 15.0 for seconds in sleeps)
+    with pytest.raises(ProviderError) as excinfo:
+        provider.embed(["hello"])
+    assert len(calls) == 1
+    assert excinfo.value.outcome == "rejected"
+    assert excinfo.value.response_received is True
+    # 明确拒绝 ≠ 远端影响未知：它可以释放占用、由 quarantine 控制后续轮次。
+    assert excinfo.value.remote_effect_unknown is False
+
+
+def test_broken_json_response_is_response_invalid(monkeypatch):
+    calls: list[Request] = []
+    broken = _JsonResponse({"data": []})
+    broken.read = lambda: b"{not json"
+
+    def broken_response(request, timeout):
+        calls.append(request)
+        return broken
+
+    monkeypatch.setattr("mortis_rag_mcp.providers.urlopen", broken_response)
+    provider = ExternalEmbeddingProvider(endpoint=ENDPOINT, model="m")
+    with pytest.raises(ProviderError) as excinfo:
+        provider.embed(["hello"])
+    assert len(calls) == 1
+    assert excinfo.value.outcome == "response_invalid"
+    assert excinfo.value.response_received is True
+
+
+def test_generic_urlerror_is_not_claimed_as_not_sent(monkeypatch):
+    """generic URLError 不许伪装成 not_sent（那等于宣称供应商未收费）。"""
+    from urllib.error import URLError
+
+    calls: list[Request] = []
+
+    def fake_urlopen(request, timeout):
+        calls.append(request)
+        raise URLError("connection reset by peer")
+
+    monkeypatch.setattr("mortis_rag_mcp.providers.urlopen", fake_urlopen)
+    provider = ExternalEmbeddingProvider(endpoint=ENDPOINT, model="m")
+
+    with pytest.raises(ProviderError) as excinfo:
+        provider.embed(["hello"])
+    assert len(calls) == 1
+    assert excinfo.value.outcome == "transport_unknown"
+    assert excinfo.value.remote_effect_unknown is True
 
 
 def test_single_batch_short_response_is_rejected(monkeypatch):

@@ -66,16 +66,17 @@ def test_mrl_native_validation_before_slice_and_l2():
 @pytest.mark.parametrize("index", [True, 0.0, "0"])
 def test_response_rejects_coerced_indexes(index):
     provider = ExternalEmbeddingProvider("https://example.test", dimension=2, profile=profile())
-    provider._post = lambda payload: {"data": [{"index": index, "embedding": [3, 4]}]}
+    provider._send_once = lambda payload, request_context=None: {"data": [{"index": index, "embedding": [3, 4]}]}
     with pytest.raises(ProviderError):
         provider.embed(["x"])
 
 
 def test_response_order_and_old_unindexed_adapter():
     provider = ExternalEmbeddingProvider("https://example.test", dimension=2, profile=profile())
-    provider._post = lambda payload: {"data": [{"index": 1, "embedding": [0, 1]}, {"index": 0, "embedding": [1, 0]}]}
+    provider._send_once = lambda payload, request_context=None: {
+        "data": [{"index": 1, "embedding": [0, 1]}, {"index": 0, "embedding": [1, 0]}]}
     assert provider.embed(["x", "y"]) == [[1, 0], [0, 1]]
-    provider._post = lambda payload: {"data": [{"embedding": [3, 4]}]}
+    provider._send_once = lambda payload, request_context=None: {"data": [{"embedding": [3, 4]}]}
     assert provider.embed(["x"])[0] == pytest.approx([0.6, 0.8])
     assert provider.embed([]) == []
 

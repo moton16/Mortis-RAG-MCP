@@ -121,6 +121,16 @@ def flush_vectors_to_disk(owner: MarkdownIndexer) -> None:
             chunk.embedding = None
 
 
+def _request_control(owner: MarkdownIndexer):
+    return getattr(owner.config, "request_control", None)
+
+
+def _bounded_resume_mode(owner: MarkdownIndexer) -> bool:
+    from ..request_lifecycle import bounded_resume_enabled
+    return bounded_resume_enabled(str(getattr(_request_control(owner), "mode", "") or "")) \
+        if getattr(_request_control(owner), "mode", "") else bounded_resume_enabled()
+
+
 def _paid_embedding_allowed(owner: MarkdownIndexer) -> bool:
     """索引批量路径的付费闸门查询（§20.7B / §20.7F）。
 
@@ -136,6 +146,20 @@ def _paid_embedding_allowed(owner: MarkdownIndexer) -> bool:
     # （issue #12）。
     if getattr(getattr(owner, "embedding_provider", None), "is_local_free", False) is True:
         return True
+    # manual 背景策略：普通读取/stats/watch 启动都不允许自动计算外部向量。
+    if str(getattr(_request_control(owner), "background_embedding", "enabled")) == "manual":
+        return False
+    if _bounded_resume_mode(owner):
+        # 新模式：**取消** profile 级未决暂停。防重放由组件级持久 hold 承担，
+        # 未决意图不再让整个 profile 停摆。续算不可用时显式延期。
+        try:
+            fingerprint = owner._embedding_profile.fingerprint
+            may = getattr(owner, "may_use_paid_profile", None)
+            if not callable(may) or not may(fingerprint, kind="embed"):
+                return False
+            return owner._paid_control_store() is not None
+        except Exception:
+            return False
     may = getattr(owner, "may_use_paid_profile", None)
     if not callable(may):
         return False
@@ -182,6 +206,11 @@ class _TemplatingProvider:
 
     def embed(self, texts):
         return embed_with_profile(self._provider, texts, self._profile)
+
+    def embed_batch_once(self, texts, *, request_context=None):
+        """后台单批入口：模板仍只在这里应用一次，且恰好一个物理 POST。"""
+        return embed_with_profile(self._provider, texts, self._profile,
+                                 request_context=request_context, single_batch=True)
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._provider, name)
@@ -360,6 +389,220 @@ def _quarantine_pending(
     return active, quarantined
 
 
+# --------------------------------------------------------------------------
+# v0.9.2：后台付费嵌入的组件级续算（方案 D）
+# --------------------------------------------------------------------------
+
+_HELD_REASON_CODES = {
+    "held_unknown": "AUTOMATIC_REPLAY_HELD",
+    "held_response_invalid": "RESPONSE_INVALID",
+    "held_result_missing": "RESULT_NOT_RECOVERED",
+}
+
+
+def _resume_owner_token(owner: MarkdownIndexer) -> str:
+    token = getattr(owner, "_resume_owner_token", "")
+    if not token:
+        from .embedding_resume import owner_token_for
+        token = owner_token_for("sync")
+        owner._resume_owner_token = token
+    return token
+
+
+def _resume_layout(owner: MarkdownIndexer):
+    layout = getattr(owner, "_storage_layout", None)
+    if layout is None:
+        from ..doc_store import resolve_storage_layout
+        layout = resolve_storage_layout(owner.config, owner.vault_path)
+        owner._storage_layout = layout
+    return layout
+
+
+def _pending_components(owner: MarkdownIndexer, pending: dict[str, list[Chunk]]) -> dict[str, dict]:
+    """按**稳定输入身份**聚合待补嵌输入；相同输入只发一个代表，回填所有绑定。"""
+    from ..request_lifecycle import PURPOSE_BACKGROUND_DOCUMENT, component_key, purpose_family, sha256_hex
+    profile_fingerprint = owner._embedding_profile.fingerprint
+    family = purpose_family(PURPOSE_BACKGROUND_DOCUMENT)
+    components: dict[str, dict] = {}
+    for source, chunks in pending.items():
+        signature = ""
+        try:
+            signature = str(owner._signatures.get(source) or "")
+        except Exception:
+            signature = ""
+        for chunk in chunks:
+            embedding_key = _reuse_key(chunk) or hashlib.sha256(chunk.content.encode("utf-8")).hexdigest()
+            exact_input = _document_input(owner, chunk.content)
+            key = component_key(purpose_family_name=family, profile_fingerprint=profile_fingerprint,
+                                embedding_key=embedding_key,
+                                exact_input_sha256=sha256_hex(exact_input))
+            existing = components.get(key)
+            if existing is not None:
+                existing["chunks"].append(chunk)
+                continue
+            components[key] = {
+                "component_key": key,
+                "embedding_key": embedding_key,
+                "input_sha256": sha256_hex(exact_input),
+                "source": source,
+                "source_kind": "document",
+                "source_sha256": signature,
+                "revision_id": str(chunk.metadata.get("revision_id") or ""),
+                "chunk_id": chunk.id,
+                "text": exact_input,
+                "chunks": [chunk],
+            }
+    return components
+
+
+def _record_hold_failure(owner: MarkdownIndexer, source: str, state: str, batch_id: str) -> None:
+    """held / 预算延期的跳过**不**增加失败 streak；失败名单用稳定原因码。"""
+    code = _HELD_REASON_CODES.get(state, "AUTOMATIC_REPLAY_HELD")
+    owner.failed_files[source] = f"{code} · batch={batch_id[:16]} · automatic replay held"
+
+
+def _embed_missing_bounded(owner: MarkdownIndexer, pending: dict[str, list[Chunk]],
+                           pending_chunks: list[Chunk], failed_before: dict[str, str],
+                           reused: int) -> bool:
+    """组件级续算：稳定输入去重 → 过滤 held → 组批 → 一次 POST → 检查点 → complete。"""
+    from .._indexer import embedding_resume
+    from ..request_lifecycle import (
+        OUTCOME_SUCCEEDED, PURPOSE_BACKGROUND_DOCUMENT, RequestContext, get_request_control_mode,
+    )
+    from ..doc_store import DocStoreError
+
+    control = owner._paid_control_store()
+    if control is None:
+        owner._embedding_paused = True
+        owner._sync_progress["phase"] = "embedding_paused"
+        owner._sync_progress["reason"] = "BACKGROUND_RESUME_UNAVAILABLE"
+        return False
+    provider = _document_provider(owner)
+    if not callable(getattr(provider, "embed_batch_once", None)):
+        owner._embedding_paused = True
+        owner._sync_progress["phase"] = "embedding_paused"
+        owner._sync_progress["reason"] = "BACKGROUND_BATCH_CAPABILITY_UNAVAILABLE"
+        return False
+
+    operation_id = getattr(owner, "_resume_operation_id", "") or embedding_resume.new_operation_id("sync")
+    owner._resume_operation_id = operation_id
+    owner_token = _resume_owner_token(owner)
+    components = _pending_components(owner, pending)
+    keys = list(components)
+    try:
+        states = embedding_resume.active_component_states(control, keys)
+    except DocStoreError:
+        owner._embedding_paused = True
+        owner._sync_progress["reason"] = "BACKGROUND_RESUME_UNAVAILABLE"
+        return False
+    # held / 已在飞行的组件从本轮发送集合中移除（不增加失败 streak）。
+    plan_components = [components[key] for key in keys
+                       if states.get(key) not in embedding_resume.ACTIVE_COMPONENT_STATES]
+    batch_size = int(owner.config.embedding.batch_size or 0)
+    if batch_size <= 0:
+        groups = [plan_components] if plan_components else []
+    else:
+        groups = [plan_components[i:i + batch_size] for i in range(0, len(plan_components), batch_size)]
+    limit = int(getattr(owner.config.request_control, "background_max_posts_per_round", 32) or 32)
+    budget = getattr(owner, "_post_budget_used", 0)
+    for group in groups:
+        if budget >= limit:
+            owner._sync_progress["budget_deferred"] = True
+            for component in group:
+                _record_hold_failure(owner, component["source"], "held_unknown", "budget")
+            break
+        batch_id = embedding_resume.new_batch_id()
+        plan = {
+            "batch_id": batch_id,
+            "operation_id": operation_id,
+            "purpose_family": "document",
+            "profile_fingerprint": owner._embedding_profile.fingerprint,
+            "endpoint": str(owner.config.embedding.endpoint or ""),
+            "components": [{k: v for k, v in c.items() if k != "chunks" and k != "text"}
+                           for c in group],
+        }
+        reservation = embedding_resume.reserve_embedding_batch(control, plan, owner_token)
+        if not reservation.ok:
+            # 唯一约束冲突 = 正常并发/重放防护：重新读状态后重新计划，绝不硬发。
+            try:
+                states = embedding_resume.active_component_states(control, keys)
+            except DocStoreError:
+                break
+            retry = [c for c in group
+                     if states.get(c["component_key"]) not in embedding_resume.ACTIVE_COMPONENT_STATES]
+            if not retry:
+                continue
+            batch_id = embedding_resume.new_batch_id()
+            plan["batch_id"] = batch_id
+            plan["components"] = [{k: v for k, v in c.items() if k != "chunks" and k != "text"}
+                                  for c in retry]
+            reservation = embedding_resume.reserve_embedding_batch(control, plan, owner_token)
+            if not reservation.ok:
+                continue
+            group = retry
+        permit = embedding_resume.begin_embedding_send(control, batch_id, owner_token)
+        if not permit.allowed:
+            continue
+        # 提交成功后才允许 transport：一个物理 POST。
+        budget += 1
+        owner._post_budget_used = budget
+        context = RequestContext(operation_id, PURPOSE_BACKGROUND_DOCUMENT, batch_id)
+        try:
+            vectors = provider.embed_batch_once([c["text"] for c in group], request_context=context)
+        except ProviderError as exc:
+            outcome = exc.as_outcome()
+            embedding_resume.record_embedding_outcome(control, batch_id, owner_token, outcome)
+            for component in group:
+                _record_hold_failure(owner, component["source"],
+                                     outcome.hold_state or "held_unknown", batch_id)
+            continue
+        except Exception as exc:  # noqa: BLE001 - 非 transport 异常不得冒充远端未知
+            from ..request_lifecycle import OUTCOME_RESPONSE_INVALID, RequestOutcome
+            embedding_resume.record_embedding_outcome(
+                control, batch_id, owner_token,
+                RequestOutcome(outcome=OUTCOME_RESPONSE_INVALID, response_received=False,
+                               remote_effect_unknown=False, detail=str(exc)[:200]))
+            for component in group:
+                _record_embedding_failure(owner, component["source"])
+                owner.failed_files[component["source"]] = _embedding_failure_summary(exc)
+            continue
+        if len(vectors) != len(group):
+            from ..request_lifecycle import OUTCOME_RESPONSE_INVALID, RequestOutcome
+            embedding_resume.record_embedding_outcome(
+                control, batch_id, owner_token,
+                RequestOutcome(outcome=OUTCOME_RESPONSE_INVALID, response_received=True,
+                               remote_effect_unknown=True,
+                               detail=f"count mismatch {len(vectors)}/{len(group)}"))
+            for component in group:
+                _record_hold_failure(owner, component["source"], "held_response_invalid", batch_id)
+            continue
+        # 成功前缀：立刻回填所有有效绑定，再落检查点。
+        bindings = []
+        for component, vector in zip(group, vectors):
+            for chunk in component["chunks"]:
+                chunk.embedding = _to_emb(vector)
+            bindings.append({"embedding_key": component["embedding_key"],
+                             "chunk_id": component["chunk_id"],
+                             "chunk": component["chunks"][0]})
+        embedding_resume.record_embedding_outcome(
+            control, batch_id, owner_token, OUTCOME_SUCCEEDED)
+        confirmed = owner.checkpoint_embeddings(bindings)
+        result = embedding_resume.confirm_embedding_checkpoint(control, batch_id, owner_token, confirmed)
+        for component in group:
+            if component["embedding_key"] in confirmed:
+                _clear_embedding_failure(owner, component["source"])
+                owner.failed_files.pop(component["source"], None)
+            else:
+                # 有结果但没保存成功：只保留 RAM 与占用，停止本轮后续付费批次。
+                _record_hold_failure(owner, component["source"], "held_result_missing", batch_id)
+        if not confirmed:
+            owner._sync_progress["phase"] = "embedding_checkpoint_failed"
+            break
+        owner._sync_progress["files_done"] = int(owner._sync_progress.get("files_done", 0)) + len(group)
+        owner._sync_progress["chunks_done"] = int(owner._sync_progress.get("chunks_done", 0)) + len(bindings)
+    return owner._embedding_changed_state(pending_chunks, failed_before, reused)
+
+
 def embed_missing(owner: MarkdownIndexer) -> bool:
     """Embed every chunk that has no vector yet.
 
@@ -411,11 +654,15 @@ def embed_missing(owner: MarkdownIndexer) -> bool:
         return reused > 0 or owner.failed_files != failed_before
 
     if owner.config.embedding.mode == "external" and not _paid_embedding_allowed(owner):
-        # R2：仅明确撤销、控制不可用、未决批量意图暂停索引，不创建漂移审批。
+        # R2/bounded_resume：仅明确撤销、明确暂停、后台策略 manual 或续算不可用
+        # 才暂停索引；**不再**因为"存在未决意图"冻结整个 profile。
         owner._embedding_paused = True
         owner._sync_progress["phase"] = "embedding_paused"
         return False
     owner._embedding_paused = False
+
+    if owner.config.embedding.mode == "external" and _bounded_resume_mode(owner):
+        return _embed_missing_bounded(owner, pending, pending_chunks, failed_before, reused)
 
     if owner.config.embedding.mode != "external":
         provider = _document_provider(owner)
@@ -691,6 +938,9 @@ def run_sync(owner: MarkdownIndexer) -> list[Chunk]:
     前置条件：调用方必须已持有 owner._sync_lock。
     运行时通过 owner.* 就地变异 22 个内部状态属性。
     """
+    # 一轮预算从 run_sync 开始建立，文本与媒体共享，不各自计数。
+    owner._post_budget_used = 0
+    owner._resume_operation_id = ""
     failed_before = dict(owner.failed_files)
     # Media and text are independent stages. Text success must not erase media
     # failure; the existing persisted failure map is also the restart retry signal.

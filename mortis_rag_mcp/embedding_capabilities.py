@@ -302,13 +302,31 @@ def embedding_key(profile: ResolvedEmbeddingProfile, text: str, modality: str = 
     return hashlib.sha256(material.encode()).hexdigest()
 
 
-def embed_with_profile(provider: Any, texts: Any, profile: ResolvedEmbeddingProfile, *, query: bool = False) -> list[list[float]]:
+def embed_with_profile(provider: Any, texts: Any, profile: ResolvedEmbeddingProfile, *, query: bool = False,
+                       request_context: Any = None, single_batch: bool = False) -> list[list[float]]:
+    """唯一的模板化路径：模板只在这里应用一次，wrapper 不得再格式化一次。
+
+    `single_batch=True` 时走 provider 的单批入口（**恰好一个物理 POST**），
+    供后台续算使用；旧路径保持多批语义，且失败批绝不自动重发。
+    """
     validate_profile(profile)
     items = list(texts)
     if not items:
         return []
     template = profile.query_template if query else profile.document_template
-    vectors = provider.embed([template.format(text=text) for text in items])
+    formatted = [template.format(text=text) for text in items]
+    extra = {} if request_context is None else {"request_context": request_context}
+    if single_batch and callable(getattr(provider, "embed_batch_once", None)):
+        vectors = provider.embed_batch_once(formatted, **extra)
+    elif hasattr(provider, "embed"):
+        try:
+            vectors = provider.embed(formatted, **extra)
+        except TypeError:
+            # 第三方 provider 不认识 request_context：绝不发第二次请求来"试"，
+            # 只在没有上下文可传时才退回旧签名。
+            vectors = provider.embed(formatted)
+    else:
+        vectors = provider.embed(formatted)
     if len(vectors) != len(items):
         raise EmbeddingContractError("embedding batch count mismatch")
     # Providers with resolved profiles have already sliced their native outputs.

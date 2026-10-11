@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import http.client
 import json
 import math
-import random
-import time
+import socket
 from typing import Any, Protocol, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -14,19 +14,21 @@ from .embedding_capabilities import (
     EmbeddingContractError, ResolvedEmbeddingProfile,
     resolve_embedding_profile, validate_vector,
 )
+from .request_lifecycle import (
+    OUTCOME_NOT_SENT, OUTCOME_REJECTED, OUTCOME_RESPONSE_INVALID,
+    OUTCOME_TRANSPORT_UNKNOWN, RequestContext, RequestOutcome,
+    audit_is_blocking, classify_http_status, get_request_control_mode,
+    legacy_error_code, manual_context, payload_fingerprint,
+)
 
-# 测试注入点：monkeypatch `_sleep` 即可断言退避序列，不必真的等待。
-_sleep = time.sleep
-# 指数退避的上限，避免网络长时间不可用时把调用方挂死。
-_MAX_BACKOFF = 30.0
-# 退避抖动幅度（向上浮动 0~50%）：多个 worker 拿到同一个 Retry-After 时
-# 会同时醒来、同时重发，再次撞上限流（thundering herd）。
-_JITTER_RATIO = 0.5
+# HTTP 错误摘要上限（issue #17 纪律：受限摘要，不落完整正文）。
 _HTTP_ERROR_READ_LIMIT = 1024
 _HTTP_ERROR_DETAIL_LIMIT = 200
 
 
 class ProviderError(RuntimeError):
+    """Provider 失败。结构化字段表达「发生了什么」，不表达「供应商是否收费」。"""
+
     def __init__(
         self,
         message: str,
@@ -35,12 +37,81 @@ class ProviderError(RuntimeError):
         response_detail: str = "",
         batch_count: int | None = None,
         batch_fingerprint: str = "",
+        outcome: str = "",
+        response_received: bool | None = None,
+        remote_effect_unknown: bool | None = None,
+        request_fingerprint: str = "",
+        operation_id: str = "",
+        batch_id: str = "",
     ) -> None:
         super().__init__(message)
         self.http_status = http_status
         self.response_detail = response_detail[:_HTTP_ERROR_DETAIL_LIMIT]
         self.batch_count = batch_count
         self.batch_fingerprint = batch_fingerprint
+        self.outcome = outcome
+        self.response_received = response_received
+        self.remote_effect_unknown = remote_effect_unknown
+        self.request_fingerprint = request_fingerprint
+        self.operation_id = operation_id
+        self.batch_id = batch_id
+
+    def as_outcome(self) -> RequestOutcome:
+        """投影为结构化结果（缺省按「远端影响未知」的保守解释）。"""
+        known = self.outcome or OUTCOME_TRANSPORT_UNKNOWN
+        return RequestOutcome(
+            outcome=known,
+            response_received=bool(self.response_received) if self.response_received is not None
+            else self.http_status is not None,
+            remote_effect_unknown=True if self.remote_effect_unknown is None
+            else bool(self.remote_effect_unknown),
+            http_status=self.http_status,
+            detail=self.response_detail,
+            request_fingerprint=self.request_fingerprint,
+            operation_id=self.operation_id,
+            batch_id=self.batch_id,
+        )
+
+
+def _transport_outcome(exc: BaseException) -> RequestOutcome:
+    """把传输层异常分类为结构化结果。
+
+    顺序要紧：`HTTPError` 是 `URLError` 的子类，必须先判；只有能证明「连接在
+    提交前就失败」的情形（DNS/地址解析）才可归为 `not_sent`——把全部
+    `URLError` 都认成 `not_sent` 等于宣称供应商没收费，是假的安全。
+    """
+    if isinstance(exc, HTTPError):
+        code = int(exc.code) if exc.code is not None else None
+        summary, _, detail = _request_failure_summary(exc)
+        outcome, unknown = classify_http_status(code)
+        return RequestOutcome(outcome=outcome, response_received=True,
+                              remote_effect_unknown=unknown, http_status=code,
+                              detail=str(detail) or summary, summary=summary)
+    if isinstance(exc, http.client.IncompleteRead):
+        # 响应已经开始返回但读取被截断：收到过响应，但产物不可用。
+        return RequestOutcome(outcome=OUTCOME_RESPONSE_INVALID, response_received=True,
+                              remote_effect_unknown=True, http_status=None,
+                              detail=f"incomplete read: {exc}"[:_HTTP_ERROR_DETAIL_LIMIT])
+    if isinstance(exc, (TimeoutError, socket.timeout)):
+        return RequestOutcome(outcome=OUTCOME_TRANSPORT_UNKNOWN, response_received=False,
+                              remote_effect_unknown=True, http_status=None,
+                              detail=str(exc)[:_HTTP_ERROR_DETAIL_LIMIT])
+    if isinstance(exc, URLError):
+        reason = getattr(exc, "reason", None)
+        if isinstance(reason, socket.gaierror):
+            return RequestOutcome(outcome=OUTCOME_NOT_SENT, response_received=False,
+                                  remote_effect_unknown=False, http_status=None,
+                                  detail=str(exc)[:_HTTP_ERROR_DETAIL_LIMIT])
+        return RequestOutcome(outcome=OUTCOME_TRANSPORT_UNKNOWN, response_received=False,
+                              remote_effect_unknown=True, http_status=None,
+                              detail=str(exc)[:_HTTP_ERROR_DETAIL_LIMIT])
+    if isinstance(exc, (http.client.HTTPException, OSError)):
+        return RequestOutcome(outcome=OUTCOME_TRANSPORT_UNKNOWN, response_received=False,
+                              remote_effect_unknown=True, http_status=None,
+                              detail=str(exc)[:_HTTP_ERROR_DETAIL_LIMIT])
+    return RequestOutcome(outcome=OUTCOME_TRANSPORT_UNKNOWN, response_received=False,
+                          remote_effect_unknown=True, http_status=None,
+                          detail=str(exc)[:_HTTP_ERROR_DETAIL_LIMIT])
 
 
 def _request_failure_summary(exc: BaseException) -> tuple[str, int | None, str]:
@@ -82,8 +153,16 @@ class StaticEmbeddingProvider:
     def __init__(self, dimension: int = 384) -> None:
         self.dimension = dimension
 
-    def embed(self, texts: Sequence[str]) -> list[list[float]]:
+    #: 后台单批能力标记：静态/本地 provider 天然支持「一次调用一个批次」。
+    supports_batch_once = True
+
+    def embed(self, texts: Sequence[str], *, request_context: RequestContext | None = None) -> list[list[float]]:
         return [self._embed_one(text) for text in texts]
+
+    def embed_batch_once(self, texts: Sequence[str], *,
+                         request_context: RequestContext | None = None) -> list[list[float]]:
+        """单批入口：本地 provider 不产生任何网络请求，行为与 `embed` 一致。"""
+        return self.embed(texts, request_context=request_context)
 
     def _embed_one(self, text: str) -> list[float]:
         values = [0.0] * self.dimension
@@ -96,7 +175,11 @@ class StaticEmbeddingProvider:
 
 
 def _retry_after_seconds(headers: Any) -> float | None:
-    """解析 Retry-After 响应头（只认数字秒数；HTTP-date 形式返回 None）。"""
+    """解析 Retry-After 响应头（只认数字秒数；HTTP-date 形式返回 None）。
+
+    只作**诊断**：v0.9.2 起 provider 内零自动重发，读取 Retry-After 不授权重发，
+    也不推断供应商是否计费。
+    """
     if headers is None:
         return None
     try:
@@ -109,11 +192,9 @@ def _retry_after_seconds(headers: Any) -> float | None:
         seconds = float(str(raw).strip())
     except (TypeError, ValueError):
         return None
-    # inf / 1e999 这类值必须挡掉：_backoff_seconds 用 max() 取较大者，
-    # 服务端只要回一个 `Retry-After: inf`，time.sleep(inf) 会把线程永久挂死。
     if not math.isfinite(seconds) or seconds < 0:
         return None
-    return min(seconds, _MAX_BACKOFF)
+    return min(seconds, 60.0)
 
 
 def _is_loopback_endpoint(endpoint: str) -> bool:
@@ -142,88 +223,156 @@ class _JsonHttpProvider:
         self.endpoint = endpoint
         self.api_key = api_key
         self.timeout = timeout
+        # 弃用字段：v0.9.2 起 provider 内零自动重发，仅保留解析兼容。
         self.max_retries = max_retries
         self.retry_backoff = retry_backoff
         self.request_journal: Any = None
         self.paid_guard: Any = None
         self.request_profile = ""
+        #: 非空时覆盖全局模式（配置装配写入），空串表示跟随全局默认。
+        self.request_control_mode = ""
+        #: 审计写失败独立记录，绝不阻断已验证响应的返回（T06）。
+        self.audit_errors: list[dict[str, str]] = []
+        self.last_request_fingerprint = ""
 
     @property
     def is_local_free(self) -> bool:
         return not bool(self.api_key and self.api_key.strip()) and _is_loopback_endpoint(self.endpoint)
 
-    def configure_paid_requests(self, journal: Any, guard: Any, profile_fingerprint: str) -> None:
+    @property
+    def request_mode(self) -> str:
+        return self.request_control_mode or get_request_control_mode()
+
+    @property
+    def audit_write_errors(self) -> int:
+        return len(self.audit_errors)
+
+    def configure_paid_requests(self, journal: Any, guard: Any, profile_fingerprint: str,
+                                *, mode: str = "") -> None:
         self.request_journal = journal
         self.paid_guard = guard
         self.request_profile = profile_fingerprint
+        if mode:
+            self.request_control_mode = mode
 
-    def _post(self, payload: dict[str, Any]) -> Any:
+    def _record_audit_error(self, phase: str, exc: BaseException) -> None:
+        self.audit_errors.append({"phase": phase, "error": type(exc).__name__,
+                                  "detail": str(exc)[:_HTTP_ERROR_DETAIL_LIMIT]})
+
+    def _audit_before_send(self, fingerprint: str, mode: str) -> str | None:
+        """非阻塞审计：写失败只记账，绝不丢掉已验证响应、也绝不拒绝发送。"""
+        journal = self.request_journal
+        if journal is None or self.is_local_free:
+            return None
+        try:
+            return journal.before_send(fingerprint, self.endpoint, self.request_profile)
+        except Exception as exc:  # noqa: BLE001 - 审计必须尽力而为
+            self._record_audit_error("before_send", exc)
+            if audit_is_blocking(mode):
+                raise
+            return None
+
+    def _audit_finish(self, request_id: str | None, outcome: RequestOutcome, mode: str) -> None:
+        if request_id is None:
+            return
+        journal = self.request_journal
+        if journal is None:
+            return
+        try:
+            if outcome.outcome == "succeeded":
+                journal.mark_success(request_id)
+            else:
+                journal.mark_unknown(request_id, f"{outcome.outcome}: {outcome.detail}")
+        except Exception as exc:  # noqa: BLE001
+            self._record_audit_error("after_send", exc)
+            if audit_is_blocking(mode):
+                raise
+
+    def _raise_classified(self, outcome: RequestOutcome, mode: str, *, local: bool) -> None:
+        if local:
+            code = "LOCAL_REQUEST_FAILED"
+        elif audit_is_blocking(mode):
+            code = legacy_error_code(outcome.outcome)
+        else:
+            code = outcome.error_code
+        summary = outcome.summary or outcome.detail or "request failed"
+        raise ProviderError(
+            f"{code}: {summary}",
+            http_status=outcome.http_status,
+            response_detail=outcome.detail,
+            outcome=outcome.outcome,
+            response_received=outcome.response_received,
+            remote_effect_unknown=outcome.remote_effect_unknown,
+            request_fingerprint=outcome.request_fingerprint,
+            operation_id=outcome.operation_id,
+            batch_id=outcome.batch_id,
+        )
+
+    def _send_once(self, payload: dict[str, Any], *,
+                   request_context: RequestContext | None = None) -> Any:
+        """恰好一个物理 POST；零自动重发（429/5xx/网络/JSON 都不重发）。"""
+        context = request_context if isinstance(request_context, RequestContext) else manual_context("manual_query")
+        mode = self.request_mode
         headers = {"Content-Type": "application/json", "Accept": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
-        # Request 对象可在重试循环里复用，无需每次重建。
         request = Request(
             self.endpoint,
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
             headers=headers,
             method="POST",
         )
-        journal = self.request_journal
-        if journal is None or self.paid_guard is None:
-            if not self.is_local_free:
-                raise ProviderError("PAID_REQUEST_CONTROL_UNAVAILABLE: durable journal required; profile may be revoked")
-        elif not self.paid_guard(self.request_profile):
-            raise ProviderError("PAID_REQUEST_CONTROL_UNAVAILABLE: durable journal required; profile may be revoked")
+        body = request.data or b""
+        fingerprint = payload_fingerprint(body)
+        self.last_request_fingerprint = fingerprint
+        base = {"request_fingerprint": fingerprint, "operation_id": context.operation_id,
+                "batch_id": context.batch_id}
 
-        if journal is not None:
-            payload_hash = hashlib.sha256(request.data).hexdigest()
-            request_id = journal.before_send(payload_hash, self.endpoint, self.request_profile)
-            try:
-                # Non-idempotent POST: even 429/5xx may already have incurred cost.
-                with urlopen(request, timeout=self.timeout) as response:
-                    result = json.loads(response.read().decode("utf-8"))
-                journal.mark_success(request_id)
-                return result
-            except (HTTPError, URLError, OSError, ValueError, json.JSONDecodeError) as exc:
-                summary, status, detail = _request_failure_summary(exc)
-                journal.mark_unknown(request_id, f"response_unconfirmed: {summary}")
+        guard = self.paid_guard
+        if guard is None or self.paid_guard is None:
+            if not self.is_local_free and audit_is_blocking(mode):
                 raise ProviderError(
-                    "SUBMISSION_UNKNOWN: request outcome unknown; automatic retry disabled; "
-                    f"{summary}",
-                    http_status=status,
-                    response_detail=detail,
-                ) from exc
-        else:
-            try:
-                with urlopen(request, timeout=self.timeout) as response:
-                    return json.loads(response.read().decode("utf-8"))
-            except (HTTPError, URLError, OSError, ValueError, json.JSONDecodeError) as exc:
-                summary, status, detail = _request_failure_summary(exc)
-                raise ProviderError(
-                    f"LOCAL_REQUEST_FAILED: request to local endpoint failed: {summary}",
-                    http_status=status,
-                    response_detail=detail,
-                ) from exc
+                    "PAID_REQUEST_CONTROL_UNAVAILABLE: durable journal required; profile may be revoked",
+                    outcome=OUTCOME_NOT_SENT, response_received=False,
+                    remote_effect_unknown=False, **base)
+        elif not guard(self.request_profile):
+            raise ProviderError(
+                "REQUEST_ROUTE_PAUSED: request route is paused (explicit revoke or policy)",
+                outcome=OUTCOME_NOT_SENT, response_received=False,
+                remote_effect_unknown=False, **base)
 
-    def _backoff_seconds(self, attempt: int, exc: BaseException) -> float | None:
-        """返回本次失败应等待的秒数；None 表示不可重试，立即失败。"""
-        retry_after = 0.0
-        if isinstance(exc, HTTPError):
-            code = getattr(exc, "code", 0) or 0
-            if code == 429:
-                # 服务端给出的限流等待时间优先于本地估算的退避。
-                retry_after = _retry_after_seconds(getattr(exc, "hdrs", None)) or 0.0
-            elif code < 500:
-                # 其余 4xx（以及 3xx 等非成功响应）重试无意义，保持旧的立即失败语义。
-                return None
-        elif not isinstance(exc, (URLError, OSError)):
-            # ValueError / JSONDecodeError：响应体本身损坏，重试无益。
-            return None
-        # 本地估算与服务端建议取较大者，再统一封顶 —— 封顶必须放在 max() 之外，
-        # 否则服务端给的超大 Retry-After 会绕过 _MAX_BACKOFF。
-        delay = max(min(self.retry_backoff * (2 ** attempt), _MAX_BACKOFF), retry_after)
-        jittered = delay * (1.0 + random.random() * _JITTER_RATIO)
-        return min(jittered, _MAX_BACKOFF)
+        request_id = self._audit_before_send(fingerprint, mode)
+        try:
+            with urlopen(request, timeout=self.timeout) as response:
+                status = int(getattr(response, "status", 0) or 0) or None
+                raw = response.read()
+            try:
+                result = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError) as exc:
+                outcome = RequestOutcome(outcome=OUTCOME_RESPONSE_INVALID,
+                                         response_received=True, remote_effect_unknown=True,
+                                         http_status=status,
+                                         detail=f"invalid JSON response: {exc}"[:_HTTP_ERROR_DETAIL_LIMIT],
+                                         **base)
+                self._audit_finish(request_id, outcome, mode)
+                self._raise_classified(outcome, mode, local=self.is_local_free)
+        except (HTTPError, TimeoutError, socket.timeout, http.client.HTTPException, URLError, OSError) as exc:
+            classified = _transport_outcome(exc)
+            outcome = RequestOutcome(
+                outcome=classified.outcome, response_received=classified.response_received,
+                remote_effect_unknown=classified.remote_effect_unknown,
+                http_status=classified.http_status, detail=classified.detail,
+                summary=classified.summary, **base)
+            self._audit_finish(request_id, outcome, mode)
+            self._raise_classified(outcome, mode, local=self.is_local_free)
+        self._audit_finish(request_id, RequestOutcome(
+            outcome="succeeded", response_received=True, remote_effect_unknown=True,
+            http_status=status, **base), mode)
+        return result
+
+    def _post(self, payload: dict[str, Any], *, request_context: RequestContext | None = None) -> Any:
+        """兼容入口：等价于 `_send_once`（一次物理 POST，零自动重发）。"""
+        return self._send_once(payload, request_context=request_context)
 
 
 class ExternalEmbeddingProvider(_JsonHttpProvider):
@@ -239,21 +388,44 @@ class ExternalEmbeddingProvider(_JsonHttpProvider):
             self.dimension = profile.effective_dim
             self.send_dimensions = profile.request_dim is not None
 
-    def embed(self, texts: Sequence[str]) -> list[list[float]]:
+    #: 外部 provider 具备后台单批能力（一次调用 = 恰好一个物理 POST）。
+    supports_batch_once = True
+
+    def embed(self, texts: Sequence[str], *, request_context: RequestContext | None = None) -> list[list[float]]:
+        """旧兼容签名。内部多批时**不**自动重发失败批次——异常直接上抛。"""
         if not texts:
             return []
         items = list(texts)
         if self.batch_size <= 0 or len(items) <= self.batch_size:
-            return self._embed_batch(items)
+            return self._embed_batch(items, request_context=request_context)
         # 长文件按 batch_size 切片：单请求过大既容易被限流，也容易触发服务端长度上限。
         vectors: list[list[float]] = []
         for start in range(0, len(items), self.batch_size):
             batch = items[start : start + self.batch_size]
             # 条数校验在 _embed_batch 内统一做，单批与多批路径都不会漏。
-            vectors.extend(self._embed_batch(batch))
+            vectors.extend(self._embed_batch(batch, request_context=request_context))
         return vectors
 
-    def _embed_batch(self, batch: list[str]) -> list[list[float]]:
+    def embed_batch_once(self, texts: Sequence[str], *,
+                         request_context: RequestContext | None = None) -> list[list[float]]:
+        """后台单批入口：**恰好一个物理 POST**。
+
+        超过 `batch_size` 直接拒绝，绝不隐藏再次分批——那会让「一次调用 = 一次
+        POST」的预算与 hold 判据失真。调用方负责按 batch_size 组批。
+        """
+        items = list(texts or [])
+        if not items:
+            return []
+        if self.batch_size > 0 and len(items) > self.batch_size:
+            raise ProviderError(
+                f"embed_batch_once received {len(items)} inputs but batch_size={self.batch_size}; "
+                "caller must group batches before dispatch",
+                outcome=OUTCOME_NOT_SENT, response_received=False,
+                remote_effect_unknown=False, batch_count=len(items))
+        return self._embed_batch(items, request_context=request_context)
+
+    def _embed_batch(self, batch: list[str], *,
+                     request_context: RequestContext | None = None) -> list[list[float]]:
         request_input: list[str] | list[dict[str, str]] = batch
         if self.input_modality_declaration == "typed":
             request_input = [{"text": text} for text in batch]
@@ -268,7 +440,7 @@ class ExternalEmbeddingProvider(_JsonHttpProvider):
         # TODO(issue-17): 单条定位只能由 doctor 人工确认入口显式重发；
         # 索引路径不得自动逐条探测或二分，以免未知结果的 POST 重复计费。
         try:
-            response = self._post(payload)
+            response = self._send_once(payload, request_context=request_context)
         except ProviderError as exc:
             exc.batch_count = len(batch)
             exc.batch_fingerprint = batch_fingerprint
@@ -313,15 +485,21 @@ class ExternalRerankerProvider(_JsonHttpProvider):
         super().__init__(endpoint, api_key, timeout, max_retries, retry_backoff)
         self.model = model
 
-    def rerank(self, query: str, documents: Sequence[str]) -> list[dict[str, Any]]:
+    def rerank(self, query: str, documents: Sequence[str], *,
+               request_context: RequestContext | None = None) -> list[dict[str, Any]]:
         if not documents:
             return []
         payload = {"model": self.model, "query": query, "documents": list(documents)}
-        response = self._post(payload)
+        response = self._send_once(payload, request_context=request_context)
         results = response.get("results") if isinstance(response, dict) else None
         if not isinstance(results, list):
             raise ProviderError("reranker response must contain a results list")
         return results
+
+    def rerank_once(self, query: str, documents: Sequence[str], *,
+                    request_context: RequestContext | None = None) -> list[dict[str, Any]]:
+        """manual rerank 的单次入口：一次调用最多一个物理 POST。"""
+        return self.rerank(query, documents, request_context=request_context)
 
     def rerank_or_none(self, query: str, documents: Sequence[str]) -> list[dict[str, Any]] | None:
         try:

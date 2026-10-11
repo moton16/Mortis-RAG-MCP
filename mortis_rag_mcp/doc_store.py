@@ -126,6 +126,16 @@ class StoreConflict(DocStoreError):
     code = "STORE_CONFLICT"
 
 
+class ResumeConflict(StoreConflict):
+    """续算组件唯一约束冲突：同一输入身份已被另一批次占用（reserved/held/…）。
+
+    这是**正常的并发/重放防护结果**，不是数据损坏：调用方必须重新读取状态后
+    重新计划，绝不能吞掉它继续发送。
+    """
+
+    code = "RESUME_COMPONENT_CONFLICT"
+
+
 class LockUnavailable(DocStoreError):
     code = "LOCK_UNAVAILABLE"
     retryable = True
@@ -1427,6 +1437,283 @@ class ControlStore:
                 "attempt", "state", "reason", "created_at", "updated_at")
         return [dict(zip(keys, row)) for row in rows]
 
+    # ------------------------------------------- 续算表：embedding_batches/components
+
+    def _ensure_resume_schema(self, conn: sqlite3.Connection) -> None:
+        """惰性补建续算表（只加表、不改 `SCHEMA_VERSION`）。
+
+        DDL 逐条 execute 并置于一个显式短事务内：**不能**用 `executescript`，它会
+        先隐式 COMMIT 当前事务，把 reserve 的原子性打穿。失败整体回滚，绝不留下
+        只建了一半的表或索引。
+        """
+        started = not conn.in_transaction
+        if started:
+            conn.execute("BEGIN IMMEDIATE")
+        try:
+            for statement in _RESUME_SCHEMA_STATEMENTS:
+                conn.execute(statement)
+            if started:
+                conn.commit()
+        except BaseException:
+            if started:
+                self._rollback_quietly(conn)
+            raise
+
+    def reserve_embedding_batch(self, batch_id: str, *, operation_id: str, purpose_family: str,
+                                profile_fingerprint: str, endpoint: str, owner_token: str,
+                                components: Sequence[Mapping[str, Any]], vault_epoch: int = 0,
+                                generation_id: str = "", payload_hash: str = "") -> dict:
+        """原子占用一批后台组件；任何冲突整批回滚（不偷偷部分占用）。"""
+        for name, value in (("batch_id", batch_id), ("operation_id", operation_id),
+                            ("purpose_family", purpose_family),
+                            ("profile_fingerprint", profile_fingerprint),
+                            ("endpoint", endpoint), ("owner_token", owner_token)):
+            if not isinstance(value, str) or not value:
+                raise StoreContractError(f"{name} 必填")
+        rows = list(components or [])
+        if not rows:
+            raise StoreContractError("reserve 至少需要一个组件")
+        now = time.time()
+        with self.mutation() as conn:
+            self._ensure_resume_schema(conn)
+            try:
+                conn.execute(
+                    "INSERT INTO embedding_batches (batch_id, operation_id, purpose_family, "
+                    "profile_fingerprint, endpoint, payload_hash, owner_token, vault_epoch, "
+                    "generation_id, state, outcome, http_status, reason, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'reserved', '', NULL, '', ?, ?)",
+                    (batch_id, operation_id, purpose_family, profile_fingerprint, endpoint,
+                     str(payload_hash or ""), owner_token, int(vault_epoch), str(generation_id),
+                     now, now),
+                )
+                for ordinal, component in enumerate(rows):
+                    conn.execute(
+                        "INSERT INTO embedding_components (batch_id, ordinal, component_key, "
+                        "embedding_key, input_sha256, source, source_kind, source_sha256, "
+                        "revision_id, chunk_id, state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'reserved')",
+                        (batch_id, ordinal,
+                         str(component.get("component_key") or ""),
+                         str(component.get("embedding_key") or ""),
+                         str(component.get("input_sha256") or ""),
+                         str(component.get("source") or ""),
+                         str(component.get("source_kind") or ""),
+                         str(component.get("source_sha256") or ""),
+                         str(component.get("revision_id") or ""),
+                         str(component.get("chunk_id") or "")),
+                    )
+                conn.commit()
+            except sqlite3.IntegrityError as exc:
+                self._rollback_quietly(conn)
+                raise ResumeConflict(
+                    f"组件身份已被占用（batch_id={batch_id}）：{exc}"
+                ) from exc
+        return {"batch_id": batch_id, "state": "reserved", "components": len(rows),
+                "operation_id": operation_id, "created_at": now}
+
+    def begin_embedding_send(self, batch_id: str, owner_token: str, payload_hash: str = "") -> bool:
+        """`reserved → sending` 的 CAS，**必须在调用 transport 前**持久提交。
+
+        提交失败 = 零 POST。False 表示 owner/状态不匹配（并发或已推进）。
+        """
+        now = time.time()
+        with self.mutation() as conn:
+            self._ensure_resume_schema(conn)
+            cursor = conn.execute(
+                "UPDATE embedding_batches SET state = 'sending', payload_hash = ?, updated_at = ? "
+                "WHERE batch_id = ? AND owner_token = ? AND state = 'reserved'",
+                (str(payload_hash or ""), now, batch_id, owner_token),
+            )
+            if cursor.rowcount != 1:
+                self._rollback_quietly(conn)
+                return False
+            conn.execute(
+                "UPDATE embedding_components SET state = 'sending' "
+                "WHERE batch_id = ? AND state = 'reserved'", (batch_id,))
+            conn.commit()
+        return True
+
+    def record_embedding_outcome(self, batch_id: str, owner_token: str, outcome: str, *,
+                                 http_status: int | None = None, reason: str = "",
+                                 component_state: str = "") -> bool:
+        """记录一次发送结果：组件与批次在**同一事务**内推进。
+
+        `succeeded` 只置 `result_pending`（还未经检查点确认）；未知结果一律转
+        对应的 held 状态并保留 active 占用，绝不自动释放。
+        """
+        from .request_lifecycle import OUTCOME_HOLD_STATE, OUTCOME_SUCCEEDED
+        mapping = {
+            OUTCOME_SUCCEEDED: "result_pending",
+            "not_sent": "released",
+            "rejected": "released",
+        }
+        target = component_state or mapping.get(outcome) or OUTCOME_HOLD_STATE.get(outcome) or "held_unknown"
+        batch_state = {
+            "result_pending": "result_pending",
+            "released": "released" if outcome == "not_sent" else "rejected",
+        }.get(target, target)
+        now = time.time()
+        with self.mutation() as conn:
+            self._ensure_resume_schema(conn)
+            cursor = conn.execute(
+                "UPDATE embedding_batches SET state = ?, outcome = ?, http_status = ?, reason = ?, "
+                "updated_at = ? WHERE batch_id = ? AND owner_token = ? "
+                "AND state IN ('reserved','sending','result_pending')",
+                (batch_state, str(outcome), http_status, str(reason)[:400], now,
+                 batch_id, owner_token),
+            )
+            if cursor.rowcount != 1:
+                self._rollback_quietly(conn)
+                return False
+            conn.execute(
+                "UPDATE embedding_components SET state = ? WHERE batch_id = ? "
+                "AND state IN ('reserved','sending','result_pending')", (target, batch_id))
+            conn.commit()
+        return True
+
+    def confirm_embedding_checkpoint(self, batch_id: str, owner_token: str,
+                                     persisted_keys: Sequence[str]) -> dict:
+        """检查点确认：只有被严格确认持久化的组件才能 `complete`。
+
+        未确认的一律 `held_result_missing`（曾取得结果但无可恢复成果），而不是
+        `complete`——那会让跨重启的缓存丢失变成"静默已算过"。
+        """
+        keys = {str(item) for item in persisted_keys or ()}
+        now = time.time()
+        with self.mutation() as conn:
+            self._ensure_resume_schema(conn)
+            rows = conn.execute(
+                "SELECT ordinal, embedding_key, chunk_id FROM embedding_components "
+                "WHERE batch_id = ?", (batch_id,)).fetchall()
+            confirmed = 0
+            for ordinal, embedding_key, chunk_id in rows:
+                ok = str(embedding_key) in keys or str(chunk_id) in keys
+                conn.execute(
+                    "UPDATE embedding_components SET state = ? WHERE batch_id = ? AND ordinal = ?",
+                    ("complete" if ok else "held_result_missing", batch_id, int(ordinal)))
+                confirmed += 1 if ok else 0
+            batch_state = "complete" if confirmed == len(rows) and rows else (
+                "held_result_missing" if rows else "complete")
+            cursor = conn.execute(
+                "UPDATE embedding_batches SET state = ?, updated_at = ? "
+                "WHERE batch_id = ? AND owner_token = ? AND state = 'result_pending'",
+                (batch_state, now, batch_id, owner_token))
+            if cursor.rowcount != 1:
+                self._rollback_quietly(conn)
+                return {"batch_id": batch_id, "confirmed": confirmed, "total": len(rows),
+                        "applied": False}
+            conn.commit()
+        return {"batch_id": batch_id, "confirmed": confirmed, "total": len(rows),
+                "state": batch_state, "applied": True}
+
+    def embedding_component_states(self, component_keys: Sequence[str]) -> dict[str, str]:
+        """读取输入身份的当前 active 状态（规划阶段过滤 held/占用中的组件）。"""
+        keys = [str(item) for item in component_keys or ()]
+        if not keys:
+            return {}
+        states: dict[str, str] = {}
+        with self.mutation() as conn:
+            self._ensure_resume_schema(conn)
+            for start in range(0, len(keys), 400):
+                chunk = keys[start:start + 400]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = conn.execute(
+                    "SELECT component_key, state FROM embedding_components "
+                    f"WHERE component_key IN ({placeholders})", tuple(chunk)).fetchall()
+                for key, state in rows:
+                    states[str(key)] = str(state)
+        return states
+
+    def list_embedding_work(self, *, source: str = "", batch_id: str = "",
+                            states: Sequence[str] = ()) -> list[dict]:
+        """按 source / batch / 状态列出续算工作（只读，不安排任何网络动作）。"""
+        with self.mutation() as conn:
+            self._ensure_resume_schema(conn)
+            rows = conn.execute(
+                "SELECT batch_id, operation_id, purpose_family, profile_fingerprint, endpoint, "
+                "payload_hash, owner_token, vault_epoch, generation_id, state, outcome, "
+                "http_status, reason, created_at, updated_at FROM embedding_batches "
+                "ORDER BY created_at").fetchall()
+        batch_keys = ("batch_id", "operation_id", "purpose_family", "profile_fingerprint",
+                      "endpoint", "payload_hash", "owner_token", "vault_epoch",
+                      "generation_id", "state", "outcome", "http_status", "reason",
+                      "created_at", "updated_at")
+        wanted_states = {str(item) for item in states or ()}
+        result: list[dict] = []
+        for row in rows:
+            batch = dict(zip(batch_keys, row))
+            if batch_id and batch["batch_id"] != batch_id:
+                continue
+            if wanted_states and batch["state"] not in wanted_states:
+                continue
+            components = self._embedding_components(batch["batch_id"])
+            if source and not any(c["source"] == source for c in components):
+                continue
+            batch["components"] = components
+            result.append(batch)
+        return result
+
+    def _embedding_components(self, batch_id: str) -> list[dict]:
+        with self.mutation() as conn:
+            self._ensure_resume_schema(conn)
+            rows = conn.execute(
+                "SELECT ordinal, component_key, embedding_key, input_sha256, source, source_kind, "
+                "source_sha256, revision_id, chunk_id, state FROM embedding_components "
+                "WHERE batch_id = ? ORDER BY ordinal", (batch_id,)).fetchall()
+        keys = ("ordinal", "component_key", "embedding_key", "input_sha256", "source",
+                "source_kind", "source_sha256", "revision_id", "chunk_id", "state")
+        return [dict(zip(keys, row)) for row in rows]
+
+    def resolve_embedding_work(self, batch_id: str, *, action: str,
+                               owner_token: str = "", confirm_repeat_cost: bool = False,
+                               note: str = "") -> dict:
+        """显式处置一个批次：`retry` / `abandon` / `release`。
+
+        * `retry`：需 `confirm_repeat_cost=True`；只释放**本批次**组件，不解除其他
+          记录；`sending` 活跃批次一律拒绝。
+        * `abandon`：转 `manual_only`，退出自动续算；**保留** active 占用，所以
+          watch 不会自动重发。
+        * `release`：仅在确定未发送或人工授权新尝试时使用。
+        """
+        if action not in {"retry", "abandon", "release"}:
+            raise StoreContractError(f"unsupported resume action: {action}")
+        now = time.time()
+        with self.mutation() as conn:
+            self._ensure_resume_schema(conn)
+            row = conn.execute(
+                "SELECT state FROM embedding_batches WHERE batch_id = ?", (batch_id,)).fetchone()
+            if row is None:
+                raise StoreContractError(f"未记录的续算批次：{batch_id!r}")
+            current = str(row[0])
+            if action == "abandon":
+                target = "manual_only"
+            elif action == "release":
+                target = "released"
+            else:
+                if not confirm_repeat_cost:
+                    self._rollback_quietly(conn)
+                    return {"batch_id": batch_id, "applied": False,
+                            "error": "RESUME_RETRY_NEEDS_CONFIRMATION"}
+                if current == "sending":
+                    self._rollback_quietly(conn)
+                    return {"batch_id": batch_id, "applied": False,
+                            "error": "RESUME_BATCH_STILL_SENDING"}
+                target = "released"
+            component_target = "manual_only" if action == "abandon" else "released"
+            cursor = conn.execute(
+                "UPDATE embedding_batches SET state = ?, outcome = ?, reason = ?, updated_at = ? "
+                "WHERE batch_id = ? AND state != 'complete'",
+                (target, action, str(note)[:400], now, batch_id))
+            if cursor.rowcount != 1:
+                self._rollback_quietly(conn)
+                return {"batch_id": batch_id, "applied": False,
+                        "error": "RESUME_BATCH_IMMUTABLE"}
+            conn.execute(
+                "UPDATE embedding_components SET state = ? WHERE batch_id = ? AND state != 'complete'",
+                (component_target, batch_id))
+            conn.commit()
+        return {"batch_id": batch_id, "applied": True, "state": target,
+                "component_state": component_target, "previous_state": current}
+
     def close(self) -> None:
         conn = self._conn()
         if conn is not None:
@@ -1444,6 +1731,36 @@ class ControlStore:
 
 
 # --------------------------------------------------------------------------- schema
+
+#: 续算表 DDL（v0.9.2）。逐条 execute，禁止 executescript（它会隐式 COMMIT）。
+#: 只存哈希/定位/状态，**不存 chunk 正文、API key 或向量 BLOB**。
+_RESUME_SCHEMA_STATEMENTS = (
+    "CREATE TABLE IF NOT EXISTS embedding_batches ("
+    "batch_id TEXT PRIMARY KEY, operation_id TEXT NOT NULL, purpose_family TEXT NOT NULL, "
+    "profile_fingerprint TEXT NOT NULL, endpoint TEXT NOT NULL, payload_hash TEXT NOT NULL DEFAULT '', "
+    "owner_token TEXT NOT NULL, vault_epoch INTEGER NOT NULL DEFAULT 0, "
+    "generation_id TEXT NOT NULL DEFAULT '', state TEXT NOT NULL, outcome TEXT NOT NULL DEFAULT '', "
+    "http_status INTEGER, reason TEXT NOT NULL DEFAULT '', created_at REAL NOT NULL, "
+    "updated_at REAL NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS embedding_components ("
+    "batch_id TEXT NOT NULL REFERENCES embedding_batches(batch_id), ordinal INTEGER NOT NULL, "
+    "component_key TEXT NOT NULL, embedding_key TEXT NOT NULL, input_sha256 TEXT NOT NULL, "
+    "source TEXT NOT NULL, source_kind TEXT NOT NULL, source_sha256 TEXT NOT NULL DEFAULT '', "
+    "revision_id TEXT NOT NULL DEFAULT '', chunk_id TEXT NOT NULL, state TEXT NOT NULL, "
+    "PRIMARY KEY (batch_id, ordinal))",
+    # 唯一的 active 占用约束：同一个稳定输入身份在任一时刻只能有一个未完成占用。
+    # 这是重放防护的**最终判据**，调度串行只是减少冲突、不能代替它。
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_embedding_active_component "
+    "ON embedding_components(component_key) WHERE state IN "
+    "('reserved','sending','result_pending','held_unknown','held_response_invalid',"
+    "'held_result_missing','manual_only')",
+    "CREATE INDEX IF NOT EXISTS idx_embedding_batch_state "
+    "ON embedding_batches(profile_fingerprint, purpose_family, state)",
+    "CREATE INDEX IF NOT EXISTS idx_embedding_component_source "
+    "ON embedding_components(source, source_sha256, revision_id)",
+    "CREATE INDEX IF NOT EXISTS idx_embedding_component_history "
+    "ON embedding_components(component_key, state)",
+)
 
 _DOCSTORE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS store_meta (

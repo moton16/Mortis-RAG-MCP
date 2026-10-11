@@ -11,9 +11,33 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from .embedding_capabilities import ResolvedEmbeddingProfile, validate_profile, validate_vector
-from .providers import ProviderError, _is_loopback_endpoint
+from .providers import ProviderError, _is_loopback_endpoint, _transport_outcome
+from .request_lifecycle import (
+    OUTCOME_NOT_SENT, OUTCOME_RESPONSE_INVALID, OUTCOME_SUCCEEDED,
+    RequestContext, RequestOutcome, audit_is_blocking, get_request_control_mode,
+)
 
 _MAX_RESPONSE_BYTES = 10 * 1024 * 1024  # 10 MiB response body limit
+
+
+def _media_outcome(exc: BaseException) -> RequestOutcome:
+    """把媒体 transport/adapter 抛出的异常归一为结构化结果。
+
+    `MediaResponseError` 表示**收到了响应但产物不可用**，不是没发；transport 侧的
+    网络/HTTP 事实从 `__cause__` 链上还原，绝不把「响应不可用」降级成「未提交」。
+    """
+    if isinstance(exc, MediaResponseError):
+        reason = getattr(exc, "reason", "media_response_contract_failed")
+        outcome = "rejected" if reason == "media_response_rejected" else OUTCOME_RESPONSE_INVALID
+        return RequestOutcome(outcome=outcome, response_received=True,
+                              remote_effect_unknown=True, http_status=getattr(exc, "http_status", None),
+                              detail=str(exc)[:200])
+    cause = getattr(exc, "__cause__", None)
+    if cause is not None:
+        return _transport_outcome(cause)
+    return RequestOutcome(outcome="transport_unknown", response_received=False,
+                          remote_effect_unknown=True, http_status=getattr(exc, "http_status", None),
+                          detail=str(exc)[:200])
 
 
 class MediaResponseError(ProviderError):
@@ -437,12 +461,31 @@ class NativeMediaProvider:
         self._transport = transport
         self.request_journal: Any = None
         self.paid_guard: Any = None
+        #: 非空时覆盖全局请求控制模式。
+        self.request_control_mode = ""
+        #: 审计写失败独立记录，绝不丢掉已验证产物。
+        self.audit_errors: list[dict[str, str]] = []
 
-    def configure_paid_requests(self, journal: Any, guard: Any, profile_fingerprint: str) -> None:
+    @property
+    def request_mode(self) -> str:
+        return self.request_control_mode or get_request_control_mode()
+
+    @property
+    def audit_write_errors(self) -> int:
+        return len(self.audit_errors)
+
+    def configure_paid_requests(self, journal: Any, guard: Any, profile_fingerprint: str,
+                                *, mode: str = "") -> None:
         if profile_fingerprint != self.profile.fingerprint:
             raise ProviderError("native media authorization profile mismatch")
         self.request_journal = journal
         self.paid_guard = guard
+        if mode:
+            self.request_control_mode = mode
+
+    def _record_audit_error(self, phase: str, exc: BaseException) -> None:
+        self.audit_errors.append({"phase": phase, "error": type(exc).__name__,
+                                  "detail": str(exc)[:200]})
 
     @property
     def is_local_free(self) -> bool:
@@ -468,7 +511,12 @@ class NativeMediaProvider:
             "max_batch_size": self.evidence.max_batch_size,
         }
 
-    def embed_media(self, inputs: Sequence[EmbeddingInput]) -> list[list[float]]:
+    def embed_media(self, inputs: Sequence[EmbeddingInput], *,
+                    request_context: RequestContext | None = None) -> list[list[float]]:
+        return self.embed_media_batch_once(inputs, request_context=request_context)
+
+    def embed_media_batch_once(self, inputs: Sequence[EmbeddingInput], *,
+                               request_context: RequestContext | None = None) -> list[list[float]]:
         items = list(inputs)
         if not items:
             return []
@@ -490,37 +538,98 @@ class NativeMediaProvider:
         # （issue #12/#13）。付费路径的结构一条未动。
         local_free = self.is_local_free
         journal = self.request_journal
+        mode = self.request_mode
+        context = request_context if isinstance(request_context, RequestContext) else None
+        base = {
+            "operation_id": context.operation_id if context else "",
+            "batch_id": context.batch_id if context else "",
+        }
         if journal is None or self.paid_guard is None:
-            if not local_free:
-                raise ProviderError("EMBEDDING_PENDING_APPROVAL: native media request blocked")
+            if not local_free and audit_is_blocking(mode):
+                raise ProviderError("EMBEDDING_PENDING_APPROVAL: native media request blocked",
+                                    outcome=OUTCOME_NOT_SENT, response_received=False,
+                                    remote_effect_unknown=False, **base)
         elif not (local_free or self.paid_guard(self.profile.fingerprint)):
-            raise ProviderError("EMBEDDING_PENDING_APPROVAL: native media request blocked")
+            raise ProviderError("REQUEST_ROUTE_PAUSED: native media route is paused",
+                                outcome=OUTCOME_NOT_SENT, response_received=False,
+                                remote_effect_unknown=False, **base)
         material = repr([(item.request_id, item.modality, item.mime_type, item.media_hash) for item in items])
         payload_hash = hashlib.sha256(material.encode()).hexdigest()
-        request_id = None if local_free else journal.before_send(
-            payload_hash, self.profile.endpoint, self.profile.fingerprint)
+        request_id = None
+        if not local_free and journal is not None:
+            try:
+                request_id = journal.before_send(
+                    payload_hash, self.profile.endpoint, self.profile.fingerprint)
+            except Exception as exc:  # noqa: BLE001 - 审计是非阻塞的
+                self._record_audit_error("before_send", exc)
+                if audit_is_blocking(mode):
+                    raise
         try:
             response = list(self._transport(items))
-        except MediaResponseError as exc:
-            if request_id is not None:
-                journal.mark_response_failed(request_id, exc.reason)
-            raise
-        except Exception as exc:
-            if request_id is None:
+        except BaseException as exc:  # noqa: BLE001 - 分类后统一上抛
+            outcome = _media_outcome(exc)
+            outcome = RequestOutcome(outcome=outcome.outcome,
+                                     response_received=outcome.response_received,
+                                     remote_effect_unknown=outcome.remote_effect_unknown,
+                                     http_status=outcome.http_status,
+                                     detail=outcome.detail,
+                                     request_fingerprint=payload_hash, **base)
+            self._finish(request_id, outcome, mode, exc)
+            if local_free and request_id is None and not isinstance(exc, MediaResponseError):
                 raise ProviderError(
-                    f"LOCAL_MEDIA_REQUEST_FAILED: request to local endpoint failed: {exc}") from exc
-            journal.mark_unknown(request_id, "response_unconfirmed")
-            raise ProviderError("SUBMISSION_UNKNOWN: native media outcome unknown") from exc
+                    f"LOCAL_MEDIA_REQUEST_FAILED: request to local endpoint failed: {exc}",
+                    outcome=outcome.outcome, response_received=outcome.response_received,
+                    remote_effect_unknown=outcome.remote_effect_unknown,
+                    http_status=outcome.http_status, response_detail=outcome.detail,
+                    request_fingerprint=payload_hash, **base) from exc
+            if isinstance(exc, MediaResponseError):
+                raise
+            from .request_lifecycle import legacy_error_code
+            raise ProviderError(
+                f"{legacy_error_code(outcome.outcome) if audit_is_blocking(mode) else outcome.error_code}"
+                f": native media request failed: {outcome.summary or outcome.detail}",
+                outcome=outcome.outcome, response_received=outcome.response_received,
+                remote_effect_unknown=outcome.remote_effect_unknown,
+                http_status=outcome.http_status, response_detail=outcome.detail,
+                request_fingerprint=payload_hash, **base) from exc
         # Receipt is not success. Validate every item before the durable success CAS.
         try:
             if len(response) != len(items):
-                raise ProviderError("native media response count mismatch")
+                raise ProviderError("native media response count mismatch",
+                                    outcome=OUTCOME_RESPONSE_INVALID, response_received=True,
+                                    remote_effect_unknown=True, request_fingerprint=payload_hash, **base)
             mapped = map_media_response(response, ids)
             vectors = [validate_vector(mapped[item_id], self.profile) for item_id in ids]
-        except Exception:
-            if request_id is not None:
-                journal.mark_response_failed(request_id)
+        except BaseException as exc:
+            outcome = RequestOutcome(outcome=OUTCOME_RESPONSE_INVALID, response_received=True,
+                                     remote_effect_unknown=True, detail=str(exc)[:200],
+                                     request_fingerprint=payload_hash, **base)
+            self._finish(request_id, outcome, mode, exc)
             raise
-        if request_id is not None:
-            journal.mark_success(request_id)
+        self._finish(request_id, RequestOutcome(outcome=OUTCOME_SUCCEEDED, response_received=True,
+                                                remote_effect_unknown=True,
+                                                request_fingerprint=payload_hash, **base), mode, None)
         return vectors
+
+    def _finish(self, request_id: str | None, outcome: RequestOutcome, mode: str,
+                cause: BaseException | None) -> None:
+        """审计收尾：尽力而为；失败只记账，绝不丢掉已验证产物。"""
+        if request_id is None:
+            return
+        journal = self.request_journal
+        if journal is None:
+            return
+        try:
+            if outcome.outcome == OUTCOME_SUCCEEDED:
+                journal.mark_success(request_id)
+            elif outcome.outcome == "rejected" and cause is not None:
+                reason = getattr(cause, "reason", "media_response_contract_failed")
+                journal.mark_response_failed(request_id, reason)
+            elif outcome.outcome == OUTCOME_RESPONSE_INVALID:
+                journal.mark_response_failed(request_id)
+            else:
+                journal.mark_unknown(request_id, f"{outcome.outcome}: {outcome.detail}")
+        except Exception as exc:  # noqa: BLE001
+            self._record_audit_error("after_send", exc)
+            if audit_is_blocking(mode):
+                raise
