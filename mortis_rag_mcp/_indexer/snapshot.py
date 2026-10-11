@@ -882,6 +882,7 @@ def _import_snapshot_locked(
     owner._chunks.clear()
     owner._signatures.clear()
     owner.failed_files.clear()
+    owner._embed_failure_quarantine.clear()
     if owner._chunks_cache_path is not None:
         _CacheCodec.dump(owner._chunks_cache_path, owner._chunks_meta(), {})  # type: ignore[arg-type]
     if owner._fts_cache_path is not None:

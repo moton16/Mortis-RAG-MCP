@@ -56,3 +56,75 @@ def test_failed_file_records_bounded_http_batch_summary(tmp_path, monkeypatch):
         f"HTTP 422 · bad text modality · batch={len(batch)} sha256:{fingerprint}"
     )
     assert len(failure) <= 1024
+
+
+class _FlakyProvider:
+    is_local_free = True
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.fail = True
+
+    def embed(self, texts):
+        self.calls += 1
+        if self.fail:
+            raise RuntimeError("endpoint unavailable")
+        return [[1.0] for _ in texts]
+
+
+def _flaky_indexer(tmp_path):
+    (tmp_path / "a.md").write_text("# A\nhello world", encoding="utf-8")
+    provider = _FlakyProvider()
+    indexer = MarkdownIndexer(
+        tmp_path,
+        _external_config(tmp_path),
+        embedding_provider=provider,
+    )
+    return indexer, provider
+
+
+def test_quarantine_skips_round_after_failure_threshold(tmp_path):
+    indexer, provider = _flaky_indexer(tmp_path)
+    try:
+        for _ in range(3):
+            indexer.sync()
+        assert provider.calls == 3
+
+        indexer.sync()
+
+        assert provider.calls == 3
+        assert indexer._sync_progress["quarantined"] == 1
+        assert all(chunk.embedding is None for chunk in indexer.all_chunks())
+    finally:
+        indexer.close_document_store()
+
+
+def test_quarantine_forces_retries_on_exponential_rounds(tmp_path):
+    indexer, provider = _flaky_indexer(tmp_path)
+    calls_after_round = []
+    try:
+        for _ in range(8):
+            indexer.sync()
+            calls_after_round.append(provider.calls)
+    finally:
+        indexer.close_document_store()
+
+    assert calls_after_round == [1, 2, 3, 3, 4, 4, 4, 5]
+
+
+def test_successful_forced_retry_clears_quarantine(tmp_path):
+    indexer, provider = _flaky_indexer(tmp_path)
+    try:
+        for _ in range(4):
+            indexer.sync()
+        assert provider.calls == 3
+
+        provider.fail = False
+        indexer.sync()
+
+        assert provider.calls == 4
+        assert indexer.failed_files == {}
+        assert indexer._embed_failure_quarantine == {}
+        assert all(chunk.embedding is not None for chunk in indexer.all_chunks())
+    finally:
+        indexer.close_document_store()

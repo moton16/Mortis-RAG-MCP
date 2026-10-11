@@ -28,6 +28,7 @@ if TYPE_CHECKING:
 
 _FAILED_FILE_TEXT_LIMIT = 1024
 _FAILED_RESPONSE_DETAIL_LIMIT = 200
+QUARANTINE_STREAK = 3
 
 
 def _embedding_failure_summary(exc: BaseException) -> str:
@@ -321,6 +322,44 @@ def embedding_changed_state(
     return any(owner._chunk_has_vector(chunk) for chunk in pending_chunks)
 
 
+def _reset_quarantine_on_config_change(owner: MarkdownIndexer) -> None:
+    config_key = hashlib.sha256(repr(owner.config.embedding).encode("utf-8")).hexdigest()
+    if owner._embed_quarantine_config_key != config_key:
+        owner._embed_failure_quarantine.clear()
+        owner._embed_quarantine_config_key = config_key
+
+
+def _record_embedding_failure(owner: MarkdownIndexer, source: str) -> None:
+    streak, _rounds_waited = owner._embed_failure_quarantine.get(source, (0, 0))
+    owner._embed_failure_quarantine[source] = (streak + 1, 0)
+
+
+def _clear_embedding_failure(owner: MarkdownIndexer, source: str) -> None:
+    owner._embed_failure_quarantine.pop(source, None)
+
+
+def _quarantine_pending(
+    owner: MarkdownIndexer,
+    pending: dict[str, list[Chunk]],
+) -> tuple[dict[str, list[Chunk]], int]:
+    active: dict[str, list[Chunk]] = {}
+    quarantined = 0
+    for source, chunks in pending.items():
+        state = owner._embed_failure_quarantine.get(source)
+        if state is None or state[0] < QUARANTINE_STREAK:
+            active[source] = chunks
+            continue
+        streak, rounds_waited = state
+        retry_after_rounds = 2 ** (streak - QUARANTINE_STREAK)
+        if rounds_waited < retry_after_rounds:
+            owner._embed_failure_quarantine[source] = (streak, rounds_waited + 1)
+            quarantined += 1
+            continue
+        owner._embed_failure_quarantine[source] = (streak, 0)
+        active[source] = chunks
+    return active, quarantined
+
+
 def embed_missing(owner: MarkdownIndexer) -> bool:
     """Embed every chunk that has no vector yet.
 
@@ -340,6 +379,7 @@ def embed_missing(owner: MarkdownIndexer) -> bool:
     owner._stamp_embedding_keys()
     # 先做一轮输入身份复用：已经算过的内容不再花钱重算一次。
     reused = owner._reuse_vectors_by_content_hash()
+    _reset_quarantine_on_config_change(owner)
 
     failed_before = dict(owner.failed_files)
     pending: dict[str, list[Chunk]] = {}
@@ -350,9 +390,14 @@ def embed_missing(owner: MarkdownIndexer) -> bool:
                    and not owner._chunk_has_vector(chunk)]
         if missing:
             pending[source] = missing
+        else:
+            _clear_embedding_failure(owner, source)
     if not pending:
         # 复用到已有向量的 chunk 也需要落盘，否则下轮重新花钱重算。
         return reused > 0 or owner.failed_files != failed_before
+
+    # 缺向量仍是唯一自愈判据；quarantine 只从本轮发送集合里暂时移除 source。
+    pending, quarantined = _quarantine_pending(owner, pending)
     pending_chunks = [chunk for chunks in pending.values() for chunk in chunks]
     owner._sync_progress = {
         "phase": "embedding",
@@ -360,7 +405,10 @@ def embed_missing(owner: MarkdownIndexer) -> bool:
         "files_total": len(pending),
         "chunks_done": 0,
         "chunks_total": len(pending_chunks),
+        "quarantined": quarantined,
     }
+    if not pending:
+        return reused > 0 or owner.failed_files != failed_before
 
     if owner.config.embedding.mode == "external" and not _paid_embedding_allowed(owner):
         # R2：仅明确撤销、控制不可用、未决批量意图暂停索引，不创建漂移审批。
@@ -377,9 +425,11 @@ def embed_missing(owner: MarkdownIndexer) -> bool:
                 for chunk, vector in zip(chunks, vectors):
                     chunk.embedding = _to_emb(vector)
             except Exception as exc:
+                _record_embedding_failure(owner, source)
                 owner.failed_files[source] = _embedding_failure_summary(exc)
             else:
                 # 补向量成功即撤销旧失败记录，否则持久化文件会永久撒谎。
+                _clear_embedding_failure(owner, source)
                 owner.failed_files.pop(source, None)
             finally:
                 owner._sync_progress["files_done"] += 1
@@ -394,8 +444,10 @@ def embed_missing(owner: MarkdownIndexer) -> bool:
             try:
                 owner._embed_one_file(source, chunks, document_provider)
             except Exception as exc:
+                _record_embedding_failure(owner, source)
                 owner.failed_files[source] = _embedding_failure_summary(exc)
             else:
+                _clear_embedding_failure(owner, source)
                 owner.failed_files.pop(source, None)
             finally:
                 owner._sync_progress["files_done"] += 1
@@ -420,8 +472,10 @@ def embed_missing(owner: MarkdownIndexer) -> bool:
                 owner._sync_progress["chunks_done"] += len(chunks)
     for source in pending:
         if source in failures:
+            _record_embedding_failure(owner, source)
             owner.failed_files[source] = failures[source]
         else:
+            _clear_embedding_failure(owner, source)
             owner.failed_files.pop(source, None)
     return owner._embedding_changed_state(pending_chunks, failed_before, reused)
 
@@ -431,7 +485,7 @@ def revoke_source(owner: MarkdownIndexer, source: str, *, reason: str) -> bool:
     ids = {chunk.id for chunk in chunks}
     for state in (owner._signatures, owner._stat_cache, getattr(owner, "_virtual_sha_cache", {}),
                   owner._stat_seen_ns, owner._stat_confirmations, owner.fast_path_warnings,
-                  owner.failed_files):
+                  owner.failed_files, owner._embed_failure_quarantine):
         state.pop(source, None)
     for chunk_id in ids:
         owner._pending_vectors.pop(chunk_id, None)

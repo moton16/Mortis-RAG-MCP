@@ -226,6 +226,10 @@ class MarkdownIndexer:
         # 文本后再按 chunk.id 补挂（见 _load_vectors_cache / _attach_pending_vectors）。
         self._pending_vectors: dict[str, Any] = {}
         self.failed_files: dict[str, str] = {}
+        # issue #17：仅进程内抑制重复失败；不落盘，重启即清零。
+        # value = (连续失败次数, 自上次失败起已跳过的同步轮数)。
+        self._embed_failure_quarantine: dict[str, tuple[int, int]] = {}
+        self._embed_quarantine_config_key = ""
         self.persistence_status: dict[str, Any] = {"state": "disabled", "errors": {}}
         self.last_sync: float | None = None
         self._watch_stop = threading.Event()
@@ -278,6 +282,7 @@ class MarkdownIndexer:
             "files_total": 0,
             "chunks_done": 0,
             "chunks_total": 0,
+            "quarantined": 0,
         }
         # v0.9.0 Lane A（C91/C92）：版本化文档库（解析事实）与派生索引分离。
         # 布局只在这里解析路径，store 连接惰性建立——读路径不因为一次查询就建库。
@@ -1051,6 +1056,7 @@ class MarkdownIndexer:
             "files_total": 0,
             "chunks_done": 0,
             "chunks_total": 0,
+            "quarantined": 0,
         }
         try:
             return self._sync_locked_impl()
@@ -1669,6 +1675,7 @@ class MarkdownIndexer:
             self._failed_cache_path = None
             # 缓存整体丢弃，失败名单也随之作废（它只是缓存的附属观测数据）。
             self.failed_files.clear()
+            self._embed_failure_quarantine.clear()
             self._stat_cache.clear()
             self._virtual_sha_cache.clear()
             self._stat_seen_ns.clear()
@@ -1730,6 +1737,7 @@ class MarkdownIndexer:
             self._stat_confirmations.clear()
             self.fast_path_warnings.clear()
             self.failed_files.clear()
+            self._embed_failure_quarantine.clear()
             self._visible_docs_cache = None
             self._ignore_matcher_cache = None
             self._disk_vectors.clear()
