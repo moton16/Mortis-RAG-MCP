@@ -1841,3 +1841,30 @@ issue #12/#13 付费闸门与 issue #15 性能四条根因的修复随本补丁�
 **仍未验证**
 
 - 非 Windows 平台端到端；本机的类级桩收窄只靠探针 + 本机全量佐证，真实 py3.13 时序由 CI 判定。
+
+### [FIX-issue17-BC] — moton16,2026-10-11,CodeBuddy,Hy4-Preview — fix: 文本模态显式声明与 embedding 失败隔离
+
+> **涵盖提交**：`fdcfab2`（P0）、`d2dfbee`（P1）、`6676bce`（P2）、`ac1eac8`（P3）。
+
+**改动**
+
+- P0：`[embedding].input_modality_declaration` 新增 `none` / `typed` / `hint` 三态；默认 `none` 保持 OpenAI 兼容裸字符串数组，只在 `_embed_batch` 请求体边界序列化；非法值配置期拒绝，reranker 未改。
+- P1：文本 HTTP 失败读取最多 1024 bytes，优先提取 `error.message` 并把正文片段限制为 200 字符；本地分支保留 `LOCAL_REQUEST_FAILED`，付费分支保留 `SUBMISSION_UNKNOWN` 与非幂等 POST 禁止自动重发语义。
+- P2：失败异常只携带批次条数、整批 SHA-256 与受限响应摘要；`failed_files` 写成 `HTTP <code> · <detail> · batch=<n> sha256:<16位>`，不落完整 chunk，不做逐条/二分自动定位。
+- P3：按 source 维护仅进程内连续失败状态；第 3 次失败后先跳过 1 轮，后续失败按 2、4、8…轮退避再强制重试；成功、source 撤销、配置变化、缓存清理、快照切代与 `kb_rebuild` 清零；缺向量判据未改，`_sync_progress.quarantined` 暴露本轮跳过数。
+
+**红 → 绿证据**
+
+- P0 新文件修复前 **5 failed**（三态构造参数不存在、默认字段不存在、非法值未校验）→ P0 靶向 **68 passed**。
+- P1 两条正文断言修复前 **2 failed**（付费/本地消息均无 `HTTP <code>` 与正文）→ P1 靶向 **59 passed**。
+- P2 批次摘要修复前 **1 failed**（仍是完整 `LOCAL_REQUEST_FAILED` 普通字符串）→ P2 靶向 **46 passed**。
+- P3 三条隔离断言修复前 **3 failed / 1 passed**（第 4 轮仍重发、无指数放行、无成功清零）→ P3 新文件 **4 passed**；相关失败持久化/进度回归 **18 passed**。
+- 指定五文件加两个新增文件最终靶向：**124 passed**。
+- 有效全量：`python -m pytest tests --basetemp .runtime/pt -q` → **1338 passed / 2 skipped / 3 deselected / 1 warning**（182.44 s）。首次启动在任何用例执行前因残留 `.runtime/pt` 无法重建而产生 1338 个 setup error；非破坏性移走残留目录后按同一命令完成上述有效全量。
+
+**边界 / 未做**
+
+- quarantine 只降低同一 source 的轮级重发频率，不拆批、不恢复已丢弃的前导批向量；强制重试仍可能整文件重算，但指数放行保证缺向量最终自愈。进程重启会刻意清零，不能把临时抑制升级为持久跳过。
+- 付费 journal 的未决 POST 仍按 profile 整体暂停，优先级高于 source quarantine；需先人工处理未决意图，不把「结果未知」误判为可重试失败。
+- 单条坏输入定位的 doctor 人工确认入口未实现；索引路径仅留 TODO，绝不自动逐条/二分重发。
+- 未 push、未开 PR、未改版本号、未发起真实计费请求。
