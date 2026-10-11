@@ -1452,7 +1452,7 @@ Codex 主流程（2026-10-09 / America_New_York）。代码候选93c39a50b09ec61
 **验证**
 
 - 反向确认（新用例先在未修复代码上跑红）：`tests/test_issue15_perf.py::test_unresolved_media_intent_probed_once_per_sync` 造 500 个带媒体的已摄取虚拟源 + 5,000 行 `request_intents`（与 issue 同量级），用计数桩统计整轮 `kind="media"` 的探查次数 —— 修复前 **500 次（红）**，修复后 **≤ 1 次（绿）**。同用例还钉住「未决仍必须拦住重算：本轮不产生原生媒体向量」。
-- 靶向（§7.1 集合，逐文件跑，全部通过）：`test_e20_media_outcome` 42、`test_index_state` 5、`test_import_refresh` 5、`test_read_stale` 8、`test_virtual_sync` 25、`test_exempt` 7、`test_hybrid` 10、`test_subvaults` 5、`test_concurrency_hardening` 8、`test_watch_integration` 17、`test_text_profile_wiring` 26、`test_issue15_perf` 1。
+- 靶向（§7.1 集合，逐文件跑，全部通过）：`test_e20_media_outcome` 42、`test_index_state` 5、`test_import_refresh` 5、`test_read_stale` 8、`test_virtual_sync` 24、`test_exempt` 7、`test_hybrid` 10、`test_subvaults` 5、`test_concurrency_hardening` 8、`test_watch_integration` 17、`test_text_profile_wiring` 26、`test_issue15_perf` 1。
 - 补充靶向（媒体/同步面）：`test_paid_request_journal` 20、`test_e20_media_connection` 44、`test_media_dispatch` 11、`test_media_indexing` 11、`test_media_occurrence_anchor` 5、`test_media_transport_contract` 13、`test_migration_media` 3、`test_sync_engine` 5、`test_kb_read_media` 6 —— 全部通过。§9 里标记为「最脆」的两颗钉子（`test_e20_media_outcome.py:243`、`test_virtual_sync.py:381`）本批**未触碰**。
 
 **未做（明确不声称已修）**
@@ -1478,7 +1478,7 @@ Codex 主流程（2026-10-09 / America_New_York）。代码候选93c39a50b09ec61
 **验证**
 
 - 反向确认：`tests/test_issue15_perf.py::test_virtual_source_is_not_reread_on_every_sync`（500 个已摄取虚拟源，只统计**真的读了多少字节**，允许保留 open+close 探针）—— 修复前第二轮仍读 **13,890 字节（红）**，修复后 **0 字节（绿）**；同时钉住「第一轮必须真的读盘」与「缓存命中不改变索引结果（500 个 source 全在）」。
-- 靶向（逐文件跑，全部通过）：§7.1 集合 `test_e20_media_outcome` 42 / `test_paid_request_journal` 20 / `test_index_state` 5 / `test_import_refresh` 5 / `test_read_stale` 8 / `test_virtual_sync` 25 / `test_exempt` 7 / `test_hybrid` 10 / `test_subvaults` 5 / `test_concurrency_hardening` 8 / `test_watch_integration` 17；Fast-Stat 判据面 `test_indexer` 11 / `test_anti_contention` 8 / `test_p5_lifecycle` 3 / `test_improvements` 8；同步与装配面 `test_sync_engine` 5 / `test_e20_media_connection` 44。
+- 靶向（逐文件跑，全部通过）：§7.1 集合 `test_e20_media_outcome` 42 / `test_paid_request_journal` 20 / `test_index_state` 5 / `test_import_refresh` 5 / `test_read_stale` 8 / `test_virtual_sync` 24 / `test_exempt` 7 / `test_hybrid` 10 / `test_subvaults` 5 / `test_concurrency_hardening` 8 / `test_watch_integration` 17；Fast-Stat 判据面 `test_indexer` 11 / `test_anti_contention` 8 / `test_p5_lifecycle` 3 / `test_improvements` 8；同步与装配面 `test_sync_engine` 5 / `test_e20_media_connection` 44。
 - §9「最脆」钉子：本批**实际撞到一颗**——`test_virtual_sync.py` 的「物理源不可读必须降级」（见上第 3 点），已用可读性探针修好并复跑通过；`test_e20_media_outcome.py:243` 与 `test_virtual_sync.py:381` 未受影响。
 
 **未做（明确不声称已修）**
@@ -1507,7 +1507,7 @@ Codex 主流程（2026-10-09 / America_New_York）。代码候选93c39a50b09ec61
 **验证**
 
 - 反向确认：`tests/test_issue15_perf.py::test_read_refresh_does_not_mark_a_ready_vault_as_rebuilding` —— 已同步的库把 `last_sync` 拨回 5 秒（让 1 秒抑制窗口失效），挂上「watchr 在线且存活」替身：修复前 `request_refresh(for_read=True)` 返回 **True** 且 `index_state` 报 **rebuilding（红）**，修复后返回 **False** 且保持 **ready（绿）**。同用例还钉住「显式请求仍必须排得进去」（非 for_read 返回 True 且 `refresh_pending` 为真）。CI 的非 Windows 平台无原生监听，故用例用替身对象保证跨平台确定性。
-- 靶向（逐文件跑，全部通过）：`test_index_state` 5（§9 标为**最脆**的 `:109` 在此）、`test_import_refresh` 5、`test_read_stale` 8、`test_watch_integration` 17、`test_multivault` 9、`test_virtual_sync` 25、`test_exempt` 7、`test_hybrid` 10、`test_subvaults` 5、`test_concurrency_hardening` 8、`test_e20_media_outcome` 42、`test_paid_request_journal` 20、`test_e20_ops` 13、`test_e20_disk_durability` 3、`test_scoped_search` 14、`test_anti_contention` 8、`test_budget_bytes` 15、`test_ingest_server` 12、`test_kb_read_chunkid` 21、`test_e15_service_contracts` 22、`test_beta2_docs_contract` 3、`test_text_profile_wiring` 26、`test_issue15_perf` 3。
+- 靶向（逐文件跑，全部通过）：`test_index_state` 5（§9 标为**最脆**的 `:109` 在此）、`test_import_refresh` 5、`test_read_stale` 8、`test_watch_integration` 17、`test_multivault` 9、`test_virtual_sync` 24、`test_exempt` 7、`test_hybrid` 10、`test_subvaults` 5、`test_concurrency_hardening` 8、`test_e20_media_outcome` 42、`test_paid_request_journal` 20、`test_e20_ops` 13、`test_e20_disk_durability` 3、`test_scoped_search` 14、`test_anti_contention` 8、`test_budget_bytes` 15、`test_ingest_server` 12、`test_kb_read_chunkid` 21、`test_e15_service_contracts` 22、`test_beta2_docs_contract` 3、`test_text_profile_wiring` 26、`test_issue15_perf` 3。
 
 **未做（明确不声称已修）**
 
@@ -1538,7 +1538,7 @@ Codex 主流程（2026-10-09 / America_New_York）。代码候选93c39a50b09ec61
 **验证**
 
 - 反向确认：`tests/test_issue15_perf.py::test_single_search_does_not_recompute_visibility_per_chunk` —— 3 个 source / 多个 chunk 的库，统计 `IgnoreMatcher.is_ignored` 与 `store.list_documents()` 的调用次数：修复前 `is_ignored` **12 次（红）**，修复后 **≤ 3 × source 数（绿）**；同时钉住 `list_documents` 仍为 **3 次**（不得因为优化而变多，也不得因为记忆化而悄悄退化成跨阶段缓存）。
-- 靶向（逐文件跑，全部通过）：`test_virtual_sync` 25、`test_index_state` 5、`test_exempt` 7（可见性/豁免面）、`test_indexer` 11、`test_anti_contention` 8、`test_dedup` 8、`test_scoped_search` 14、`test_kb_read_chunkid` 21、`test_hybrid` 10、`test_import_refresh` 5、`test_read_stale` 8、`test_watch_integration` 17、`test_subvaults` 5、`test_concurrency_hardening` 8、`test_multivault` 9、`test_e20_media_outcome` 42、`test_paid_request_journal` 20、`test_e15_service_contracts` 22、`test_issue15_perf` 4。
+- 靶向（逐文件跑，全部通过）：`test_virtual_sync` 24、`test_index_state` 5、`test_exempt` 7（可见性/豁免面）、`test_indexer` 11、`test_anti_contention` 8、`test_dedup` 8、`test_scoped_search` 14、`test_kb_read_chunkid` 21、`test_hybrid` 10、`test_import_refresh` 5、`test_read_stale` 8、`test_watch_integration` 17、`test_subvaults` 5、`test_concurrency_hardening` 8、`test_multivault` 9、`test_e20_media_outcome` 42、`test_paid_request_journal` 20、`test_e15_service_contracts` 22、`test_issue15_perf` 4。
 - §9「最脆」钉子：本批**实际撞到两颗**（`test_virtual_sync.py:381` 与 `:265`），均已通过收窄改动保住，见上。
 
 **未做（明确不声称已修）**
@@ -1572,7 +1572,7 @@ Codex 主流程（2026-10-09 / America_New_York）。代码候选93c39a50b09ec61
 - 反向确认（两条新用例修复前均红）：
   * `test_issue15_perf.py::test_kb_rebuild_runs_a_single_full_build` —— 监听收放顺序修复前是 `['rebuild']`（红），修复后 `['stop', 'rebuild', 'start']`（绿），并断言 `stats["files"] >= 1`。
   * `test_issue15_perf.py::test_rebuild_writes_fts_in_one_transaction` —— 整批回填事务数修复前 **0**（红，逐 source 事务照旧发生），修复后 **1**，且 `upsert_source` 调用数为 **0**；同时钉住 `idx._fts.count() == len(idx.all_chunks())`（`test_hybrid.py:166/171` 的口径）。
-- 靶向（逐文件跑，全部通过）：`test_hybrid` 10、`test_subvaults` 5、`test_snapshot` 14、`test_snapshot_import_safety` 6、`test_failed_files` 6、`test_concurrency_hardening` 8、`test_watch_integration` 17、`test_virtual_sync` 25、`test_dedup` 8、`test_index_state` 5、`test_import_refresh` 5、`test_read_stale` 8、`test_exempt` 7、`test_e20_media_outcome` 42、`test_paid_request_journal` 20、`test_scoped_search` 14、`test_kb_read_chunkid` 21、`test_multivault` 9、`test_e15_service_contracts` 22、`test_ingest_server` 12、`test_issue15_perf` 6。
+- 靶向（逐文件跑，全部通过）：`test_hybrid` 10、`test_subvaults` 5、`test_snapshot` 14、`test_snapshot_import_safety` 6、`test_failed_files` 6、`test_concurrency_hardening` 8、`test_watch_integration` 17、`test_virtual_sync` 24、`test_dedup` 8、`test_index_state` 5、`test_import_refresh` 5、`test_read_stale` 8、`test_exempt` 7、`test_e20_media_outcome` 42、`test_paid_request_journal` 20、`test_scoped_search` 14、`test_kb_read_chunkid` 21、`test_multivault` 9、`test_e15_service_contracts` 22、`test_ingest_server` 12、`test_issue15_perf` 6。
 - §9「最脆」钉子：`test_hybrid.py:166/171`（FTS 条数）与 `test_snapshot_import_safety.py`（rollback 前后逐条相等且顺序敏感）本批直接相关，均通过。
 
 **未做（明确不声称已修）**
@@ -1617,3 +1617,163 @@ Codex 主流程（2026-10-09 / America_New_York）。代码候选93c39a50b09ec61
 | 4 `kb_rebuild` 双重全量 + 逐文件 FTS 事务 | P4-a/b | 已修（单次全量 + 单事务回填；**冷启动时序下仍有残余，见 P4 条目**） |
 
 **未做（明确不声称）**：未改版本号；未 push、未开 PR、未打 tag / Release、未发 PyPI；P3-b（跨调用可见性纪元）与 P4 的方案 2/3 未做；`--list-requests` 脱敏口径未动。
+
+### [FIX-issue15-P3b] — moton16,2026-10-10,CodeBuddy,Hy4-Preview — perf(search): 可见性纪元 + `.vaultignore` 文件签名缓存（跨调用复用，单次检索读库 3 → 1）
+
+> **涵盖提交**：`f3b23b4`
+
+**代码改动概况**
+
+1. `mortis_rag_mcp/doc_store.py`（`DocumentStore`）：新增进程内单调 `documents_epoch`（`documents_epoch` 属性 + `_bump_documents_epoch()`），由**任何会改变 `documents` 行的写入**推进——`stage_revision`、`commit_revision`、`commit_job_revision`、`set_visibility`、`invalidate_source`、`mark_deleted`，以及 `_ensure_read_generation` 的 generation 切换与 snapshot import 收尾。**不复用 `change_seq`**：`set_visibility` / `invalidate_source` 不 bump 它（收不到纯可见性翻转），而且它同时驱动派生层陈旧判定，为缓存去 bump 会让派生层误判 `stale` 而触发重嵌（重新计费）。
+2. `mortis_rag_mcp/indexer.py`：新增 `_visible_documents()`——以 `(store 实例, documents_epoch)` 为键缓存 `source -> DocumentRecord` 映射，读得**前后各取一次纪元**，不相等就放弃这一次缓存（与并发写入交错时宁可重读，也不要把更旧的映射挂到更新的纪元上）；库不可读/损坏时按现状返回空映射且**不缓存**。
+3. 同文件 `_ignore_matcher()`：以 `(配置模式元组, .vaultignore 的 (mtime_ns, size, ctime_ns))` 为键缓存 matcher（`_config_ignore_patterns()` / `_ignore_file_signature()` 两个新 helper，`_load_ignore_patterns()` 语义与顺序不变）。文件签名一次 stat 取代「整文件重读 + 正则重建」。
+4. `_filter_visible_chunks()` 改用上面两个入口；`rebuild()` 与 `purge_cache()` 清空这两个缓存（与 `_stat_cache` 等派生缓存同生命周期）。
+
+**为什么两条护栏仍是绿的（不是绕过）**
+
+- `tests/test_virtual_sync.py::test_empty_query_filters_recheck_visibility`：钩子里 `set_visibility('exempt')` 推进 epoch → 后一次过滤发现纪元失配 → 重读 → 返回空。
+- `tests/test_virtual_sync.py::test_ignore_final_filter_with_broken_store`：钩子里直写 `.vaultignore` → 文件签名变化 → matcher 重建 → `note.md` 被忽略 → 返回空。
+
+**验证**
+
+- 反向确认：更新 `tests/test_issue15_perf.py::test_single_search_does_not_recompute_visibility_per_chunk`，把「单次检索读库次数」从 3 改钉为 1。修复前红：`AssertionError: 单次检索读库 3 次 … assert 3 == 1`（`['list', 'list', 'list']`）；修复后绿。
+- 靶向（逐文件跑，全部通过）：`test_virtual_sync` 24、`test_exempt` 7、`test_index_state` 5、`test_issue15_perf`、`test_indexer` 11、`test_anti_contention` 8、`test_dedup` 8、`test_scoped_search` 14、`test_kb_read_chunkid` 21、`test_hybrid` 10、`test_import_refresh` 5、`test_read_stale` 8、`test_watch_integration` 17、`test_subvaults` 5、`test_concurrency_hardening` 8、`test_multivault` 9、`test_e20_media_outcome` 42、`test_paid_request_journal` 20、`test_e15_service_contracts` 22、`test_ingest_virtual`、`test_virtual_config`、`test_snapshot` 14、`test_snapshot_import_safety` 6、`test_doc_store` 15、`test_doc_store_recovery` = **342 passed**。
+- 探针 `.runtime/issue15/inv/probe_p3_search_path.py`（2,892 虚拟文档 / 9,316 chunk / 120 source）：单次 `search` 中位 **36.1 ms → 20.3 ms**；`all_chunks()` 中位 15.8 ms → 10.9 ms；单次检索 `list_documents()` 调用 **3 → ≤1**（`sync()` 预热后实测 0 次；已核验缓存里是**非空**映射，不是「空映射假象」）。
+
+**未做 / 残余（明确不声称已修）**
+
+- 纪元是**进程内**计数：跨进程改可见性（同一库的两个 MCP 服务进程）不会推进它，缓存陈旧窗口 = 本进程下一次自身 `documents` 写入。这与 issue #15 已登记在案的「跨进程陈旧窗口 = 一轮 sync」同级，不额外收紧。
+- 未改版本号；未 push、未开 PR、未打 tag / Release、未发 PyPI。
+
+### [FIX-issue15-P1c] — moton16,2026-10-10,CodeBuddy,Hy4-Preview — perf(media): 零成本媒体 route 不再探查意图库
+
+> **涵盖提交**：`b7c81cc`
+
+**代码改动概况**
+
+`mortis_rag_mcp/_indexer/sync_engine.py::media_native_for_revision`：把 `is_local_free` 判据提到 `owner._paid_control_store()` 与 `unresolved_paid()` **之前**（`local_free` 为真时 `control=None`、`unresolved=False`）。此前判序相反，于是零成本（loopback、无凭据）媒体 route 只要有媒体工作就每轮探一次意图库，结果被后置短路丢弃——纯浪费，且破坏「零成本端点完全不触意图库」这条性质。付费路径逐行未动。
+
+**验证**
+
+- 反向确认：新增 `tests/test_issue15_perf.py::test_local_free_media_route_does_not_probe_the_intent_store`（loopback 媒体端点 + 1 个带媒体虚拟源，计数 `has_unresolved_paid_intents(kind="media")`）。修复前红：`AssertionError: 零成本媒体 route 仍探查了 1 次未决意图；应为 0 次 … assert ['media'] == []`；修复后绿。同用例钉住「跳过探查不得顺手把工作也跳掉」：零成本 media 仍必须产出原生媒体向量。
+- 靶向（逐文件跑，全部通过）：`test_e20_media_outcome` 42、`test_paid_request_journal` 20、`test_issue15_perf`、`test_e20_media_connection` 44、`test_media_dispatch` 11、`test_media_indexing` 11、`test_text_profile_wiring` 26、`test_providers`、`test_media_transport_contract` 13、`test_sync_engine` 5 = **214 passed / 2 skipped**。
+- 探针 `.runtime/issue15/inv/probe_p1_local_free.py`：零成本第 1 轮意图探查 **`['media','embed']` → `['embed']`**、「`_paid_control_store` 调用」4 → 2；付费端点对照仍为 `['media','embed']`（未受影响）。
+
+**未做 / 残余**
+
+- 同一 `media_native_for_revision` 里 `unresolved_paid` 由调用方（`run_sync` 的整轮预计算）传入的路径未动：`run_sync` 的 `unresolved_media()` 预取仍在 `source in media_failures and media_route is not None` 时才求值，零成本 route 在该分支仍会探一次。本卡按计划只收口判序，未扩大改动面。
+- 未改版本号；未 push、未开 PR、未打 tag / Release、未发 PyPI。
+
+### [FIX-issue15-P4a2] — moton16,2026-10-10,CodeBuddy,Hy4-Preview — perf(rebuild): 冷路径也只做一次全量（延期启动监听 + 跳过首轮）
+
+> **涵盖提交**：`173f5a4`
+
+**代码改动概况**
+
+1. `mortis_rag_mcp/_indexer/watch.py`：`start_watching` 新增 `skip_initial_sync: bool = False`，置一次性标志 `owner._watch_skip_initial_sync`；新增 `_consume_skip_initial_sync()`，由 `_native_watch_loop` 与 `_watch_loop` 在**各自的首次 sync 点**消费（轮询分支仍然先取 `_quick_signatures()` 基线，避免跳过 sync 时丢掉这段窗口的改动；原生 watcher 降级回退到轮询时标志已消费，按正常首轮走）。
+2. `mortis_rag_mcp/indexer.py`：`start_watching` 透传该参数；`__init__` 初始化 `_watch_skip_initial_sync = False`。
+3. `mortis_rag_mcp/server.py`：`_indexer_for(..., *, autostart: bool = True)`——`autostart=False` 时**只发布进 `_indexers`、不启动监听**（`server.py:660-665` 的「先发布再启动」契约在两条路径下都保持，ingest hook 的 `_ignore_provider` 仍拿得到 indexer）；`_kb_rebuild` 改为 `_indexer_for(autostart=False)` → `stop_watching()` → `rebuild()` → `start_watching(skip_initial_sync=True)`（`try/finally` 保证一定拉起）。
+
+**验证（验收口径 = 整轮 `run_sync` 次数，不只看监听收放顺序）**
+
+- 反向确认（`tests/test_issue15_perf.py`）：
+  * `test_kb_rebuild_runs_a_single_full_build`（温路径）修复前红：`2 次 ['MainThread', 'vault-watch-native']`；修复后 1 次，且监听收放仍为 `['stop', 'rebuild', 'start']`。
+  * 新增 `test_kb_rebuild_on_a_cold_vault_runs_a_single_full_build`（冷路径：只登记、未加载）修复前红：`3 次 ['vault-watch-native', 'MainThread', 'vault-watch-native']`；修复后 1 次。用例同时钉住「跳过首轮 ≠ 永不启动」：`indexer._watch_thread is not None`。
+- 靶向（逐文件跑，全部通过）：`test_concurrency_hardening` 8、`test_watch_integration` 17、`test_subvaults` 5、`test_snapshot` 14、`test_snapshot_import_safety` 6、`test_failed_files` 6、`test_issue15_perf`、`test_p5_lifecycle`、`test_virtual_read_server`、`test_multivault` 9、`test_import_refresh` 5、`test_read_stale` 8、`test_index_state` 5、`test_hybrid` 10、`test_dedup` 8、`test_ingest_server` 12、`test_scoped_search` 14、`test_kb_read_chunkid` 21、`test_e15_service_contracts` 22、`test_e20_media_outcome` 42、`test_paid_request_journal` 20、`test_virtual_sync` 24、`test_exempt` 7、`test_virtual_config`、`test_anti_contention` 8、`test_doc_store` 15 = **335 passed / 1 skipped**。
+- 探针 `.runtime/issue15/inv/probe_p2_p4.py`：冷路径 **3 → 1**（只剩 `MainThread` 那次 `rebuild`）、温路径 **2 → 1**。
+
+**测试口径注记（跑套件时踩到并已处理，非产品缺陷）**
+
+- 计数桩只统计**本库**（按 `owner.vault_path` 过滤）：`run_sync` 是模块级函数，别处用例遗留的 watcher 线程会打到同一个桩上——实测 `test_snapshot.py::test_server_kb_export_import_roundtrip` 遗留的 `vault-watch-native` 会在本用例窗口内再记一轮，把「1 次」污染成 2。
+- 用例先等 `VaultMcpServer.__init__` 起的 `vault-startup` 预索引线程收工（`_settle_startup_indexing`），否则该线程可能在库登记后接管 `_indexer_for(autostart=True)` 并多跑一轮。
+
+**未做 / 残余**
+
+- 原生 watcher 在线期间自身的**兜底全量对账**（`watch_fallback_interval`，默认 30s）未动：它不是 `kb_rebuild` 的重复构建，是覆盖事件丢失的对账。
+- 监听降级回退（原生线程发现 watcher 已死 → 退回 `_watch_loop`）时会跑一次正常首轮 sync，未收窄——此时内存索引可能与磁盘不符，重跑一轮是合理的。
+- 未改版本号；未 push、未开 PR、未打 tag / Release、未发 PyPI。
+
+### [FIX-issue15-ftsbatch] — moton16,2026-10-10,CodeBuddy,Hy4-Preview — perf(fts): 进程启动 / `kb_import` 的 FTS 回填改单事务
+
+> **涵盖提交**：`2f0822b`
+
+**代码改动概况**
+
+`mortis_rag_mcp/indexer.py::_fts_ensure_populated`：逐 source 的 `self._fts_upsert(source, chunks)` 改调 `self._fts_upsert_many(list(self._chunks.items()))`。这条路径被 **每次进程启动**的 warm-cache 分支（无文件变动时 `sync` 什么都不写，靠它补回填）与 `kb_import` 的三条路径（`snapshot.py`）调用，与 P4-b 已消除的 `rebuild()` 末尾模式同型。写入顺序与「逐 source 先删后插」语义由 `FtsIndex.upsert_sources` 保证。
+
+**验证**
+
+- 反向确认：新增 `tests/test_issue15_perf.py::test_fts_warm_cache_populate_uses_one_transaction`（清空 FTS 行制造「行数陈旧」的启动态，再调 `_fts_ensure_populated`）。修复前红：`AssertionError: 回填事务数为 3（应为 1）`；修复后绿，且 `upsert_source` 调用数为 0、`_fts.count() == len(all_chunks())`（`test_hybrid.py:166/171` 的口径）。
+- 靶向（逐文件跑，全部通过）：`test_hybrid` 10、`test_snapshot_import_safety` 6（rollback 前后逐条相等且顺序敏感）、`test_subvaults` 5、`test_snapshot` 14、`test_snapshot_v2_store`、`test_issue15_perf`、`test_dedup` 8、`test_scoped_search` 14、`test_kb_read_chunkid` 21、`test_virtual_sync` 24、`test_exempt` 7、`test_import_refresh` 5、`test_index_state` 5、`test_e15_service_contracts` 22、`test_virtual_config`、`test_doc_store` 15、`test_doc_store_recovery`、`test_failed_files` 6、`test_multivault` 9 = **234 passed**。
+
+**未做 / 残余**
+
+- 同步路径的逐 source 写入（`_fts_upsert` 单 source = 一个事务）保持原样：那是增量级写入，不在本卡范围。
+- 未改版本号；未 push、未开 PR、未打 tag / Release、未发 PyPI。
+
+### [FIX-issue15-P1nit] — moton16,2026-10-10,CodeBuddy,Hy4-Preview — fix(sync): 媒体探针判据先失效再并回失败前缀
+
+> **涵盖提交**：`cc65268`
+
+**代码改动概况**
+
+`mortis_rag_mcp/_indexer/sync_engine.py`（`run_sync` 的原生媒体阶段 `except`）：改为先 `_media_probe["fresh"] = False`，再 `chunks.extend(getattr(exc, "chunks", ()))`，最后记 `media_failures[source]`。改动前是「先并回成功前缀、再失效判据」——今天不可达（`MediaStageError.chunks` 恒为 list），属纯语义顺序：任何异常对象都不该让「未决判据仍新鲜」活过本轮（否则可能在同一轮内重复计费）。
+
+**验证**：靶向 `test_issue15_perf`、`test_e20_media_outcome` 42、`test_paid_request_journal` 20、`test_e20_media_connection` 44、`test_media_dispatch` 11、`test_media_indexing` 11、`test_sync_engine` 5、`test_media_transport_contract` 13 = **153 passed / 2 skipped**。
+
+**未做**：无新回归用例（该分支今天不可达，只在既有 P1 用例上复跑）；未改版本号；未 push、未开 PR、未打 tag / Release、未发 PyPI。
+
+### [FIX-issue15-P2b] — moton16,2026-10-10,CodeBuddy,Hy4-Preview — perf(read): 非原生平台的读路径兜底按对账周期限流
+
+> **涵盖提交**：`35ff1e5`
+
+**裁定**：P2 的首轮修复只收窄了「原生 watcher 在线」这一种情形，Linux/macOS / 显式 `watch_method="poll"` / 原生 watcher 降级三种情形仍会在 1 秒后**每查排一轮全量 sync** 并把自己判成 `rebuilding`。本窗口向主人提问后获授权「继续调研并直接实施，目标是不影响正常使用」，因此采用**既有口径**（`watch_fallback_interval`，与原生模式兜底全量同一周期，默认 30s）限流，不引入新的时间常量，也不改 `index_state` 的判据本身。
+
+**代码改动概况**
+
+`mortis_rag_mcp/_indexer/watch.py::request_refresh` 的 `for_read` 分支：
+
+1. 原生 watcher 在线且存活 → 直接 `return False`（既有行为，未动）。
+2. **否则**若监听循环在线且存活（`owner._watch_thread.is_alive()`，覆盖轮询 / 降级两种情形）：按 `watch_fallback_interval` 限流——`interval <= 0`（显式关闭周期对账）或距上次同步不足 `interval` 时 `return False`。理由是真实文本变动仍由 `_watch_loop` 的签名轮询即时入列，读路径只需兜住**签名轮询看不见**的变动（`.vaultignore`、权限/ACL 翻转等）。
+3. **完全没有监听循环**（冷启动 / `stop_watching()` 之后）→ 保留原来的 1 秒抑制窗口与登记行为（`index_state` 在真冷启动时仍应报 `rebuilding`）。
+
+**验证**
+
+- 反向确认（`tests/test_issue15_perf.py`，修复前两条均红）：
+  * 新增 `test_read_refresh_is_throttled_without_a_native_watcher`：`_fs_watcher=None` + 在线监听线程替身 + `last_sync` 拨回 5 秒。修复前红：`轮询模式下距上次同步 5 秒仍登记了全量 sync（修复前抑制窗口只有 1 秒）`；修复后 `for_read=False`、`refresh_pending=False`、`index_state == "ready"`，并且把 `last_sync` 拨回 `watch_fallback_interval + 1` 秒后仍能排进去（兜底没被删掉）。
+  * 新增 `test_read_refresh_fallback_disabled_never_schedules_from_reads`：`watch_fallback_interval = 0` 时读路径完全不自排（显式请求 `for_read=False` 不受影响）。修复前红：`关掉周期对账后读路径仍每查排一轮全量`。
+- 靶向（逐文件跑，全部通过）：`test_issue15_perf`、`test_index_state` 5（含 §9 标为**最脆**的 `:109`——该用例的 indexer 从未 `start_watching`，走「无监听循环」分支，仍报 `rebuilding`/`unverified`）、`test_import_refresh` 5、`test_read_stale` 8、`test_watch_integration` 17、`test_multivault` 9、`test_concurrency_hardening` 8、`test_p5_lifecycle`、`test_virtual_read_server`、`test_e20_media_outcome` 42、`test_paid_request_journal` 20、`test_scoped_search` 14、`test_kb_read_chunkid` 21、`test_e15_service_contracts` 22、`test_virtual_sync` 24、`test_anti_contention` 8 = **222 passed / 1 skipped**。
+- 探针 `.runtime/issue15/inv/probe_p2_p4.py`（`watch_method` 三态实测）：`poll` 从 `for_read->True / pending=True / index_state=rebuilding` 变为 **`for_read->False / pending=False / index_state=ready`**；`auto` / `native` 不变（`False` / `ready`）；冷启动（`last_sync=None`）仍为 `True`（保留）。
+
+**未做 / 残余（如实登记）**
+
+- 轮询模式对 `.vaultignore` 这类「非 indexable 文本扩展名」的改动仍是**低频对账**才生效（≤ `watch_fallback_interval`）。这是刻意的口径统一：原生 watcher 的 `_on_fs_events` / `_fs_event_matters` 同样不把 `.vaultignore` 判为文本事件，原生模式下本就没有「读路径即时应用 `.vaultignore`」这条保证。走 `kb_ignore` / `add_exemption_pattern` 的显式 prune 不受影响。
+- 未在非 Windows 平台做端到端实测（本机只有 Windows + 原生监听可用）；覆盖靠替身对象 + 探针，与 P2 首轮同一做法。
+- 未改版本号；未 push、未开 PR、未打 tag / Release、未发 PyPI。
+
+### [FIX-issue15-收口窗口] — moton16,2026-10-10,CodeBuddy,Hy4-Preview — test+perf: issue #15 遗留项收口（P3-b / P1-c / P4-a 冷路径 / FTS 批量 / P2 非原生面）
+
+> **涵盖提交**：`f3b23b4`（P3-b）、`b7c81cc`（P1-c）、`173f5a4`（P4-a 冷路径）、`2f0822b`（FTS 批量）、`cc65268`（P1 nit）、`35ff1e5`（P2 非原生面）
+
+**全量 pytest（整批末尾只跑一次）**
+
+`.\.venv\Scripts\python.exe -m pytest -q --basetemp .runtime\issue15-fix\full-01` → **1315 passed / 14 skipped / 3 deselected**（192.03 s）。
+
+相对上一窗口基线（1322 passed / 2 skipped / 3 deselected）的口径说明：本窗口新增 5 条用例（+5 collected），另有 **12 条用例在本解释器下因缺可选 extra 转为 skip**——`pymupdf`、`docx`、`pptx`、`openpyxl`、`PIL`、`fitz` 未装入 `.venv`，由 `pytest.importorskip` 诚实跳过（`test_extra_formats` 5、`test_route_execution_upgrade` 4、`test_media_dispatch` 2、`test_virtual_read_server` 1）。这不是产品行为变化，换装齐 extras 的解释器即回到可用面全跑。
+
+**本窗口 6 条改动的收益对照（同机、同脚本、修复前 vs 修复后）**
+
+| 项 | 指标 | 修复前 | 修复后 |
+|---|---|---|---|
+| P3-b | 单次 `search` 读库次数 / 中位墙钟（2,892 文档·9,316 chunk） | 3 次 / 36.1 ms | **≤1 次** / **20.3 ms** |
+| P1-c | 零成本媒体 route 的媒体意图探查次数 | 1 次/轮 | **0 次** |
+| P4-a | 一次 `kb_rebuild` 的整轮 `run_sync` 次数（冷 / 温） | 3 / 2 | **1 / 1** |
+| FTS 批量 | warm-cache 回填的 FTS 事务数 | = source 数 | **1** |
+| P2 非原生 | `poll` 模式下 `for_read` / `index_state` | `True` / `rebuilding` | **`False` / `ready`** |
+
+**仍未验证的项（明确不声称）**
+
+1. **非 Windows 平台实测**：本机只有 Windows（原生监听可用）。P2 的轮询/降级面、以及 P4-a 在 `watch_method="poll"` 下的监听收放，只有替身对象 + 单进程探针证据，没有真实 Linux/macOS 会话实测。
+2. **issue 量级（3,475 md + 2,892 虚拟文档）的稳态单轮墙钟**：未跑。本窗口只有缩尺 fixture（2,892 虚拟文档的检索路径探针）与 30 文件级 rebuild 探针；不声称达到 issue 的 15~20 倍。
+3. **跨进程可见性陈旧窗口**（P3-b 残余）：同一库两个服务进程时，改可见性的陈旧窗口 = 本进程下一次自身 `documents` 写入；未做跨进程实测。
+4. 未改版本号；未 push、未开 PR、未打 tag / Release、未发 PyPI；未改 `.gitignore`；未 force-add `docs/`。
