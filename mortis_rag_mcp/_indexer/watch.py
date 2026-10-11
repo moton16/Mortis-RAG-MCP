@@ -51,6 +51,7 @@ def start_watching(
     owner: MarkdownIndexer,
     interval: float = 0.25,
     debounce_seconds: float | None = None,
+    skip_initial_sync: bool = False,
 ) -> None:
     if getattr(owner, "_stopping", False):
         if owner._watch_thread is not None:
@@ -79,6 +80,12 @@ def start_watching(
     # kb_init 返回的 "indexing: started in background" 是假的 —— 请求会
     # 阻塞到整个库索引 + embedding 完成（大库是分钟到小时级），客户端往往
     # 直接超时。首轮 sync 交给下面起的监听线程去做。
+    #
+    # issue #15 / P4-a：`skip_initial_sync=True` 让监听线程**跳过首轮全量
+    # sync**，供 `_kb_rebuild` 在 rebuild 之后拉起监听时使用（rebuild 本身已
+    # 是一次全量，重建后立刻再跑一轮基本是空转）。标志一次性消费：只有紧接
+    # 这一次启动跳过，之后（含降级回退到轮询）恢复正常首轮。
+    owner._watch_skip_initial_sync = bool(skip_initial_sync)
     owner._watch_stop.clear()
     method = owner.config.watch_method
     # auto：平台支持就用原生；native：优先原生（比如想在非 Windows 上显式
@@ -501,8 +508,8 @@ def _native_watch_loop(owner: MarkdownIndexer, interval: float, debounce: float)
     # 启动请求一次 ingest 扫描（处理启动时既有的待摄取文档）
     owner.request_ingest_scan()
     # 首轮全量 sync：watch_fallback_interval=0 时兜底循环一次都不会跑，
-    # 没有这一句就永远等不到第一次索引。
-    if not owner._watch_stop.is_set():
+    # 没有这一句就永远等不到第一次索引。`skip_initial_sync` 供 kb_rebuild 用。
+    if not owner._watch_stop.is_set() and not _consume_skip_initial_sync(owner):
         owner._run_sync_quietly()
     while not owner._watch_stop.is_set():
         if owner._fs_watcher is None or not owner._fs_watcher.is_alive():
@@ -532,8 +539,10 @@ def _watch_loop(owner: MarkdownIndexer, interval: float, debounce: float) -> Non
     # 落盘的改动会被当成已同步而从此丢失——线程刚启动时这个窗口最大（主线程
     # 往往在 watcher 线程第一次扫描前就写完了文件）。先取基线再 sync，两者
     # 之间出现的改动由随后的 sync 补上，之后的改动才由轮询发现。
+    # 注意：跳过首轮 sync 时**仍然**要取基线，否则这段窗口的改动会丢失。
     previous = owner._quick_signatures()
-    owner._run_sync_quietly()
+    if not _consume_skip_initial_sync(owner):
+        owner._run_sync_quietly()
 
     poll_ingest_interval = (
         owner.config.watch_fallback_interval
@@ -576,6 +585,17 @@ def _quick_signatures(owner: MarkdownIndexer) -> dict[str, tuple[int, int]]:
             continue  # 文件刚被删：跳过，下一轮自然消失
         out[owner._source(path)] = (stat.st_mtime_ns, stat.st_size)
     return out
+
+
+def _consume_skip_initial_sync(owner: MarkdownIndexer) -> bool:
+    """读取并清除「跳过首轮 sync」标志（issue #15 / P4-a）。
+
+    一次性语义：`_kb_rebuild` 在 rebuild 之后拉起监听时置位，监听线程只跳过紧接
+    这一次的首轮全量；之后（含原生 watcher 降级回退到轮询）恢复正常首轮。
+    """
+    skip = bool(getattr(owner, "_watch_skip_initial_sync", False))
+    owner._watch_skip_initial_sync = False
+    return skip
 
 
 def _join_started_thread(thread: threading.Thread | None, timeout: float = 2.0) -> bool:

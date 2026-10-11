@@ -230,6 +230,10 @@ class MarkdownIndexer:
         self.last_sync: float | None = None
         self._watch_stop = threading.Event()
         self._watch_thread: threading.Thread | None = None
+        # issue #15 / P4-a：一次性「跳过首轮 sync」标志，由 start_watching 置位、
+        # 监听线程消费（`_consume_skip_initial_sync`）。供 kb_rebuild 在 rebuild
+        # 之后拉起监听时避免重建后的近空转全量。
+        self._watch_skip_initial_sync = False
         # native 监听（Windows ReadDirectoryChangesW）：watcher 本体 + 防抖状态。
         # 防抖定时器到点后做一次全量 sync；事件密集时不断顺延但受
         # _FS_MAX_DEBOUNCE_WAIT 封顶（见 _on_fs_events）。
@@ -1813,8 +1817,10 @@ class MarkdownIndexer:
             raise ValueError("source must stay inside the vault")
         return candidate
 
-    def start_watching(self, interval: float = 0.25, debounce_seconds: float | None = None) -> None:
-        return _watch.start_watching(self, interval=interval, debounce_seconds=debounce_seconds)
+    def start_watching(self, interval: float = 0.25, debounce_seconds: float | None = None,
+                       skip_initial_sync: bool = False) -> None:
+        return _watch.start_watching(self, interval=interval, debounce_seconds=debounce_seconds,
+                                     skip_initial_sync=skip_initial_sync)
 
     def _start_fs_scheduler(self) -> None:
         return _watch._start_fs_scheduler(self)

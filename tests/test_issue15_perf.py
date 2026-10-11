@@ -7,6 +7,7 @@
 修复后才应该转绿。
 """
 import hashlib
+import threading
 import time
 from pathlib import Path
 from urllib.error import URLError
@@ -181,6 +182,20 @@ class _LiveWatcher:
         return None
 
 
+def _settle_startup_indexing(server):
+    """等 `VaultMcpServer.__init__` 起的 `vault-startup` 预索引线程收工。
+
+    该线程会遍历注册表并 `_indexer_for(...)` + `sync()`；若它在用例把库登记进
+    注册表之后才走到 `registry.load()`，就会替我们多跑一轮全量（还会把监听以
+    `autostart=True` 提前拉起），把「一次 kb_rebuild 的整轮 `run_sync` 次数」这
+    条口径污染成 2。等它收工再开始计数，口径才确定。
+    """
+    del server  # 线程引用没留在 server 上，按名字找
+    for thread in threading.enumerate():
+        if thread.name == "vault-startup":
+            thread.join(timeout=5.0)
+
+
 def _plain_indexer(tmp_path):
     vault = tmp_path / "vault"
     vault.mkdir(parents=True, exist_ok=True)
@@ -251,46 +266,123 @@ def test_single_search_does_not_recompute_visibility_per_chunk(tmp_path, monkeyp
 
 
 def test_kb_rebuild_runs_a_single_full_build(tmp_path, monkeypatch):
-    """P4-a：一次 `kb_rebuild` 不得把派生层完整构建两遍。
+    """P4-a：一次 `kb_rebuild` 只能跑一次整轮全量构建（温路径 2 → 1）。
 
     现状（修复前）：`_indexer_for` 对尚未加载的库先 `start_watching()`，监听线程
     启动即跑一次首轮全量 sync；紧接着 `rebuild()` 清空缓存再全量重建一次——两次
-    全量在 `_sync_lock` 上串行（issue #15 根因 4）。
+    全量在 `_sync_lock` 上串行（issue #15 根因 4）。温路径（库已加载、watcher 在线）
+    同样会多出「重建后首轮」，实测整轮 `run_sync` 2 次。
+
+    验收口径按**整轮 `run_sync` 次数**，而不是只看监听收放顺序：这里两条都断言。
     """
     import json
+
+    from mortis_rag_mcp._indexer import sync_engine
 
     vault = tmp_path / "vault"
     vault.mkdir()
     (vault / "a.md").write_text("# A\nrebuild needle 的内容。\n", encoding="utf-8")
     server = VaultMcpServer()
-    server.call_tool("kb_init", {"path": str(vault), "name": "R"})
-    indexer = server._indexer_for({"vault_path": str(vault)})
-    events: list[str] = []
-    real_stop, real_rebuild, real_start = (
-        indexer.stop_watching, indexer.rebuild, indexer.start_watching)
+    runs: list[str] = []
+    real_run_sync = sync_engine.run_sync
 
-    def spy_stop():
-        events.append("stop")
-        return real_stop()
+    def counting_run_sync(owner):
+        # 只统计**本库**：`run_sync` 是模块级函数，别处测试遗留的 watcher 线程
+        # （`VaultMcpServer.shutdown()` 未及收干净时的在飞首轮）会打到同一个桩上。
+        if Path(owner.vault_path).resolve() == vault.resolve():
+            runs.append(threading.current_thread().name)
+        return real_run_sync(owner)
 
-    def spy_rebuild():
-        events.append("rebuild")
-        return real_rebuild()
+    monkeypatch.setattr(sync_engine, "run_sync", counting_run_sync)
+    try:
+        _settle_startup_indexing(server)
+        server.call_tool("kb_init", {"path": str(vault), "name": "R"})
+        indexer = server._indexer_for({"vault_path": str(vault)})
+        deadline = time.time() + 5
+        while indexer.last_sync is None and time.time() < deadline:
+            time.sleep(0.05)
+        time.sleep(0.5)  # 等 kb_init 的后台首轮彻底落地
+        runs.clear()
 
-    def spy_start():
-        events.append("start")
-        return real_start()
+        events: list[str] = []
+        real_stop, real_rebuild, real_start = (
+            indexer.stop_watching, indexer.rebuild, indexer.start_watching)
 
-    monkeypatch.setattr(indexer, "stop_watching", spy_stop)
-    monkeypatch.setattr(indexer, "rebuild", spy_rebuild)
-    monkeypatch.setattr(indexer, "start_watching", spy_start)
-    response = server.call_tool("kb_rebuild", {"vault_path": str(vault)})
-    assert events == ["stop", "rebuild", "start"], (
-        f"kb_rebuild 期间监听的收放顺序不对：{events}（应为 stop → rebuild → start，"
-        f"修复前是 ['rebuild']，即后台首轮与前台 rebuild 两次全量串行）")
-    stats = json.loads(response["content"][0]["text"])
-    assert stats["files"] >= 1
-    server.shutdown()
+        def spy_stop():
+            events.append("stop")
+            return real_stop()
+
+        def spy_rebuild():
+            events.append("rebuild")
+            return real_rebuild()
+
+        def spy_start(*args, **kwargs):
+            events.append("start")
+            return real_start(*args, **kwargs)
+
+        monkeypatch.setattr(indexer, "stop_watching", spy_stop)
+        monkeypatch.setattr(indexer, "rebuild", spy_rebuild)
+        monkeypatch.setattr(indexer, "start_watching", spy_start)
+        response = server.call_tool("kb_rebuild", {"vault_path": str(vault)})
+        time.sleep(1.0)  # 等被拉起的监听线程落地：若还有首轮就会记进来
+        assert events == ["stop", "rebuild", "start"], (
+            f"kb_rebuild 期间监听的收放顺序不对：{events}（应为 stop → rebuild → start，"
+            f"修复前是 ['rebuild']，即后台首轮与前台 rebuild 两次全量串行）")
+        assert len(runs) == 1, (
+            f"kb_rebuild 整轮 run_sync 跑了 {len(runs)} 次（温路径应为 1；"
+            f"修复前 2 次 = 前台 rebuild + 重建后首轮）：{runs}")
+        stats = json.loads(response["content"][0]["text"])
+        assert stats["files"] >= 1
+    finally:
+        server.shutdown()
+
+
+def test_kb_rebuild_on_a_cold_vault_runs_a_single_full_build(tmp_path, monkeypatch):
+    """P4-a：未加载的库上 `kb_rebuild` 只能跑一次整轮全量（冷路径 3 → 1）。
+
+    现状（修复前）实测整轮 `run_sync` **3** 次：t+0 后台监听首轮全量 → t+1.2 前台
+    `rebuild()` → t+1.27 重建后首轮近空转；`stop_watching()` 只是等到了在飞的后台
+    首轮，即「被串行化而非消除」。修复靠两步：`autostart=False` 不启动后台监听
+    （冷路径根本没有第一次全量），rebuild 之后才 `start_watching(skip_initial_sync=True)`
+    （消掉重建后的近空转）。
+
+    同时钉住「跳过首轮」不等于「永不启动」：监听线程确实被拉起。
+    """
+    import json
+
+    from mortis_rag_mcp._indexer import sync_engine
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    for i in range(3):
+        (vault / f"n{i}.md").write_text(f"# N{i}\nrebuild needle 的内容。\n", encoding="utf-8")
+    server = VaultMcpServer()
+    runs: list[str] = []
+    real_run_sync = sync_engine.run_sync
+
+    def counting_run_sync(owner):
+        # 只统计**本库**：`run_sync` 是模块级函数，别处测试遗留的 watcher 线程会打到
+        # 同一个桩上（实测 `test_snapshot.py::test_server_kb_export_import_roundtrip`
+        # 遗留的 `vault-watch-native` 会在本用例窗口内再跑一轮）。
+        if Path(owner.vault_path).resolve() == vault.resolve():
+            runs.append(threading.current_thread().name)
+        return real_run_sync(owner)
+
+    monkeypatch.setattr(sync_engine, "run_sync", counting_run_sync)
+    try:
+        _settle_startup_indexing(server)
+        server.registry.add(str(vault), name="Cold")
+        assert len(server._indexers) == 0, "冷路径前提：库尚未加载"
+        response = server.call_tool("kb_rebuild", {"vault_path": str(vault)})
+        time.sleep(1.5)  # 等任何被拉起的监听线程落地
+        assert len(runs) == 1, (
+            f"冷路径整轮 run_sync 跑了 {len(runs)} 次（应为 1；修复前 3 次："
+            f"后台首轮全量 → 前台 rebuild → 重建后首轮近空转）：{runs}")
+        assert json.loads(response["content"][0]["text"])["files"] >= 1
+        indexer = server._indexer_for({"vault_path": str(vault)})
+        assert indexer._watch_thread is not None, "rebuild 之后必须把监听拉起来"
+    finally:
+        server.shutdown()
 
 
 def test_rebuild_writes_fts_in_one_transaction(tmp_path, monkeypatch):
