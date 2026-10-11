@@ -26,6 +26,24 @@ if TYPE_CHECKING:
     from mortis_rag_mcp.indexer import MarkdownIndexer
 
 
+_FAILED_FILE_TEXT_LIMIT = 1024
+_FAILED_RESPONSE_DETAIL_LIMIT = 200
+
+
+def _embedding_failure_summary(exc: BaseException) -> str:
+    status = getattr(exc, "http_status", None)
+    batch_count = getattr(exc, "batch_count", None)
+    batch_fingerprint = str(getattr(exc, "batch_fingerprint", ""))[:16]
+    if status is None or batch_count is None or not batch_fingerprint:
+        return str(exc)[:_FAILED_FILE_TEXT_LIMIT]
+    detail = str(getattr(exc, "response_detail", ""))[:_FAILED_RESPONSE_DETAIL_LIMIT]
+    parts = [f"HTTP {status}"]
+    if detail:
+        parts.append(detail)
+    parts.append(f"batch={batch_count} sha256:{batch_fingerprint}")
+    return " · ".join(parts)[:_FAILED_FILE_TEXT_LIMIT]
+
+
 def _to_emb(vectors: Iterable[float]) -> array:
     return array(_EMB_DTYPE, vectors)
 
@@ -359,7 +377,7 @@ def embed_missing(owner: MarkdownIndexer) -> bool:
                 for chunk, vector in zip(chunks, vectors):
                     chunk.embedding = _to_emb(vector)
             except Exception as exc:
-                owner.failed_files[source] = str(exc)
+                owner.failed_files[source] = _embedding_failure_summary(exc)
             else:
                 # 补向量成功即撤销旧失败记录，否则持久化文件会永久撒谎。
                 owner.failed_files.pop(source, None)
@@ -376,7 +394,7 @@ def embed_missing(owner: MarkdownIndexer) -> bool:
             try:
                 owner._embed_one_file(source, chunks, document_provider)
             except Exception as exc:
-                owner.failed_files[source] = str(exc)
+                owner.failed_files[source] = _embedding_failure_summary(exc)
             else:
                 owner.failed_files.pop(source, None)
             finally:
@@ -396,7 +414,7 @@ def embed_missing(owner: MarkdownIndexer) -> bool:
             try:
                 future.result()
             except Exception as exc:
-                failures[source] = str(exc)
+                failures[source] = _embedding_failure_summary(exc)
             finally:
                 owner._sync_progress["files_done"] += 1
                 owner._sync_progress["chunks_done"] += len(chunks)

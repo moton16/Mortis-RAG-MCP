@@ -33,10 +33,14 @@ class ProviderError(RuntimeError):
         *,
         http_status: int | None = None,
         response_detail: str = "",
+        batch_count: int | None = None,
+        batch_fingerprint: str = "",
     ) -> None:
         super().__init__(message)
         self.http_status = http_status
         self.response_detail = response_detail[:_HTTP_ERROR_DETAIL_LIMIT]
+        self.batch_count = batch_count
+        self.batch_fingerprint = batch_fingerprint
 
 
 def _request_failure_summary(exc: BaseException) -> tuple[str, int | None, str]:
@@ -258,7 +262,17 @@ class ExternalEmbeddingProvider(_JsonHttpProvider):
             payload["input_modality"] = "text"
         if self.dimension and self.send_dimensions:
             payload["dimensions"] = self.dimension
-        response = self._post(payload)
+        batch_fingerprint = hashlib.sha256(
+            json.dumps(batch, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        # TODO(issue-17): 单条定位只能由 doctor 人工确认入口显式重发；
+        # 索引路径不得自动逐条探测或二分，以免未知结果的 POST 重复计费。
+        try:
+            response = self._post(payload)
+        except ProviderError as exc:
+            exc.batch_count = len(batch)
+            exc.batch_fingerprint = batch_fingerprint
+            raise
         data = response.get("data") if isinstance(response, dict) else None
         if not isinstance(data, list):
             raise ProviderError("embedding response must contain a data list")
