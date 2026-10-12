@@ -84,7 +84,7 @@
 python -m mortis_rag_mcp --app-config "C:\Config\app.toml" --list-requests --vault "C:\Notes"
 python -m mortis_rag_mcp --app-config "C:\Config\app.toml" --abandon-request REQUEST_ID --vault "C:\Notes"
 ```
-- 上述查看/放弃是独立动作，勿无条件连跑；CLI `--vault` 用绝对路径，一次一个 action，`--apply` 仅配迁移。
+- 上述查看/放弃是独立动作，勿无条件连跑；CLI `--vault` 用绝对路径，一次一个 action，`--apply` 仅配 `--migrate-ingest` 或 `--request-control`（后者不带 `--apply` 就是 dry-run）。
 - `kb_ingest(action="retry", job_id=实际ID)` 只恢复 virtual 的 failed/cancelled；failed 保有效 checkpoint，cancelled 清失去保护的段。unknown 先解决请求。
 
 ## 迁移、降级与事实恢复

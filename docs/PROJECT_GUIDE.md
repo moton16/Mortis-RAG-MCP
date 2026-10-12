@@ -124,7 +124,7 @@ checkpoint 边界、旧切块兼容与存档续页均保留在对应参考。宿
 |`sqlite3`|FTS5 全文索引（每库一个 sqlite 文件）；可选的 sqlite-vec 向量库|`fts.py`、`vector.py`|
 |`re`|标题解析、frontmatter、分词、图片注入|`indexer.py`|
 |`threading` / `concurrent.futures`|watcher 线程、防抖调度线程、并发 embedding|`indexer.py`、`server.py`|
-|`urllib.request`|外部 embedding / reranker 的 HTTP 调用（重试 + 退避）|`providers.py`|
+|`urllib.request`|外部 embedding / reranker / 媒体的 HTTP 调用（每次调用恰好一个物理 POST，零自动重发，且不跟随 3xx）|`providers.py`|
 |`ctypes`|Windows `ReadDirectoryChangesW` 原生目录监听|`fsnotify.py`|
 |`tomllib`（3.11+）|TOML 配置解析；3.10 无 tomllib 时用内置 fallback 迷你解析器|`config.py`|
 |`zipfile`|索引快照导入导出|`indexer.py`|
@@ -276,10 +276,13 @@ embedding（static 哈希 / 外部 API，按文件并发）     ←—— 向量
 **职责**：把"向量化"和"重排"抽象成两个 Protocol，提供静态哈希实现与外部 HTTP 实现。
 
 * `StaticEmbeddingProvider`：对文本取 sha256，按 digest 字节循环填满 `dimension` 维再归一化。确定性、零成本，仅用于测试/离线。
-* `_JsonHttpProvider`（基类）：`urllib` POST JSON，带**重试循环**：
+* `_JsonHttpProvider`（基类）：`urllib` POST JSON，**恰好一个物理 POST、零自动重发**（v0.9.2 起）：
 
-  * `_backoff_seconds`：HTTP 429 优先遵循服务端 `Retry-After`（只认有限数字秒，`inf` 会被挡掉——否则 `sleep(inf)` 永久挂死）；其余 4xx 不重试立即失败；5xx/网络错误/URLError 指数退避（基数 `retry_backoff`，封顶 30s，加 0~50% 抖动防 thundering herd）。
-  * `_sleep` 是模块级变量，测试 monkeypatch 它即可断言退避序列而不用真等。
+  * 429 / 5xx / 网络错误 / URLError / 非法 JSON 一律**分类上抛**，不重试、不自动退避：把「结果未知」当成可重试失败会导致重复计费。
+  * **不跟随 3xx**：付费请求非幂等。跟随重定向会让「第一跳已收到并可能计费」的请求被归因到另一个主机、把 `Authorization` 转发给重定向目标，并让 302 + 目标 DNS 失败被误判成「未发出」。3xx 一律以 `HTTPError` 上抛 → `http_error` + `remote_effect_unknown=True`。
+  * `Retry-After` 仍会被解析（`_retry_after_seconds`），但只用于诊断展示，不驱动任何重发。
+  * 结果是结构化 `RequestOutcome`：`not_sent`（本地校验失败，或连接在提交前就失败）/ `rejected`（HTTP 4xx，远端未处理）/ `http_error` / `transport_unknown` / `response_invalid`（已收到 2xx 但产物不可用）。前两类会释放输入身份占用，后三类在后台**必须 hold**。
+  * 产物合同由调用方校验，终态记账也由调用方补落（`defer_success=True` → `_finalize_receipt`）：2xx 只证明传输成功，形状非法的响应**不得**在记账里出现 `success`。
 * `ExternalEmbeddingProvider`：
 
   * 按 `batch_size` 把长文件的 chunk 列表切片成多个请求（旧行为是整文件一个请求，容易被限流/超长）。
@@ -627,9 +630,9 @@ query 为空 → 直接返回（过滤+分页后）的 chunk 列表
 |`send_dimensions`|true|是否在请求体传 `dimensions`（MRL 模型 true；bge-m3 必须 false）|
 |`input_modality_declaration`|`none`|文本 input 模态声明：`none` 保持标准 OpenAI 兼容裸字符串数组；仅当对端要求显式声明时改为 `typed`（`{"text": ...}`）或 `hint`（`input_modality="text"`）|
 |`timeout`|30|秒，(0, 300]|
-|`max_retries`|3|首败后额外重试次数，[0,10]；每次尝试吃满一个 timeout|
+|`max_retries`|3|**当前不生效**：v0.9.2 起每次调用恰好一个物理 POST，失败一律分类上抛。键仍被接受并校验范围 [0,10]，仅为向后兼容；去掉它属于破坏性配置变更，需单独决策|
 |`batch_size`|32|单请求最大文本数，<=0 关闭切批|
-|`retry_backoff`|1.0|指数退避基数秒，(0,60]；429 时服务端 Retry-After 优先|
+|`retry_backoff`|1.0|**当前不生效**：退避不再驱动发送（同上）。键仍被接受并校验范围 (0,60]|
 |`query_template` / `document_template`|`{text}`|查询/文档两侧的文本模板（0.9.0）；非对称端点须显式设置，不按模型名猜前缀|
 |`capability_profile`|空|能力 profile 名（如 `embeddinggemma2`）；空 = 保守纯文本行为，不自动猜模型|
 |`adapter`|`openai_text`|provider 适配器选择|
@@ -721,6 +724,23 @@ query 为空 → 直接返回（过滤+分页后）的 chunk 列表
 |`enabled`|false|结构化 jsonl 诊断日志总开关（严格隐私白名单 10 键，绝不记录 query/正文/路径/密钥）|
 |`dir`|`~/.mortis_rag_mcp`|日志目录（写 `diag.log`，支持 `~` 展开与环境变量）|
 |`max_bytes` / `files` / `retention_days`|1048576 / 2 / 7|单文件上限、轮转保留份数、历史保留天数|
+
+### `[request_control]`
+
+|键|默认|说明|
+|-|-|-|
+|`mode`|`bounded_resume`|请求控制模式。`bounded_resume` = 组件级占用 + 持久 unknown hold（目标默认）；`legacy_profile` = 临时回滚兼容，恢复旧的 profile 级未决暂停（代价见下）|
+|`background_embedding`|`enabled`|`manual` 时后台不自动计算外部文档 / 原生媒体向量（两条路径共用同一判据）；普通读取 / stats / watch 启动也不隐式付费|
+|`background_max_posts_per_round`|32|单轮后台付费 POST 上限（1..1024），文档与媒体**共享**。是操作内计数器，不是账户金额预算或票据|
+|`query_max_posts`|8|一次跨库 fan-out 检索允许发出的付费查询嵌入数上限（1..128，按 profile 去重）；超限的库降级为纯词法并在 `errors` 里记 `query_max_posts=N reached`|
+|`audit_retention_days`|30|终态审计行的保留期（0 = 全保留），由**显式动作**执行：`kb_request_control action=prune_audit` 或 CLI `--request-control prune_audit --apply`。仍未处置的旧记录（`writer` 为空）不随保留期删除|
+|`paused_profiles`|`[]`|明确的暂停清单（精确 profile fingerprint），不是审批清单。空列表**不得**被解读成「历史撤销已被解除」|
+
+补充口径：
+
+* **回滚代价**：`legacy_profile` 下任何一条 `submission_unknown` 未决意图都会让 `has_unresolved_paid_intents` 冻结**整条** profile 的付费嵌入（`bounded_resume` 只冻结对应输入身份）。这是临时兼容模式，不是等价替代。
+* **模块级兜底**：`request_lifecycle._DEFAULT_MODE` 故意保持 `legacy_profile`，用于「未装配 provider」的 fail-closed（直接拒发 `PAID_REQUEST_CONTROL_UNAVAILABLE`）。产品默认是按实例装配的 `mode=bounded_resume`——不要为了「和配置默认对齐」去改这个常量。
+* **暂停来源**：`paused_profiles`（配置）∪ 控制库里明确 `revoked` 的 profile。`resume_route` 只能清 DB 侧；命中配置清单时它**不写库**并返回 `ROUTE_PAUSED_BY_CONFIG`。
 
 **配置生效语义**：改任何键都不需要重启之外的干预——文本层/向量层 meta 不匹配会自动失效对应层（见 4.5.3）。缓存键未变但语义变了（比如改了切块代码忘了 bump chunker）是唯一危险场景，开发时务必遵守「改切块必 bump 代际」。
 
@@ -852,7 +872,7 @@ tests/（文件数以 collection 为准；默认快层，完整所有层须 -o a
 
 * 测试经 `VAULT_MCP_REGISTRY` 环境变量把注册表重定向到 pytest 临时目录，绝不碰用户真实注册表；缓存目录用 `tmp_path`。
 * 默认快层使用 `static` 或显式离线 transport 边界；独立 `real_carrier` 层保留两个不同的真实载体合同，载体缺席记 skip，不用 fake 代替。普通回归不访问付费 API。
-* 退避序列断言靠 monkeypatch `providers._sleep`。
+* 「重试退避序列」类断言已作废：v0.9.2 起 provider 零自动重发，`providers._sleep` / `_backoff_seconds` 已不存在（`tests/test_providers.py` 顶部显式声明 superseded）。不要为了跑通旧断言把它们加回来。
 * 可选依赖缺失或非 Windows 平台的用例会自动 skip（sqlite-vec / docs / media 三类）。E17 终态 `.venv` 全量为 **1140 passed / 14 skipped**，这 14 个 skip **全部**属于上面两类原因——skip 不是通过，不能当成对应后端或格式已验证。
 
 ---

@@ -1918,3 +1918,148 @@ issue #12/#13 付费闸门与 issue #15 性能四条根因的修复随本补丁�
 - 未 commit 之外的动作：未 push、未开 PR、未打 tag / Release、未改版本号、未发 PyPI。
 - 未验证：真实供应商计费与幂等、`real_carrier` 标记用例、跨进程死进程遗留清理（缺存活登记表）、宿主侧媒体显示。
 - 本机交付记录与两处反方向订正的完整依据在 `docs/v0.9.2/PAID_REQUEST_CONTROL_EXECUTION.md` §19（`docs/` 被 `.gitignore` 忽略，属本地交付，需手工复制）。
+
+### [FIX-v092-review2] — moton16,2026-10-12,CodeBuddy,DeepSeek-V4.1-Flash — fix(requests): 二次评审修复 P0/P1/P2 共 11 处
+
+> **涵盖提交**：`1e015b9`（付费发送链路）、`0d83bce`（续算与运维面）、`d60c9d2`（回归）；同批文档同步（`README.md`、`docs/PROJECT_GUIDE.md`、`skills/mortis-rag-mcp/references/maintenance.md`、本条目）。前置：`784f2c5`、`1feb2ce`。
+> 说明：本条与 `[FIX-v092-review3]` / `[FIX-v092-review4]` 的修复在**同一批**落盘（三个窗口的改动未逐窗口提交），故三笔提交同时涵盖三条条目，不是笔误。
+
+**评审范围与判据**
+
+对**补丁评审的修复提交**（`784f2c5` 生产代码 + `1feb2ce` 文档，`307fdfb..1feb2ce`，1988 行）做二次评审：6 个专项子代理 + 红队 + 一轮独立对抗审（本机无 `bun`/`codex`，gstack 前言与遥测脚本未执行，评审日志手工追加）。17 条发现，其中 1 条 P0、2 条 P1、7 条 P2，另有 7 条 P3 未施工。结论：上一轮 21 条的主线确已修到，但**本批修复自身引入了一处必然触发的回归**，另有两条是上一轮漏掉的洞。
+
+**P0（本批新引入）**
+
+- `doctor.py` 探活 guard：`db_allowed` 是 `paid_request_guard()` 返回的 **bool**，却写成 `bool(db_allowed(profile))` → 只要 fingerprint 非空（真实外部 profile 必然非空）就抛 `TypeError: 'bool' object is not callable`，被 `probe_embedding`/`probe_reranker` 的 `except` 吞成「探测失败」。后果：`--doctor` 的付费 embed/rerank 探活**永远失败**，本轮想加的「尊重显式撤销与配置暂停」判据**从未生效**（`pause_route` 之后仍会发一次真实付费请求）。同一处配套修正：reranker 探活指纹原用原始 endpoint，与运行时 `indexer._reranker_profile_fingerprint` 的 `normalize_endpoint` 口径不一致 → 会查错 profile。
+
+**P1（上一轮漏掉）**
+
+- `providers._audit_finish` 只给 `succeeded` / `OUTCOME_NOT_SENT` 做终态化，**漏了 `OUTCOME_REJECTED`**：HTTP 4xx（`classify_http_status` 判 `remote_effect_unknown=False`，远端明确未处理）落 `mark_unknown` → `submission_unknown`，而它不适用租约 → 永久未决 → 回滚 `legacy_profile` 后 `has_unresolved_paid_intents` 恒真，整条付费嵌入静默退回词法；`kb_stats.paid_route_blocked` 也一直报「冻结中」。媒体路径早已对 rejected 终态化，属两条路径口径不对称。新增 `PaidRequestJournal.mark_rejected`（复用 `abandoned` 终态，以 `reason` 区分来源）后对齐。
+- `audit_complete` 的成果核验器看不见磁盘证据：`_resume_verifier` 依赖 `owner._disk_vectors`，而该集合只在 `sync_engine` 热路径重建，磁盘后端刻意不把向量读进 RAM → 冷进程里 `recoverable` 恒空 → 健康的 `complete` 批次被判 `held_result_missing`，而 `held_*` 会**冻结整个 profile**。修法：核验前按需重建（`ensure_disk_vectors_migrated(strict=True)`，后端读不出 id 时**抛错**而不是报「没有向量」），且核验器抛错时**跳过**该批次（不再据此下发 `held_*`）。
+
+**P2（7 处）**
+
+- `resume_route` 命中配置暂停时先返回：原顺序是先 `authorize_paid_profile`（清 `revoked_at`）再判 `paused_profiles`，于是返回 `applied=false` 的同时已把控制库里的显式撤销清掉——报告与副作用矛盾，且配置一移除就会静默恢复付费发送。
+- `prune_audit` 保护未处置的旧记录：`DELETE ... state IN ('success','abandoned')` 原不分 `writer`，会静默删掉 `writer=''`（旧版本写入、仍未登记 disposition）的人工对账台账（默认 `audit_retention_days=30`，属可达路径）。现在只清「新代码写的终态行 ∪ 已登记 disposition 的旧行」，并在返回体新增 `skipped_legacy_pending`。
+- 付费面 schema 不再在只读路径落 DDL：新增 `writer` 列的 `ALTER TABLE` 挂在 `_ensure_payment_schema`，而它被 `intent_state` / `list_request_intents` / `paid_authorization_state` / `list_payment_authorizations` 调用 → 旧控制库上执行只读 `kb_request_control list` 会真落 DDL + commit。现在读路径走 `_payment_schema_ready` 只读判据，且 `open(write=False)` 声明只读时**不做 DDL**（写路径保留惰性补齐）。
+- MCP 工具 schema 与常量对齐：`kb_request_control` 的 `inputSchema.action.enum` 只有 7 个动作，而 `REQUEST_CONTROL_ACTIONS` 与 CLI help/文档都是 10 个（缺 `release` / `audit_complete` / `prune_audit`）。服务端运行时一直按 10 项校验，所以影响是 agent 侧可发现性——`release`（解锁死 owner `sending` 批次的唯一出口）对按 schema 取参数的工具调用不可见。
+- `release` 的重复计费门槛关掉 TOCTOU：确认判据原基于 `list_embedding_work` 快照，随后硬编码 `confirm_repeat_cost=True` 调 `resolve_embedding_work`，而它的 `UPDATE` 只按 `batch_id AND state != 'complete'` 匹配 → 快照后从 `reserved` 推进到 `sending` 的批次会被「免确认」放行。现在 `resolve_embedding_work` 新增 `expected_state`（同一事务内 CAS）并自守「非 `reserved` 需 `confirm_repeat_cost`」，失败返回 `RESUME_BATCH_STATE_CHANGED` / `RESUME_RELEASE_NEEDS_CONFIRMATION`。
+- 2xx 不再先落 `success`：`_send_once` 收到 2xx + 可解码就记 `success`，而产物形状校验发生在其后（`providers.py` 的 `_post_response_contract_error` 系列）→ 形状非法的 2xx 在账上是「已成功」，同一载荷重发不再被意图闸门看见，与「success 只在产物通过后落账」的承诺相反。现在 `_send_once(defer_success=True)` 把记账交给调用方（`_PostReceipt` + `_finalize_receipt`），校验不通过补落 `response_invalid`。语法兼容：调用方用 `accepts_keyword` 判断（原 `embedding_capabilities._accepts_keyword` 公开为 `accepts_keyword`），测试桩/第三方替换的 `_send_once` 仍按原签名工作。
+- 迁移台账读错误可见：`_legacy_migration_pending` 原把 `list_request_intents` / `list_embedding_work` / `legacy_disposition_ids` 的异常吞成空集，读失败被上报成「没有待处置旧记录」（假全清）。现在把原因写进返回体的 `legacy_read_error`，与续算侧 `held_summary.available=False` 同口径。
+
+**文档同步**
+
+- `README.md`：工具计数 16 → 17、补 `kb_request_control` 行、`kb_rebuild` 补 `confirm_cost` 语义。
+- `docs/PROJECT_GUIDE.md`：§7 补 `[request_control]` 键表（原文只有 587 行顺带提过一次）；§4.3 与 §11 删掉早已不存在的 `_backoff_seconds` / `_sleep` 重试退避描述（v0.9.2 起 provider 零自动重发，相关旧断言已在 `tests/test_providers.py` 声明 superseded）；技术栈表与配置表同步；`max_retries` / `retry_backoff` 明确标注**当前不生效**（键仍被接受校验，去掉属破坏性配置变更，需单独决策）。
+- `skills/mortis-rag-mcp/references/maintenance.md`：`--apply` 口径订正为「仅配 `--migrate-ingest` 或 `--request-control`」，与 `server.main` 的校验一致。
+
+**验证**
+
+- 新增回归测试 `tests/test_v092_review_fixes.py`（15 例，离线），逐条钉住上述契约，含一条**反向**用例：核验器正常返回空集时仍必须判成果丢失（防止上面的修复被过度放宽）。
+- 靶向（各批 `exit=0`）：`test_providers`（37）→ `test_paid_request_journal + test_request_control_management + test_embedding_resume + test_embedding_profiles + test_request_control_policy`（118）→ 再加 `test_e20_media_outcome + test_embed_failure_quarantine + test_request_lifecycle`（154）→ 新增文件（15）。
+- 全量：**1404 passed / 14 skipped / 3 deselected / 0 failed**（138.03 s；工作区外运行器 `E:/coding/.mortis-runs/run-offline.ps1`，`--basetemp`/`TEMP`/日志都在仓库外）。基线 1389 passed，差额即本批新增的 15 例；`V092_EXTERNAL_NETWORK_LOG` 未生成 = 零外网尝试。
+
+**边界 / 未做**
+
+- 未施工的 P3：`server.py` 的 `dispatch_lock` 只包住快照读（与模块 docstring 的承诺不符，正确性由 CAS 兜着）；`_legacy_migration_pending` / `held_summary` 反复调用 `list_embedding_work` 导致的 1+N 全表扫描（调用点是本批新增，查询形状是既有的）；默认模式下 `_audit_before_send` 会吞掉 `PAID_REQUEST_UNRESOLVED`（docstring 自陈「绝不拒绝发送」= 设计如此，但文档口径需另说）；以及 6 处负路径测试缺口（`query_max_posts` 拦截、`held_summary.available=False`、`release` 对 `complete` 批次、无续算表时的 `prune_audit`、`verify_failed`、`writer='v092'` 排除）。
+- 存疑未验证（confidence ≤4，未采纳为结论）：`providers._transport_outcome` 把 `URLError(gaierror)` 判为 `not_sent` 而 urllib 的 3xx 重定向会对目标主机再次解析 DNS——此时原始 POST 可能已发出并计费；需一条实机探针才能定案。
+- 未 push、未开 PR、未打 tag / Release、未改版本号、未发 PyPI、未发起真实计费请求。
+
+### [FIX-v092-review3] — moton16,2026-10-12,CodeBuddy,DeepSeek-V4.1-Flash — fix(requests): 遗留项实机复核确诊两处 P1 并修复
+
+> **涵盖提交**：本条目所在提交。前置：`[FIX-v092-review2]`（P0+P1+P2 共 11 处）。
+
+**复核方式与判据**
+
+对上一轮登记的遗留项做**实机探针**复核（脚本与原始输出在 `E:/coding/.mortis-runs/v092/probe-gaierror/`、`probe-resend/`、`probe-retry/`，均在工作区外）。结论是两处 P1 **确诊**，其中一处是上一轮**我自己把它降级错了**（当时用「docstring 自陈设计如此」+「另有组件账本兜底」两条否证它——但兜底只覆盖 bounded planner 路径，能力缺失时的按文件回退路径没有兜底）。
+
+**修复 1：付费 POST 不再跟随 3xx（`providers` / `media_providers`）**
+
+裸 `urlopen` 会跟随 3xx，实测三个后果：
+
+- `302` + 重定向目标 DNS 失败 → 第一跳**已收到完整付费 POST**，而 `_transport_outcome` 归 `not_sent`（`remote_effect_unknown=False`）→ `mark_not_sent` 终态化 → **放行同载荷重发**；
+- 目标可解析时，调用会**接受重定向目标的响应**作为本次结果（结果被归因到另一个主机）；
+- CPython 的 `redirect_request` 只剥 `Content-Length`/`Content-Type`，**保留 `Authorization`** → 端点只要回一个 302 就能把 API key 引到任意主机（探针实测目标收到 `Bearer sk-probe-SECRET-abc123`）。
+
+修法：`providers` 自建**不注册 `HTTPRedirectHandler`** 的 opener，并把模块级 `urlopen` 换成该实现（保留同名以便既有测试注入点继续可用）；`media_providers` 复用同一出口（`from .providers import urlopen`，仍是本模块的模块级名字）。于是 3xx 以 `HTTPError` 上抛，由 `classify_http_status` 归 `http_error` + `remote_effect_unknown=True`。
+复验探针（走真实 provider）：`target_hits=0`、`leaked_to_target=0`、`outcome=http_error`、`remote_effect_unknown=true` → `VERDICT=FIXED`。
+反例同时被证伪：307/308 在 POST 场景 CPython 本就不跟随（归 `http_error`+unknown），真正的连接前 DNS 失败仍正确归 `not_sent`；「307 会把付费载荷重发到目标」的假设**不成立**（302 把 POST 降级为 GET，目标只收到 0 字节 GET）。
+
+**修复 2：闸门拒绝不再被当成「审计写失败」吞掉**
+
+`_audit_before_send` 原用一个 `except Exception` 同时吞「审计写失败」与「闸门主动拒绝」，于是在默认 `bounded_resume` 下，`before_send` 抛的 `PAID_REQUEST_UNRESOLVED`（同一载荷已有未决意图）被吞掉后 `urlopen` 照发。实机复现（`probe-resend/`）：内层 provider 缺 `embed_batch_once` → `_single_batch_capable` 判否 → 同步回退到按文件的旧多批路径（该路径**不查组件账本**）→ 第二轮发出**字节完全一致**的第二个 POST（同 sha256），`attempt` 仍为 1、无任何用户确认。
+
+修法分两层：
+
+- 新增 `providers.PaidRequestRefused(ProviderError)`，`paid_requests.before_send` 的「同一载荷已有未决意图」分支改抛它；`_audit_before_send` 对该类型**无条件上抛**（`media_providers` 同型分支一并改）。对不认识新关键字的第三方/测试替身 journal，用既有的 `accepts_keyword` 判签名后再传 `reject_unresolved`，不做破坏性签名要求。
+- 新增 `RequestContext.ledger_managed`（由 `sync_engine` 的单批 planner 置 True）：**账本管辖**的发送不再走意图级拒绝——那条路径的重发已由占用 + CAS 唯一索引挡住，只可能来自操作者显式 `retry`/`release`（`confirm_repeat_cost=true`），再按意图拒一次就会把操作者刚批准的重发拦回去（`tests/test_paid_request_journal.py::test_multi_batch_unknown_holds_only_the_failed_batch` 精确定位了这一点）。非账本路径（能力缺失回退、人工查询）保留意图级闸门兜底。
+
+复验探针（同一脚本，未改动）：`round 1 = 1 POST` → `round 2 = 0 POST`，`DUPLICATE_SAME_PAYLOAD_POST=False`，且 `failed_files` 出现诚实的拒绝信息 → `VERDICT=NOT_REPRODUCED`。操作者出口：`--list-requests` / `--abandon-request`（既有）。
+
+**验证**
+
+- 新增/补强回归 `tests/test_v092_review_fixes.py`（**18 例**，其中 3 例为本批新增：不跟随 3xx 且不外泄 key、非账本路径闸门拒绝必须上抛、账本路径不被意图闸门拦回）。
+- 靶向：`test_paid_request_journal + test_request_control_management + test_request_control_policy + test_providers + test_request_lifecycle + test_v092_review_fixes + test_embedding_resume + test_embedding_profiles + test_e15_service_contracts + test_e20_media_outcome + test_v092_migration_rollback_drill + test_chunk_identity + test_text_profile_wiring` → **260 passed**（工作区外运行器）。
+- 全量：**1406 passed / 14 skipped / 3 deselected / 1 failed**（133.74 s，工作区外运行器）。唯一失败是 `tests/test_improvements.py::test_fast_stat_skips_disk_read_when_unmodified`，属**既有的时序型跨用例泄漏**，与本批无关：该用例在单独运行时 8 passed；与 `tests/test_diaglog.py` 同跑时，后者某用例留下的监听线程会在本用例全局 patch `Path.read_bytes` 的窗口里读它自己的 vault 文件，从而多计一次读盘（断言要求 ≤1）。已用 **HEAD 对照 worktree** 判定：把本批改动原样复制到 HEAD 之上，同一个用例对在两边**都会间歇失败**（主树 FAIL/PASS、worktree PASS/FAIL）→ 既存缺陷，非本批引入。建议单开一卡（与既有的「批式 stdio 老用例依赖后台首建抢跑」同属测试隔离改造）。
+
+**已知同类缺陷（本轮未修，明确登记）**
+
+- `ingest/mineru.py` 的三处 `urllib.request.urlopen` 属**同一类**（付费非幂等 POST 跟随 3xx、`Authorization` 可被转发）。未一并改的原因：其测试是**全局 patch `urllib.request.urlopen`**，换出口会击穿那些用例，需要连同测试注入缝一起改——单独决策。
+- `media_providers` 的媒体发送目前不带账本上下文（不走 `embedding_batches` 占用），因此仍受意图级闸门约束；其操作者出口是 `--abandon-request`。
+- 仍未复核：`dispatch_lock` 只包快照读（文档 vs 实现）、`list_embedding_work` 的 1+N 全表扫描实测成本、6 处负路径测试缺口。
+
+- 未 push、未开 PR、未打 tag / Release、未改版本号、未发 PyPI、未发起真实计费请求。
+
+### [FIX-v092-review4] — moton16,2026-10-12,CodeBuddy,Hy4-preview — fix(requests): 遗留项 L1–L6 实机调研、版本级 review 与四处修复
+
+> **涵盖提交**：本条目所在提交。前置：`[FIX-v092-review3]`（两处 P1）。本轮是**调研窗口 + 施工窗口**：
+> 先给 L1–L6 逐项结论（能复现的一律写探针），再把其中 4 项与版本级 review 发现的 2 处阻断项一并修掉。
+> 探针与原始输出：`E:/coding/.mortis-runs/v092/probe-resume|probe-scale|probe-media/`（工作区外）。
+
+**L1 `recover_interrupted_batches` 的 dispatch 锁范围 —— 成立，且不是「仅文档问题」**
+
+两个独立 `ControlStore` 连接在「A 快照之后 / A 改库之前」插入 B 的状态推进（`probe-resume/probe.py`），四个分支各自定案：
+
+- `reserved` 与 `sending` 分支**忽略写操作的返回值**，`released_reserved` / `held_sending` 无条件自增 → 控制库其实什么都没做，运维看到的「已释放 N 批」是假的（违反函数 docstring 自陈的「绝不谎报已处置」）。
+- `sending` 分支的 `from_states` 默认含 `result_pending` → 快照之后旧 owner 若已落成功结果，会被**降级成 `held_unknown`**。「已收到成功响应」被判成「结果未知」，且 `held_*` 会冻结整条路由 —— 这是真实错误状态，不是文档措辞问题。
+- `result_pending` / `complete` 分支本来就检查返回值，诚实记账（对照成立）。
+- 组件占用互斥由 CAS 兜住（`S5`：另一 owner 抢同一组件 `ok=False`），锁不是必需的。
+
+修法**故意不扩大锁范围**（那会让锁随批次数与磁盘核验线性增长），改为**逐操作 CAS**：`reserved` 分支传 `expected_state="reserved"`；`sending` 两个分支显式 `from_states=("sending",)`；三处改库一律按返回值记账，失败进 `errors`。docstring 改为准确描述：锁只保证**快照**与别的调度者串行，处置靠状态机兜底。回归 2 例（把探针的两种交错固化）。
+
+**L2 1+N 扫描 —— 成立，瓶颈是 `mutation()` 加锁次数，不是 SQL 扫描**
+
+2000 批次 × 8 组件（16000 组件）+ 5000 条 intents 实测：`list_embedding_work` 全量 **0.722 s / 2001 次**、`held_summary` 0.368 s / 1002 次、`_legacy_migration_pending` **0.738 s / 2002 次**、`request_control_action(action=list)` **1.473 s / 4003 次**；同样结果的优化实现（谓词下推 + 组件一次 JOIN 分片）**0.018 s / 1 次**。补 `(state, updated_at)` 索引几乎无变化（锁次数没变），现有的 `(profile_fingerprint, purpose_family, state)` 因最左前缀用不上。SQL 下推方案已写入执行文档 §22.2，**本轮未施工**（性能改造，列清单等裁定）。
+
+**L3 六处负路径测试 —— 已补齐**
+
+`query_max_posts` 确实拦截、`held_summary.available=False`、`release` 对 `complete` 批次（无确认 → `RESUME_RELEASE_NEEDS_CONFIRMATION`，带确认 → `RESUME_BATCH_IMMUTABLE`）、无续算表时的 `prune_audit`、`verify_failed` 跳过分支、`writer='v092'` 排除分支。其中 `query_max_posts` 那条用 fake server 替身直连 `fanout.fanout_search`，**不走 stdio**（避免给「批式 stdio 抢跑」那张卡再加负担）。
+
+**L4 `ingest/mineru.py` 三处 `urlopen` —— 同类缺陷成立，已修**
+
+`mineru.py:1177` 的 `Authorization: Bearer` 会随 3xx 被转发，预签名 PUT 还会被降级成 GET。新增模块级出口 `mineru._urlopen`（默认走 `providers` 的不跟随重定向 opener），三处全部改走它（下载也一并改：口径对称 + 重定向目标未经 `_validate_remote_url` 的 SSRF 面）。测试注入缝随之改造：`monkeypatch.setattr(urllib.request, "urlopen", ...)` 对 mineru 已失效，改为 `monkeypatch.setattr("mortis_rag_mcp.ingest.mineru._urlopen", ...)`，实测 9 处（`test_ingest_mineru.py` 7 处、`test_http_json_admission.py` 2 处）；其余用例本来就 patch `_http_json` / `_http_bytes` / `_put_upload`，不受影响。新增回归：本机双 HTTP server，源站对带 Bearer 的 POST 回 302 → 目标站**零命中**、`MineruError.http_status == 302`。
+
+**L5 媒体是否该接 `ledger_managed` —— 前提不成立**
+
+`reserve_embedding_batch` 的调用点只有 `sync_engine.py:691/706`（文本单批 planner），媒体路径 `sync_engine.py:1133` 的 `embed_media` 不 reserve → 媒体**不进** `embedding_batches`，`ledger_managed` 无从接起。真实缺口另在两处（探针 `probe-media/`）：付费媒体一次 unknown 后整条媒体嵌入停摆，**没有 retry/release 出口，只能 `--abandon-request`**；且该意图 `writer='v092'` → 不出现在 `request_control_action(action=list)` 的待处置台账，只在 `--list-requests` 可见（两个管理面可视性不对称）。建议 v0.9.3 再决定是否让媒体也进账本。
+
+**L6 `test_fast_stat_skips_disk_read_when_unmodified` 间歇失败 —— 定位到具体用例并已修**
+
+二分定位到 **`tests/test_diaglog.py::test_diag_error_handling_stage_fail`（:216）**：它经 `call_tool → _indexer_for → start_watching()` 拉起监听线程（interval 0.25 s），用例结束无清理，线程继续周期 sync 自己的 vault；铁证是失败断言打印的 `read_bytes_calls` 里前两条是 `...\test_diag_error_handling_stage0\my_vault\note1.md`。修法选**全局**而非单文件：`tests/conftest.py` 新增 autouse fixture `stop_background_watchers`，跟踪 `MarkdownIndexer.start_watching` 并在 teardown 逐个 `stop_watching()`（`try/except` 包住，规避 py3.13 join 未启动线程抛错）；只做 teardown 清理，不改用例内时序。验证：同一组合 **5/5 通过**（此前 3/3 失败），耗时未变。它与既有的「批式 stdio 老用例依赖后台首建抢跑」合并为一张卡：本 fixture 解决**跨用例污染**，抢跑本身（用例内靠 `sleep` 等后台首轮）是另一半，未做。
+
+**版本级 review（`git diff main` 含未提交改动）**
+
+阻断项 5 条，其中 3 条本轮已修：
+
+- **裸 `python -m mortis_rag_mcp --doctor` 退出 2（已修）**：门禁要求所有管理动作带 `--vault`，但 `--doctor` 分支不消费 vault_path。README.md:54 / README_EN.md:54 / QUICKSTART_user.md:17 / CHANGELOG_user.md:77 都是这条命令，照抄即失败（实测 EXIT 2 → 0）。
+- **`kb_export.overwrite` 未在 inputSchema 声明（已修）**：实现支持（`server.py:1342-1347`），schema 漏声明会让严格客户端无法覆盖已存在的 zip。
+- L1、L4（见上，已修）。
+- **版本号仍为 0.9.1，而 README.md:95 / PROJECT_GUIDE.md:279,590,633,875 已写「v0.9.2 起/新增」，CHANGELOG_user.md 无 0.9.2 段 —— 需主人裁定（本窗口未授权改版本号）**。→ 已由本批末尾的 `[release-v0.9.2]` 条目一并执行（版本号 + 用户文档 + Skill 同步）。
+
+非阻断登记 8 条（`VAULT_PATH_REQUIRED` 死码、`release` 的 batch_id 校验 MCP/CLI 口径不同、配置未知键静默忽略、`audit_retention_days` 上界不一致、README 对 `kb_export`/`kb_import` 的口径等）。三批 Changelog 条目里最具体的 8 条代码断言逐条回源码复核**全部成立**（无夸大）。
+
+**验证**
+
+- 靶向：`test_v092_review_fixes` **26 passed**、`test_ingest_mineru` 24 passed、`test_http_json_admission` 3 passed、`resume + review_fixes + drill` 46 passed、六文件 109 passed；`tests/test_diaglog.py + tests/test_improvements.py` **5/5**。
+- 全量（工作区外运行器）：主树 r1 **1415 passed / 1 failed**、r2 **1416 passed / 0 failed**；HEAD 对照 worktree **1389 passed / 0 failed**。唯一失败 `tests/test_ingest_auto.py::test_a_b_a_version_changes_eligible_again` 单独跑 3/3 通过（52 passed），与本批改动领域无交集（未动 ingest/seen 逻辑，conftest fixture 只作用于 `MarkdownIndexer.start_watching`）→ 判为既有的间歇时序用例。
+- 未 push、未开 PR、未打 tag / Release、**未改版本号**、未发 PyPI、未发起真实计费请求。
