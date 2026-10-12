@@ -210,12 +210,13 @@ class _TemplatingProvider:
     def embed_batch_once(self, texts, *, request_context=None):
         """后台单批入口：模板**只在这里应用一次**，且恰好一个物理 POST。
 
-        计划层（续算组件身份）用的是同一模板后的文本做身份计算，但传给本方法的
-        是原始正文 —— 绝不能两端各格式化一次。
+        调用方（`_embed_missing_bounded`）传的是原始正文，模板由 `embed_with_profile`
+        统一应用一次 —— 计划层的组件身份用同一模板后的文本计算，因此两端一致且
+        不会二次格式化。`embed_with_profile(single_batch=True)` 同时保留了「内层
+        provider 没有单批能力时退回 `embed`」的兼容路径。
         """
-        template = getattr(self._profile, "document_template", "{text}") or "{text}"
-        formatted = [template.format(text=text) for text in texts]
-        return self._provider.embed_batch_once(formatted, request_context=request_context)
+        return embed_with_profile(self._provider, texts, self._profile,
+                                  request_context=request_context, single_batch=True)
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._provider, name)

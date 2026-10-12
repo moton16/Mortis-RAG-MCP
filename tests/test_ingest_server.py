@@ -32,6 +32,22 @@ def _payload(result_line: dict) -> dict:
     return json.loads(result_line["result"]["content"][0]["text"])
 
 
+@pytest.fixture(autouse=True)
+def no_real_mineru_network(monkeypatch):
+    """隔离纪律：本文件存在跨用例残留的 worker 线程，任何真实端点访问都必须被挡住。
+
+    逐个用例单跑时都是干净的，但整文件连跑时上一个用例遗留的后台 worker 线程会在
+    后续用例期间继续消费队列并真的去连 mineru.net。这里在类级别挡住真实解析入口，
+    保证本文件零外网访问。
+    """
+    from mortis_rag_mcp.ingest.mineru import MineruClient
+
+    def _blocked(*args, **kwargs):
+        raise RuntimeError("test isolation: real mineru endpoint must not be contacted")
+
+    monkeypatch.setattr(MineruClient, "parse_structured", _blocked)
+
+
 def test_tool_definitions_includes_kb_ingest():
     tools = _tool_definitions()
     tool_map = {t["name"]: t for t in tools}
@@ -137,9 +153,13 @@ def test_kb_ingest_submit_when_enabled(tmp_path, monkeypatch):
     server.config.ingest.enabled = True
     server.call_tool("kb_init", {"path": str(vault)})
 
-    with patch("mortis_rag_mcp.ingest.worker.IngestManager._client_or_make") as mock_client_factory:
+    # 隔离纪律：worker 线程真实走的是 VirtualIngestWorker 的 client 工厂，
+    # 只打桩 IngestManager 会让后台线程拿着真实 MineruClient 去连 mineru.net。
+    with patch("mortis_rag_mcp.ingest.worker.IngestManager._client_or_make") as mock_client_factory, \
+            patch("mortis_rag_mcp.ingest.worker.VirtualIngestWorker._client_or_make") as virtual_factory:
         mock_client = MagicMock()
         mock_client_factory.return_value = mock_client
+        virtual_factory.return_value = mock_client
         # Mock parse return
         mock_parsed = MagicMock()
         mock_parsed.channel = "v4"
@@ -299,9 +319,11 @@ def test_mock_e2e_auto_ingest_flow(tmp_path, monkeypatch):
     # v0.9.0 C96 起 ingest.storage 默认 virtual，故这里显式选回 legacy。
     server.config.ingest.storage = "legacy"
 
-    with patch("mortis_rag_mcp.ingest.worker.IngestManager._client_or_make") as mock_client_factory:
+    with patch("mortis_rag_mcp.ingest.worker.IngestManager._client_or_make") as mock_client_factory, \
+            patch("mortis_rag_mcp.ingest.worker.VirtualIngestWorker._client_or_make") as virtual_factory:
         mock_client = MagicMock()
         mock_client_factory.return_value = mock_client
+        virtual_factory.return_value = mock_client
         mock_parsed = MagicMock()
         mock_parsed.channel = "v4"
         mock_parsed.markdown = "# Quantum Computing Overview\nQubits and entanglement in deep space."
