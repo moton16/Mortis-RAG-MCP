@@ -14,7 +14,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
 import json
 import time
-from typing import Any, Iterable, TYPE_CHECKING
+from typing import Any, Iterable, Mapping, Sequence, TYPE_CHECKING
 
 from ..providers import EmbeddingProvider, ProviderError
 from ..embedding_capabilities import embed_with_profile
@@ -24,6 +24,25 @@ from .chunking import _INDEXABLE_TEXT_EXTS
 
 if TYPE_CHECKING:
     from mortis_rag_mcp.indexer import MarkdownIndexer
+
+
+_FAILED_FILE_TEXT_LIMIT = 1024
+_FAILED_RESPONSE_DETAIL_LIMIT = 200
+QUARANTINE_STREAK = 3
+
+
+def _embedding_failure_summary(exc: BaseException) -> str:
+    status = getattr(exc, "http_status", None)
+    batch_count = getattr(exc, "batch_count", None)
+    batch_fingerprint = str(getattr(exc, "batch_fingerprint", ""))[:16]
+    if status is None or batch_count is None or not batch_fingerprint:
+        return str(exc)[:_FAILED_FILE_TEXT_LIMIT]
+    detail = str(getattr(exc, "response_detail", ""))[:_FAILED_RESPONSE_DETAIL_LIMIT]
+    parts = [f"HTTP {status}"]
+    if detail:
+        parts.append(detail)
+    parts.append(f"batch={batch_count} sha256:{batch_fingerprint}")
+    return " · ".join(parts)[:_FAILED_FILE_TEXT_LIMIT]
 
 
 def _to_emb(vectors: Iterable[float]) -> array:
@@ -42,12 +61,16 @@ def chunk_has_vector(owner: MarkdownIndexer, chunk: Chunk) -> bool:
     return chunk.embedding is not None and len(chunk.embedding) > 0
 
 
-def ensure_disk_vectors_migrated(owner: MarkdownIndexer) -> None:
+def ensure_disk_vectors_migrated(owner: MarkdownIndexer, *, strict: bool = False) -> None:
     """Reconcile the disk vector store with in-memory chunks.
 
     Rebuilds the RAM bookkeeping set from the disk store, and performs a
     one-time migration from the legacy .vec.bin when the disk store is
     empty (so switching backends never triggers a full re-embed).
+
+    `strict=True`（成果核验路径）：后端读不出 id 时**抛出**而不是吞成空集。
+    「读不到证据」与「证据不存在」必须分开——前者只能报核验不可用，后者才允许
+    判成果丢失；混为一谈会把健康的 `complete` 批次推进成 `held_result_missing`。
     """
     if not owner._vectors_on_disk or owner._disk_vectors:
         return
@@ -60,7 +83,8 @@ def ensure_disk_vectors_migrated(owner: MarkdownIndexer) -> None:
                 owner._load_vectors_cache()
             owner._flush_vectors_to_disk()
     except Exception:
-        pass
+        if strict:
+            raise
 
 
 def flush_vectors_to_disk(owner: MarkdownIndexer) -> None:
@@ -102,6 +126,27 @@ def flush_vectors_to_disk(owner: MarkdownIndexer) -> None:
             chunk.embedding = None
 
 
+def _request_control(owner: MarkdownIndexer):
+    return getattr(owner.config, "request_control", None)
+
+
+def _bounded_resume_mode(owner: MarkdownIndexer) -> bool:
+    from ..request_lifecycle import bounded_resume_enabled
+    return bounded_resume_enabled(str(getattr(_request_control(owner), "mode", "") or "")) \
+        if getattr(_request_control(owner), "mode", "") else bounded_resume_enabled()
+
+
+def _background_embedding_is_manual(owner: MarkdownIndexer) -> bool:
+    """后台策略 `manual`：不得自动计算外部向量（文本**与**媒体共用同一判据）。
+
+    这个判据必须对所有付费后台路径生效，而不是只在文档嵌入路径里判一次 ——
+    否则配了 `manual` 的用户会以为已经停止自动付费，媒体阶段却照发 POST
+    （v0.9.2 复核修正）。
+    """
+    rc = _request_control(owner)
+    return str(getattr(rc, "background_embedding", "enabled") or "enabled").strip().lower() == "manual"
+
+
 def _paid_embedding_allowed(owner: MarkdownIndexer) -> bool:
     """索引批量路径的付费闸门查询（§20.7B / §20.7F）。
 
@@ -117,8 +162,42 @@ def _paid_embedding_allowed(owner: MarkdownIndexer) -> bool:
     # （issue #12）。
     if getattr(getattr(owner, "embedding_provider", None), "is_local_free", False) is True:
         return True
+    # manual 背景策略：普通读取/stats/watch 启动都不允许自动计算外部向量。
+    if _background_embedding_is_manual(owner):
+        return False
+    if _bounded_resume_mode(owner):
+        # 新模式：**取消** profile 级未决暂停。防重放由组件级持久 hold 承担，
+        # 未决意图不再让整个 profile 停摆。续算不可用时显式延期。
+        try:
+            fingerprint = owner._embedding_profile.fingerprint
+            may = getattr(owner, "may_use_paid_profile", None)
+            if not callable(may) or not may(fingerprint, kind="embed"):
+                return False
+            return owner._paid_control_store() is not None
+        except Exception:
+            return False
     may = getattr(owner, "may_use_paid_profile", None)
     if not callable(may):
+        return False
+    # 回滚兼容模式（legacy_profile）的防重放安全网：旧路径不读组件表，所以必须在这里
+    # 把新表的组件 hold 当成 profile 级暂停。否则 `held_result_missing` /
+    # `held_response_invalid`（结果已知但没落盘）这类 hold 在切回旧模式后会被旧路径
+    # 自动重发 —— 等于裸撤锁、重复计费（v0.9.2 §5 反方复核 R2）。
+    from .._indexer import embedding_resume
+    # `manual_only` 例外：那是运维显式 abandon 的决定（已带「可能重复计费」警示），
+    # 若也算暂停，旧模式下一次 abandon 会让整库永久不能嵌入 —— abandon 成了死路，
+    # 只有付费 retry 能解锁。`held_*`（结果未知/未落盘）继续 fail closed。
+    legacy_blocking = tuple(state for state in embedding_resume.HELD_COMPONENT_STATES
+                            if state != "manual_only")
+    try:
+        control = owner._paid_control_store()
+        if control is not None:
+            fingerprint = str(getattr(owner._embedding_profile, "fingerprint", "") or "")
+            for batch in embedding_resume.list_embedding_work(control, states=legacy_blocking):
+                if not fingerprint or str(batch.get("profile_fingerprint") or "") == fingerprint:
+                    return False
+    except Exception:
+        # 读不到续算状态时 fail closed：宁可 0 请求也不冒重复计费风险。
         return False
     try:
         fingerprint = owner._embedding_profile.fingerprint
@@ -164,8 +243,36 @@ class _TemplatingProvider:
     def embed(self, texts):
         return embed_with_profile(self._provider, texts, self._profile)
 
+    def embed_batch_once(self, texts, *, request_context=None):
+        """后台单批入口：模板**只在这里应用一次**，且恰好一个物理 POST。
+
+        调用方（`_embed_missing_bounded`）传的是原始正文，模板由 `embed_with_profile`
+        统一应用一次 —— 计划层的组件身份用同一模板后的文本计算，因此两端一致且
+        不会二次格式化。内层 provider 没有单批能力时这里会明确报错（契约），由
+        `_single_batch_capable` 在**进入续算路径之前**就判掉，不会走到这一步。
+        """
+        return embed_with_profile(self._provider, texts, self._profile,
+                                  request_context=request_context, single_batch=True)
+
+    def supports_single_batch(self) -> bool:
+        """wrapper 的单批能力**取决于内层 provider**，不能靠 wrapper 自己声明。
+
+        wrapper 永远有 `embed_batch_once` 方法，如果只用 `hasattr` 判断能力，任何
+        第三方/测试 provider 都会被当成"支持单批"，进而在 `embed_with_profile` 里
+        失败或被静默降级成多批（账实不符）。
+        """
+        return callable(getattr(self._provider, "embed_batch_once", None))
+
     def __getattr__(self, name: str) -> Any:
         return getattr(self._provider, name)
+
+
+def _single_batch_capable(provider: Any) -> bool:
+    """该 provider（含模板 wrapper）能保证「一次调用 = 一个物理 POST」吗？"""
+    if not callable(getattr(provider, "embed_batch_once", None)):
+        return False
+    probe = getattr(provider, "supports_single_batch", None)
+    return not callable(probe) or bool(probe())
 
 
 def _document_provider(owner: MarkdownIndexer) -> Any:
@@ -303,6 +410,378 @@ def embedding_changed_state(
     return any(owner._chunk_has_vector(chunk) for chunk in pending_chunks)
 
 
+def _reset_quarantine_on_config_change(owner: MarkdownIndexer) -> None:
+    config_key = hashlib.sha256(repr(owner.config.embedding).encode("utf-8")).hexdigest()
+    if owner._embed_quarantine_config_key != config_key:
+        owner._embed_failure_quarantine.clear()
+        owner._embed_quarantine_config_key = config_key
+
+
+def _record_embedding_failure(owner: MarkdownIndexer, source: str) -> None:
+    streak, _rounds_waited = owner._embed_failure_quarantine.get(source, (0, 0))
+    owner._embed_failure_quarantine[source] = (streak + 1, 0)
+
+
+def _clear_embedding_failure(owner: MarkdownIndexer, source: str) -> None:
+    owner._embed_failure_quarantine.pop(source, None)
+
+
+def _quarantine_pending(
+    owner: MarkdownIndexer,
+    pending: dict[str, list[Chunk]],
+) -> tuple[dict[str, list[Chunk]], int]:
+    active: dict[str, list[Chunk]] = {}
+    quarantined = 0
+    for source, chunks in pending.items():
+        state = owner._embed_failure_quarantine.get(source)
+        if state is None or state[0] < QUARANTINE_STREAK:
+            active[source] = chunks
+            continue
+        streak, rounds_waited = state
+        retry_after_rounds = 2 ** (streak - QUARANTINE_STREAK)
+        if rounds_waited < retry_after_rounds:
+            owner._embed_failure_quarantine[source] = (streak, rounds_waited + 1)
+            quarantined += 1
+            continue
+        owner._embed_failure_quarantine[source] = (streak, 0)
+        active[source] = chunks
+    return active, quarantined
+
+
+# --------------------------------------------------------------------------
+# v0.9.2：后台付费嵌入的组件级续算（方案 D）
+# --------------------------------------------------------------------------
+
+_HELD_REASON_CODES = {
+    "held_unknown": "AUTOMATIC_REPLAY_HELD",
+    "held_response_invalid": "RESPONSE_INVALID",
+    "held_result_missing": "RESULT_NOT_RECOVERED",
+    # 预算延期是良性上限，不是「远端结果未知」：不得复用 AUTOMATIC_REPLAY_HELD，
+    # 否则运维会把纯预算跳过误判成可能需要人工处置的未知计费。
+    "budget_deferred": "BUDGET_DEFERRED",
+}
+
+
+#: 预算延期使用的伪状态码（只用于 failed_files 观测，不写组件状态）。
+BUDGET_DEFERRED_STATE = "budget_deferred"
+
+
+def _resume_owner_token(owner: MarkdownIndexer) -> str:
+    token = getattr(owner, "_resume_owner_token", "")
+    if not token:
+        from .embedding_resume import owner_token_for
+        token = owner_token_for("sync")
+        owner._resume_owner_token = token
+    return token
+
+
+def _resume_layout(owner: MarkdownIndexer):
+    layout = getattr(owner, "_storage_layout", None)
+    if layout is None:
+        from ..doc_store import resolve_storage_layout
+        layout = resolve_storage_layout(owner.config, owner.vault_path)
+        owner._storage_layout = layout
+    return layout
+
+
+def _resume_verifier(owner: MarkdownIndexer):
+    """恢复扫描的**严格成果核验**：复用 `checkpoint_embeddings` 的同一条持久判据。
+
+    返回 closure 而非一次算好的集合：库里没有中断批次时零成本；只有真的存在
+    `sending` / `result_pending` 批次时才建 chunk id 索引（O(chunks) 一次）。
+
+    判据与确认路径一致 —— 磁盘后端只认后端确认写入的 id；内存/缓存后端看 chunk
+    是否仍带向量（重启后它只可能来自已落盘的缓存）。查不到证据一律不算可恢复，
+    于是走 `held_*`，绝不因为"看起来算过"就省掉一次付费确认。
+    """
+    index: dict[str, Chunk] = {}
+
+    def verify(components: Sequence[Mapping[str, Any]]) -> set[str]:
+        pairs: dict[str, str] = {}
+        for component in components:
+            chunk_id = str(component.get("chunk_id") or "")
+            key = str(component.get("embedding_key") or "")
+            if chunk_id and key:
+                pairs.setdefault(chunk_id, key)
+        if not pairs:
+            return set()
+        # 磁盘后端：RAM 记账集合只在 sync 热路径重建，冷进程里它是空集。不先补建就
+        # 会把「本进程还没读过 vec0」误判成「磁盘上没有这些向量」，于是
+        # `audit_complete` 把健康的 complete 批次整批推进 held_result_missing
+        # （held_* 会冻结该 profile）。这里按需重建，读不到就抛出去报核验不可用。
+        ensure_disk_vectors_migrated(owner, strict=True)
+        if not index:
+            for chunks in getattr(owner, "_chunks", {}).values():
+                for chunk in chunks:
+                    index[chunk.id] = chunk
+        on_disk = bool(getattr(owner, "_vectors_on_disk", False))
+        confirmed: set[str] = set()
+        for chunk_id, key in pairs.items():
+            chunk = index.get(chunk_id)
+            if chunk is None:
+                continue
+            if on_disk:
+                if chunk_id in getattr(owner, "_disk_vectors", ()):
+                    confirmed.add(key)
+            elif owner._chunk_has_vector(chunk):
+                confirmed.add(key)
+        return confirmed
+
+    return verify
+
+
+def _pending_components(owner: MarkdownIndexer, pending: dict[str, list[Chunk]]) -> dict[str, dict]:
+    """按**稳定输入身份**聚合待补嵌输入；相同输入只发一个代表，回填所有绑定。"""
+    from ..request_lifecycle import PURPOSE_BACKGROUND_DOCUMENT, component_key, purpose_family, sha256_hex
+    profile_fingerprint = owner._embedding_profile.fingerprint
+    family = purpose_family(PURPOSE_BACKGROUND_DOCUMENT)
+    components: dict[str, dict] = {}
+    for source, chunks in pending.items():
+        signature = ""
+        try:
+            signature = str(owner._signatures.get(source) or "")
+        except Exception:
+            signature = ""
+        for chunk in chunks:
+            embedding_key = _reuse_key(chunk) or hashlib.sha256(chunk.content.encode("utf-8")).hexdigest()
+            # 身份用**模板后**文本（真实 wire 输入）；发送给 provider 的仍是正文，
+            # 由 _TemplatingProvider 统一模板化一次。
+            exact_input = _document_input(owner, chunk.content)
+            key = component_key(purpose_family_name=family, profile_fingerprint=profile_fingerprint,
+                                embedding_key=embedding_key,
+                                exact_input_sha256=sha256_hex(exact_input))
+            existing = components.get(key)
+            if existing is not None:
+                existing["chunks"].append(chunk)
+                continue
+            components[key] = {
+                "component_key": key,
+                "embedding_key": embedding_key,
+                "input_sha256": sha256_hex(exact_input),
+                "source": source,
+                "source_kind": "document",
+                "source_sha256": signature,
+                "revision_id": str(chunk.metadata.get("revision_id") or ""),
+                "chunk_id": chunk.id,
+                # 原始正文：模板由 _TemplatingProvider 应用，避免二次格式化。
+                "text": chunk.content,
+                "chunks": [chunk],
+            }
+    return components
+
+
+def _record_hold_failure(owner: MarkdownIndexer, source: str, state: str, batch_id: str) -> None:
+    """held / 预算延期的跳过**不**增加失败 streak；失败名单用稳定原因码。"""
+    code = _HELD_REASON_CODES.get(state, "AUTOMATIC_REPLAY_HELD")
+    owner.failed_files[source] = f"{code} · batch={batch_id[:16]} · automatic replay held"
+
+
+#: 确定**没有**产生远端影响的失败码：这些不是 hold，下一轮会自动重新计划。
+_NON_HOLD_REASON_CODES = {
+    "not_sent": "REQUEST_NOT_SENT",
+    "rejected": "REQUEST_REJECTED",
+}
+
+
+def _record_outcome_failure(owner: MarkdownIndexer, source: str, outcome: Any, batch_id: str) -> None:
+    """按结果**事实**写失败名单：hold 用 hold 码，明确被拒/未发送不用 hold 语义。
+
+    此前一律写 `outcome.hold_state or "held_unknown"`：`rejected`（4xx，组件已被控制库
+    释放、下一轮会自动重新计划）也被标成「AUTOMATIC_REPLAY_HELD · automatic replay
+    held」，既误导运维去手工处置，又因为走的是 hold 分支而不累加退避 streak ——
+    一个持续 4xx 的源会永远每轮重试。
+    """
+    state = outcome.hold_state
+    if state:
+        _record_hold_failure(owner, source, state, batch_id)
+        return
+    code = _NON_HOLD_REASON_CODES.get(str(getattr(outcome, "outcome", "")), "REQUEST_NOT_SENT")
+    _record_embedding_failure(owner, source)
+    owner.failed_files[source] = (
+        f"{code} · batch={batch_id[:16]} · request not billed; next round retries automatically")
+
+
+def _embed_missing_bounded(owner: MarkdownIndexer, pending: dict[str, list[Chunk]],
+                           pending_chunks: list[Chunk], failed_before: dict[str, str],
+                           reused: int) -> bool:
+    """组件级续算：稳定输入去重 → 过滤 held → 组批 → 一次 POST → 检查点 → complete。"""
+    from .._indexer import embedding_resume
+    from ..request_lifecycle import (
+        OUTCOME_SUCCEEDED, PURPOSE_BACKGROUND_DOCUMENT, RequestContext, get_request_control_mode,
+    )
+    from ..doc_store import DocStoreError
+
+    control = owner._paid_control_store()
+    if control is None:
+        owner._embedding_paused = True
+        owner._sync_progress["phase"] = "embedding_paused"
+        owner._sync_progress["reason"] = "BACKGROUND_RESUME_UNAVAILABLE"
+        return False
+    provider = _document_provider(owner)
+    if not callable(getattr(provider, "embed_batch_once", None)):
+        owner._embedding_paused = True
+        owner._sync_progress["phase"] = "embedding_paused"
+        owner._sync_progress["reason"] = "BACKGROUND_BATCH_CAPABILITY_UNAVAILABLE"
+        return False
+    # 崩溃/中断恢复扫描：**每次调用都扫**，只处置**本进程**遗留的 active 批次 ——
+    # `reserved` 释放（状态本身证明此前没有发送）、`sending` 在有持久成果时完成、
+    # 否则转持久 hold（结果不可证，不自动重发）。
+    #
+    # 此前写成"每实例只扫一次"，而扫描发生在本次调用**创建任何批次之前**：那时库里
+    # 不可能存在本进程 token 的批次，于是谓词恒假、所有批次都被 `skipped_unproven`
+    # 跳过 → 这段恢复在生产里从未处置过任何一行，同进程中断残留（例如 `begin_send`
+    # 遇到控制库瞬时错误后 `continue` 留下的 `reserved`）会永久占用输入身份并静默不补嵌。
+    #
+    # 跨进程的他人 token 依然**不做**自动处置：没有可靠存活证明就不能判定对方已死
+    # （R2 纪律）。这类残留由运维用 `kb_request_control action=release` 显式解锁。
+    token = _resume_owner_token(owner)
+    try:
+        layout = _resume_layout(owner)
+        recovery = embedding_resume.recover_interrupted_batches(
+            control, layout=layout, owner_token="",
+            verify_recoverable=_resume_verifier(owner),
+            owner_predicate=lambda owner_token: str(owner_token) == token)
+        if recovery.get("errors"):
+            owner._sync_progress["resume_recovery_errors"] = recovery["errors"][:3]
+        owner._sync_progress["resume_recovery"] = {
+            key: int(recovery.get(key) or 0)
+            for key in ("released_reserved", "held_sending", "completed_pending",
+                        "missing_result", "held_complete", "skipped_unproven")}
+    except Exception as exc:  # noqa: BLE001 - 恢复不可用必须可观测，不能静默
+        owner._sync_progress["resume_recovery_errors"] = [str(exc)[:200]]
+
+    operation_id = getattr(owner, "_resume_operation_id", "") or embedding_resume.new_operation_id("sync")
+    owner._resume_operation_id = operation_id
+    owner_token = _resume_owner_token(owner)
+    components = _pending_components(owner, pending)
+    keys = list(components)
+    try:
+        states = embedding_resume.active_component_states(control, keys)
+    except DocStoreError:
+        owner._embedding_paused = True
+        owner._sync_progress["reason"] = "BACKGROUND_RESUME_UNAVAILABLE"
+        return False
+    # held / 已在飞行的组件从本轮发送集合中移除（不增加失败 streak）。
+    plan_components = [components[key] for key in keys
+                       if states.get(key) not in embedding_resume.ACTIVE_COMPONENT_STATES]
+    batch_size = int(owner.config.embedding.batch_size or 0)
+    if batch_size <= 0:
+        groups = [plan_components] if plan_components else []
+    else:
+        groups = [plan_components[i:i + batch_size] for i in range(0, len(plan_components), batch_size)]
+    limit = int(getattr(owner.config.request_control, "background_max_posts_per_round", 32) or 32)
+    budget = getattr(owner, "_post_budget_used", 0)
+    for group in groups:
+        if budget >= limit:
+            owner._sync_progress["budget_deferred"] = True
+            for component in group:
+                _record_hold_failure(owner, component["source"],
+                                     BUDGET_DEFERRED_STATE, "budget")
+            break
+        batch_id = embedding_resume.new_batch_id()
+        plan = {
+            "batch_id": batch_id,
+            "operation_id": operation_id,
+            "purpose_family": "document",
+            "profile_fingerprint": owner._embedding_profile.fingerprint,
+            "endpoint": str(owner.config.embedding.endpoint or ""),
+            "components": [{k: v for k, v in c.items() if k != "chunks" and k != "text"}
+                           for c in group],
+        }
+        reservation = embedding_resume.reserve_embedding_batch(control, plan, owner_token)
+        if not reservation.ok:
+            # 唯一约束冲突 = 正常并发/重放防护：重新读状态后重新计划，绝不硬发。
+            try:
+                states = embedding_resume.active_component_states(control, keys)
+            except DocStoreError:
+                break
+            retry = [c for c in group
+                     if states.get(c["component_key"]) not in embedding_resume.ACTIVE_COMPONENT_STATES]
+            if not retry:
+                continue
+            batch_id = embedding_resume.new_batch_id()
+            plan["batch_id"] = batch_id
+            plan["components"] = [{k: v for k, v in c.items() if k != "chunks" and k != "text"}
+                                  for c in retry]
+            reservation = embedding_resume.reserve_embedding_batch(control, plan, owner_token)
+            if not reservation.ok:
+                continue
+            group = retry
+        permit = embedding_resume.begin_embedding_send(control, batch_id, owner_token)
+        if not permit.allowed:
+            continue
+        # 提交成功后才允许 transport：一个物理 POST。
+        budget += 1
+        owner._post_budget_used = budget
+        context = RequestContext(operation_id, PURPOSE_BACKGROUND_DOCUMENT, batch_id,
+                                 ledger_managed=True)
+        try:
+            vectors = provider.embed_batch_once([c["text"] for c in group], request_context=context)
+        except ProviderError as exc:
+            outcome = exc.as_outcome()
+            embedding_resume.record_embedding_outcome(control, batch_id, owner_token, outcome)
+            for component in group:
+                _record_outcome_failure(owner, component["source"], outcome, batch_id)
+            continue
+        except Exception as exc:  # noqa: BLE001 - 非 transport 异常不得冒充远端未知
+            from ..request_lifecycle import OUTCOME_RESPONSE_INVALID, RequestOutcome
+            embedding_resume.record_embedding_outcome(
+                control, batch_id, owner_token,
+                RequestOutcome(outcome=OUTCOME_RESPONSE_INVALID, response_received=False,
+                               remote_effect_unknown=False, detail=str(exc)[:200]))
+            for component in group:
+                _record_embedding_failure(owner, component["source"])
+                owner.failed_files[component["source"]] = _embedding_failure_summary(exc)
+            continue
+        if len(vectors) != len(group):
+            from ..request_lifecycle import OUTCOME_RESPONSE_INVALID, RequestOutcome
+            embedding_resume.record_embedding_outcome(
+                control, batch_id, owner_token,
+                RequestOutcome(outcome=OUTCOME_RESPONSE_INVALID, response_received=True,
+                               remote_effect_unknown=True,
+                               detail=f"count mismatch {len(vectors)}/{len(group)}"))
+            for component in group:
+                _record_hold_failure(owner, component["source"], "held_response_invalid", batch_id)
+            continue
+        # 成功前缀：立刻回填所有有效绑定，再落检查点。
+        bindings = []
+        for component, vector in zip(group, vectors):
+            for chunk in component["chunks"]:
+                chunk.embedding = _to_emb(vector)
+            bindings.append({"embedding_key": component["embedding_key"],
+                             "chunk_id": component["chunk_id"],
+                             "chunk": component["chunks"][0]})
+        embedding_resume.record_embedding_outcome(
+            control, batch_id, owner_token, OUTCOME_SUCCEEDED)
+        confirmed = owner.checkpoint_embeddings(bindings)
+        result = embedding_resume.confirm_embedding_checkpoint(control, batch_id, owner_token, confirmed)
+        if not result.get("applied"):
+            # 控制库拒绝了这次检查点（owner/状态 CAS 未命中）：账本仍停在 result_pending。
+            # 此时绝不能清失败、更不能继续堆后面的付费批次 —— 本地以为"已保存"而账本
+            # 没有，就会在下一次恢复扫描里被当成成果丢失，甚至反复重算。
+            owner._sync_progress["phase"] = "embedding_checkpoint_failed"
+            owner._sync_progress["checkpoint_refused"] = True
+            for component in group:
+                _record_hold_failure(owner, component["source"], "held_result_missing", batch_id)
+            break
+        for component in group:
+            if component["embedding_key"] in confirmed:
+                _clear_embedding_failure(owner, component["source"])
+                owner.failed_files.pop(component["source"], None)
+            else:
+                # 有结果但没保存成功：只保留 RAM 与占用，停止本轮后续付费批次。
+                _record_hold_failure(owner, component["source"], "held_result_missing", batch_id)
+        # 反方复核 R2：**部分**确认同样必须停付。磁盘后端逐 chunk upsert 可能只成功
+        # 一部分，只拦「零确认」会让剩余未确认组件继续堆后面的付费批次。
+        # 停付只推迟后续批次，不影响本轮已确认的检查点。
+        if len(confirmed) < len(group):
+            owner._sync_progress["phase"] = "embedding_checkpoint_failed"
+            break
+        owner._sync_progress["files_done"] = int(owner._sync_progress.get("files_done", 0)) + len(group)
+        owner._sync_progress["chunks_done"] = int(owner._sync_progress.get("chunks_done", 0)) + len(bindings)
+    return owner._embedding_changed_state(pending_chunks, failed_before, reused)
+
+
 def embed_missing(owner: MarkdownIndexer) -> bool:
     """Embed every chunk that has no vector yet.
 
@@ -322,6 +801,7 @@ def embed_missing(owner: MarkdownIndexer) -> bool:
     owner._stamp_embedding_keys()
     # 先做一轮输入身份复用：已经算过的内容不再花钱重算一次。
     reused = owner._reuse_vectors_by_content_hash()
+    _reset_quarantine_on_config_change(owner)
 
     failed_before = dict(owner.failed_files)
     pending: dict[str, list[Chunk]] = {}
@@ -332,9 +812,14 @@ def embed_missing(owner: MarkdownIndexer) -> bool:
                    and not owner._chunk_has_vector(chunk)]
         if missing:
             pending[source] = missing
+        else:
+            _clear_embedding_failure(owner, source)
     if not pending:
         # 复用到已有向量的 chunk 也需要落盘，否则下轮重新花钱重算。
         return reused > 0 or owner.failed_files != failed_before
+
+    # 缺向量仍是唯一自愈判据；quarantine 只从本轮发送集合里暂时移除 source。
+    pending, quarantined = _quarantine_pending(owner, pending)
     pending_chunks = [chunk for chunks in pending.values() for chunk in chunks]
     owner._sync_progress = {
         "phase": "embedding",
@@ -342,14 +827,32 @@ def embed_missing(owner: MarkdownIndexer) -> bool:
         "files_total": len(pending),
         "chunks_done": 0,
         "chunks_total": len(pending_chunks),
+        "quarantined": quarantined,
     }
+    if not pending:
+        return reused > 0 or owner.failed_files != failed_before
 
     if owner.config.embedding.mode == "external" and not _paid_embedding_allowed(owner):
-        # R2：仅明确撤销、控制不可用、未决批量意图暂停索引，不创建漂移审批。
+        # R2/bounded_resume：仅明确撤销、明确暂停、后台策略 manual 或续算不可用
+        # 才暂停索引；**不再**因为"存在未决意图"冻结整个 profile。
         owner._embedding_paused = True
         owner._sync_progress["phase"] = "embedding_paused"
         return False
     owner._embedding_paused = False
+
+    # 零成本端点（loopback + 无凭据）不产生费用，也不进续算台账：继续走旧的
+    # 按文件分组路径，避免把本机推理后端接进付费占用逻辑（issue #12 纪律）。
+    if (owner.config.embedding.mode == "external" and _bounded_resume_mode(owner)
+            and not getattr(owner.embedding_provider, "is_local_free", False)
+            and str(owner.config.embedding.endpoint or "").strip()):
+        # 没有端点就无法标识路由，续算不可用 → 继续走旧的按文件分组路径。
+        #
+        # 续算台账按「一次调用 = 一个物理 POST」记账（占用/预算/检查点都据此），
+        # 所以只有内层 provider 真能单批发送时才走这条路；能力缺失退回旧路径而不是
+        # 暂停整库嵌入。
+        if _single_batch_capable(_document_provider(owner)):
+            return _embed_missing_bounded(owner, pending, pending_chunks, failed_before, reused)
+        owner._sync_progress["bounded_resume_skipped"] = "BACKGROUND_BATCH_CAPABILITY_UNAVAILABLE"
 
     if owner.config.embedding.mode != "external":
         provider = _document_provider(owner)
@@ -359,9 +862,11 @@ def embed_missing(owner: MarkdownIndexer) -> bool:
                 for chunk, vector in zip(chunks, vectors):
                     chunk.embedding = _to_emb(vector)
             except Exception as exc:
-                owner.failed_files[source] = str(exc)
+                _record_embedding_failure(owner, source)
+                owner.failed_files[source] = _embedding_failure_summary(exc)
             else:
                 # 补向量成功即撤销旧失败记录，否则持久化文件会永久撒谎。
+                _clear_embedding_failure(owner, source)
                 owner.failed_files.pop(source, None)
             finally:
                 owner._sync_progress["files_done"] += 1
@@ -376,8 +881,10 @@ def embed_missing(owner: MarkdownIndexer) -> bool:
             try:
                 owner._embed_one_file(source, chunks, document_provider)
             except Exception as exc:
-                owner.failed_files[source] = str(exc)
+                _record_embedding_failure(owner, source)
+                owner.failed_files[source] = _embedding_failure_summary(exc)
             else:
+                _clear_embedding_failure(owner, source)
                 owner.failed_files.pop(source, None)
             finally:
                 owner._sync_progress["files_done"] += 1
@@ -396,14 +903,16 @@ def embed_missing(owner: MarkdownIndexer) -> bool:
             try:
                 future.result()
             except Exception as exc:
-                failures[source] = str(exc)
+                failures[source] = _embedding_failure_summary(exc)
             finally:
                 owner._sync_progress["files_done"] += 1
                 owner._sync_progress["chunks_done"] += len(chunks)
     for source in pending:
         if source in failures:
+            _record_embedding_failure(owner, source)
             owner.failed_files[source] = failures[source]
         else:
+            _clear_embedding_failure(owner, source)
             owner.failed_files.pop(source, None)
     return owner._embedding_changed_state(pending_chunks, failed_before, reused)
 
@@ -413,7 +922,7 @@ def revoke_source(owner: MarkdownIndexer, source: str, *, reason: str) -> bool:
     ids = {chunk.id for chunk in chunks}
     for state in (owner._signatures, owner._stat_cache, getattr(owner, "_virtual_sha_cache", {}),
                   owner._stat_seen_ns, owner._stat_confirmations, owner.fast_path_warnings,
-                  owner.failed_files):
+                  owner.failed_files, owner._embed_failure_quarantine):
         state.pop(source, None)
     for chunk_id in ids:
         owner._pending_vectors.pop(chunk_id, None)
@@ -589,6 +1098,13 @@ def media_native_for_revision(owner: MarkdownIndexer, store: Any, source: str, r
     # 结果每轮都被后置的短路丢弃——纯浪费，且破坏了「零成本端点完全不触意图库」
     # 这条性质。判序改为先看成本，付费路径一行未动。
     local_free = bool(getattr(provider, "is_local_free", False))
+    # 后台策略 `manual`（v0.9.2 复核修正）：付费媒体同样不得自动计算 —— 这个键此前
+    # 只在文档嵌入路径生效，配了 manual 的用户仍会被 watch/启动触发的原生媒体 POST
+    # 扣费。只拦「发送」，不拦「复用」：上面已有向量的 chunk 照常返回（零成本）。
+    if not local_free and _background_embedding_is_manual(owner):
+        owner._sync_progress["media_deferred"] = True
+        owner._sync_progress["media_deferred_reason"] = "BACKGROUND_MANUAL"
+        return chunks
     control = None if local_free else owner._paid_control_store()
     unresolved = False
     if not local_free:
@@ -598,9 +1114,22 @@ def media_native_for_revision(owner: MarkdownIndexer, store: Any, source: str, r
                 control, "media", provider.profile.fingerprint)
     if control is not None and unresolved:
         raise MediaStageError("PAID_REQUEST_UNRESOLVED: native media outcome unknown; automatic retry disabled", chunks)
+    # 一轮预算由文档与媒体**共享**（§8）：此前只有文档批自增，媒体每次 POST 都不计数，
+    # 于是 `background_max_posts_per_round` 对媒体完全不设限，`kb_stats` 的
+    # posts_used/posts_limit 也会系统性少报。
+    budget_limit = int(getattr(_request_control(owner), "background_max_posts_per_round", 32) or 32)
+    budget = int(getattr(owner, "_post_budget_used", 0) or 0)
     for start in range(0, len(pending), batch):
+        if not local_free and budget >= budget_limit:
+            owner._sync_progress["budget_deferred"] = True
+            owner._sync_progress["media_deferred"] = True
+            owner._sync_progress["media_deferred_reason"] = "BUDGET_DEFERRED"
+            break
         batch_inputs = pending[start:start + batch]
         try:
+            if not local_free:
+                budget += 1
+                owner._post_budget_used = budget
             vectors = provider.embed_media(batch_inputs)
             if len(vectors) != len(batch_inputs):
                 raise ProviderError("native media response count mismatch")
@@ -619,6 +1148,9 @@ def run_sync(owner: MarkdownIndexer) -> list[Chunk]:
     前置条件：调用方必须已持有 owner._sync_lock。
     运行时通过 owner.* 就地变异 22 个内部状态属性。
     """
+    # 一轮预算从 run_sync 开始建立，文本与媒体共享，不各自计数。
+    owner._post_budget_used = 0
+    owner._resume_operation_id = ""
     failed_before = dict(owner.failed_files)
     # Media and text are independent stages. Text success must not erase media
     # failure; the existing persisted failure map is also the restart retry signal.
@@ -981,6 +1513,12 @@ def run_sync(owner: MarkdownIndexer) -> list[Chunk]:
         owner._stat_confirmations[source] = 1
         owner.fast_path_warnings.pop(source, None)
         owner.failed_files.pop(source, None)
+        # 内容已变更 → 旧退避 streak 归零：新内容的输入身份是新的，继续按旧 streak 隔离
+        # 属误伤（用户修好文件却要再等几轮退避才重试）。
+        try:
+            owner._embed_failure_quarantine.pop(source, None)
+        except AttributeError:
+            pass
         owner._fts_upsert(source, chunks)
         # Disk-backed mode: re-chunking a file orphans its old vector ids.
         if owner._vectors_on_disk and old_chunks:

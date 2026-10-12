@@ -9,6 +9,7 @@ LEGACY_TOOLS = {
     "kb_init", "kb_init_solo", "kb_remove", "kb_describe", "kb_list",
     "kb_ingest", "kb_set_weight", "kb_rebuild", "kb_export", "kb_import",
     "kb_search", "kb_list_files", "kb_read", "kb_stats", "kb_exempt",
+    "kb_request_control",
 }
 
 
@@ -18,7 +19,7 @@ def bare_server():
     return server
 
 
-def test_media_schema_keeps_legacy_tools():
+def test_media_schema_keeps_legacy_tools_plus_request_control():
     definitions = {tool["name"]: tool for tool in _tool_definitions()}
     assert set(definitions) == LEGACY_TOOLS | {"kb_read_media"}
     assert set(VaultMcpServer._TOOL_ROUTE_TABLE) == set(definitions)

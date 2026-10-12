@@ -3,6 +3,47 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 与
 [Semantic Versioning](https://semver.org/lang/zh-CN/)。提交信息为 Conventional Commits。
 
+## [0.9.2] - 2026-10-12
+
+> **版本核心摘要**：
+> 本补丁把「外部付费端点」这条链路改成**可审计、可处置、绝不重复计费**：一次调用恰好一个物理 POST，失败不再自动重发；结果未知时只冻结受影响的后台批次，不再冻死整条索引；新增 `kb_request_control` 给出明确的人工出口。数据布局与已有配置项向后兼容，平滑升级。
+
+### Added (新增功能)
+
+- **新增第 17 个工具 `kb_request_control`（本机外部付费请求控制台账）**：
+  - 查看三类待处置项：结果未知的 hold、被明确暂停的路由、旧版本遗留且尚未登记处置方式的记录，并可显式处置（`retry`、`abandon`、`release`、`pause_route`、`resume_route`、`resolve_legacy`、`audit_complete`、`prune_audit`）；
+  - 所有变更默认 `dry_run=true`：不联网、不启动监听，先看清再动作。
+- **文本 input 模态可显式声明（issue #17）**：
+  - `[embedding].input_modality_declaration` 支持 `none` / `typed` / `hint` 三态，默认 `none` 保持 OpenAI 兼容的裸字符串数组；只有对端明确要求时才改为 `typed`（`{"text": ...}`）或 `hint`（`input_modality="text"`）。
+
+### Fixed (修复)
+
+- **一次调用恰好一个物理 POST，不再重复计费**：
+  - 429 / 5xx / 网络错误 / 非法 JSON 一律分类上抛，不再退避重发（此前一次限流抖动就可能把同一批付费请求重发多次）；
+  - 付费 POST **不再跟随 3xx**：`Authorization` 不会被转发到重定向目标，且「第一跳已收到并可能计费」的请求不再被误判成「未发出」而放行重发。
+- **结果未知只冻结受影响的批次，不再冻死整条索引**：
+  - 「结果未知」改为按组件占用 hold 受影响的后台输入，不再按 profile 整体暂停；跨进程崩溃遗留的 `sending` 批次可用 `release` 解锁，成功但产物缺失的批次不再被误判为成果丢失；
+  - HTTP 4xx（远端明确未处理）单独终态化，不再永久挂在「未决」上把付费嵌入静默拖回词法检索。
+- **处置结果不再谎报**：恢复扫描对 `reserved` / `sending` 的处置改为按数据库返回值记账，并加状态 CAS 校验，运维看到的「已释放 / 已 hold N 批」与实际落库一致。
+- **两处「照抄即错」的诊断命令已修**：
+  - 裸 `python -m mortis_rag_mcp --doctor` 不再被 `--vault` 门禁拦成 exit 2（README / 快速上手里就是这条命令）；
+  - 付费 embed / rerank 探活不再恒失败，`--doctor` 能如实反映端点可用性。
+- **失败信息有界且不刷屏（issue #17）**：文本 HTTP 失败只读取有限响应体、给出 `HTTP <code> · <detail> · batch=<n> sha256:<16位>` 摘要；同一来源连续失败后按指数退避隔离跳过，不再每轮重发。
+- **`kb_export` 的 `overwrite` 已在其工具 schema 中声明**：严格客户端现在可以覆盖已存在的备份 zip。
+
+### Changed & Improved (优化与改进)
+
+- **`kb_rebuild` 付费前先给预览**：文本或原生媒体任一路径为付费端点时必须传 `confirm_cost=true`，否则只返回预览——零请求、零副作用。
+- **只读操作不再在控制库落表结构**：`kb_request_control list` 这类只读路径不再触发 `ALTER TABLE` 与提交，旧控制库上查一次不会改库。
+- **旧记录清理不再误删**：`audit` 清理只清「本版本写入的终态行」与「已登记处置方式的旧行」，未处置的人工对账台账不再被静默删除。
+- **配置项 `max_retries` / `retry_backoff` 当前不生效**：键仍被接受并按原范围校验，仅为向后兼容；去掉它们属于破坏性配置变更，需单独决策。
+
+### Upgrade Guide (升级指引)
+
+- **平滑升级**：不改变已有知识库的数据布局，不产生额外模型计费；已有配置无需修改。
+- **如果你用外部付费端点**：升级后重试行为变严（失败即上抛、不再自动重发），属预期行为；出现「结果未知」时请用 `kb_request_control` 或 CLI `--list-requests` / `--abandon-request` 处置，而不是等它自动恢复。
+- **如果你只用本机零成本端点**：行为与 0.9.1 一致，付费闸门不介入。
+
 ## [0.9.1] - 2026-10-10
 
 > **版本核心摘要**：

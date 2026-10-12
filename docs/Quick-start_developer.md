@@ -10,7 +10,7 @@
 ## 1. 30 秒版：这是什么
 
 Mortis'RAG MCP 是一个**本地 Markdown 知识库 RAG 服务器**，通过 MCP 协议（stdio +
-换行分隔 JSON-RPC，协议版本 `2025-06-18`）向 AI agent 提供 16 个 `kb_*` 工具：
+换行分隔 JSON-RPC，协议版本 `2025-06-18`）向 AI agent 提供 17 个 `kb_*` 工具：
 注册任意文件夹为知识库 → 后台增量索引（切块 + embedding + FTS）→ 三路混合检索
 （FTS5 BM25 + 向量余弦 + bigram 词法，RRF 融合）→ rerank → 返回结构化 chunks。
 
@@ -45,7 +45,23 @@ Mortis'RAG MCP 是一个**本地 Markdown 知识库 RAG 服务器**，通过 MCP
 中途仅相关单文件，全量在整合末或 CI。不要写默认 `%TEMP%`，不要共用 basetemp。
 本地完成检查后只 `git add -- 明确路径` 并及时 commit，保留 hooks，不自动远端操作。
 
-### 1.2 0.9.1 补丁范围（2026-10-10）
+### 1.2 0.9.2 补丁范围（2026-10-12）
+
+补丁版本：新增 1 个工具（`kb_request_control`，共 17 个）、1 个配置键
+（`[embedding].input_modality_declaration`）、`doc_store` 新增续算表（惰性补齐，旧库兼容）。
+改动面与不变量见 `PROJECT_GUIDE.md` 的「0.9.2 增量」。动手前注意三条：
+
+- **付费路径零自动重发是硬约束**：`_JsonHttpProvider` 不再重试/退避，任何新增外部调用点
+  都不得自行包重试循环；「结果未知」只能 hold，不能当可重试失败。测试桩若要模拟 provider，
+  注意 `_send_once` 现在支持 `defer_success`（用 `accepts_keyword` 判签名，旧桩照旧工作）。
+- **付费 POST 必须走模块出口**：新增外部请求一律用 `providers.urlopen`（不注册
+  `HTTPRedirectHandler`），不要直接 `urllib.request.urlopen`；`ingest/mineru` 用
+  `mineru._urlopen`，测试注入缝也随之改变（patch `urllib.request.urlopen` 对它已失效）。
+- **未知结果是组件级占用**：判断「能否再次发送」要看 `embedding_components` 的 active 状态，
+  不要用旧的 profile 级冻结口径；新增后台发送路径必须考虑是否 `reserve_embedding_batch`
+  （`RequestContext.ledger_managed` 决定是否走意图级闸门）。
+
+### 1.3 0.9.1 补丁范围（2026-10-10）
 
 补丁版本：无工具 schema / 配置键 / 文档库 schema / 数据布局变更。改动面与不变量见
 `PROJECT_GUIDE.md` 的「0.9.1 增量」；逐 commit 技术流水见 `Changelog_developer.md` 的
@@ -67,7 +83,7 @@ Mortis-RAG-MCP/
 │   ├── __main__.py          # 入口：python -m mortis_rag_mcp --serve-mcp-stdio
 │   ├── config.py            # 配置加载（956 行）
 │   ├── registry.py          # 用户级知识库注册表（384 行）
-│   ├── server.py            # MCP 协议层 + 16 个公开工具路由表与轻量入口
+│   ├── server.py            # MCP 协议层 + 17 个公开工具路由表与轻量入口
 │   ├── _server/             # 服务端路由与跨库编排私有包
 │   │   ├── search_dispatch.py # 单库/Scoped/全局检索路由与入参规范化
 │   │   └── fanout.py          # 跨库候选聚合、权重计算、去重、rerank、全局/分组分页
@@ -112,7 +128,7 @@ AI agent (WorkBuddy/Codex/...)
 ┌─────────────────────────────────────────────┐
 │ server.py  VaultMcpServer                    │  协议层：initialize / tools/list /
 │  - _tool_definitions()  工具 schema          │  tools/call 分发、参数归一化、
-│  - call_tool()          16 个工具入口        │  跨库 fan-out 合并、库级权重
+│  - call_tool()          17 个工具入口        │  跨库 fan-out 合并、库级权重
 │  - _fanout_search()     跨库检索             │
 └──────┬───────────────────┬──────────────────┘
        │                   │
@@ -204,7 +220,7 @@ stdin 一行 JSON → handle() → method=="tools/call"
 | `config.py` | TOML 加载、`${ENV_VAR}` 插值、配置链 `--app-config` > `MORTIS_RAG_CONFIG` > `VAULT_MCP_CONFIG` > `~/.mortis_rag_mcp/config.toml` > `~/.vault_mcp/config.toml` > 默认 | `load_config()` | 新配置项必须给默认值 + example 文件同步加注释；`AppConfig.vault_path` 会被 `__post_init__` 特殊处理 |
 | `registry.py` | vaults.toml 读写（**原子写 tmp+replace**，跨进程排他锁 Windows `msvcrt.locking`/POSIX `fcntl.flock`） | `VaultRegistry.add/remove/set_weight/set_solo` | 字符串字段序列化必须 `json.dumps`（曾有 LLM 传入的引号毁掉整个注册表的 bug）；新字段要在 `load()` 里给老文件回退值 |
 | `doctor.py` | 环境自检与 Agent 信任锚（`STATUS.md` / `status.json`）生成器 | `doctor.run()` | 零第三方依赖，探活复用 `providers.py`；核心项门禁防假 VALID；Windows 冲突 4 次退避原子写 |
-| `server.py` | 协议层 + 16 个公开工具路由表与轻量入口 | `call_tool()` / `main()` | 16 个工具显式映射表路由；所有入参统一走 `_normalize_call_arguments()` 归一化；检索分发委托至 `_server/` |
+| `server.py` | 协议层 + 17 个公开工具路由表与轻量入口 | `call_tool()` / `main()` | 17 个工具显式映射表路由；所有入参统一走 `_normalize_call_arguments()` 归一化；检索分发委托至 `_server/` |
 | `doc_store.py` | 版本化文档库：generation/revision/control/job/checkpoint/blob/occurrence；virtual 解析事实的唯一落点 | `DocumentStore` / `document_store_for()` | 事实层不是派生缓存，普通清缓存/`kb_rebuild` 不得碰它，只有显式 purge 才清理；revision/epoch 不得降级 |
 | `media_providers.py` / `providers.py` | 原生媒体 embedding transport 与 embedding/reranker/media provider HTTP 封装 | `create_media_provider()` / `create_*_provider()` | 媒体能力**只**由显式 `media_*` 声明决定，不按 model 名猜协议、不按同维向量推 alignment；本地回环端点缺 journal/guard 时走 `is_local_free` bypass，显式撤销仍生效 |
 | `_server/` | 服务端跨库编排与检索分发私有包 | `dispatch_search()` / `fanout_search()` | 活实例契约（直读 `_indexers`，禁快照化）；跨库 embedding 全局仅计算一次；库级权重在 rerank 完成后乘回 |

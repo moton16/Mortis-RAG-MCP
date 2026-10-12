@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/moton16/Mortis-RAG-MCP/actions/workflows/ci.yml/badge.svg)](https://github.com/moton16/Mortis-RAG-MCP/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-[![Version: 0.9.1](https://img.shields.io/badge/Version-0.9.1-blue.svg)](CHANGELOG_user.md)
+[![Version: 0.9.2](https://img.shields.io/badge/Version-0.9.2-blue.svg)](CHANGELOG_user.md)
 
 English | [简体中文](README.md)
 
@@ -11,18 +11,28 @@ English | [简体中文](README.md)
 
 ---
 
-## 🚀 Current Release: v0.9.1 (Fix & Performance Patch)
+## 🚀 Current Release: v0.9.2 (Paid Request Audit & Billing Safety Patch)
 
-v0.9.1 fixes local zero-cost inference endpoints being wrongly blocked by the paid-request gate (which could stall indexing for a long time) and substantially improves search and rebuild performance on large vaults. The fail-closed gate for paid endpoints is unchanged.
+v0.9.2 makes the external paid-endpoint path **auditable, actionable, and never double-billed**: exactly one physical POST per call with no automatic retry, unknown results hold only the affected background batch instead of freezing the whole index, and a new `kb_request_control` tool gives you explicit operator exits. Data layout and existing config stay backward compatible.
 
-- 🛡️ **Zero-cost endpoints are no longer blocked**: an endpoint on a loopback address (e.g. `127.0.0.1`) with no API credential is no longer recorded in the paid ledger, nor dragged down by historical unresolved intents; the fail-closed side guarding real billing is untouched.
-- 🔓 **Unresolved requests no longer freeze indexing forever**: a failed ledger write gets one compensating retry; a `prepared` intent on a zero-cost endpoint is released after its lease, while `submission_unknown` still requires manual reconciliation.
-- 🔎 **Observable blockage**: `kb_stats` gains `paid_route_blocked`, naming the one intent actually blocking each request kind (present only when something is genuinely blocked).
-- ⚡ **Faster and cheaper**: document reads per search drop from 3 to 1 (measured 0 once sync is warm). On the same machine and script, median `kb_search` went 36.1 ms → 20.3 ms on 2,892 documents / 9,316 chunks — a probe-relative record, not a cross-environment guarantee; one `kb_rebuild` now runs a single full sync round (cold 3 → 1, warm 2 → 1).
+- 🔒 **One call = one send, never billed twice**: 429 / 5xx / network errors / invalid JSON are classified and raised, never retried with backoff; paid POSTs **do not follow 3xx**, so `Authorization` is never forwarded to a redirect target and an already-sent request is never misclassified as "not sent" and re-sent.
+- 🎛️ **Unknown results hold only the affected batch**: a component-level lease ledger plus a resume table hold only the impacted background inputs instead of freezing an entire profile; `retry` / `release` are explicit operator exits.
+- 🧭 **New 17th tool `kb_request_control`**: inspect unknown-result holds, explicitly paused routes, and legacy records awaiting disposition, then act on them (`retry` / `abandon` / `release` / `pause_route` / `resume_route` / `resolve_legacy` / `audit_complete` / `prune_audit`); defaults to `dry_run=true` — no network, no watcher.
+- 💰 **`kb_rebuild` previews before it bills**: when either the text or native media path points at a paid endpoint you must pass `confirm_cost=true`; otherwise you get a preview with zero requests and zero side effects.
+- 🩺 **Two copy-paste-broken diagnostics fixed**: bare `python -m mortis_rag_mcp --doctor` is no longer rejected with exit 2 by the `--vault` gate; paid embed / rerank probes no longer always fail. `kb_export`'s `overwrite` is now declared in its tool schema.
+- 🧩 **Text modality declaration & failure isolation (issue #17)**: `[embedding].input_modality_declaration` accepts `none` / `typed` / `hint` (default `none` stays OpenAI-compatible); text HTTP failures produce bounded summaries and a source with repeated failures is isolated with exponential backoff instead of being resent every round.
 
 ---
 
-## 🏁 Previous Milestone: v0.9.0 (Major Feature Release)
+## 🏁 Previous Milestone: v0.9.1 (Fix & Performance Patch)
+
+- 🛡️ **Zero-cost endpoints are no longer blocked**: an endpoint on a loopback address (e.g. `127.0.0.1`) with no API credential is no longer recorded in the paid ledger; the fail-closed side guarding real billing is untouched.
+- 🔓 **Unresolved requests no longer freeze indexing forever**: a failed ledger write gets one compensating retry; a `prepared` intent on a zero-cost endpoint is released after its lease.
+- ⚡ **Faster and cheaper**: document reads per search drop from 3 to 1; one `kb_rebuild` now runs a single full sync round (cold 3 → 1, warm 2 → 1).
+
+---
+
+## 🏁 Earlier Milestone: v0.9.0 (Major Feature Release)
 
 v0.9.0 marks a comprehensive architectural leap and officially relicenses under the business-friendly **Apache License 2.0**, bringing the following core advancements:
 

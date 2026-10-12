@@ -113,6 +113,15 @@ def test_agent_channel_protocol_is_text_only(monkeypatch, tmp_path: Path):
     doc = tmp_path / "paper.pdf"
     doc.write_bytes(b"%PDF-1.4 agent channel contract probe")
 
+    # 隔离纪律：任何外部调用都必须 fake。此前漏了 agent submit，测试会真的对
+    # mineru.net 发起一次 POST（离线/受控环境下直接失败）。
+    monkeypatch.setattr(
+        client, "_paid_post",
+        lambda url, body, **kwargs: {
+            "code": 0,
+            "data": {"task_id": "agent-task-1", "file_url": "https://example.invalid/upload"},
+        },
+    )
     monkeypatch.setattr(client, "_upload_payload", lambda path: (b"payload", []))
     monkeypatch.setattr(mineru_module, "_put_upload", lambda url, payload, timeout: None)
     monkeypatch.setattr(

@@ -368,12 +368,24 @@ def fanout_search(
                 profile = indexer._embedding_profile
                 space = profile.fingerprint
                 if space not in query_by_space:
-                    try:
-                        query_by_space[space] = embed_with_profile(
-                            indexer.embedding_provider, [query], profile, query=True)[0]
-                    except Exception as exc:
+                    # `query_max_posts`：一次 fan-out 里允许发出的付费查询嵌入上限（按
+                    # profile 去重）。此前这个键没有任何消费者，跨库检索可以无上限地
+                    # 逐库发付费查询 POST（v0.9.2 复核修正）。
+                    # `query_by_space` 的键数 == 已尝试过的 profile 数（含失败的），
+                    # 所以用它当计数器既覆盖成功也覆盖"可能已计费"的失败。
+                    limit = int(getattr(getattr(indexer.config, "request_control", None),
+                                        "query_max_posts", 8) or 8)
+                    if len(query_by_space) >= limit:
                         query_by_space[space] = None
-                        errors[f"_query_embedding:{space}"] = str(exc)
+                        errors[f"_query_embedding:{space}"] = (
+                            f"query_max_posts={limit} reached; semantic search skipped for this vault")
+                    else:
+                        try:
+                            query_by_space[space] = embed_with_profile(
+                                indexer.embedding_provider, [query], profile, query=True)[0]
+                        except Exception as exc:
+                            query_by_space[space] = None
+                            errors[f"_query_embedding:{space}"] = str(exc)
                 query_vector = query_by_space[space]
                 skip_semantic = query_vector is None
             chunks = indexer.search(

@@ -11,7 +11,7 @@ import time
 from argparse import ArgumentParser
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from . import __version__
 from .config import load_config, resolve_config_path
@@ -221,6 +221,8 @@ def _tool_definitions() -> list[dict[str, Any]]:
             "description": "把知识库的索引快照（chunks + 向量 + FTS）导出为 zip 文件，用于换机/换目录迁移，导入后无需全量重新 embedding。要求缓存已启用且完成过至少一次索引。",
             "inputSchema": {"type": "object", "required": ["out_path"], "properties": {
                 "out_path": {"type": "string", "description": "必填，快照输出路径（.zip）"},
+                "overwrite": {"type": "boolean", "default": False,
+                              "description": "目标 zip 已存在时覆盖它（实现此前已支持，schema 漏声明会让严格客户端无法传）"},
                 "vault_path": {"type": "string", "description": vault_path_hint},
             }},
         },
@@ -238,9 +240,26 @@ def _tool_definitions() -> list[dict[str, Any]]:
         },
         {
             "name": "kb_rebuild",
-            "description": "删除指定知识库的磁盘缓存并强制全量重建索引（首次建库或内容大改后用）。",
+            "description": "删除指定知识库的磁盘缓存并强制全量重建索引（首次建库或内容大改后用）。外部付费库缺 confirm_cost 时只返回预览，不清缓存、不启动监听、不发送请求。",
             "inputSchema": {"type": "object", "properties": {
                 "vault_path": {"type": "string", "description": vault_path_hint},
+                "confirm_cost": {"type": "boolean", "default": False, "description": "确认外部全量重算的重复计费风险；外部模式必需"},
+            }},
+        },
+        {
+            "name": "kb_request_control",
+            "description": "只读查看或显式处置本机外部请求控制状态（未知结果 hold / 明确暂停 / 旧记录迁移 / 成果审计与保留期清理）。必须显式传 vault_path；所有变更默认 dry_run，需显式 dry_run=false。不联网、不安排刷新、不启动监听。",
+            "inputSchema": {"type": "object", "required": ["vault_path", "action"], "properties": {
+                "vault_path": {"type": "string", "description": "**必填**：目标知识库绝对路径（防止恢复错库）"},
+                "action": {"type": "string", "enum": ["list", "inspect", "retry", "abandon", "release",
+                                                      "pause_route", "resume_route", "resolve_legacy",
+                                                      "audit_complete", "prune_audit"],
+                           "description": "list/inspect 只读；retry 需 confirm_repeat_cost；abandon 退出自动续算；release 解除占用让下一轮可重发（旧 owner 已死的 sending 批次唯一出口，非 reserved 需 confirm_repeat_cost）；pause_route/resume_route 改明确暂停；resolve_legacy 处置列出的旧记录；audit_complete 用持久向量证据复核历史 complete 批次（需该库索引器，会写库）；prune_audit 按 request_control.audit_retention_days 清终态审计行"},
+                "batch_id": {"type": "string", "description": "inspect / retry / abandon / release 的目标批次"},
+                "profile_fingerprint": {"type": "string", "description": "pause_route / resume_route 的目标 profile 精确指纹"},
+                "request_ids": {"type": "array", "items": {"type": "string"}, "description": "resolve_legacy 要处置的旧 request_id 列表"},
+                "confirm_repeat_cost": {"type": "boolean", "default": False, "description": "确认可能重复计费（retry / resolve_legacy 必需；release 在非 reserved 状态必需）"},
+                "dry_run": {"type": "boolean", "default": True, "description": "默认 true：只预览；显式 false 才落库"},
             }},
         },
         {
@@ -937,8 +956,15 @@ class VaultMcpServer:
             key = str(Path(vault_path).expanduser().resolve())
             indexer = self._indexers.get(key)
             fp = getattr(getattr(provider, "profile", None), "fingerprint", "")
+            # 模式必须**显式**装配。此前两条旁路都没传 `mode=`，provider 于是回落到模块级
+            # 默认（legacy_profile），在 shipped 默认是 bounded_resume 的情况下静默降级成
+            # 「审计写失败即拒绝发送 / 丢掉已收到的响应」（v0.9.2 复核修正）。
+            from . import request_lifecycle
+            configured = str(getattr(getattr(self.config, "request_control", None), "mode", "")
+                             or "").strip().lower()
+            mode = configured or request_lifecycle.get_request_control_mode()
             if indexer is not None:
-                indexer.configure_paid_provider("media", provider, fp)
+                indexer.configure_paid_provider("media", provider, fp, mode=mode)
             elif getattr(provider, "is_local_free", False) is True:
                 # 未建 indexer 的旁路装配：零成本端点同样不进台账（issue #12），
                 # 与 indexer.configure_paid_provider 保持同一判据。
@@ -951,7 +977,7 @@ class VaultMcpServer:
                     guard = lambda profile_fp: paid_request_guard(control, profile_fp)
                     configure = getattr(provider, "configure_paid_requests", None)
                     if callable(configure):
-                        configure(journal, guard, fp)
+                        configure(journal, guard, fp, mode=mode)
         return provider, None
 
     def _media_provider(self, vault_path: str | Path | None = None) -> Any:
@@ -1091,7 +1117,8 @@ class VaultMcpServer:
             group_offsets=group_offsets,
         )
 
-    # v0.8.0 Phase 1：call_tool 由巨型 if 链改为显式路由表（15 个 kb_* 工具 → 处理方法）。
+    # v0.8.0 Phase 1：call_tool 由巨型 if 链改为显式路由表；工具数随版本增长
+    # （v0.9.2 起 17 个），此处不再钉具体数字，以 `_tool_definitions()` 为准。
     # 工具名、参数语义、返回结构与 unknown-tool 报错行为完全不变（MCP 协议契约）。
     _TOOL_ROUTE_TABLE: dict[str, str] = {
         "kb_init": "_kb_init",
@@ -1102,6 +1129,7 @@ class VaultMcpServer:
         "kb_ingest": "_kb_ingest",
         "kb_set_weight": "_kb_set_weight",
         "kb_rebuild": "_kb_rebuild",
+        "kb_request_control": "_kb_request_control",
         "kb_export": "_kb_export",
         "kb_import": "_kb_import",
         "kb_search": "_kb_search",
@@ -1214,12 +1242,91 @@ class VaultMcpServer:
         #      近空转的首轮 sync（此时索引已是最新，该轮基本不做任何事）。
         # 结果是冷/温两条路径都只剩前台 `rebuild()` 那一次全量。
         indexer = self._indexer_for(arguments, autostart=False)
+        # v0.9.2 §9：外部全量重算必须先确认。缺确认时只返回预览——不清缓存、
+        # 不停止/启动监听、不发送任何请求。
+        confirm_cost = arguments.get("confirm_cost", False)
+        if not isinstance(confirm_cost, bool):
+            # 与 `_kb_request_control` 的 confirm_repeat_cost 同口径：LLM 客户端很容易
+            # 把布尔写成字符串 "false"，而 `bool("false")` 是 True —— 等于直接放行付费重建。
+            raise ValueError("confirm_cost must be a boolean")
+        paid_paths = _rebuild_paid_paths(indexer)
+        if paid_paths and not confirm_cost:
+            from ._indexer import embedding_resume
+            control = indexer._paid_control_store()
+            held = 0
+            active = 0
+            if control is not None:
+                try:
+                    summary = embedding_resume.held_summary(control)
+                    held = int(summary.get("held_components") or 0)
+                    active = int(summary.get("active_components") or 0)
+                except Exception:
+                    held = -1
+            pending_items = 0
+            for chunks in getattr(indexer, "_chunks", {}).values():
+                for chunk in chunks:
+                    if chunk.metadata.get("embedding_disabled"):
+                        continue
+                    if not indexer._chunk_has_vector(chunk):
+                        pending_items += 1
+            media = getattr(indexer, "media_provider", None)
+            return {
+                "rebuild": "preview",
+                "applied": False,
+                "vault_path": str(indexer.vault_path),
+                "profile_fingerprint": getattr(indexer._embedding_profile, "fingerprint", ""),
+                "paid_paths": paid_paths,
+                "media_profile_fingerprint": str(
+                    getattr(getattr(media, "profile", None), "fingerprint", "") or ""),
+                "pending_items_estimate": pending_items,
+                "estimated_posts": "unknown (depends on batch_size and dedup)",
+                "held_components": held,
+                # 中断残留的 active 占用同样不会被重放，但会挡住这些输入身份：预览里
+                # 必须能看见，否则用户以为"重建一遍就好了"。
+                "active_components": active,
+                "requires": "confirm_cost=true",
+                "note": "rebuild repeats paid embedding on every paid path listed above; "
+                        "held/active components are never replayed and MinerU parsing is not re-run",
+            }
         indexer.stop_watching()
         try:
             indexer.rebuild()
         finally:
             indexer.start_watching(skip_initial_sync=True)
         return indexer.stats()
+
+    def _kb_request_control(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        """精确查看/处置外部请求控制状态；必须显式 vault_path，默认 dry_run。"""
+        vault_path = str(arguments.get("vault_path", "")).strip()
+        if not vault_path:
+            raise ValueError("vault_path is required for kb_request_control")
+        action = str(arguments.get("action", "")).strip()
+        if action not in REQUEST_CONTROL_ACTIONS:
+            raise ValueError(
+                f"action must be one of {list(REQUEST_CONTROL_ACTIONS)} for kb_request_control")
+        dry_run = arguments.get("dry_run", True)
+        if not isinstance(dry_run, bool):
+            raise ValueError("dry_run must be a boolean")
+        confirm = arguments.get("confirm_repeat_cost", False)
+        if not isinstance(confirm, bool):
+            raise ValueError("confirm_repeat_cost must be a boolean")
+        request_ids = arguments.get("request_ids") or ()
+        if not isinstance(request_ids, (list, tuple)) or any(
+                not isinstance(item, str) or not item for item in request_ids):
+            raise ValueError("request_ids must be a list of non-empty strings")
+        if action in {"retry", "abandon", "release"} and not str(arguments.get("batch_id", "")).strip():
+            raise ValueError(f"batch_id is required for action={action}")
+        if action in {"pause_route", "resume_route"} and not str(
+                arguments.get("profile_fingerprint", "")).strip():
+            raise ValueError(f"profile_fingerprint is required for action={action}")
+        if action == "resolve_legacy" and not request_ids:
+            raise ValueError("request_ids is required for action=resolve_legacy")
+        return request_control_action(
+            vault_path=vault_path, action=action,
+            batch_id=str(arguments.get("batch_id", "")),
+            profile_fingerprint=str(arguments.get("profile_fingerprint", "")),
+            request_ids=request_ids, confirm_repeat_cost=confirm, dry_run=dry_run,
+            indexer_provider=lambda: self._indexer_for(arguments, autostart=False))
 
     def _kb_export(self, arguments: dict[str, Any]) -> dict[str, Any]:
         indexer = self._indexer_for(arguments)
@@ -1905,13 +2012,59 @@ class VaultMcpServer:
                 stats["paid_route_blocked"] = blocked
         if getattr(indexer, "_embedding_paused", False):
             stats["embedding_paused"] = True
-            stats["embedding_paused_reason"] = (
-                "paid embedding is paused: an earlier paid request has an unknown outcome; "
-                "confirm or abandon those intents (see pending_paid_requests) before retrying"
-                if unresolved_intents else
-                "paid embedding requires explicit approval for the current profile "
-                "(run --approve-reembedding <profile_fingerprint>)"
-            )
+            rc_reason = getattr(indexer.config, "request_control", None)
+            if str(getattr(rc_reason, "background_embedding", "enabled") or "enabled").strip().lower() == "manual":
+                # `manual` 是用户**自己选的策略**，不是"有未决请求/需要授权"：此前它落进
+                # else 分支，被报成 "requires explicit approval (run --approve-reembedding)"，
+                # 把人指向一个对 manual 完全无效的动作（v0.9.2 复核修正）。
+                stats["embedding_paused_reason"] = (
+                    "background embedding is disabled by policy "
+                    "(request_control.background_embedding=manual): background sync and watch will "
+                    "not compute external document/media vectors; set it to 'enabled' to resume")
+            elif unresolved_intents:
+                stats["embedding_paused_reason"] = (
+                    "paid embedding is paused: an earlier paid request has an unknown outcome; "
+                    "confirm or abandon those intents (see pending_paid_requests) before retrying")
+            else:
+                stats["embedding_paused_reason"] = (
+                    "paid embedding requires explicit approval for the current profile "
+                    "(run --approve-reembedding <profile_fingerprint>)")
+        # v0.9.2 §9：请求控制结构化诊断。只读，不安排刷新、不启动监听、不联网。
+        try:
+            from ._indexer import embedding_resume as _resume
+            mode = indexer.request_control_mode()
+            control = indexer._paid_control_store()
+            held = _resume.held_summary(control) if control is not None else {
+                "available": False, "held_batches": 0, "held_components": 0,
+                "active_batches": 0, "active_components": 0, "updated_at": 0.0}
+            rc = getattr(indexer.config, "request_control", None)
+            limit = int(getattr(rc, "background_max_posts_per_round", 32) or 32)
+            used = int(getattr(indexer, "_post_budget_used", 0) or 0)
+            background_embedding = str(getattr(rc, "background_embedding", "enabled") or "enabled")
+            stats["request_control"] = {
+                "mode": mode,
+                "background_embedding": background_embedding,
+                "background_state": ("paused" if getattr(indexer, "_embedding_paused", False)
+                                     else "manual" if background_embedding == "manual"
+                                     else "deferred" if used >= limit else "enabled"),
+                "effective_paid_workers": 1 if indexer.config.embedding.mode == "external" else 0,
+                "posts_used": used,
+                "posts_limit": limit,
+                "query_max_posts": int(getattr(rc, "query_max_posts", 8) or 8),
+                "audit_retention_days": int(getattr(rc, "audit_retention_days", 30) or 0),
+                "held_batches": int(held.get("held_batches") or 0),
+                "held_components": int(held.get("held_components") or 0),
+                # 中断残留的 active 占用：不在 hold 集合里，但同样挡住这些输入身份，
+                # 必须单独可见（否则"卡住"只能靠 kb_request_control list 手工翻）。
+                "active_batches": int(held.get("active_batches") or 0),
+                "active_components": int(held.get("active_components") or 0),
+                "paused_routes": sorted(indexer.paused_route_fingerprints()),
+                "audit_write_errors": int(getattr(indexer.embedding_provider, "audit_write_errors", 0) or 0),
+                "legacy_migration_pending": len(_legacy_migration_pending(control)) if control is not None else 0,
+                "resume_store_available": bool(held.get("available", False)),
+            }
+        except Exception:
+            stats["request_control"] = {"mode": "unknown", "resume_store_available": False}
         if getattr(indexer, "_paid_profile_requires_approval", False):
             stats["pending_reembedding_approval"] = True
             try:
@@ -2201,8 +2354,13 @@ def _explicit_config_problem(explicit: str | Path | None) -> str:
     return ""
 
 
+def _config_for(config_path: str | Path | None = None):
+    """管理入口自己的配置解析（与 `_control_for` 同一口径，供策略侧只读查询）。"""
+    return load_config(resolve_config_path(config_path))
+
+
 def _control_for(vault_path: str | Path, config_path: str | Path | None = None):
-    config = load_config(resolve_config_path(config_path))
+    config = _config_for(config_path)
     target = Path(vault_path).expanduser()
     return resolve_storage_layout(config, target)
 
@@ -2270,22 +2428,321 @@ def abandon_request(request_id: str, *, vault_path: str | Path,
                         "repeat work that was already processed (and billed) before")}
 
 
+def _rebuild_paid_paths(indexer: Any) -> list[str]:
+    """`rebuild` 会实际走到的**付费**路径（空列表 = 零成本重建）。
+
+    文本与原生媒体是**两条独立装配**的 provider（媒体走 `media_*` 配置），所以只判
+    文本 provider 的 `is_local_free` 会让「文本 static/loopback + 付费媒体端点」这类
+    配置无确认重建并扣费（v0.9.2 复核修正）。
+    """
+    paths: list[str] = []
+    text_external = str(getattr(indexer.config.embedding, "mode", "")) == "external"
+    if text_external and not bool(getattr(indexer.embedding_provider, "is_local_free", False)):
+        paths.append("text")
+    media = getattr(indexer, "media_provider", None)
+    if media is not None and not bool(getattr(media, "is_local_free", False)):
+        paths.append("native_media")
+    return paths
+
+
+#: `kb_request_control` 的合法动作（v0.9.2 §9）。
+#
+#: `release`：把批次的占用解除，让下一轮可以重新计划这个输入身份。这是**唯一**能
+#: 解锁「旧 owner 已死但 token 无法证明」的 `sending` 批次的入口（跨进程自动清理按
+#: 设计不做）。因为它可能让已发出的请求再发一次，非 `reserved` 状态必须显式确认。
+#: `audit_complete`：用持久向量证据复核历史 `complete` 批次，成果丢失的转
+#: `held_result_missing`（§5 的成果审计；需要该库的向量证据，CLI 侧无索引器时拒绝）。
+REQUEST_CONTROL_ACTIONS = ("list", "inspect", "retry", "abandon", "release",
+                           "pause_route", "resume_route", "resolve_legacy", "audit_complete",
+                           "prune_audit")
+
+
+def _legacy_migration_pending(control: Any, *,
+                              errors: list[str] | None = None) -> list[dict[str, Any]]:
+    """旧 journal 中**无法可靠映射到组件**的相关记录（保守边界，不猜映射）。
+
+    * `prepared` / `submission_unknown`：可能根本没发出，也可能已计费；
+    * `success`：可能来自向量校验前记账，或落到 cache 之前崩溃；
+    * `abandoned`：人工放弃不证明未收费，也不自动授予重算许可。
+
+    只有当该旧记录已有可信映射（存在 `operation_id="legacy:<request_id>"` 的迁移
+    批次，或已登记到 `legacy_dispositions`）时才不列入。
+
+    这是**人工处置台账**，不是路由暂停判据：列入不会冻结任何请求（v0.9.2 复核
+    订正）。旧记录根本没有组件身份，既无法证明"已算过"也无法证明"没算过"，把它们
+    当成 profile 级暂停只会重演 v0.8.x 的"一条 unknown 冻死整库"——而这正是本次改造
+    要撤掉的东西。真正影响放行的是：组件级 hold（同身份）与显式撤销/暂停清单。
+    处置动作是 `resolve_legacy`（登记 disposition，不改历史事实状态）。
+    """
+    from ._indexer import embedding_resume
+    try:
+        intents = control.list_request_intents()
+    except Exception as exc:
+        # 读失败绝不能被上报成「没有待处置旧记录」（那是假全清）：显式记账，
+        # 与续算侧 `held_summary` 的 `available=False` 同口径。
+        if errors is not None:
+            errors.append(f"intents_unreadable:{exc}")
+        return []
+    mapped: set[str] = set()
+    try:
+        for batch in embedding_resume.list_embedding_work(control):
+            operation = str(batch.get("operation_id") or "")
+            if operation.startswith("legacy:"):
+                mapped.add(operation[len("legacy:"):])
+    except Exception as exc:
+        if errors is not None:
+            errors.append(f"work_unreadable:{exc}")
+        mapped = set()
+    try:
+        # 已人工处置（含 success/abandoned 这类不可改状态的历史事实）→ 退出待处置集合。
+        mapped |= control.legacy_disposition_ids()
+    except Exception as exc:
+        if errors is not None:
+            errors.append(f"dispositions_unreadable:{exc}")
+    pending = []
+    for row in intents:
+        request_id = str(row.get("request_id") or "")
+        state = str(row.get("state") or "")
+        if state not in {"prepared", "submission_unknown", "success", "abandoned"}:
+            continue
+        if request_id in mapped:
+            continue
+        # 新代码（v0.9.2 起）写的意图自带 writer 标记：它的决策不依赖 journal，
+        # 也不可能「无法映射到组件」，所以不属于待处置对象。旧版本写入的行
+        # writer 为空串 → 无法可靠排除，保守列入。
+        if str(row.get("writer") or "") == "v092":
+            continue
+        pending.append({"request_id": request_id, "kind": str(row.get("kind") or ""),
+                        "state": state, "reason": str(row.get("reason") or ""),
+                        "profile_fingerprint": str(row.get("profile_fingerprint") or "")})
+    return pending
+
+
+def request_control_action(*, vault_path: str | Path, action: str, batch_id: str = "",
+                          profile_fingerprint: str = "", request_ids: Sequence[str] = (),
+                          confirm_repeat_cost: bool = False, dry_run: bool = True,
+                          config_path: str | Path | None = None,
+                          indexer_provider: Any = None) -> dict[str, Any]:
+    """精确恢复/暂停的业务函数：MCP 工具与管理 CLI 共用同一份实现。
+
+    * 必须显式给 `vault_path`（防止恢复错库）；
+    * 所有变更默认 dry_run=True，必须显式 `dry_run=false` 才落库；
+    * 只读动作（list/inspect）不安排 refresh、不启动 watch、不联网；
+    * `retry` 必须 `confirm_repeat_cost=true`，且拒绝仍活跃的 sending 批次；
+    * `abandon` 只转 `manual_only`（退出自动续算），**不**释放组件让 watch 重发；
+    * `release` 解除占用让下一轮可重发（旧 owner 已死的 `sending` 批次唯一出口）；
+      非 `reserved` 状态必须 `confirm_repeat_cost=true`；
+    * `audit_complete` 需要 `indexer_provider`（向量证据），没有就明确拒绝而不是
+      假装审计过；`audit_complete` 会写库，因此同样受 `dry_run` 约束。
+    """
+    from .doc_store import ControlStore
+    from ._indexer import embedding_resume
+
+    if not str(vault_path or "").strip():
+        return {"applied": False, "error": "VAULT_PATH_REQUIRED",
+                "hint": "kb_request_control requires an explicit vault_path"}
+    if action not in REQUEST_CONTROL_ACTIONS:
+        return {"applied": False, "error": "UNSUPPORTED_ACTION",
+                "supported": list(REQUEST_CONTROL_ACTIONS)}
+    read_only = action in {"list", "inspect"}
+    write = not read_only and not dry_run
+    layout = _control_for(vault_path, config_path)
+    control = ControlStore(layout)
+    try:
+        try:
+            control.open(create=False, write=write)
+        except Exception as exc:
+            return {"applied": False, "error": "CONTROL_STORE_UNAVAILABLE",
+                    "detail": str(exc)[:200], "vault_path": str(vault_path)}
+        legacy_errors: list[str] = []
+        legacy = _legacy_migration_pending(control, errors=legacy_errors)
+        try:
+            work = embedding_resume.list_embedding_work(
+                control, batch_id=str(batch_id or ""))
+        except Exception as exc:
+            work = []
+            work_error = str(exc)[:200]
+        else:
+            work_error = ""
+        base = {"vault_path": str(Path(vault_path).expanduser()), "action": action,
+                "dry_run": bool(dry_run), "legacy_migration_pending": legacy,
+                **({"legacy_read_error": list(legacy_errors)} if legacy_errors else {}),
+                "resume_store_error": work_error,
+                "work": [{"batch_id": b["batch_id"], "state": b["state"],
+                          "outcome": b.get("outcome", ""),
+                          "purpose_family": b.get("purpose_family", ""),
+                          "profile_fingerprint": b.get("profile_fingerprint", ""),
+                          "reason": b.get("reason", ""),
+                          "components": len(b.get("components") or ())} for b in work]}
+        if read_only:
+            base["applied"] = False
+            base["read_only"] = True
+            return base
+        if action in {"retry", "abandon"} and not str(batch_id or "").strip():
+            return {**base, "applied": False, "error": "BATCH_ID_REQUIRED"}
+        if action in {"pause_route", "resume_route"} and not str(profile_fingerprint or "").strip():
+            return {**base, "applied": False, "error": "PROFILE_FINGERPRINT_REQUIRED"}
+        if action == "resolve_legacy" and not list(request_ids or ()):
+            return {**base, "applied": False, "error": "REQUEST_IDS_REQUIRED"}
+        if dry_run:
+            return {**base, "applied": False, "preview": True,
+                    "hint": "set dry_run=false to apply"}
+        if action == "pause_route":
+            control.revoke_paid_authorization(str(profile_fingerprint))
+            return {**base, "applied": True, "route_paused": str(profile_fingerprint)}
+        if action == "resume_route":
+            # 只解除**明确暂停**；绝不解除 batch hold。
+            #
+            # 暂停有两个来源：配置 `paused_profiles` ∪ 旧控制库里 revoked 的 profile。这里
+            # 只能清 DB 侧；配置侧是运维自己的清单，不该由这个工具代改。但**必须如实报告**
+            # —— 此前无条件返回 applied=true，config 清单里的指纹一个请求都不会被放行，
+            # 运维会以为已经恢复（v0.9.2 复核修正）。
+            paused_by_config = False
+            try:
+                cfg = _config_for(config_path)
+                rc = getattr(cfg, "request_control", None)
+                paused_by_config = str(profile_fingerprint) in {
+                    str(item) for item in (getattr(rc, "paused_profiles", ()) or ())}
+            except Exception:
+                paused_by_config = False
+            if paused_by_config:
+                # 命中配置暂停时**绝不写库**。此前先调 `authorize_paid_profile`
+                # （INSERT OR REPLACE … revoked_at=NULL）再判配置清单，于是返回
+                # applied=false 的同时已经把控制库里的显式撤销清掉了：报告与副作用
+                # 自相矛盾，而且运维一旦把该指纹从配置移除，路由会在没有再次 resume 的
+                # 情况下静默恢复付费发送。
+                return {**base, "applied": False, "route_resumed": False,
+                        "paused_by_config": True, "error": "ROUTE_PAUSED_BY_CONFIG",
+                        "hint": ("this fingerprint is also listed in request_control.paused_profiles; "
+                                 "remove it from the app config to actually resume the route")}
+            control.authorize_paid_profile(str(profile_fingerprint), scope="resume_route",
+                                           note="explicit route resume (does not release batch holds)")
+            return {**base, "applied": True, "route_resumed": str(profile_fingerprint),
+                    "paused_by_config": False}
+        if action == "resolve_legacy":
+            if not confirm_repeat_cost:
+                return {**base, "applied": False,
+                        "error": "RESOLVE_LEGACY_NEEDS_CONFIRMATION",
+                        "hint": "confirm_repeat_cost=true is required; legacy records may "
+                                "already have been charged"}
+            dispositions = []
+            applied_any = False
+            for request_id in request_ids:
+                rid = str(request_id)
+                record = next((row for row in legacy if row["request_id"] == rid), None)
+                if record is None:
+                    dispositions.append({"request_id": rid, "applied": False,
+                                         "error": "NOT_IN_PENDING_SET"})
+                    continue
+                # `prepared` / `submission_unknown` 仍未决：按旧语义转 abandoned。
+                moved = False
+                if record["state"] in {"prepared", "submission_unknown"}:
+                    moved = control.mark_intent(
+                        rid, "abandoned",
+                        reason="resolve_legacy: confirmed repeat-cost disposition",
+                        expected_states=("prepared", "submission_unknown"))
+                # success / abandoned 是历史事实：状态不可改，只登记「已处置」。
+                # 幂等：重复处置返回 False，且不谎报 applied。
+                registered = control.record_legacy_disposition(
+                    rid, kind=record["kind"], state=record["state"],
+                    note="resolve_legacy: operator confirmed repeat-cost disposition")
+                row_applied = bool(moved or registered)
+                applied_any = applied_any or row_applied
+                dispositions.append({"request_id": rid, "applied": row_applied,
+                                     "state": record["state"],
+                                     "state_moved": bool(moved),
+                                     "disposition_registered": bool(registered),
+                                     **({} if row_applied else {"error": "ALREADY_DISPOSED"})})
+            return {**base, "applied": applied_any, "dispositions": dispositions}
+        if action == "release":
+            target = next((b for b in work if b["batch_id"] == str(batch_id)), None)
+            if target is None:
+                return {**base, "applied": False, "error": "BATCH_NOT_FOUND"}
+            state = str(target.get("state") or "")
+            if state != "reserved" and not confirm_repeat_cost:
+                # `reserved` 从未进入 sending，释放它不可能重复计费；其余状态释放后
+                # 下一轮会重新 POST，必须显式确认（与 retry 同一口径）。
+                return {**base, "applied": False, "error": "RELEASE_NEEDS_CONFIRMATION",
+                        "batch_state": state,
+                        "hint": ("releasing a batch that may already have been sent lets the next "
+                                 "round issue a billed request again; pass confirm_repeat_cost=true")}
+            result = embedding_resume.resolve_embedding_work(
+                control, str(batch_id), action="release",
+                confirm_repeat_cost=bool(confirm_repeat_cost),
+                # 快照状态一并传入：store 在同一事务内按**刚读到的**状态复核，
+                # 避免把「快照时是 reserved（免确认）」套用到刚推进到 sending 的批次。
+                expected_state=state,
+                note="operator release via kb_request_control")
+            return {**base, **result}
+        if action == "audit_complete":
+            indexer = indexer_provider() if callable(indexer_provider) else None
+            if indexer is None:
+                return {**base, "applied": False, "error": "AUDIT_REQUIRES_INDEXER",
+                        "hint": ("audit_complete needs this vault's persistent vector evidence; "
+                                 "run it through the kb_request_control MCP tool")}
+            from .doc_store import resolve_storage_layout
+            try:
+                layout = resolve_storage_layout(indexer.config, indexer.vault_path)
+                audit = embedding_resume.recover_interrupted_batches(
+                    control, layout=layout, owner_token="",
+                    verify_recoverable=indexer.resume_recoverable_probe(),
+                    audit_complete=True, states=("complete",),
+                    # 审计看的是**成果证据**，与 owner 是否存活无关：历史 complete 批次的
+                    # owner 早就退出了，只有持久向量能证明它真的算过。
+                    owner_predicate=lambda _token: True)
+            except Exception as exc:  # noqa: BLE001 - 审计失败必须显式报，不能报"没问题"
+                return {**base, "applied": False, "error": "AUDIT_FAILED", "detail": str(exc)[:200]}
+            return {**base, "applied": bool(audit.get("held_complete")), "audit": audit}
+        if action == "prune_audit":
+            # `request_control.audit_retention_days` 此前是个纯装饰键：没有任何代码读它，
+            # 于是承诺的"只清终态审计"从未发生，journal/续算表无界增长（v0.9.2 复核修正）。
+            # 清理是显式动作（且受 dry_run 约束），不在同步热路径上偷偷删行。
+            days = 0
+            try:
+                days = int(getattr(getattr(_config_for(config_path), "request_control", None),
+                                   "audit_retention_days", 0) or 0)
+            except Exception:
+                days = 0
+            if days <= 0:
+                return {**base, "applied": False, "error": "RETENTION_DISABLED",
+                        "hint": ("request_control.audit_retention_days=0 keeps every audit row; "
+                                 "set it to N>0 days to enable pruning")}
+            return {**base, **control.prune_audit(days)}
+        result = embedding_resume.resolve_embedding_work(
+            control, str(batch_id), action=action, confirm_repeat_cost=confirm_repeat_cost,
+            note="operator via kb_request_control")
+        return {**base, **result}
+    finally:
+        control.close()
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = ArgumentParser(prog="mortis-rag-mcp")
     parser.add_argument("--serve-mcp-stdio", action="store_true")
     parser.add_argument("--app-config", default=None)
     parser.add_argument("--doctor", action="store_true",
-                        help="全量探测本机环境（含 API 真实调用）并重写 ~/.mortis_rag_mcp/STATUS.md 与 status.json")
+                        help="全量探测本机环境（含 API 真实调用）并重写 ~/.mortis_rag_mcp/STATUS.md 与 status.json"
+                             "；不指向具体知识库，**不需要 --vault**")
     parser.add_argument("--approve-reembedding", default=None, metavar="PROFILE_FINGERPRINT",
                         help="显式授权精确 embedding profile 的付费重嵌（只写本机授权记录，不调用 API）")
     parser.add_argument("--migrate-ingest", action="store_true",
                         help="迁移旧 .mortis-parsed 镜像到文档库（默认 dry-run；不联网、不删除旧镜像）")
-    parser.add_argument("--apply", action="store_true", help="仅 --migrate-ingest 可用：真正写库")
+    parser.add_argument("--apply", action="store_true",
+                        help="仅 --migrate-ingest 或 --request-control 可用：真正写库（其余动作默认 dry-run）")
     parser.add_argument("--list-requests", action="store_true",
                         help="只读列出本机付费请求意图（需 --vault；不发起请求）")
     parser.add_argument("--abandon-request", default=None, metavar="REQUEST_ID",
                         help="放弃一条未决付费请求意图（需 --vault；只改本机记录，不重发、不授权）")
-    parser.add_argument("--vault", default=None, help="管理操作（--approve-reembedding / --migrate-ingest / --list-requests / --abandon-request）的目标库路径")
+    parser.add_argument("--request-control", default=None, metavar="ACTION",
+                        help="请求控制管理入口（需 --vault）：list|inspect|retry|abandon|release|"
+                             "pause_route|resume_route|resolve_legacy|prune_audit（audit_complete 需要"
+                             "向量证据，只能用 MCP 工具 kb_request_control）")
+    parser.add_argument("--batch-id", default=None, metavar="BATCH_ID")
+    parser.add_argument("--profile-fingerprint", default=None, metavar="FINGERPRINT")
+    parser.add_argument("--request-ids", default=None, metavar="ID[,ID...]")
+    parser.add_argument("--confirm-repeat-cost", action="store_true",
+                        help="确认可能重复计费（retry / resolve_legacy 必需；--request-control 需配合 --apply 才落库）")
+    parser.add_argument("--vault", default=None, help="管理操作（--approve-reembedding / --migrate-ingest / --list-requests / --abandon-request / --request-control）的目标库路径")
     parser.add_argument("--quiet", action="store_true", help="静默模式，禁止输出到 stdout")
     args = parser.parse_args(argv)
     # 管理 action 互斥（E06）：一次只做一件事，避免组合出意外副作用。
@@ -2296,16 +2753,20 @@ def main(argv: list[str] | None = None) -> int:
         ("--approve-reembedding", args.approve_reembedding is not None),
         ("--list-requests", args.list_requests),
         ("--abandon-request", args.abandon_request is not None),
+        ("--request-control", args.request_control is not None),
     ) if value]
     if len(selected) > 1:
         parser.error("management actions are mutually exclusive: " + ", ".join(selected))
-    if args.apply and not args.migrate_ingest:
-        parser.error("--apply is only valid with --migrate-ingest")
+    if args.apply and not (args.migrate_ingest or args.request_control is not None):
+        parser.error("--apply is only valid with --migrate-ingest or --request-control")
     if not selected and not args.serve_mcp_stdio:
         parser.error("--serve-mcp-stdio is required")
     if selected and "--serve-mcp-stdio" not in selected:
         # 管理操作必须显式指向目标库（正常 serve 不受此限制）。
-        if not args.vault:
+        # `--doctor` 例外：它不消费 vault_path（`doctor.run` 只用 app_config），强制
+        # `--vault` 会让文档里的 `python -m mortis_rag_mcp --doctor` 直接 exit 2
+        # （README / QUICKSTART 都是这条命令）。门禁只应该管**真的要用库的**动作。
+        if not args.vault and "--doctor" not in selected:
             parser.error("--vault is required for " + ", ".join(selected))
     # 坏配置绝不静默回落：显式 --app-config 或实际选中的 env 无效 → 退出 2。
     problem = _explicit_config_problem(args.app_config)
@@ -2320,6 +2781,17 @@ def main(argv: list[str] | None = None) -> int:
     if args.abandon_request is not None:
         result = abandon_request(args.abandon_request, vault_path=args.vault,
                                  config_path=args.app_config)
+        if not args.quiet:
+            sys.stdout.write(json.dumps(result, ensure_ascii=False) + "\n")
+        return 0
+    if args.request_control is not None:
+        ids = tuple(part.strip() for part in str(args.request_ids or "").split(",") if part.strip())
+        result = request_control_action(
+            vault_path=args.vault, action=str(args.request_control).strip(),
+            batch_id=str(args.batch_id or ""),
+            profile_fingerprint=str(args.profile_fingerprint or ""),
+            request_ids=ids, confirm_repeat_cost=bool(args.confirm_repeat_cost),
+            dry_run=not args.apply, config_path=args.app_config)
         if not args.quiet:
             sys.stdout.write(json.dumps(result, ensure_ascii=False) + "\n")
         return 0

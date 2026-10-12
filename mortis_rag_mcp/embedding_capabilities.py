@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import math
 from string import Formatter
@@ -302,13 +303,61 @@ def embedding_key(profile: ResolvedEmbeddingProfile, text: str, modality: str = 
     return hashlib.sha256(material.encode()).hexdigest()
 
 
-def embed_with_profile(provider: Any, texts: Any, profile: ResolvedEmbeddingProfile, *, query: bool = False) -> list[list[float]]:
+def accepts_keyword(func: Any, name: str) -> bool:
+    """该可调用对象接受关键字 `name` 吗？只读签名，**绝不**用 try/except 试调用。
+
+    拿不到签名时按「接受」处理：宁可让它在参数校验阶段报错，也不要在"可能已经发出
+    物理请求"之后再试第二次调用（那会重复计费）。
+    """
+    try:
+        signature = inspect.signature(func)
+    except (TypeError, ValueError):
+        return True
+    for parameter in signature.parameters.values():
+        if parameter.kind is inspect.Parameter.VAR_KEYWORD:
+            return True
+        if parameter.name == name and parameter.kind in (
+                inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY):
+            return True
+    return False
+
+
+def embed_with_profile(provider: Any, texts: Any, profile: ResolvedEmbeddingProfile, *, query: bool = False,
+                       request_context: Any = None, single_batch: bool = False) -> list[list[float]]:
+    """唯一的模板化路径：模板只在这里应用一次，wrapper 不得再格式化一次。
+
+    `single_batch=True` 时走 provider 的单批入口（**恰好一个物理 POST**），供后台续算
+    使用；旧路径保持多批语义，且失败批绝不自动重发。
+
+    上下文透传靠**读签名**决定，不靠 `try/except TypeError` 试调用：后者在
+    `request_context is None` 时两次调用完全相同，provider 内部任何 `TypeError`
+    都会触发第二次物理请求（重复计费），而注释里承诺的恰恰是「绝不发第二次请求来试」。
+    """
     validate_profile(profile)
     items = list(texts)
     if not items:
         return []
     template = profile.query_template if query else profile.document_template
-    vectors = provider.embed([template.format(text=text) for text in items])
+    formatted = [template.format(text=text) for text in items]
+    single_entry = getattr(provider, "embed_batch_once", None)
+    if single_batch:
+        if not callable(single_entry):
+            # 单批契约必须由 provider 提供：退回 `embed` 会变成多批 = 多次物理 POST，
+            # 而检查点/预算/占用都按"一次调用一次 POST"记账，等于账实不符。
+            raise EmbeddingContractError(
+                "provider does not implement embed_batch_once; single-batch background embedding "
+                "requires exactly one physical POST per call")
+        target = single_entry
+    else:
+        target = getattr(provider, "embed", None)
+        if not callable(target):
+            raise EmbeddingContractError("provider has no embedding entry point")
+    keyword = {} if request_context is None else {"request_context": request_context}
+    if keyword and not accepts_keyword(target, "request_context"):
+        # 第三方 provider 不认识 `request_context`：退回旧签名。这里只是**少传一个**
+        # 关键字，不会造成第二次请求。
+        keyword = {}
+    vectors = target(formatted, **keyword)
     if len(vectors) != len(items):
         raise EmbeddingContractError("embedding batch count mismatch")
     # Providers with resolved profiles have already sliced their native outputs.

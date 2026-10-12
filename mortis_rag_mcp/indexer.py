@@ -39,6 +39,7 @@ from .fts import FtsIndex
 from .ingest import INGEST_EXTS
 from .ingest.tables import iter_table_blocks, split_table_into_chunks
 from .providers import EmbeddingProvider, ProviderError, RerankerProvider, _is_loopback_endpoint, create_embedding_provider, create_media_provider, create_reranker_provider
+from . import request_lifecycle
 from .vector import create_vector_backend
 # v0.8.0 P2：数据模型与缓存编解码提取至私有包 _indexer/（本文件转为 Facade）。
 # 下方 re-export 保持 `from mortis_rag_mcp.indexer import ...` 公开导入面 100% 不变。
@@ -226,6 +227,10 @@ class MarkdownIndexer:
         # 文本后再按 chunk.id 补挂（见 _load_vectors_cache / _attach_pending_vectors）。
         self._pending_vectors: dict[str, Any] = {}
         self.failed_files: dict[str, str] = {}
+        # issue #17：仅进程内抑制重复失败；不落盘，重启即清零。
+        # value = (连续失败次数, 自上次失败起已跳过的同步轮数)。
+        self._embed_failure_quarantine: dict[str, tuple[int, int]] = {}
+        self._embed_quarantine_config_key = ""
         self.persistence_status: dict[str, Any] = {"state": "disabled", "errors": {}}
         self.last_sync: float | None = None
         self._watch_stop = threading.Event()
@@ -278,6 +283,7 @@ class MarkdownIndexer:
             "files_total": 0,
             "chunks_done": 0,
             "chunks_total": 0,
+            "quarantined": 0,
         }
         # v0.9.0 Lane A（C91/C92）：版本化文档库（解析事实）与派生索引分离。
         # 布局只在这里解析路径，store 连接惰性建立——读路径不因为一次查询就建库。
@@ -518,14 +524,48 @@ class MarkdownIndexer:
                              normalize_endpoint(str(getattr(config, "endpoint", "") or ""))))
         return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
+    def request_control_mode(self) -> str:
+        """本次实例的请求控制模式（配置驱动；缺省跟随全局默认）。"""
+        config = getattr(self.config, "request_control", None)
+        mode = str(getattr(config, "mode", "") or "").strip().lower()
+        return mode or request_lifecycle.get_request_control_mode()
+
+    def paused_route_fingerprints(self) -> set[str]:
+        """明确暂停的路由：配置 `paused_profiles` ∪ 旧控制库里明确 revoked 的 profile。
+
+        这是**不可变策略快照**的输入，不是审批清单：正常启用配置不派生任何
+        pending approval。空 `paused_profiles` 绝不能被解读成「撤销历史 revoked」。
+        """
+        config = getattr(self.config, "request_control", None)
+        paused = {str(item) for item in (getattr(config, "paused_profiles", ()) or ())}
+        control = self._paid_control_store()
+        if control is not None:
+            try:
+                for row in control.list_payment_authorizations():
+                    if row.get("revoked_at") is not None:
+                        paused.add(str(row.get("profile_fingerprint") or ""))
+            except Exception:
+                # 读不到旧撤销历史时**不**把它当成"无撤销"，交给调用方报
+                # route_policy_unknown。
+                paused.add("\x00unreadable")
+        return {item for item in paused if item}
+
     def _paid_guard_for(self, fingerprint: str, kind: str):
         def guard(profile_fingerprint: str) -> bool:
             if profile_fingerprint != fingerprint:
                 # 装配身份不一致仍拒绝，不能把旧空间用于新配置。
                 return False
+            paused = self.paused_route_fingerprints()
+            if "\x00unreadable" in paused:
+                # 无法确认兼容撤销策略：fail closed（不是"付费日志必需"）。
+                return False
+            if profile_fingerprint in paused:
+                return False
             control = self._paid_control_store()
             if control is None:
-                return False
+                # 旧模式保持 fail closed（无 journal 即拒绝）；新模式手动
+                # query/rerank 不依赖审计写库，后台可用性由续算层单独判定。
+                return request_lifecycle.bounded_resume_enabled(self.request_control_mode())
             return paid_request_guard(control, profile_fingerprint)
         return guard
 
@@ -575,7 +615,8 @@ class MarkdownIndexer:
             item["endpoint_is_loopback"] = _is_loopback_endpoint(str(item.get("endpoint") or ""))
         return rows
 
-    def configure_paid_provider(self, kind: str, provider: Any, profile_fingerprint: str) -> bool:
+    def configure_paid_provider(self, kind: str, provider: Any, profile_fingerprint: str,
+                                *, mode: str = "") -> bool:
         """把持久 journal + 闸门装配到任何 `configure_paid_requests` provider 上。
 
         媒体等新 provider 必须经此装配（§20.7B 覆盖 media）：
@@ -592,18 +633,22 @@ class MarkdownIndexer:
         if getattr(provider, "is_local_free", False) is True:
             return True
         configure(PaidRequestJournal(self._paid_control_store, kind),
-                  self._paid_guard_for(profile_fingerprint, kind), profile_fingerprint)
+                  self._paid_guard_for(profile_fingerprint, kind), profile_fingerprint,
+                  mode=mode)
         return True
 
     def _configure_paid_providers(self) -> None:
+        # 模式**只**装配到本实例持有的 provider 上，不改全局默认：全局默认值属于
+        # 未装配 provider（如测试直接构造）的兼容口径，进程级改动会造成跨库串味。
+        mode = self.request_control_mode()
         self.configure_paid_provider("embed", self.embedding_provider,
-                                     self._embedding_profile.fingerprint)
+                                     self._embedding_profile.fingerprint, mode=mode)
         self.configure_paid_provider("rerank", self.reranker_provider,
-                                     self._reranker_profile_fingerprint())
+                                     self._reranker_profile_fingerprint(), mode=mode)
         # E07：原生媒体 provider 走同一持久 journal/闸门（§20.7B 覆盖 media）。
         if self.media_provider is not None:
             self.configure_paid_provider("media", self.media_provider,
-                                         self.media_provider.profile.fingerprint)
+                                         self.media_provider.profile.fingerprint, mode=mode)
 
     def may_use_paid_profile(self, profile_fingerprint: str, *, kind: str = "embed") -> bool:
         """统一闸门（§20.7B）：embed_missing / query / fanout / rerank / 媒体 / 转录
@@ -785,6 +830,48 @@ class MarkdownIndexer:
                 "failed" if self.persistence_status["errors"] else
                 "ready" if self._chunks_cache_path is not None else "disabled"
             )
+
+    def checkpoint_embeddings(self, bindings, captured_identity=None) -> set[str]:
+        """严格持久化确认：只有**被确认写入**的输入键才返回。
+
+        返回空集表示未确认：调用方必须保留 `result_pending` 并停止本轮后续自动
+        付费批次，不能继续花钱堆积更多未保存结果。
+
+        严格判据（v0.9.2 §7）：
+        * memory 后端：codec 原子写成功（无 persistence error）且 RAM 仍有向量；
+        * disk 后端：后端返回确认写入的 id，且该 id 在 `_disk_vectors` 中；
+        * `_save_cache()` 正常返回、RAM 有向量、后端返回 None 都**不算**确认。
+        """
+        if not bindings:
+            return set()
+        pairs: list[tuple[str, str, Any]] = []
+        for binding in bindings:
+            key = str(binding.get("embedding_key") or "")
+            chunk_id = str(binding.get("chunk_id") or "")
+            if key:
+                pairs.append((key, chunk_id, binding.get("chunk")))
+        if not pairs:
+            return set()
+        on_disk = bool(getattr(self, "_vectors_on_disk", False))
+        if not on_disk and self._vectors_cache_path is None:
+            # 缓存关闭 = 没有任何可确认的持久层，绝不乐观记账。
+            return set()
+        if on_disk:
+            self._flush_vectors_to_disk()
+            confirmed = set()
+            for key, chunk_id, _chunk in pairs:
+                if chunk_id and chunk_id in self._disk_vectors:
+                    confirmed.add(key)
+            return confirmed
+        self._save_cache()
+        if self.persistence_status["errors"].get("vectors"):
+            return set()
+        confirmed = set()
+        for key, chunk_id, chunk in pairs:
+            if chunk is not None and not self._chunk_has_vector(chunk):
+                continue
+            confirmed.add(key)
+        return confirmed
 
     def _record_persistence_error(self, layer: str, path: Path, exc: Exception) -> None:
         self.persistence_status["errors"][layer] = {
@@ -1051,6 +1138,7 @@ class MarkdownIndexer:
             "files_total": 0,
             "chunks_done": 0,
             "chunks_total": 0,
+            "quarantined": 0,
         }
         try:
             return self._sync_locked_impl()
@@ -1112,6 +1200,17 @@ class MarkdownIndexer:
 
     def _chunk_has_vector(self, chunk: Chunk) -> bool:
         return _sync_engine.chunk_has_vector(self, chunk)
+
+    def resume_recoverable_probe(self):
+        """恢复/审计扫描的成果核验回调（v0.9.2 §5）。
+
+        返回的 closure 内部缓存 chunk id 索引，可跨多个批次复用；判据与
+        `checkpoint_embeddings` 一致（磁盘后端只认后端确认写入的 id）。
+        磁盘后端下 closure 会**按需**从 vec0 重建 RAM 记账集合：冷进程里该集合
+        还是空集，不补建就会把「本进程还没读过磁盘」误判成「磁盘上没有向量」。
+        重建失败时抛错（而不是返回空集），由调用方按「核验不可用」处理。
+        """
+        return _sync_engine._resume_verifier(self)
 
     def _stamp_embedding_keys(self) -> None:
         return _sync_engine._stamp_embedding_keys(self)
@@ -1669,6 +1768,7 @@ class MarkdownIndexer:
             self._failed_cache_path = None
             # 缓存整体丢弃，失败名单也随之作废（它只是缓存的附属观测数据）。
             self.failed_files.clear()
+            self._embed_failure_quarantine.clear()
             self._stat_cache.clear()
             self._virtual_sha_cache.clear()
             self._stat_seen_ns.clear()
@@ -1730,6 +1830,7 @@ class MarkdownIndexer:
             self._stat_confirmations.clear()
             self.fast_path_warnings.clear()
             self.failed_files.clear()
+            self._embed_failure_quarantine.clear()
             self._visible_docs_cache = None
             self._ignore_matcher_cache = None
             self._disk_vectors.clear()

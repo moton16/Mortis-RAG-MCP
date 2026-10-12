@@ -18,9 +18,9 @@ def test_docs_describe_real_cli_and_unverified_native():
     assert "运行（或请用户运行）" not in skill
 
 
-def test_actual_sixteen_tools_and_example_templates():
+def test_actual_seventeen_tools_and_example_templates():
     tools = {t["name"]: t for t in _tool_definitions()}
-    assert len(tools) == 16
+    assert len(tools) == 17
     assert {"kb_read_media", "kb_ingest", "kb_import"} <= tools.keys()
     assert "retry" in tools["kb_ingest"]["inputSchema"]["properties"]["action"]["enum"]
     example = load_config(ROOT / "config/app.toml.example")

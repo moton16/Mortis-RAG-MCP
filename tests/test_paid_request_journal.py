@@ -111,7 +111,13 @@ def test_journal_blocks_resend_until_intent_resolved(tmp_path):
 
 
 def test_sync_does_not_resend_after_unknown_outcome(tmp_path, monkeypatch):
-    """端到端：一次网络错误（结果未知）之后，下一轮 sync 不得再发同一载荷。"""
+    """端到端（v0.9.2 bounded_resume）：未知结果只 hold 该输入，下一轮零重发。
+
+    旧合同是「整个 profile 冻结」；新模式改成组件级持久 hold —— 判据从
+    「存在未决意图」换成「该稳定输入身份仍被占用」。
+    """
+    from mortis_rag_mcp._indexer import embedding_resume
+
     cfg = make_config(tmp_path)
     vault = tmp_path / "vault"
     vault.mkdir()
@@ -129,16 +135,54 @@ def test_sync_does_not_resend_after_unknown_outcome(tmp_path, monkeypatch):
         assert len(calls) == 1, "首次应发出一次请求"
         indexer.sync()
         assert len(calls) == 1, "结果未知后不得自动重发"
+        # 审计记录仍然存在（可观测），但不再是暂停判据。
         intents = indexer._paid_control_store().list_request_intents()
         assert [item["state"] for item in intents] == ["submission_unknown"]
-        assert indexer._embedding_paused is True
+        # 真正阻止重发的是该输入身份的持久 hold。
+        work = embedding_resume.list_embedding_work(
+            indexer._paid_control_store(), states=("held_unknown",))
+        assert len(work) == 1
+        assert work[0]["components"][0]["state"] == "held_unknown"
         assert not any(chunk.embedding for chunks in indexer._chunks.values() for chunk in chunks)
+        assert indexer.failed_files.get("a.md", "").startswith("AUTOMATIC_REPLAY_HELD")
     finally:
         indexer.close_document_store()
 
 
-def test_multi_batch_unknown_pauses_instead_of_resending_leading_batches(tmp_path, monkeypatch):
-    """多批切片下结果未知 → 整体暂停，不得每轮重发已成功的**前导批**（重复计费）。"""
+def test_legacy_mode_still_freezes_the_profile(tmp_path, monkeypatch):
+    """回滚兼容模式：旧的 profile 级未决暂停必须仍然生效（未通过验收前的安全网）。"""
+    from mortis_rag_mcp.config import RequestControlConfig
+
+    cfg = make_config(tmp_path)
+    object.__setattr__(cfg, "request_control",
+                       RequestControlConfig(mode="legacy_profile"))
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (vault / "a.md").write_text("# A\n\nbody text unknown\n", encoding="utf-8")
+    calls: list[dict] = []
+
+    def failing_urlopen(request, timeout=None):
+        calls.append(json.loads(request.data.decode("utf-8")))
+        raise OSError("simulated network failure")
+
+    monkeypatch.setattr("mortis_rag_mcp.providers.urlopen", failing_urlopen)
+    indexer = MarkdownIndexer(vault, cfg)
+    try:
+        indexer.sync()
+        assert len(calls) == 1
+        indexer.sync()
+        assert len(calls) == 1
+        assert indexer._embedding_paused is True
+    finally:
+        indexer.close_document_store()
+
+
+def test_multi_batch_unknown_holds_only_the_failed_batch(tmp_path, monkeypatch):
+    """多批切片下第 2 批未知 → 成功前导批落检查点复用，只有失败组件 hold。
+
+    旧合同是「整条 profile 暂停」；新模式下保护粒度是**稳定输入身份**，
+    所以前导批既可以复用，也不需要重发。
+    """
     cfg = make_config(tmp_path)
     cfg.chunk_size = 40
     cfg.chunk_overlap = 0
@@ -163,30 +207,33 @@ def test_multi_batch_unknown_pauses_instead_of_resending_leading_batches(tmp_pat
     monkeypatch.setattr("mortis_rag_mcp.providers.urlopen", flaky_urlopen)
     indexer = MarkdownIndexer(vault, cfg)
     try:
+        from mortis_rag_mcp._indexer import embedding_resume
+
         indexer.sync()
         assert len(sent) == 2, "首个文件应分两批发出"
+        # 未决意图仍可观测（审计），但暂停判据是组件 hold。
         assert indexer.unresolved_paid_intents(), "未决意图必须可观测"
-        assert indexer.has_unresolved_paid_intents(indexer._paid_control_store(), "embed") is True
-
-        indexer.sync()
-        assert len(sent) == 2, "未决期间不得重发任何一批（含已成功的前导批）"
-        assert indexer._embedding_paused is True
-        # 暂停只覆盖索引批量路径：查询期嵌入是单次、载荷唯一、不重放的请求，
-        # 不能被一起拦掉（否则一次网络抖动会让语义检索静默退回词法）。
-        from mortis_rag_mcp._indexer.sync_engine import _paid_embedding_allowed
-        assert _paid_embedding_allowed(indexer) is False, "索引批量路径必须暂停"
-        assert indexer.may_use_paid_profile(indexer._embedding_profile.fingerprint) is True, \
-            "查询期闸门不得被索引期未决意图阻塞"
-        indexer.search("独立查询", use_rerank=False)
-        assert len(sent) == 3 and sent[-1] == "独立查询", "暂停索引仍允许独立查询 POST"
-
-        # 人工确认/放弃未决意图之后才恢复发送。
         control = indexer._paid_control_store()
-        for item in control.list_request_intents():
-            if item["state"] == "submission_unknown":
-                control.mark_intent(item["request_id"], "abandoned", "operator reviewed")
+        held = embedding_resume.list_embedding_work(control, states=("held_unknown",))
+        assert len(held) == 1, "只有失败的那一批被 hold"
+        # 前导批已经落检查点：后续轮次复用，不再重发。
+        complete = embedding_resume.list_embedding_work(control, states=("complete",))
+        assert len(complete) == 1
+
         indexer.sync()
-        assert len(sent) > 3, "放弃未决意图后应恢复"
+        assert len(sent) == 2, "不得重发已成功的前导批，也不得自动重发未知批"
+        # 手动 query 路由判断独立（不受后台 hold 影响）。
+        assert indexer.may_use_paid_profile(indexer._embedding_profile.fingerprint) is True, \
+            "查询期闸门不得被索引期未决组件阻塞"
+
+        # 显式 retry（确认可能重复计费）后才允许重算该组件。
+        batch_id = held[0]["batch_id"]
+        result = embedding_resume.resolve_embedding_work(
+            control, batch_id, action="retry", confirm_repeat_cost=True,
+            note="operator approved repeat cost")
+        assert result["applied"] is True
+        indexer.sync()
+        assert len(sent) > 2, "显式 retry 后该组件可重新计算"
     finally:
         indexer.close_document_store()
 

@@ -79,7 +79,18 @@ python -m mortis_rag_mcp --app-config ".\config\app.toml" --abandon-request REQU
 
 `--doctor` 是显式诊断，可能访问真实端点；STATUS.md 缺失不触发 Agent 自动探活。正常查询直接用已有工具，实际报错再按错误/本地状态排查。
 
-### 0.6 0.9.1 补丁速查
+### 0.6 0.9.2 补丁速查
+
+0.9.2 是付费请求审计与计费安全补丁，不改变数据布局与已有配置项，升级不需要额外步骤（新增第 17 个工具 `kb_request_control` 与 `[embedding].input_modality_declaration` 配置键，均为可选）。
+
+1. **一次调用恰好一个物理 POST**：429 / 5xx / 网络错误 / 非法 JSON 一律分类上抛，不再退避重发；付费 POST 不再跟随 3xx，`Authorization` 不会被转发到重定向目标。此前一次限流抖动就可能把同一批付费请求重发多次。
+2. **结果未知只冻结受影响的批次**：改为按组件占用 hold 受影响的后台输入，不再按 profile 整体暂停；跨进程崩溃遗留的 `sending` 批次用 `release` 解锁。HTTP 4xx（远端明确未处理）单独终态化，不再永久挂在未决上。
+3. **用 `kb_request_control` 处置待办**：查看未知结果 hold、被明确暂停的路由、旧版本遗留待处置记录，再显式 `retry` / `abandon` / `release` / `pause_route` / `resume_route` / `resolve_legacy` / `audit_complete` / `prune_audit`；默认 `dry_run=true`。CLI 侧仍是 `--list-requests` / `--abandon-request`。
+4. **`kb_rebuild` 付费前先预览**：文本或原生媒体任一路径为付费端点时必须传 `confirm_cost=true`，否则只返回预览（零请求、零副作用）。
+5. **诊断命令照抄即用**：裸 `python -m mortis_rag_mcp --doctor` 不再被 `--vault` 门禁拦成 exit 2；付费 embed / rerank 探活不再恒失败。
+6. **文本模态与失败隔离（issue #17）**：需要显式声明文本 input 模态时设 `input_modality_declaration`（`none` / `typed` / `hint`，默认 `none`）；同一来源连续失败会按指数退避隔离跳过，失败信息只给有界摘要。
+
+### 0.7 0.9.1 补丁速查
 
 0.9.1 是修复与性能补丁，不改变数据布局、配置项与工具签名，升级不需要额外步骤。
 

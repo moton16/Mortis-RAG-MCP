@@ -126,6 +126,16 @@ class StoreConflict(DocStoreError):
     code = "STORE_CONFLICT"
 
 
+class ResumeConflict(StoreConflict):
+    """续算组件唯一约束冲突：同一输入身份已被另一批次占用（reserved/held/…）。
+
+    这是**正常的并发/重放防护结果**，不是数据损坏：调用方必须重新读取状态后
+    重新计划，绝不能吞掉它继续发送。
+    """
+
+    code = "RESUME_COMPONENT_CONFLICT"
+
+
 class LockUnavailable(DocStoreError):
     code = "LOCK_UNAVAILABLE"
     retryable = True
@@ -913,11 +923,52 @@ class ControlStore:
     `payment_authorizations`/`request_intents`（C97/C98/C100）。
     """
 
+    @staticmethod
+    def _payment_schema_ready(conn: sqlite3.Connection) -> bool:
+        """只读判据：付费面表与 `writer` 列是否都已就位（不建表、不改表）。"""
+        row = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'payment_authorizations'"
+        ).fetchone()
+        if row is None:
+            return False
+        row = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'request_intents'"
+        ).fetchone()
+        if row is None:
+            return False
+        columns = {str(item[1]) for item in conn.execute("PRAGMA table_info(request_intents)")}
+        return "writer" in columns
+
+    def payment_schema_present(self) -> bool:
+        """付费面 schema 是否已就绪（只读；不建表、不提交）。"""
+        try:
+            return self._payment_schema_ready(self._require_conn())
+        except sqlite3.Error:
+            return False
+
+    def _ensure_payment_schema_for_read(self, conn: sqlite3.Connection) -> bool:
+        """读路径的付费面就位判据；**声明只读时绝不落 DDL**。
+
+        返回 False = 「本控制库还没补齐 v0.9.2 付费面」：调用方按「没有任何记录」
+        处理，而不是顺手 `CREATE TABLE` / `ALTER TABLE`（那会让一次只读查询变成
+        写操作，违背 `list` / `dry_run` 的只读承诺，也会在只读载体上变成与语义
+        无关的失败）。写路径继续走 `_ensure_payment_schema` 的惰性补齐。
+        """
+        if self._payment_schema_ready(conn):
+            return True
+        if self._read_only_declared:
+            return False
+        self._ensure_payment_schema(conn)
+        return self._payment_schema_ready(conn)
+
     def __init__(self, layout: StorageLayout) -> None:
         self.layout = layout
         self._binding = _vault_binding(layout)
         self._tls = threading.local()
         self._degraded = False
+        #: 调用方是否**声明**了只读打开（`open(write=False)`）。声明只读时读路径
+        #: 不得落 DDL：`list` / `dry_run` 对外承诺只读，顺手建表会把一次查询变成写。
+        self._read_only_declared = False
 
     # ------------------------------------------------------------------ conn io
 
@@ -950,6 +1001,7 @@ class ControlStore:
 
     def open(self, *, create: bool = True, write: bool = False) -> None:
         """打开控制库；`create=False` 且文件不存在 → StoreCorrupt（明确 code）。"""
+        self._read_only_declared = not write
         path = self.layout.control_path
         exists = path.is_file() and path.stat().st_size > 0
         if not exists and not create:
@@ -1291,6 +1343,12 @@ class ControlStore:
         # 不改 schema_version。
         conn.execute("CREATE INDEX IF NOT EXISTS idx_request_intents_kind_fp_state "
                      "ON request_intents(kind, profile_fingerprint, state)")
+        # v0.9.2：区分「新代码写的意图」与「旧版本遗留记录」。旧行没有这一列，
+        # 补列后取默认空串 → 只有空串（= 旧版本写入）才是无法可靠映射的待处置对象。
+        # 与上面同策略：只加列，不改 schema_version。
+        columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(request_intents)")}
+        if "writer" not in columns:
+            conn.execute("ALTER TABLE request_intents ADD COLUMN writer TEXT NOT NULL DEFAULT ''")
         conn.commit()
 
     def authorize_paid_profile(self, profile_fingerprint: str, *, scope: str,
@@ -1329,7 +1387,8 @@ class ControlStore:
         if not isinstance(profile_fingerprint, str) or not profile_fingerprint:
             return "absent"
         with self.mutation() as conn:
-            self._ensure_payment_schema(conn)
+            if not self._ensure_payment_schema_for_read(conn):
+                return "absent"
             row = conn.execute("SELECT revoked_at FROM payment_authorizations WHERE profile_fingerprint = ?",
                                (profile_fingerprint,)).fetchone()
         if row is None:
@@ -1341,7 +1400,8 @@ class ControlStore:
 
     def list_payment_authorizations(self) -> list[dict]:
         with self.mutation() as conn:
-            self._ensure_payment_schema(conn)
+            if not self._ensure_payment_schema_for_read(conn):
+                return []
             rows = conn.execute("SELECT profile_fingerprint, scope, cost_summary_json, note, "
                                "authorized_at, revoked_at FROM payment_authorizations "
                                "ORDER BY authorized_at").fetchall()
@@ -1351,7 +1411,7 @@ class ControlStore:
 
     def record_send_intent(self, request_id: str, *, kind: str, payload_hash: str, endpoint: str,
                            profile_fingerprint: str = "", attempt: int | None = 1,
-                           reject_unresolved: bool = False) -> None:
+                           reject_unresolved: bool = False, writer: str = "v092") -> None:
         """在同一 mutation 锁内检查未决并落意图；网络发送始终在锁外。
 
         journal 使用 reject_unresolved=True / attempt=None，自动计数而不授权重发。
@@ -1381,9 +1441,10 @@ class ControlStore:
             conn.execute(
                 "INSERT INTO request_intents "
                 "(request_id, kind, payload_hash, endpoint, profile_fingerprint, attempt, state, reason, "
-                "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'prepared', '', ?, ?)",
+                "created_at, updated_at, writer) VALUES (?, ?, ?, ?, ?, ?, 'prepared', '', ?, ?, ?)",
                 (request_id, kind, payload_hash, endpoint, profile_fingerprint, int(attempt),
-                 time.time(), time.time()),
+                 time.time(), time.time(),
+                 "" if writer is None else str(writer)[:32]),
             )
             conn.commit()
 
@@ -1410,22 +1471,440 @@ class ControlStore:
 
     def intent_state(self, request_id: str) -> str | None:
         with self.mutation() as conn:
-            self._ensure_payment_schema(conn)
+            if not self._ensure_payment_schema_for_read(conn):
+                return None
             row = conn.execute("SELECT state FROM request_intents WHERE request_id = ?", (request_id,)).fetchone()
             return None if row is None else str(row[0])
 
     def list_request_intents(self, *, state: str = "") -> list[dict]:
         with self.mutation() as conn:
-            self._ensure_payment_schema(conn)
+            if not self._ensure_payment_schema_for_read(conn):
+                return []
             rows = conn.execute(
                 "SELECT request_id, kind, payload_hash, endpoint, profile_fingerprint, attempt, state, "
-                "reason, created_at, updated_at FROM request_intents "
+                "reason, created_at, updated_at, writer FROM request_intents "
                 "WHERE (? = '' OR state = ?) ORDER BY created_at",
                 (state, state),
             ).fetchall()
         keys = ("request_id", "kind", "payload_hash", "endpoint", "profile_fingerprint",
-                "attempt", "state", "reason", "created_at", "updated_at")
+                "attempt", "state", "reason", "created_at", "updated_at", "writer")
         return [dict(zip(keys, row)) for row in rows]
+
+    # ------------------------------------------- 续算表：embedding_batches/components
+
+    def _ensure_resume_schema(self, conn: sqlite3.Connection) -> None:
+        """惰性补建续算表（只加表、不改 `SCHEMA_VERSION`）。
+
+        DDL 逐条 execute 并置于一个显式短事务内：**不能**用 `executescript`，它会
+        先隐式 COMMIT 当前事务，把 reserve 的原子性打穿。失败整体回滚，绝不留下
+        只建了一半的表或索引。
+        """
+        started = not conn.in_transaction
+        if started:
+            conn.execute("BEGIN IMMEDIATE")
+        try:
+            for statement in _RESUME_SCHEMA_STATEMENTS:
+                conn.execute(statement)
+            if started:
+                conn.commit()
+        except BaseException:
+            if started:
+                self._rollback_quietly(conn)
+            raise
+
+    @staticmethod
+    def _resume_schema_ready(conn: sqlite3.Connection) -> bool:
+        """只读判据：续算表是否已存在。读路径**不得**因为"顺便建一下"而写库。"""
+        row = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'embedding_batches'"
+        ).fetchone()
+        return row is not None
+
+    def resume_schema_present(self) -> bool:
+        """续算表是否已建（只读；不建表、不提交）。"""
+        try:
+            return self._resume_schema_ready(self._require_conn())
+        except sqlite3.Error:
+            return False
+
+    def reserve_embedding_batch(self, batch_id: str, *, operation_id: str, purpose_family: str,
+                                profile_fingerprint: str, endpoint: str, owner_token: str,
+                                components: Sequence[Mapping[str, Any]], vault_epoch: int = 0,
+                                generation_id: str = "", payload_hash: str = "") -> dict:
+        """原子占用一批后台组件；任何冲突整批回滚（不偷偷部分占用）。"""
+        for name, value in (("batch_id", batch_id), ("operation_id", operation_id),
+                            ("purpose_family", purpose_family),
+                            ("profile_fingerprint", profile_fingerprint),
+                            ("endpoint", endpoint), ("owner_token", owner_token)):
+            if not isinstance(value, str) or not value:
+                raise StoreContractError(f"{name} 必填")
+        rows = list(components or [])
+        if not rows:
+            raise StoreContractError("reserve 至少需要一个组件")
+        now = time.time()
+        with self.mutation() as conn:
+            self._ensure_resume_schema(conn)
+            try:
+                conn.execute(
+                    "INSERT INTO embedding_batches (batch_id, operation_id, purpose_family, "
+                    "profile_fingerprint, endpoint, payload_hash, owner_token, vault_epoch, "
+                    "generation_id, state, outcome, http_status, reason, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'reserved', '', NULL, '', ?, ?)",
+                    (batch_id, operation_id, purpose_family, profile_fingerprint, endpoint,
+                     str(payload_hash or ""), owner_token, int(vault_epoch), str(generation_id),
+                     now, now),
+                )
+                for ordinal, component in enumerate(rows):
+                    conn.execute(
+                        "INSERT INTO embedding_components (batch_id, ordinal, component_key, "
+                        "embedding_key, input_sha256, source, source_kind, source_sha256, "
+                        "revision_id, chunk_id, state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'reserved')",
+                        (batch_id, ordinal,
+                         str(component.get("component_key") or ""),
+                         str(component.get("embedding_key") or ""),
+                         str(component.get("input_sha256") or ""),
+                         str(component.get("source") or ""),
+                         str(component.get("source_kind") or ""),
+                         str(component.get("source_sha256") or ""),
+                         str(component.get("revision_id") or ""),
+                         str(component.get("chunk_id") or "")),
+                    )
+                conn.commit()
+            except sqlite3.IntegrityError as exc:
+                self._rollback_quietly(conn)
+                raise ResumeConflict(
+                    f"组件身份已被占用（batch_id={batch_id}）：{exc}"
+                ) from exc
+        return {"batch_id": batch_id, "state": "reserved", "components": len(rows),
+                "operation_id": operation_id, "created_at": now}
+
+    def begin_embedding_send(self, batch_id: str, owner_token: str, payload_hash: str = "") -> bool:
+        """`reserved → sending` 的 CAS，**必须在调用 transport 前**持久提交。
+
+        提交失败 = 零 POST。False 表示 owner/状态不匹配（并发或已推进）。
+        """
+        now = time.time()
+        with self.mutation() as conn:
+            self._ensure_resume_schema(conn)
+            cursor = conn.execute(
+                "UPDATE embedding_batches SET state = 'sending', payload_hash = ?, updated_at = ? "
+                "WHERE batch_id = ? AND owner_token = ? AND state = 'reserved'",
+                (str(payload_hash or ""), now, batch_id, owner_token),
+            )
+            if cursor.rowcount != 1:
+                self._rollback_quietly(conn)
+                return False
+            conn.execute(
+                "UPDATE embedding_components SET state = 'sending' "
+                "WHERE batch_id = ? AND state = 'reserved'", (batch_id,))
+            conn.commit()
+        return True
+
+    def record_embedding_outcome(self, batch_id: str, owner_token: str, outcome: str, *,
+                                 http_status: int | None = None, reason: str = "",
+                                 component_state: str = "",
+                                 from_states: Sequence[str] = ("reserved", "sending",
+                                                               "result_pending")) -> bool:
+        """记录一次发送结果：组件与批次在**同一事务**内推进。
+
+        `succeeded` 只置 `result_pending`（还未经检查点确认）；未知结果一律转
+        对应的 held 状态并保留 active 占用，绝不自动释放。
+        """
+        from .request_lifecycle import OUTCOME_HOLD_STATE, OUTCOME_SUCCEEDED
+        mapping = {
+            OUTCOME_SUCCEEDED: "result_pending",
+            "not_sent": "released",
+            "rejected": "released",
+        }
+        target = component_state or mapping.get(outcome) or OUTCOME_HOLD_STATE.get(outcome) or "held_unknown"
+        batch_state = {
+            "result_pending": "result_pending",
+            "released": "released" if outcome == "not_sent" else "rejected",
+        }.get(target, target)
+        now = time.time()
+        with self.mutation() as conn:
+            self._ensure_resume_schema(conn)
+            placeholders = ",".join("?" for _ in from_states)
+            cursor = conn.execute(
+                "UPDATE embedding_batches SET state = ?, outcome = ?, http_status = ?, reason = ?, "
+                f"updated_at = ? WHERE batch_id = ? AND owner_token = ? "
+                f"AND state IN ({placeholders})",
+                (batch_state, str(outcome), http_status, str(reason)[:400], now,
+                 batch_id, owner_token, *from_states),
+            )
+            if cursor.rowcount != 1:
+                self._rollback_quietly(conn)
+                return False
+            conn.execute(
+                "UPDATE embedding_components SET state = ? WHERE batch_id = ? "
+                f"AND state IN ({placeholders})", (target, batch_id, *from_states))
+            conn.commit()
+        return True
+
+    def confirm_embedding_checkpoint(self, batch_id: str, owner_token: str,
+                                     persisted_keys: Sequence[str]) -> dict:
+        """检查点确认：只有被严格确认持久化的组件才能 `complete`。
+
+        未确认的一律 `held_result_missing`（曾取得结果但无可恢复成果），而不是
+        `complete`——那会让跨重启的缓存丢失变成"静默已算过"。
+        """
+        keys = {str(item) for item in persisted_keys or ()}
+        now = time.time()
+        with self.mutation() as conn:
+            self._ensure_resume_schema(conn)
+            rows = conn.execute(
+                "SELECT ordinal, embedding_key, chunk_id FROM embedding_components "
+                "WHERE batch_id = ?", (batch_id,)).fetchall()
+            confirmed = 0
+            for ordinal, embedding_key, chunk_id in rows:
+                ok = str(embedding_key) in keys or str(chunk_id) in keys
+                conn.execute(
+                    "UPDATE embedding_components SET state = ? WHERE batch_id = ? AND ordinal = ?",
+                    ("complete" if ok else "held_result_missing", batch_id, int(ordinal)))
+                confirmed += 1 if ok else 0
+            batch_state = "complete" if confirmed == len(rows) and rows else (
+                "held_result_missing" if rows else "complete")
+            cursor = conn.execute(
+                "UPDATE embedding_batches SET state = ?, updated_at = ? "
+                "WHERE batch_id = ? AND owner_token = ? AND state = 'result_pending'",
+                (batch_state, now, batch_id, owner_token))
+            if cursor.rowcount != 1:
+                self._rollback_quietly(conn)
+                return {"batch_id": batch_id, "confirmed": confirmed, "total": len(rows),
+                        "applied": False}
+            conn.commit()
+        return {"batch_id": batch_id, "confirmed": confirmed, "total": len(rows),
+                "state": batch_state, "applied": True}
+
+    def embedding_component_states(self, component_keys: Sequence[str]) -> dict[str, str]:
+        """读取输入身份的当前 active 状态（规划阶段过滤 held/占用中的组件）。"""
+        keys = [str(item) for item in component_keys or ()]
+        if not keys:
+            return {}
+        states: dict[str, str] = {}
+        with self.mutation() as conn:
+            # 读路径不建表：`list` / `dry_run` 对外承诺只读，DDL 会让只读库上的
+            # 一次查询变成一个与语义无关的写失败（v0.9.2 复核修正）。
+            if not self._resume_schema_ready(conn):
+                return {}
+            for start in range(0, len(keys), 400):
+                chunk = keys[start:start + 400]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = conn.execute(
+                    "SELECT component_key, state FROM embedding_components "
+                    f"WHERE component_key IN ({placeholders})", tuple(chunk)).fetchall()
+                for key, state in rows:
+                    states[str(key)] = str(state)
+        return states
+
+    def list_embedding_work(self, *, source: str = "", batch_id: str = "",
+                            states: Sequence[str] = ()) -> list[dict]:
+        """按 source / batch / 状态列出续算工作（只读，不安排任何网络动作）。
+
+        只读：续算表还不存在时返回空列表，**不**顺手建表（否则 `list` / `dry_run`
+        会在控制库里落 DDL 与一次 commit）。
+        """
+        with self.mutation() as conn:
+            if not self._resume_schema_ready(conn):
+                return []
+            rows = conn.execute(
+                "SELECT batch_id, operation_id, purpose_family, profile_fingerprint, endpoint, "
+                "payload_hash, owner_token, vault_epoch, generation_id, state, outcome, "
+                "http_status, reason, created_at, updated_at FROM embedding_batches "
+                "ORDER BY created_at").fetchall()
+        batch_keys = ("batch_id", "operation_id", "purpose_family", "profile_fingerprint",
+                      "endpoint", "payload_hash", "owner_token", "vault_epoch",
+                      "generation_id", "state", "outcome", "http_status", "reason",
+                      "created_at", "updated_at")
+        wanted_states = {str(item) for item in states or ()}
+        result: list[dict] = []
+        for row in rows:
+            batch = dict(zip(batch_keys, row))
+            if batch_id and batch["batch_id"] != batch_id:
+                continue
+            if wanted_states and batch["state"] not in wanted_states:
+                continue
+            components = self._embedding_components(batch["batch_id"])
+            if source and not any(c["source"] == source for c in components):
+                continue
+            batch["components"] = components
+            result.append(batch)
+        return result
+
+    def _embedding_components(self, batch_id: str) -> list[dict]:
+        with self.mutation() as conn:
+            if not self._resume_schema_ready(conn):
+                return []
+            rows = conn.execute(
+                "SELECT ordinal, component_key, embedding_key, input_sha256, source, source_kind, "
+                "source_sha256, revision_id, chunk_id, state FROM embedding_components "
+                "WHERE batch_id = ? ORDER BY ordinal", (batch_id,)).fetchall()
+        keys = ("ordinal", "component_key", "embedding_key", "input_sha256", "source",
+                "source_kind", "source_sha256", "revision_id", "chunk_id", "state")
+        return [dict(zip(keys, row)) for row in rows]
+
+    def resolve_embedding_work(self, batch_id: str, *, action: str,
+                               owner_token: str = "", confirm_repeat_cost: bool = False,
+                               expected_state: str = "", note: str = "") -> dict:
+        """显式处置一个批次：`retry` / `abandon` / `release`。
+
+        * `retry`：需 `confirm_repeat_cost=True`；只释放**本批次**组件，不解除其他
+          记录；`sending` 活跃批次一律拒绝。
+        * `abandon`：转 `manual_only`，退出自动续算；**保留** active 占用，所以
+          watch 不会自动重发。
+        * `release`：仅在确定未发送或人工授权新尝试时使用；非 `reserved` 状态必须
+          `confirm_repeat_cost=True`，且该门槛在本事务内按**刚读到的**状态判定。
+        * `expected_state`：调用方若按快照做过判据（如「`reserved` 免确认」），必须
+          把它传进来。状态在快照之后被别的 owner 推进过就拒绝，绝不把免确认的口径
+          套用到可能已经发出并计费的批次上。
+        """
+        if action not in {"retry", "abandon", "release"}:
+            raise StoreContractError(f"unsupported resume action: {action}")
+        now = time.time()
+        with self.mutation() as conn:
+            self._ensure_resume_schema(conn)
+            row = conn.execute(
+                "SELECT state FROM embedding_batches WHERE batch_id = ?", (batch_id,)).fetchone()
+            if row is None:
+                raise StoreContractError(f"未记录的续算批次：{batch_id!r}")
+            current = str(row[0])
+            if expected_state and current != str(expected_state):
+                self._rollback_quietly(conn)
+                return {"batch_id": batch_id, "applied": False,
+                        "error": "RESUME_BATCH_STATE_CHANGED",
+                        "expected_state": str(expected_state), "batch_state": current,
+                        "hint": "the batch state changed after your snapshot; re-inspect "
+                                "and confirm again"}
+            if action == "abandon":
+                target = "manual_only"
+            elif action == "release":
+                if current != "reserved" and not confirm_repeat_cost:
+                    # 与 `retry` 同一口径，但按**本事务内刚读到的**状态判定：
+                    # 免确认只对 `reserved`（从未进入 sending）成立。
+                    self._rollback_quietly(conn)
+                    return {"batch_id": batch_id, "applied": False,
+                            "error": "RESUME_RELEASE_NEEDS_CONFIRMATION",
+                            "batch_state": current,
+                            "hint": ("releasing a batch that may already have been sent lets the "
+                                     "next round issue a billed request again; pass "
+                                     "confirm_repeat_cost=true")}
+                target = "released"
+            else:
+                if not confirm_repeat_cost:
+                    self._rollback_quietly(conn)
+                    return {"batch_id": batch_id, "applied": False,
+                            "error": "RESUME_RETRY_NEEDS_CONFIRMATION"}
+                if current == "sending":
+                    self._rollback_quietly(conn)
+                    return {"batch_id": batch_id, "applied": False,
+                            "error": "RESUME_BATCH_STILL_SENDING",
+                            # `retry` 只重放**已确定不再发送**的批次；仍在 sending 的批次
+                            # 需要先由运维判定旧 owner 已死 → 用 `release` 解锁。
+                            "hint": "this batch may still be sending; use action=release "
+                                    "(with confirm_repeat_cost=true) to unlock a dead owner"}
+                target = "released"
+            component_target = "manual_only" if action == "abandon" else "released"
+            cursor = conn.execute(
+                "UPDATE embedding_batches SET state = ?, outcome = ?, reason = ?, updated_at = ? "
+                "WHERE batch_id = ? AND state != 'complete'",
+                (target, action, str(note)[:400], now, batch_id))
+            if cursor.rowcount != 1:
+                self._rollback_quietly(conn)
+                return {"batch_id": batch_id, "applied": False,
+                        "error": "RESUME_BATCH_IMMUTABLE"}
+            conn.execute(
+                "UPDATE embedding_components SET state = ? WHERE batch_id = ? AND state != 'complete'",
+                (component_target, batch_id))
+            conn.commit()
+        return {"batch_id": batch_id, "applied": True, "state": target,
+                "component_state": component_target, "previous_state": current}
+
+    def record_legacy_disposition(self, request_id: str, *, kind: str = "", state: str = "",
+                                  note: str = "") -> bool:
+        """登记一条旧 journal 记录已人工处置。返回 True 表示本次新登记。
+
+        `success`/`abandoned` 是历史事实、不允许改状态，所以处置只能登记在
+        `legacy_dispositions` 里；重复登记返回 False（幂等，不谎报 applied）。
+        """
+        if not isinstance(request_id, str) or not request_id:
+            raise StoreContractError("request_id 必填")
+        with self.mutation() as conn:
+            self._ensure_resume_schema(conn)
+            cursor = conn.execute(
+                "INSERT OR IGNORE INTO legacy_dispositions "
+                "(request_id, kind, state, note, decided_at) VALUES (?, ?, ?, ?, ?)",
+                (request_id, str(kind)[:64], str(state)[:32], str(note)[:400], time.time()))
+            conn.commit()
+            return cursor.rowcount == 1
+
+    def prune_audit(self, retention_days: int, *, now: float | None = None) -> dict:
+        """按保留期清理**终态**审计行（`request_control.audit_retention_days`）。
+
+        `retention_days <= 0` = 保留全部（不做任何删除）。只清终态：
+        `request_intents` 的 `success` / `abandoned`，以及 `embedding_batches` 里
+        不在 active/hold 集合内的批次（`complete` / `released` / `rejected`）。
+        **绝不动** still-active 的占用（`reserved`/`sending`/`result_pending`）与
+        `held_*` / `manual_only` —— 那些是防重放的判据，删掉等于放开重复计费。
+        旧版本写入的行（`writer=''`）同样受保护：它们承载「无法可靠映射到组件」的
+        人工处置台账，未登记 `legacy_dispositions` 前不随保留期清理消失。
+        """
+        days = int(retention_days or 0)
+        if days <= 0:
+            return {"applied": False, "pruned": False, "reason": "RETENTION_DISABLED"}
+        cutoff = float(now if now is not None else time.time()) - days * 86400.0
+        pruned_intents = 0
+        pruned_batches = 0
+        pruned_components = 0
+        skipped_legacy = 0
+        with self.mutation() as conn:
+            if not self._resume_schema_ready(conn):
+                # 审计表都还没建：没有任何可清的行，也不替调用方建表。
+                # 没有 `legacy_dispositions` 可查 → 旧行一律不删（宁留不删）。
+                pruned_intents = conn.execute(
+                    "DELETE FROM request_intents WHERE state IN ('success', 'abandoned') "
+                    "AND updated_at < ? AND writer <> ''", (cutoff,)).rowcount or 0
+                skipped_legacy = conn.execute(
+                    "SELECT COUNT(*) FROM request_intents WHERE state IN ('success', 'abandoned') "
+                    "AND updated_at < ? AND writer = ''", (cutoff,)).fetchone()[0] or 0
+                conn.commit()
+                return {"applied": bool(pruned_intents), "pruned": True,
+                        "request_intents": int(pruned_intents), "batches": 0,
+                        "components": 0, "skipped_legacy_pending": int(skipped_legacy),
+                        "cutoff": cutoff, "retention_days": days}
+            terminal = ("complete", "released", "rejected")
+            placeholders = ",".join("?" for _ in terminal)
+            pruned_components = conn.execute(
+                "DELETE FROM embedding_components WHERE state IN "
+                "('complete', 'released') AND batch_id IN ("
+                f"SELECT batch_id FROM embedding_batches WHERE state IN ({placeholders}) "
+                "AND updated_at < ?)", (*terminal, cutoff)).rowcount or 0
+            pruned_batches = conn.execute(
+                f"DELETE FROM embedding_batches WHERE state IN ({placeholders}) AND updated_at < ?",
+                (*terminal, cutoff)).rowcount or 0
+            legacy_guard = ("AND (writer <> '' OR request_id IN "
+                            "(SELECT request_id FROM legacy_dispositions))")
+            pruned_intents = conn.execute(
+                "DELETE FROM request_intents WHERE state IN ('success', 'abandoned') "
+                f"AND updated_at < ? {legacy_guard}", (cutoff,)).rowcount or 0
+            skipped_legacy = conn.execute(
+                "SELECT COUNT(*) FROM request_intents WHERE state IN ('success', 'abandoned') "
+                "AND updated_at < ? AND writer = '' AND request_id NOT IN "
+                "(SELECT request_id FROM legacy_dispositions)", (cutoff,)).fetchone()[0] or 0
+            conn.commit()
+        return {"applied": bool(pruned_intents or pruned_batches), "pruned": True,
+                "request_intents": int(pruned_intents), "batches": int(pruned_batches),
+                "components": int(pruned_components),
+                "skipped_legacy_pending": int(skipped_legacy),
+                "cutoff": cutoff, "retention_days": days}
+
+    def legacy_disposition_ids(self) -> set[str]:
+        """已处置的旧记录 id 集合（只读；表不存在时返回空集，不掩盖读取错误）。"""
+        conn = self._require_conn()
+        try:
+            rows = conn.execute("SELECT request_id FROM legacy_dispositions").fetchall()
+        except sqlite3.OperationalError:
+            return set()
+        return {str(row[0]) for row in rows}
 
     def close(self) -> None:
         conn = self._conn()
@@ -1444,6 +1923,42 @@ class ControlStore:
 
 
 # --------------------------------------------------------------------------- schema
+
+#: 续算表 DDL（v0.9.2）。逐条 execute，禁止 executescript（它会隐式 COMMIT）。
+#: 只存哈希/定位/状态，**不存 chunk 正文、API key 或向量 BLOB**。
+_RESUME_SCHEMA_STATEMENTS = (
+    "CREATE TABLE IF NOT EXISTS embedding_batches ("
+    "batch_id TEXT PRIMARY KEY, operation_id TEXT NOT NULL, purpose_family TEXT NOT NULL, "
+    "profile_fingerprint TEXT NOT NULL, endpoint TEXT NOT NULL, payload_hash TEXT NOT NULL DEFAULT '', "
+    "owner_token TEXT NOT NULL, vault_epoch INTEGER NOT NULL DEFAULT 0, "
+    "generation_id TEXT NOT NULL DEFAULT '', state TEXT NOT NULL, outcome TEXT NOT NULL DEFAULT '', "
+    "http_status INTEGER, reason TEXT NOT NULL DEFAULT '', created_at REAL NOT NULL, "
+    "updated_at REAL NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS embedding_components ("
+    "batch_id TEXT NOT NULL REFERENCES embedding_batches(batch_id), ordinal INTEGER NOT NULL, "
+    "component_key TEXT NOT NULL, embedding_key TEXT NOT NULL, input_sha256 TEXT NOT NULL, "
+    "source TEXT NOT NULL, source_kind TEXT NOT NULL, source_sha256 TEXT NOT NULL DEFAULT '', "
+    "revision_id TEXT NOT NULL DEFAULT '', chunk_id TEXT NOT NULL, state TEXT NOT NULL, "
+    "PRIMARY KEY (batch_id, ordinal))",
+    # 唯一的 active 占用约束：同一个稳定输入身份在任一时刻只能有一个未完成占用。
+    # 这是重放防护的**最终判据**，调度串行只是减少冲突、不能代替它。
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_embedding_active_component "
+    "ON embedding_components(component_key) WHERE state IN "
+    "('reserved','sending','result_pending','held_unknown','held_response_invalid',"
+    "'held_result_missing','manual_only')",
+    "CREATE INDEX IF NOT EXISTS idx_embedding_batch_state "
+    "ON embedding_batches(profile_fingerprint, purpose_family, state)",
+    "CREATE INDEX IF NOT EXISTS idx_embedding_component_source "
+    "ON embedding_components(source, source_sha256, revision_id)",
+    "CREATE INDEX IF NOT EXISTS idx_embedding_component_history "
+    "ON embedding_components(component_key, state)",
+    # 旧 journal 记录的人工处置台账（v0.9.2 §10）：`success`/`abandoned` 是历史事实，
+    # 不能被改写状态；它们只能通过这里「已处置」登记来退出待迁移集合，否则那些记录
+    # 会永远留在待处置列表里（既无法解除、又会误报 applied）。
+    "CREATE TABLE IF NOT EXISTS legacy_dispositions ("
+    "request_id TEXT PRIMARY KEY, kind TEXT NOT NULL DEFAULT '', state TEXT NOT NULL DEFAULT '', "
+    "note TEXT NOT NULL DEFAULT '', decided_at REAL NOT NULL)",
+)
 
 _DOCSTORE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS store_meta (

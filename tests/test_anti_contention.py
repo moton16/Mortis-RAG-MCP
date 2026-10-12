@@ -211,6 +211,11 @@ def test_set_file_exemption_is_non_blocking(tmp_path, monkeypatch):
 
     monkeypatch.setattr(indexer, "sync", _fail_sync)
 
+    # 预热一次再计时：首次调用要把索引/缓存与文件元数据拉进热态，这部分冷启动成本与
+    # 「是否阻塞在前台同步」无关（CI 上实测过 74ms 全部来自冷启动）。前台同步若真的发生，
+    # 无论冷热都会被上面的 _fail_sync 直接判死，计时只是第二道护栏。
+    indexer.set_file_exemption("note.md", exempt=True, method="frontmatter")
+
     # 1. exempt=True 方向
     t0 = time.perf_counter()
     res_true = indexer.set_file_exemption("note.md", exempt=True, method="frontmatter")

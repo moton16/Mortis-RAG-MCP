@@ -501,3 +501,70 @@ def test_paid_media_endpoint_still_uses_the_paid_ledger(tmp_path):
         assert [i["state"] for i in media_intents(idx)] == ["success"]
     finally:
         close(idx)
+
+
+def test_manual_policy_blocks_paid_media_posts(tmp_path):
+    """v0.9.2 复核修正：`background_embedding=manual` 必须同时拦住付费原生媒体。
+
+    这个键此前只在文档嵌入路径生效：配了 manual 的用户仍会被 watch/启动触发的
+    媒体 POST 扣费，而 `kb_stats` 还报成 manual（看起来已经生效）。
+    """
+    calls = []
+
+    def transport(items):
+        calls.append([i.request_id for i in items])
+        return valid(items)
+
+    idx = make_indexer(tmp_path, media_config(), transport)
+    object.__setattr__(idx.config.request_control, "background_embedding", "manual")
+    commit_media(idx)
+    try:
+        idx.sync()
+        assert calls == [], "manual 策略下不得发出任何付费媒体 POST"
+        assert not native(idx)
+        assert media_intents(idx) == [], "不得为被策略拦下的媒体落下付费意图"
+    finally:
+        close(idx)
+
+
+def test_media_posts_count_toward_the_shared_round_budget(tmp_path):
+    """v0.9.2 复核修正：媒体 POST 必须与文档 POST 共享 `background_max_posts_per_round`。"""
+    calls = []
+
+    def transport(items):
+        calls.append([i.request_id for i in items])
+        return valid(items)
+
+    idx = make_indexer(tmp_path, media_config(), transport)
+    object.__setattr__(idx.config.request_control, "background_max_posts_per_round", 1)
+    commit_media(idx)
+    try:
+        idx.sync()
+        assert len(calls) == 1
+        assert idx._post_budget_used >= 1, "媒体 POST 必须被计入本轮预算"
+    finally:
+        close(idx)
+
+
+def test_never_sent_local_rejection_does_not_freeze_the_route(tmp_path):
+    """v0.9.2 复核修正：**从未发出**的本地校验失败不得留成未决意图冻死整条路由。
+
+    Gemini 的 `:embedContent` 端点不接受批量：两个媒体项合成一次调用时，transport 在
+    发 wire 之前就拒绝。此前它被归为 `transport_unknown` → `submission_unknown`，于是
+    下一轮 `has_unresolved_paid_intents` 让付费媒体永久停摆（要人工处置一条从未发出的请求）。
+    """
+    cfg = media_config(media_adapter="gemini",
+                       media_endpoint="https://googleapis.com/v1beta/models/fixture:embedContent")
+    idx = make_indexer(tmp_path, cfg, valid)
+    commit_media(idx, count=2)
+    try:
+        idx.sync()
+        states = [i["state"] for i in media_intents(idx)]
+        assert states, "发送前就该落下意图（before_send 在 transport 之前）"
+        assert "submission_unknown" not in states, "从未发出的请求不得被记成未决付费意图"
+        # 路由没有被冻死：换成可用 transport 后零人工处置就该继续。
+        idx.media_provider._transport = valid
+        idx.sync()
+        assert native(idx)
+    finally:
+        close(idx)

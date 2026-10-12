@@ -37,6 +37,9 @@ def resolve_media_auth(explicit_media: str = "", explicit_generic: str = "", env
             or resolve_api_key())
 
 
+_INPUT_MODALITY_DECLARATION_VALUES = {"none", "typed", "hint"}
+
+
 @dataclass(slots=True)
 class EmbeddingConfig:
     mode: str = "static"
@@ -49,6 +52,8 @@ class EmbeddingConfig:
     # (Qwen3-Embedding series) accept it; fixed-dimension models (bge-m3) reject
     # it with HTTP 400, so set this to false for those.
     send_dimensions: bool = True
+    # Endpoint-specific opt-in; "none" preserves the OpenAI-compatible contract.
+    input_modality_declaration: str = "none"
     # Extra attempts after the first failure (0 keeps the old fail-fast behavior).
     max_retries: int = 3
     # Max texts per embedding HTTP request. <=0 disables batching and sends
@@ -89,6 +94,12 @@ class EmbeddingConfig:
         from .embedding_capabilities import validate_media_modalities, validate_text_template
         validate_text_template(self.query_template)
         validate_text_template(self.document_template)
+        if self.input_modality_declaration not in _INPUT_MODALITY_DECLARATION_VALUES:
+            raise ValueError(
+                "embedding.input_modality_declaration must be one of "
+                f"{sorted(_INPUT_MODALITY_DECLARATION_VALUES)}, got "
+                f"{self.input_modality_declaration!r}"
+            )
         for name in ("model_revision", "endpoint_revision", "preprocess_version",
                      "media_alignment_space_id", "media_preprocess_version", "media_endpoint_revision",
                      "media_model_reference", "media_endpoint_fixture_reference",
@@ -451,6 +462,67 @@ class DiagConfig:
     retention_days: int = 7
 
 
+REQUEST_CONTROL_MODES = ("bounded_resume", "legacy_profile")
+BACKGROUND_EMBEDDING_MODES = ("enabled", "manual")
+
+
+@dataclass(slots=True)
+class RequestControlConfig:
+    """外部请求控制（v0.9.2 §8）。
+
+    只描述**策略与预算**，绝不进入 `ResolvedEmbeddingProfile` / 媒体 profile /
+    derived fingerprint，也不加入会触发重嵌的 embedding repr——否则改一个预算数字
+    就会让整个库重新付费重算。
+
+    * `mode`：`bounded_resume` = 组件级占用 + 持久 unknown hold（目标默认）；
+      `legacy_profile` = 临时回滚兼容模式，恢复旧 profile 级未决暂停。
+    * `background_embedding`：`manual` 时后台不自动计算外部文档/媒体向量，
+      普通读取 / stats / watch 启动也不隐式付费（文档与原生媒体两条路径共用判据）。
+    * 预算是**操作内计数器**，不是账户金额预算/票据；`background_max_posts_per_round`
+      对文档与媒体 POST **共享**，`query_max_posts` 限制一次 fan-out 检索里的付费查询嵌入数。
+    * `paused_profiles` 是明确的暂停清单（精确 fingerprint），不是审批清单。
+    * `audit_retention_days` 由显式动作执行（`kb_request_control action=prune_audit`
+      / CLI `--request-control prune_audit --apply`），只清终态审计行；0 = 全保留。
+    """
+
+    #: P4 联合验收通过后切换为目标默认：组件级占用 + 持久 unknown hold。
+    #: `legacy_profile` 只作为临时回滚兼容模式保留。
+    mode: str = "bounded_resume"
+    background_embedding: str = "enabled"
+    background_max_posts_per_round: int = 32
+    query_max_posts: int = 8
+    audit_retention_days: int = 30
+    paused_profiles: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.mode not in REQUEST_CONTROL_MODES:
+            raise ValueError(
+                f"request_control.mode must be one of {list(REQUEST_CONTROL_MODES)}, got {self.mode!r}")
+        if self.background_embedding not in BACKGROUND_EMBEDDING_MODES:
+            raise ValueError(
+                "request_control.background_embedding must be one of "
+                f"{list(BACKGROUND_EMBEDDING_MODES)}, got {self.background_embedding!r}")
+        for name, value, low, high in (
+            ("background_max_posts_per_round", self.background_max_posts_per_round, 1, 1024),
+            ("query_max_posts", self.query_max_posts, 1, 128),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
+                raise ValueError(f"request_control.{name} must be an integer in [{low}, {high}], got {value!r}")
+        if isinstance(self.audit_retention_days, bool) or not isinstance(self.audit_retention_days, int) \
+                or self.audit_retention_days < 0:
+            raise ValueError(
+                f"request_control.audit_retention_days must be a non-negative integer, "
+                f"got {self.audit_retention_days!r}")
+        if isinstance(self.paused_profiles, str):
+            object.__setattr__(self, "paused_profiles", (self.paused_profiles,))
+        cleaned: list[str] = []
+        for item in self.paused_profiles or ():
+            if not isinstance(item, str) or not item:
+                raise ValueError(f"request_control.paused_profiles entries must be non-empty strings, got {item!r}")
+            cleaned.append(item)
+        object.__setattr__(self, "paused_profiles", tuple(cleaned))
+
+
 @dataclass(slots=True)
 class AppConfig:
     # 空串 = 未配置默认库（0.3.0 起 vault 选择完全由用户级注册表接管，
@@ -496,6 +568,8 @@ class AppConfig:
     exclude_tags: list[str] = field(default_factory=lambda: list(DEFAULT_EXCLUDE_TAGS))
     exclude_frontmatter_keys: list[str] = field(default_factory=lambda: list(DEFAULT_EXCLUDE_FRONTMATTER_KEYS))
     ignore_file: str = ".vaultignore"
+    #: 外部请求控制策略与预算（v0.9.2）。追加在字段尾部，不影响既有位置参数。
+    request_control: RequestControlConfig = field(default_factory=RequestControlConfig)
 
     def __post_init__(self) -> None:
         self.vault_path = os.fspath(self.vault_path)
@@ -547,6 +621,8 @@ class AppConfig:
             raise ValueError("watch_method must be 'auto', 'native' or 'poll'")
         if self.watch_fallback_interval < 0:
             raise ValueError("watch_fallback_interval must be >= 0")
+        if not isinstance(self.request_control, RequestControlConfig):
+            raise ValueError("request_control must be a RequestControlConfig")
         out_dir = (self.ingest.output_dirname or "").strip("/\\ ")
         if not out_dir or ".." in Path(out_dir).parts or out_dir in (".", "/"):
             self.ingest.output_dirname = ".mortis-parsed"
@@ -832,6 +908,9 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
         timeout=_numeric(embedding, data, "timeout", float, 30.0, 0.0, 300.0),
         dimension=_numeric(embedding, data, "dimension", int, 384, 1),
         send_dimensions=bool(embedding.get("send_dimensions", True)),
+        input_modality_declaration=str(
+            embedding.get("input_modality_declaration", "none")
+        ).lower(),
         max_retries=_numeric(embedding, data, "max_retries", int, 3, 0, 10),
         batch_size=_numeric(embedding, data, "batch_size", int, 32, 0),
         retry_backoff=_numeric(embedding, data, "retry_backoff", float, 1.0, 0.0, 60.0),
@@ -987,4 +1066,25 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
         exclude_tags=exclude_tags,
         exclude_frontmatter_keys=exclude_fm,
         ignore_file=ignore_file,
+        request_control=_load_request_control(data),
+    )
+
+
+def _load_request_control(data: Mapping[str, Any]) -> RequestControlConfig:
+    section = _section(data, "request_control")
+    raw_mode = str(section.get("mode", "bounded_resume")).strip().lower()
+    raw_background = str(section.get("background_embedding", "enabled")).strip().lower()
+    raw_paused = section.get("paused_profiles", ())
+    if isinstance(raw_paused, str):
+        raw_paused = (raw_paused,)
+    if not isinstance(raw_paused, (list, tuple)):
+        raise ValueError(f"config key 'paused_profiles' must be an array of strings, got {raw_paused!r}")
+    return RequestControlConfig(
+        mode=raw_mode,
+        background_embedding=raw_background,
+        background_max_posts_per_round=_numeric(section, {}, "background_max_posts_per_round", int, 32, 1, 1024),
+        query_max_posts=_numeric(section, {}, "query_max_posts", int, 8, 1, 128),
+        # 0 = 保留全部（不清 held/resume，只清终态审计）。
+        audit_retention_days=_numeric(section, {}, "audit_retention_days", int, 30, 0, 36500),
+        paused_profiles=tuple(str(item) for item in raw_paused),
     )

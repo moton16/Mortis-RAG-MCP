@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mortis-rag-mcp"
-version = "0.9.1"
+version = "0.9.2"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
 description = "Mortis'RAG MCP - registry-based Markdown knowledge base RAG server (MCP over stdio, zero runtime dependencies)"

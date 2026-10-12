@@ -8,19 +8,72 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol, Sequence
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import Request
 
 from .embedding_capabilities import ResolvedEmbeddingProfile, validate_profile, validate_vector
-from .providers import ProviderError, _is_loopback_endpoint
+# `urlopen` 必须仍然是**本模块的模块级名字**：它是既有的测试注入点
+# （`patch("mortis_rag_mcp.media_providers.urlopen", ...)`）。这里刻意复用
+# `providers` 那个**不跟随 3xx** 的实现（付费请求非幂等，理由见
+# `providers._build_no_redirect_opener`）。
+from .providers import (
+    PaidRequestRefused, ProviderError, _is_loopback_endpoint, _transport_outcome,
+)
+from .providers import urlopen as urlopen  # noqa: PLC0414 - 保持模块级可替换名
+from .request_lifecycle import (
+    OUTCOME_NOT_SENT, OUTCOME_RESPONSE_INVALID, OUTCOME_SUCCEEDED,
+    RequestContext, RequestOutcome, audit_is_blocking, get_request_control_mode,
+)
 
 _MAX_RESPONSE_BYTES = 10 * 1024 * 1024  # 10 MiB response body limit
+
+
+def _pre_send_error(message: str) -> ProviderError:
+    """**尚未发送**的本地校验失败（参数/批量/体积/MIME 不合规）。
+
+    必须与「远端影响未知」分开：这些检查都在 `journal.before_send` 之前，远端一个字
+    都没收到。把它们记成 `transport_unknown` 会写下一条 `submission_unknown` 意图，
+    于是下一轮 `has_unresolved_paid_intents` 让整条媒体路由停摆 —— 一条从未发出的
+    请求冻死付费媒体（v0.9.2 复核修正）。
+    """
+    return ProviderError(message, outcome=OUTCOME_NOT_SENT, response_received=False,
+                         remote_effect_unknown=False)
+
+
+def _media_outcome(exc: BaseException) -> RequestOutcome:
+    """把媒体 transport/adapter 抛出的异常归一为结构化结果。
+
+    `MediaResponseError` 表示**收到了响应但产物不可用**，不是没发；transport 侧的
+    网络/HTTP 事实从 `__cause__` 链上还原，绝不把「响应不可用」降级成「未提交」。
+    """
+    if isinstance(exc, MediaResponseError):
+        reason = getattr(exc, "reason", "media_response_contract_failed")
+        rejected = reason == "media_response_rejected"
+        # 与文本路径同一口径：4xx 类明确拒绝 = 远端确定没处理（remote_effect_unknown
+        # 为 False）；响应到了但契约不满足 = 远端影响未知（True）。此前一律置 True，
+        # 让同一个 `rejected` 值在两条路径上含义不同。
+        return RequestOutcome(outcome="rejected" if rejected else OUTCOME_RESPONSE_INVALID,
+                              response_received=True, remote_effect_unknown=not rejected,
+                              http_status=getattr(exc, "http_status", None),
+                              detail=str(exc)[:200])
+    # 已经带结构化分类的 ProviderError（例如 transport 的发送前校验 `not_sent`）：
+    # 尊重它的 outcome，不要一律按「远端影响未知」覆盖 —— 那会把一条从未发出的请求
+    # 记成未决付费意图，冻死整条媒体路由。
+    if isinstance(exc, ProviderError) and getattr(exc, "outcome", ""):
+        return exc.as_outcome()
+    cause = getattr(exc, "__cause__", None)
+    if cause is not None:
+        return _transport_outcome(cause)
+    return RequestOutcome(outcome="transport_unknown", response_received=False,
+                          remote_effect_unknown=True, http_status=getattr(exc, "http_status", None),
+                          detail=str(exc)[:200])
 
 
 class MediaResponseError(ProviderError):
     """The endpoint responded, but its response is not an indexable success."""
 
-    def __init__(self, message: str, reason: str = "media_response_contract_failed") -> None:
-        super().__init__(message)
+    def __init__(self, message: str, reason: str = "media_response_contract_failed",
+                 http_status: int | None = None) -> None:
+        super().__init__(message, http_status=http_status)
         self.reason = reason
 
 
@@ -114,15 +167,15 @@ class HttpMediaTransport:
         if not items:
             return []
         if len(items) > self.max_batch_size:
-            raise ProviderError(f"media batch size {len(items)} exceeds limit {self.max_batch_size}")
+            raise _pre_send_error(f"media batch size {len(items)} exceeds limit {self.max_batch_size}")
         input_payloads: list[dict[str, Any]] = []
         for item in items:
             if item.modality != "image":
-                raise ProviderError(f"media modality {item.modality!r} unsupported by VL embedding transport (only 'image' supported)")
+                raise _pre_send_error(f"media modality {item.modality!r} unsupported by VL embedding transport (only 'image' supported)")
             if item.mime_type not in self.allowed_mime_types:
-                raise ProviderError(f"media mime type {item.mime_type!r} not in allowed types {self.allowed_mime_types}")
+                raise _pre_send_error(f"media mime type {item.mime_type!r} not in allowed types {self.allowed_mime_types}")
             if len(item.data) > self.max_input_bytes:
-                raise ProviderError(f"media data size {len(item.data)} exceeds limit {self.max_input_bytes}")
+                raise _pre_send_error(f"media data size {len(item.data)} exceeds limit {self.max_input_bytes}")
             b64_data = base64.b64encode(item.data).decode("ascii")
             data_uri = f"data:{item.mime_type};base64,{b64_data}"
             input_payloads.append({"image": data_uri})
@@ -170,8 +223,10 @@ class HttpMediaTransport:
                 except Exception:
                     msg += f" - {err_text[:200]}"
             if 400 <= exc.code < 500 and exc.code != 429:
-                raise MediaResponseError(f"media embedding HTTP failure: {msg}", "media_response_rejected") from exc
-            raise ProviderError(f"media embedding HTTP failure: {msg}") from exc
+                raise MediaResponseError(f"media embedding HTTP failure: {msg}",
+                                         "media_response_rejected", http_status=exc.code) from exc
+            raise ProviderError(f"media embedding HTTP failure: {msg}",
+                                http_status=exc.code) from exc
         except (URLError, OSError) as exc:
             raise ProviderError(f"media embedding network error: {exc}") from exc
 
@@ -183,7 +238,10 @@ class HttpMediaTransport:
         if isinstance(result, dict) and "error" in result:
             err = result["error"]
             err_msg = err.get("message") if isinstance(err, dict) else str(err)
-            raise MediaResponseError(f"media embedding API error: {err_msg}", "media_response_rejected")
+            # HTTP 是 200，但 body 里带 error 对象：响应确实收到了（2xx），供应商明确
+            # 拒绝这次请求 → 记 200 而不是丢掉状态码。
+            raise MediaResponseError(f"media embedding API error: {err_msg}",
+                                     "media_response_rejected", http_status=200)
 
         data = result.get("data") if isinstance(result, dict) else None
         if not isinstance(data, list):
@@ -240,10 +298,10 @@ class GeminiMediaTransport:
         if not items:
             return []
         if len(items) > self.max_batch_size:
-            raise ProviderError(f"media batch size {len(items)} exceeds limit {self.max_batch_size}")
+            raise _pre_send_error(f"media batch size {len(items)} exceeds limit {self.max_batch_size}")
 
         if self.endpoint.endswith(":embedContent") and len(items) > 1:
-            raise ProviderError(
+            raise _pre_send_error(
                 f"Gemini single :embedContent endpoint does not accept batch requests (got {len(items)} items); "
                 "use :batchEmbedContents endpoint for batched requests"
             )
@@ -253,14 +311,14 @@ class GeminiMediaTransport:
         requests_payload: list[dict[str, Any]] = []
         for item in items:
             if item.modality not in ("image", "audio"):
-                raise ProviderError(
+                raise _pre_send_error(
                     f"media modality {item.modality!r} unsupported by Gemini media embedding transport "
                     "(only 'image' and 'audio' supported)"
                 )
             if item.mime_type not in self.allowed_mime_types:
-                raise ProviderError(f"media mime type {item.mime_type!r} not in allowed types {self.allowed_mime_types}")
+                raise _pre_send_error(f"media mime type {item.mime_type!r} not in allowed types {self.allowed_mime_types}")
             if len(item.data) > self.max_input_bytes:
-                raise ProviderError(f"media data size {len(item.data)} exceeds limit {self.max_input_bytes}")
+                raise _pre_send_error(f"media data size {len(item.data)} exceeds limit {self.max_input_bytes}")
             b64_data = base64.b64encode(item.data).decode("ascii")
             part_content = {
                 "parts": [
@@ -331,8 +389,10 @@ class GeminiMediaTransport:
                 except Exception:
                     msg += f" - {err_text[:200]}"
             if 400 <= exc.code < 500 and exc.code != 429:
-                raise MediaResponseError(f"Gemini media embedding HTTP failure: {msg}", "media_response_rejected") from exc
-            raise ProviderError(f"Gemini media embedding HTTP failure: {msg}") from exc
+                raise MediaResponseError(f"Gemini media embedding HTTP failure: {msg}",
+                                         "media_response_rejected", http_status=exc.code) from exc
+            raise ProviderError(f"Gemini media embedding HTTP failure: {msg}",
+                                http_status=exc.code) from exc
         except (URLError, OSError) as exc:
             raise ProviderError(f"Gemini media embedding network error: {exc}") from exc
 
@@ -344,7 +404,8 @@ class GeminiMediaTransport:
         if isinstance(result, dict) and "error" in result:
             err = result["error"]
             err_msg = err.get("message") if isinstance(err, dict) else str(err)
-            raise MediaResponseError(f"Gemini media embedding API error: {err_msg}", "media_response_rejected")
+            raise MediaResponseError(f"Gemini media embedding API error: {err_msg}",
+                                     "media_response_rejected", http_status=200)
 
         mapped_records: list[dict[str, Any]] = []
         if isinstance(result, dict) and "embeddings" in result:
@@ -437,12 +498,31 @@ class NativeMediaProvider:
         self._transport = transport
         self.request_journal: Any = None
         self.paid_guard: Any = None
+        #: 非空时覆盖全局请求控制模式。
+        self.request_control_mode = ""
+        #: 审计写失败独立记录，绝不丢掉已验证产物。
+        self.audit_errors: list[dict[str, str]] = []
 
-    def configure_paid_requests(self, journal: Any, guard: Any, profile_fingerprint: str) -> None:
+    @property
+    def request_mode(self) -> str:
+        return self.request_control_mode or get_request_control_mode()
+
+    @property
+    def audit_write_errors(self) -> int:
+        return len(self.audit_errors)
+
+    def configure_paid_requests(self, journal: Any, guard: Any, profile_fingerprint: str,
+                                *, mode: str = "") -> None:
         if profile_fingerprint != self.profile.fingerprint:
             raise ProviderError("native media authorization profile mismatch")
         self.request_journal = journal
         self.paid_guard = guard
+        if mode:
+            self.request_control_mode = mode
+
+    def _record_audit_error(self, phase: str, exc: BaseException) -> None:
+        self.audit_errors.append({"phase": phase, "error": type(exc).__name__,
+                                  "detail": str(exc)[:200]})
 
     @property
     def is_local_free(self) -> bool:
@@ -468,7 +548,12 @@ class NativeMediaProvider:
             "max_batch_size": self.evidence.max_batch_size,
         }
 
-    def embed_media(self, inputs: Sequence[EmbeddingInput]) -> list[list[float]]:
+    def embed_media(self, inputs: Sequence[EmbeddingInput], *,
+                    request_context: RequestContext | None = None) -> list[list[float]]:
+        return self.embed_media_batch_once(inputs, request_context=request_context)
+
+    def embed_media_batch_once(self, inputs: Sequence[EmbeddingInput], *,
+                               request_context: RequestContext | None = None) -> list[list[float]]:
         items = list(inputs)
         if not items:
             return []
@@ -490,37 +575,107 @@ class NativeMediaProvider:
         # （issue #12/#13）。付费路径的结构一条未动。
         local_free = self.is_local_free
         journal = self.request_journal
+        mode = self.request_mode
+        context = request_context if isinstance(request_context, RequestContext) else None
+        base = {
+            "operation_id": context.operation_id if context else "",
+            "batch_id": context.batch_id if context else "",
+        }
         if journal is None or self.paid_guard is None:
-            if not local_free:
-                raise ProviderError("EMBEDDING_PENDING_APPROVAL: native media request blocked")
+            if not local_free and audit_is_blocking(mode):
+                raise ProviderError("EMBEDDING_PENDING_APPROVAL: native media request blocked",
+                                    outcome=OUTCOME_NOT_SENT, response_received=False,
+                                    remote_effect_unknown=False, **base)
         elif not (local_free or self.paid_guard(self.profile.fingerprint)):
-            raise ProviderError("EMBEDDING_PENDING_APPROVAL: native media request blocked")
+            raise ProviderError("REQUEST_ROUTE_PAUSED: native media route is paused",
+                                outcome=OUTCOME_NOT_SENT, response_received=False,
+                                remote_effect_unknown=False, **base)
         material = repr([(item.request_id, item.modality, item.mime_type, item.media_hash) for item in items])
         payload_hash = hashlib.sha256(material.encode()).hexdigest()
-        request_id = None if local_free else journal.before_send(
-            payload_hash, self.profile.endpoint, self.profile.fingerprint)
+        request_id = None
+        if not local_free and journal is not None:
+            try:
+                request_id = journal.before_send(
+                    payload_hash, self.profile.endpoint, self.profile.fingerprint)
+            except PaidRequestRefused as exc:
+                # 闸门主动拒绝（同一载荷已有未决意图）**不是**审计写失败：无条件上抛，
+                # 否则同一媒体载荷会被第二次物理 POST。
+                self._record_audit_error("before_send", exc)
+                raise
+            except Exception as exc:  # noqa: BLE001 - 审计写失败是非阻塞的
+                self._record_audit_error("before_send", exc)
+                if audit_is_blocking(mode):
+                    raise
         try:
             response = list(self._transport(items))
-        except MediaResponseError as exc:
-            if request_id is not None:
-                journal.mark_response_failed(request_id, exc.reason)
-            raise
-        except Exception as exc:
-            if request_id is None:
+        except BaseException as exc:  # noqa: BLE001 - 分类后统一上抛
+            outcome = _media_outcome(exc)
+            outcome = RequestOutcome(outcome=outcome.outcome,
+                                     response_received=outcome.response_received,
+                                     remote_effect_unknown=outcome.remote_effect_unknown,
+                                     http_status=outcome.http_status,
+                                     detail=outcome.detail,
+                                     request_fingerprint=payload_hash, **base)
+            self._finish(request_id, outcome, mode, exc)
+            if local_free and request_id is None and not isinstance(exc, MediaResponseError):
                 raise ProviderError(
-                    f"LOCAL_MEDIA_REQUEST_FAILED: request to local endpoint failed: {exc}") from exc
-            journal.mark_unknown(request_id, "response_unconfirmed")
-            raise ProviderError("SUBMISSION_UNKNOWN: native media outcome unknown") from exc
+                    f"LOCAL_MEDIA_REQUEST_FAILED: request to local endpoint failed: {exc}",
+                    outcome=outcome.outcome, response_received=outcome.response_received,
+                    remote_effect_unknown=outcome.remote_effect_unknown,
+                    http_status=outcome.http_status, response_detail=outcome.detail,
+                    request_fingerprint=payload_hash, **base) from exc
+            if isinstance(exc, MediaResponseError):
+                raise
+            from .request_lifecycle import legacy_error_code
+            raise ProviderError(
+                f"{legacy_error_code(outcome.outcome) if audit_is_blocking(mode) else outcome.error_code}"
+                f": native media request failed: {outcome.summary or outcome.detail}",
+                outcome=outcome.outcome, response_received=outcome.response_received,
+                remote_effect_unknown=outcome.remote_effect_unknown,
+                http_status=outcome.http_status, response_detail=outcome.detail,
+                request_fingerprint=payload_hash, **base) from exc
         # Receipt is not success. Validate every item before the durable success CAS.
         try:
             if len(response) != len(items):
-                raise ProviderError("native media response count mismatch")
+                raise ProviderError("native media response count mismatch",
+                                    outcome=OUTCOME_RESPONSE_INVALID, response_received=True,
+                                    remote_effect_unknown=True, request_fingerprint=payload_hash, **base)
             mapped = map_media_response(response, ids)
             vectors = [validate_vector(mapped[item_id], self.profile) for item_id in ids]
-        except Exception:
-            if request_id is not None:
-                journal.mark_response_failed(request_id)
+        except BaseException as exc:
+            outcome = RequestOutcome(outcome=OUTCOME_RESPONSE_INVALID, response_received=True,
+                                     remote_effect_unknown=True, detail=str(exc)[:200],
+                                     request_fingerprint=payload_hash, **base)
+            self._finish(request_id, outcome, mode, exc)
             raise
-        if request_id is not None:
-            journal.mark_success(request_id)
+        self._finish(request_id, RequestOutcome(outcome=OUTCOME_SUCCEEDED, response_received=True,
+                                                remote_effect_unknown=True,
+                                                request_fingerprint=payload_hash, **base), mode, None)
         return vectors
+
+    def _finish(self, request_id: str | None, outcome: RequestOutcome, mode: str,
+                cause: BaseException | None) -> None:
+        """审计收尾：尽力而为；失败只记账，绝不丢掉已验证产物。"""
+        if request_id is None:
+            return
+        journal = self.request_journal
+        if journal is None:
+            return
+        try:
+            if outcome.outcome == OUTCOME_SUCCEEDED:
+                journal.mark_success(request_id)
+            elif outcome.outcome == OUTCOME_NOT_SENT:
+                # 本地校验失败：远端一个字都没收到。留成未决意图会把整条媒体路由
+                # 冻死（`PAID_REQUEST_UNRESOLVED`），而那条请求从未发出。
+                journal.mark_not_sent(request_id, f"{outcome.outcome}: {outcome.detail}")
+            elif outcome.outcome == "rejected" and cause is not None:
+                reason = getattr(cause, "reason", "media_response_contract_failed")
+                journal.mark_response_failed(request_id, reason)
+            elif outcome.outcome == OUTCOME_RESPONSE_INVALID:
+                journal.mark_response_failed(request_id)
+            else:
+                journal.mark_unknown(request_id, f"{outcome.outcome}: {outcome.detail}")
+        except Exception as exc:  # noqa: BLE001
+            self._record_audit_error("after_send", exc)
+            if audit_is_blocking(mode):
+                raise
