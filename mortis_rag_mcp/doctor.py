@@ -664,7 +664,10 @@ def _configure_probe_paid(provider: object, cfg: object, *, kind: str, fingerpri
             return False
         if str(profile) in paused:
             return False
-        return True if db_allowed is None else bool(db_allowed(profile))
+        # `paid_request_guard` 返回的是**求值后的 bool**，不是可调用 guard：这里不能再
+        # 调一次（会 `TypeError: 'bool' object is not callable`，被上层吞成「探测失败」，
+        # 于是这条判据永远不生效）。
+        return True if db_allowed is None else bool(db_allowed)
 
     configure(journal, probe_guard, str(fingerprint))
     return True
@@ -712,9 +715,13 @@ def probe_reranker(cfg: object) -> dict:
         if not getattr(rr, "enabled", False):
             return _section(True, "未启用（跳过）")
         provider = create_reranker_provider(rr)
+        # 指纹材质必须与运行时一致（`indexer._reranker_profile_fingerprint` 用
+        # `normalize_endpoint`）：否则 host 大小写 / 尾斜杠不同就会算出另一个指纹，
+        # 撤销与暂停判据查错 profile，探活照样为已撤销的端点付费。
+        from .embedding_capabilities import normalize_endpoint
         fingerprint = hashlib.sha256("|".join((
             "rerank", str(getattr(rr, "adapter", "openai")), str(getattr(rr, "model", "")),
-            str(getattr(rr, "endpoint", "") or ""),
+            normalize_endpoint(str(getattr(rr, "endpoint", "") or "")),
         )).encode("utf-8")).hexdigest()
         if not _configure_probe_paid(provider, cfg, kind="rerank", fingerprint=fingerprint):
             return _section(

@@ -61,12 +61,16 @@ def chunk_has_vector(owner: MarkdownIndexer, chunk: Chunk) -> bool:
     return chunk.embedding is not None and len(chunk.embedding) > 0
 
 
-def ensure_disk_vectors_migrated(owner: MarkdownIndexer) -> None:
+def ensure_disk_vectors_migrated(owner: MarkdownIndexer, *, strict: bool = False) -> None:
     """Reconcile the disk vector store with in-memory chunks.
 
     Rebuilds the RAM bookkeeping set from the disk store, and performs a
     one-time migration from the legacy .vec.bin when the disk store is
     empty (so switching backends never triggers a full re-embed).
+
+    `strict=True`（成果核验路径）：后端读不出 id 时**抛出**而不是吞成空集。
+    「读不到证据」与「证据不存在」必须分开——前者只能报核验不可用，后者才允许
+    判成果丢失；混为一谈会把健康的 `complete` 批次推进成 `held_result_missing`。
     """
     if not owner._vectors_on_disk or owner._disk_vectors:
         return
@@ -79,7 +83,8 @@ def ensure_disk_vectors_migrated(owner: MarkdownIndexer) -> None:
                 owner._load_vectors_cache()
             owner._flush_vectors_to_disk()
     except Exception:
-        pass
+        if strict:
+            raise
 
 
 def flush_vectors_to_disk(owner: MarkdownIndexer) -> None:
@@ -500,6 +505,11 @@ def _resume_verifier(owner: MarkdownIndexer):
                 pairs.setdefault(chunk_id, key)
         if not pairs:
             return set()
+        # 磁盘后端：RAM 记账集合只在 sync 热路径重建，冷进程里它是空集。不先补建就
+        # 会把「本进程还没读过 vec0」误判成「磁盘上没有这些向量」，于是
+        # `audit_complete` 把健康的 complete 批次整批推进 held_result_missing
+        # （held_* 会冻结该 profile）。这里按需重建，读不到就抛出去报核验不可用。
+        ensure_disk_vectors_migrated(owner, strict=True)
         if not index:
             for chunks in getattr(owner, "_chunks", {}).values():
                 for chunk in chunks:
@@ -703,7 +713,8 @@ def _embed_missing_bounded(owner: MarkdownIndexer, pending: dict[str, list[Chunk
         # 提交成功后才允许 transport：一个物理 POST。
         budget += 1
         owner._post_budget_used = budget
-        context = RequestContext(operation_id, PURPOSE_BACKGROUND_DOCUMENT, batch_id)
+        context = RequestContext(operation_id, PURPOSE_BACKGROUND_DOCUMENT, batch_id,
+                                 ledger_managed=True)
         try:
             vectors = provider.embed_batch_once([c["text"] for c in group], request_context=context)
         except ProviderError as exc:

@@ -923,11 +923,52 @@ class ControlStore:
     `payment_authorizations`/`request_intents`（C97/C98/C100）。
     """
 
+    @staticmethod
+    def _payment_schema_ready(conn: sqlite3.Connection) -> bool:
+        """只读判据：付费面表与 `writer` 列是否都已就位（不建表、不改表）。"""
+        row = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'payment_authorizations'"
+        ).fetchone()
+        if row is None:
+            return False
+        row = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'request_intents'"
+        ).fetchone()
+        if row is None:
+            return False
+        columns = {str(item[1]) for item in conn.execute("PRAGMA table_info(request_intents)")}
+        return "writer" in columns
+
+    def payment_schema_present(self) -> bool:
+        """付费面 schema 是否已就绪（只读；不建表、不提交）。"""
+        try:
+            return self._payment_schema_ready(self._require_conn())
+        except sqlite3.Error:
+            return False
+
+    def _ensure_payment_schema_for_read(self, conn: sqlite3.Connection) -> bool:
+        """读路径的付费面就位判据；**声明只读时绝不落 DDL**。
+
+        返回 False = 「本控制库还没补齐 v0.9.2 付费面」：调用方按「没有任何记录」
+        处理，而不是顺手 `CREATE TABLE` / `ALTER TABLE`（那会让一次只读查询变成
+        写操作，违背 `list` / `dry_run` 的只读承诺，也会在只读载体上变成与语义
+        无关的失败）。写路径继续走 `_ensure_payment_schema` 的惰性补齐。
+        """
+        if self._payment_schema_ready(conn):
+            return True
+        if self._read_only_declared:
+            return False
+        self._ensure_payment_schema(conn)
+        return self._payment_schema_ready(conn)
+
     def __init__(self, layout: StorageLayout) -> None:
         self.layout = layout
         self._binding = _vault_binding(layout)
         self._tls = threading.local()
         self._degraded = False
+        #: 调用方是否**声明**了只读打开（`open(write=False)`）。声明只读时读路径
+        #: 不得落 DDL：`list` / `dry_run` 对外承诺只读，顺手建表会把一次查询变成写。
+        self._read_only_declared = False
 
     # ------------------------------------------------------------------ conn io
 
@@ -960,6 +1001,7 @@ class ControlStore:
 
     def open(self, *, create: bool = True, write: bool = False) -> None:
         """打开控制库；`create=False` 且文件不存在 → StoreCorrupt（明确 code）。"""
+        self._read_only_declared = not write
         path = self.layout.control_path
         exists = path.is_file() and path.stat().st_size > 0
         if not exists and not create:
@@ -1345,7 +1387,8 @@ class ControlStore:
         if not isinstance(profile_fingerprint, str) or not profile_fingerprint:
             return "absent"
         with self.mutation() as conn:
-            self._ensure_payment_schema(conn)
+            if not self._ensure_payment_schema_for_read(conn):
+                return "absent"
             row = conn.execute("SELECT revoked_at FROM payment_authorizations WHERE profile_fingerprint = ?",
                                (profile_fingerprint,)).fetchone()
         if row is None:
@@ -1357,7 +1400,8 @@ class ControlStore:
 
     def list_payment_authorizations(self) -> list[dict]:
         with self.mutation() as conn:
-            self._ensure_payment_schema(conn)
+            if not self._ensure_payment_schema_for_read(conn):
+                return []
             rows = conn.execute("SELECT profile_fingerprint, scope, cost_summary_json, note, "
                                "authorized_at, revoked_at FROM payment_authorizations "
                                "ORDER BY authorized_at").fetchall()
@@ -1427,13 +1471,15 @@ class ControlStore:
 
     def intent_state(self, request_id: str) -> str | None:
         with self.mutation() as conn:
-            self._ensure_payment_schema(conn)
+            if not self._ensure_payment_schema_for_read(conn):
+                return None
             row = conn.execute("SELECT state FROM request_intents WHERE request_id = ?", (request_id,)).fetchone()
             return None if row is None else str(row[0])
 
     def list_request_intents(self, *, state: str = "") -> list[dict]:
         with self.mutation() as conn:
-            self._ensure_payment_schema(conn)
+            if not self._ensure_payment_schema_for_read(conn):
+                return []
             rows = conn.execute(
                 "SELECT request_id, kind, payload_hash, endpoint, profile_fingerprint, attempt, state, "
                 "reason, created_at, updated_at, writer FROM request_intents "
@@ -1699,14 +1745,18 @@ class ControlStore:
 
     def resolve_embedding_work(self, batch_id: str, *, action: str,
                                owner_token: str = "", confirm_repeat_cost: bool = False,
-                               note: str = "") -> dict:
+                               expected_state: str = "", note: str = "") -> dict:
         """显式处置一个批次：`retry` / `abandon` / `release`。
 
         * `retry`：需 `confirm_repeat_cost=True`；只释放**本批次**组件，不解除其他
           记录；`sending` 活跃批次一律拒绝。
         * `abandon`：转 `manual_only`，退出自动续算；**保留** active 占用，所以
           watch 不会自动重发。
-        * `release`：仅在确定未发送或人工授权新尝试时使用。
+        * `release`：仅在确定未发送或人工授权新尝试时使用；非 `reserved` 状态必须
+          `confirm_repeat_cost=True`，且该门槛在本事务内按**刚读到的**状态判定。
+        * `expected_state`：调用方若按快照做过判据（如「`reserved` 免确认」），必须
+          把它传进来。状态在快照之后被别的 owner 推进过就拒绝，绝不把免确认的口径
+          套用到可能已经发出并计费的批次上。
         """
         if action not in {"retry", "abandon", "release"}:
             raise StoreContractError(f"unsupported resume action: {action}")
@@ -1718,9 +1768,26 @@ class ControlStore:
             if row is None:
                 raise StoreContractError(f"未记录的续算批次：{batch_id!r}")
             current = str(row[0])
+            if expected_state and current != str(expected_state):
+                self._rollback_quietly(conn)
+                return {"batch_id": batch_id, "applied": False,
+                        "error": "RESUME_BATCH_STATE_CHANGED",
+                        "expected_state": str(expected_state), "batch_state": current,
+                        "hint": "the batch state changed after your snapshot; re-inspect "
+                                "and confirm again"}
             if action == "abandon":
                 target = "manual_only"
             elif action == "release":
+                if current != "reserved" and not confirm_repeat_cost:
+                    # 与 `retry` 同一口径，但按**本事务内刚读到的**状态判定：
+                    # 免确认只对 `reserved`（从未进入 sending）成立。
+                    self._rollback_quietly(conn)
+                    return {"batch_id": batch_id, "applied": False,
+                            "error": "RESUME_RELEASE_NEEDS_CONFIRMATION",
+                            "batch_state": current,
+                            "hint": ("releasing a batch that may already have been sent lets the "
+                                     "next round issue a billed request again; pass "
+                                     "confirm_repeat_cost=true")}
                 target = "released"
             else:
                 if not confirm_repeat_cost:
@@ -1778,6 +1845,8 @@ class ControlStore:
         不在 active/hold 集合内的批次（`complete` / `released` / `rejected`）。
         **绝不动** still-active 的占用（`reserved`/`sending`/`result_pending`）与
         `held_*` / `manual_only` —— 那些是防重放的判据，删掉等于放开重复计费。
+        旧版本写入的行（`writer=''`）同样受保护：它们承载「无法可靠映射到组件」的
+        人工处置台账，未登记 `legacy_dispositions` 前不随保留期清理消失。
         """
         days = int(retention_days or 0)
         if days <= 0:
@@ -1786,16 +1855,22 @@ class ControlStore:
         pruned_intents = 0
         pruned_batches = 0
         pruned_components = 0
+        skipped_legacy = 0
         with self.mutation() as conn:
             if not self._resume_schema_ready(conn):
                 # 审计表都还没建：没有任何可清的行，也不替调用方建表。
+                # 没有 `legacy_dispositions` 可查 → 旧行一律不删（宁留不删）。
                 pruned_intents = conn.execute(
                     "DELETE FROM request_intents WHERE state IN ('success', 'abandoned') "
-                    "AND updated_at < ?", (cutoff,)).rowcount or 0
+                    "AND updated_at < ? AND writer <> ''", (cutoff,)).rowcount or 0
+                skipped_legacy = conn.execute(
+                    "SELECT COUNT(*) FROM request_intents WHERE state IN ('success', 'abandoned') "
+                    "AND updated_at < ? AND writer = ''", (cutoff,)).fetchone()[0] or 0
                 conn.commit()
                 return {"applied": bool(pruned_intents), "pruned": True,
                         "request_intents": int(pruned_intents), "batches": 0,
-                        "components": 0, "cutoff": cutoff, "retention_days": days}
+                        "components": 0, "skipped_legacy_pending": int(skipped_legacy),
+                        "cutoff": cutoff, "retention_days": days}
             terminal = ("complete", "released", "rejected")
             placeholders = ",".join("?" for _ in terminal)
             pruned_components = conn.execute(
@@ -1806,14 +1881,21 @@ class ControlStore:
             pruned_batches = conn.execute(
                 f"DELETE FROM embedding_batches WHERE state IN ({placeholders}) AND updated_at < ?",
                 (*terminal, cutoff)).rowcount or 0
+            legacy_guard = ("AND (writer <> '' OR request_id IN "
+                            "(SELECT request_id FROM legacy_dispositions))")
             pruned_intents = conn.execute(
                 "DELETE FROM request_intents WHERE state IN ('success', 'abandoned') "
-                "AND updated_at < ?", (cutoff,)).rowcount or 0
+                f"AND updated_at < ? {legacy_guard}", (cutoff,)).rowcount or 0
+            skipped_legacy = conn.execute(
+                "SELECT COUNT(*) FROM request_intents WHERE state IN ('success', 'abandoned') "
+                "AND updated_at < ? AND writer = '' AND request_id NOT IN "
+                "(SELECT request_id FROM legacy_dispositions)", (cutoff,)).fetchone()[0] or 0
             conn.commit()
         return {"applied": bool(pruned_intents or pruned_batches), "pruned": True,
                 "request_intents": int(pruned_intents), "batches": int(pruned_batches),
-                "components": int(pruned_components), "cutoff": cutoff,
-                "retention_days": days}
+                "components": int(pruned_components),
+                "skipped_legacy_pending": int(skipped_legacy),
+                "cutoff": cutoff, "retention_days": days}
 
     def legacy_disposition_ids(self) -> set[str]:
         """已处置的旧记录 id 集合（只读；表不存在时返回空集，不掩盖读取错误）。"""

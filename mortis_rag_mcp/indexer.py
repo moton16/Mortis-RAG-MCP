@@ -1206,6 +1206,9 @@ class MarkdownIndexer:
 
         返回的 closure 内部缓存 chunk id 索引，可跨多个批次复用；判据与
         `checkpoint_embeddings` 一致（磁盘后端只认后端确认写入的 id）。
+        磁盘后端下 closure 会**按需**从 vec0 重建 RAM 记账集合：冷进程里该集合
+        还是空集，不补建就会把「本进程还没读过磁盘」误判成「磁盘上没有向量」。
+        重建失败时抛错（而不是返回空集），由调用方按「核验不可用」处理。
         """
         return _sync_engine._resume_verifier(self)
 

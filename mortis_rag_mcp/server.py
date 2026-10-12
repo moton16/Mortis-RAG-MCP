@@ -221,6 +221,8 @@ def _tool_definitions() -> list[dict[str, Any]]:
             "description": "把知识库的索引快照（chunks + 向量 + FTS）导出为 zip 文件，用于换机/换目录迁移，导入后无需全量重新 embedding。要求缓存已启用且完成过至少一次索引。",
             "inputSchema": {"type": "object", "required": ["out_path"], "properties": {
                 "out_path": {"type": "string", "description": "必填，快照输出路径（.zip）"},
+                "overwrite": {"type": "boolean", "default": False,
+                              "description": "目标 zip 已存在时覆盖它（实现此前已支持，schema 漏声明会让严格客户端无法传）"},
                 "vault_path": {"type": "string", "description": vault_path_hint},
             }},
         },
@@ -246,15 +248,17 @@ def _tool_definitions() -> list[dict[str, Any]]:
         },
         {
             "name": "kb_request_control",
-            "description": "只读查看或显式处置本机外部请求控制状态（未知结果 hold / 明确暂停 / 旧记录迁移）。必须显式传 vault_path；所有变更默认 dry_run，需显式 dry_run=false。不联网、不安排刷新、不启动监听。",
+            "description": "只读查看或显式处置本机外部请求控制状态（未知结果 hold / 明确暂停 / 旧记录迁移 / 成果审计与保留期清理）。必须显式传 vault_path；所有变更默认 dry_run，需显式 dry_run=false。不联网、不安排刷新、不启动监听。",
             "inputSchema": {"type": "object", "required": ["vault_path", "action"], "properties": {
                 "vault_path": {"type": "string", "description": "**必填**：目标知识库绝对路径（防止恢复错库）"},
-                "action": {"type": "string", "enum": ["list", "inspect", "retry", "abandon", "pause_route", "resume_route", "resolve_legacy"],
-                           "description": "list/inspect 只读；retry 需 confirm_repeat_cost；abandon 退出自动续算；pause_route/resume_route 改明确暂停；resolve_legacy 处置列出的旧记录"},
-                "batch_id": {"type": "string", "description": "inspect / retry / abandon 的目标批次"},
+                "action": {"type": "string", "enum": ["list", "inspect", "retry", "abandon", "release",
+                                                      "pause_route", "resume_route", "resolve_legacy",
+                                                      "audit_complete", "prune_audit"],
+                           "description": "list/inspect 只读；retry 需 confirm_repeat_cost；abandon 退出自动续算；release 解除占用让下一轮可重发（旧 owner 已死的 sending 批次唯一出口，非 reserved 需 confirm_repeat_cost）；pause_route/resume_route 改明确暂停；resolve_legacy 处置列出的旧记录；audit_complete 用持久向量证据复核历史 complete 批次（需该库索引器，会写库）；prune_audit 按 request_control.audit_retention_days 清终态审计行"},
+                "batch_id": {"type": "string", "description": "inspect / retry / abandon / release 的目标批次"},
                 "profile_fingerprint": {"type": "string", "description": "pause_route / resume_route 的目标 profile 精确指纹"},
                 "request_ids": {"type": "array", "items": {"type": "string"}, "description": "resolve_legacy 要处置的旧 request_id 列表"},
-                "confirm_repeat_cost": {"type": "boolean", "default": False, "description": "确认可能重复计费（retry / resolve_legacy 必需）"},
+                "confirm_repeat_cost": {"type": "boolean", "default": False, "description": "确认可能重复计费（retry / resolve_legacy 必需；release 在非 reserved 状态必需）"},
                 "dry_run": {"type": "boolean", "default": True, "description": "默认 true：只预览；显式 false 才落库"},
             }},
         },
@@ -1113,7 +1117,8 @@ class VaultMcpServer:
             group_offsets=group_offsets,
         )
 
-    # v0.8.0 Phase 1：call_tool 由巨型 if 链改为显式路由表（15 个 kb_* 工具 → 处理方法）。
+    # v0.8.0 Phase 1：call_tool 由巨型 if 链改为显式路由表；工具数随版本增长
+    # （v0.9.2 起 17 个），此处不再钉具体数字，以 `_tool_definitions()` 为准。
     # 工具名、参数语义、返回结构与 unknown-tool 报错行为完全不变（MCP 协议契约）。
     _TOOL_ROUTE_TABLE: dict[str, str] = {
         "kb_init": "_kb_init",
@@ -2452,7 +2457,8 @@ REQUEST_CONTROL_ACTIONS = ("list", "inspect", "retry", "abandon", "release",
                            "prune_audit")
 
 
-def _legacy_migration_pending(control: Any) -> list[dict[str, Any]]:
+def _legacy_migration_pending(control: Any, *,
+                              errors: list[str] | None = None) -> list[dict[str, Any]]:
     """旧 journal 中**无法可靠映射到组件**的相关记录（保守边界，不猜映射）。
 
     * `prepared` / `submission_unknown`：可能根本没发出，也可能已计费；
@@ -2471,7 +2477,11 @@ def _legacy_migration_pending(control: Any) -> list[dict[str, Any]]:
     from ._indexer import embedding_resume
     try:
         intents = control.list_request_intents()
-    except Exception:
+    except Exception as exc:
+        # 读失败绝不能被上报成「没有待处置旧记录」（那是假全清）：显式记账，
+        # 与续算侧 `held_summary` 的 `available=False` 同口径。
+        if errors is not None:
+            errors.append(f"intents_unreadable:{exc}")
         return []
     mapped: set[str] = set()
     try:
@@ -2479,13 +2489,16 @@ def _legacy_migration_pending(control: Any) -> list[dict[str, Any]]:
             operation = str(batch.get("operation_id") or "")
             if operation.startswith("legacy:"):
                 mapped.add(operation[len("legacy:"):])
-    except Exception:
+    except Exception as exc:
+        if errors is not None:
+            errors.append(f"work_unreadable:{exc}")
         mapped = set()
     try:
         # 已人工处置（含 success/abandoned 这类不可改状态的历史事实）→ 退出待处置集合。
         mapped |= control.legacy_disposition_ids()
-    except Exception:
-        pass
+    except Exception as exc:
+        if errors is not None:
+            errors.append(f"dispositions_unreadable:{exc}")
     pending = []
     for row in intents:
         request_id = str(row.get("request_id") or "")
@@ -2541,7 +2554,8 @@ def request_control_action(*, vault_path: str | Path, action: str, batch_id: str
         except Exception as exc:
             return {"applied": False, "error": "CONTROL_STORE_UNAVAILABLE",
                     "detail": str(exc)[:200], "vault_path": str(vault_path)}
-        legacy = _legacy_migration_pending(control)
+        legacy_errors: list[str] = []
+        legacy = _legacy_migration_pending(control, errors=legacy_errors)
         try:
             work = embedding_resume.list_embedding_work(
                 control, batch_id=str(batch_id or ""))
@@ -2552,6 +2566,7 @@ def request_control_action(*, vault_path: str | Path, action: str, batch_id: str
             work_error = ""
         base = {"vault_path": str(Path(vault_path).expanduser()), "action": action,
                 "dry_run": bool(dry_run), "legacy_migration_pending": legacy,
+                **({"legacy_read_error": list(legacy_errors)} if legacy_errors else {}),
                 "resume_store_error": work_error,
                 "work": [{"batch_id": b["batch_id"], "state": b["state"],
                           "outcome": b.get("outcome", ""),
@@ -2590,13 +2605,18 @@ def request_control_action(*, vault_path: str | Path, action: str, batch_id: str
                     str(item) for item in (getattr(rc, "paused_profiles", ()) or ())}
             except Exception:
                 paused_by_config = False
-            control.authorize_paid_profile(str(profile_fingerprint), scope="resume_route",
-                                           note="explicit route resume (does not release batch holds)")
             if paused_by_config:
+                # 命中配置暂停时**绝不写库**。此前先调 `authorize_paid_profile`
+                # （INSERT OR REPLACE … revoked_at=NULL）再判配置清单，于是返回
+                # applied=false 的同时已经把控制库里的显式撤销清掉了：报告与副作用
+                # 自相矛盾，而且运维一旦把该指纹从配置移除，路由会在没有再次 resume 的
+                # 情况下静默恢复付费发送。
                 return {**base, "applied": False, "route_resumed": False,
                         "paused_by_config": True, "error": "ROUTE_PAUSED_BY_CONFIG",
                         "hint": ("this fingerprint is also listed in request_control.paused_profiles; "
                                  "remove it from the app config to actually resume the route")}
+            control.authorize_paid_profile(str(profile_fingerprint), scope="resume_route",
+                                           note="explicit route resume (does not release batch holds)")
             return {**base, "applied": True, "route_resumed": str(profile_fingerprint),
                     "paused_by_config": False}
         if action == "resolve_legacy":
@@ -2647,7 +2667,11 @@ def request_control_action(*, vault_path: str | Path, action: str, batch_id: str
                         "hint": ("releasing a batch that may already have been sent lets the next "
                                  "round issue a billed request again; pass confirm_repeat_cost=true")}
             result = embedding_resume.resolve_embedding_work(
-                control, str(batch_id), action="release", confirm_repeat_cost=True,
+                control, str(batch_id), action="release",
+                confirm_repeat_cost=bool(confirm_repeat_cost),
+                # 快照状态一并传入：store 在同一事务内按**刚读到的**状态复核，
+                # 避免把「快照时是 reserved（免确认）」套用到刚推进到 sending 的批次。
+                expected_state=state,
                 note="operator release via kb_request_control")
             return {**base, **result}
         if action == "audit_complete":
@@ -2697,12 +2721,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--serve-mcp-stdio", action="store_true")
     parser.add_argument("--app-config", default=None)
     parser.add_argument("--doctor", action="store_true",
-                        help="全量探测本机环境（含 API 真实调用）并重写 ~/.mortis_rag_mcp/STATUS.md 与 status.json")
+                        help="全量探测本机环境（含 API 真实调用）并重写 ~/.mortis_rag_mcp/STATUS.md 与 status.json"
+                             "；不指向具体知识库，**不需要 --vault**")
     parser.add_argument("--approve-reembedding", default=None, metavar="PROFILE_FINGERPRINT",
                         help="显式授权精确 embedding profile 的付费重嵌（只写本机授权记录，不调用 API）")
     parser.add_argument("--migrate-ingest", action="store_true",
                         help="迁移旧 .mortis-parsed 镜像到文档库（默认 dry-run；不联网、不删除旧镜像）")
-    parser.add_argument("--apply", action="store_true", help="仅 --migrate-ingest 可用：真正写库")
+    parser.add_argument("--apply", action="store_true",
+                        help="仅 --migrate-ingest 或 --request-control 可用：真正写库（其余动作默认 dry-run）")
     parser.add_argument("--list-requests", action="store_true",
                         help="只读列出本机付费请求意图（需 --vault；不发起请求）")
     parser.add_argument("--abandon-request", default=None, metavar="REQUEST_ID",
@@ -2716,7 +2742,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--request-ids", default=None, metavar="ID[,ID...]")
     parser.add_argument("--confirm-repeat-cost", action="store_true",
                         help="确认可能重复计费（retry / resolve_legacy 必需；--request-control 需配合 --apply 才落库）")
-    parser.add_argument("--vault", default=None, help="管理操作（--approve-reembedding / --migrate-ingest / --list-requests / --abandon-request）的目标库路径")
+    parser.add_argument("--vault", default=None, help="管理操作（--approve-reembedding / --migrate-ingest / --list-requests / --abandon-request / --request-control）的目标库路径")
     parser.add_argument("--quiet", action="store_true", help="静默模式，禁止输出到 stdout")
     args = parser.parse_args(argv)
     # 管理 action 互斥（E06）：一次只做一件事，避免组合出意外副作用。
@@ -2737,7 +2763,10 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--serve-mcp-stdio is required")
     if selected and "--serve-mcp-stdio" not in selected:
         # 管理操作必须显式指向目标库（正常 serve 不受此限制）。
-        if not args.vault:
+        # `--doctor` 例外：它不消费 vault_path（`doctor.run` 只用 app_config），强制
+        # `--vault` 会让文档里的 `python -m mortis_rag_mcp --doctor` 直接 exit 2
+        # （README / QUICKSTART 都是这条命令）。门禁只应该管**真的要用库的**动作。
+        if not args.vault and "--doctor" not in selected:
             parser.error("--vault is required for " + ", ".join(selected))
     # 坏配置绝不静默回落：显式 --app-config 或实际选中的 env 无效 → 退出 2。
     problem = _explicit_config_problem(args.app_config)

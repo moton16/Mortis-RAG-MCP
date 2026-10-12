@@ -6,8 +6,10 @@
   记录、检查点确认全部走同一控制库，跨进程可见。
 * 未知结果只把**受影响的组件**转成持久 hold，绝不冻结整个 profile，也不按 TTL
   自动解禁。
-* 恢复扫描必须先取得短范围 dispatch 锁，证明旧调度者已不在执行该批网络边界，
-  再处理中断状态；不能只凭进程时间或租约到期就释放占用。
+* 恢复扫描先取得短范围 dispatch 锁、**在锁内取快照**；逐批处置发生在锁外，由
+  状态机 CAS（`expected_state` / `from_states` / `owner_token`）兜住——快照之后
+  被推进过的批次一律拒绝，绝不被降级误判。锁期间不做网络等待与磁盘核验，
+  不能只凭进程时间或租约到期就释放占用。
 
 本模块不读取用户配置、不拼接请求体、不调用 transport。
 """
@@ -161,10 +163,16 @@ def list_embedding_work(control: ControlStore, *, source: str = "", batch_id: st
 
 
 def resolve_embedding_work(control: ControlStore, batch_id: str, *, action: str,
-                           confirm_repeat_cost: bool = False, note: str = "") -> dict:
-    """显式处置：`retry`（需确认可能重复计费）/ `abandon` / `release`。"""
+                           confirm_repeat_cost: bool = False, note: str = "",
+                           expected_state: str = "") -> dict:
+    """显式处置：`retry`（需确认可能重复计费）/ `abandon` / `release`。
+
+    `expected_state`：调用方按快照做的判据（如「`reserved` 免确认」）必须一并传入，
+    由 store 在同一事务内按刚读到的状态复核。
+    """
     return control.resolve_embedding_work(batch_id, action=action,
-                                          confirm_repeat_cost=confirm_repeat_cost, note=note)
+                                          confirm_repeat_cost=confirm_repeat_cost,
+                                          expected_state=expected_state, note=note)
 
 
 def active_component_states(control: ControlStore, component_keys: Sequence[str]) -> dict[str, str]:
@@ -182,7 +190,13 @@ def recover_interrupted_batches(control: ControlStore, *, layout: StorageLayout,
                                owner_predicate: Any = None,
                                timeout: float = 30.0,
                                states: Sequence[str] = RECOVERY_ACTIVE_STATES) -> dict:
-    """重启恢复扫描：**必须先取得 dispatch 锁**才能判定旧调度者已退出。
+    """重启恢复扫描：**快照在 dispatch 锁内取**，处置在锁外靠状态机 CAS 兜底。
+
+    锁只保证「这批快照与另一个调度者的处置不交错」；它**不能**证明旧调度者在
+    处置那一刻已退出（锁随后就释放了）。真正的保证是每个写操作都带状态判据
+    （`expected_state` / `from_states` / `owner_token`）：快照后被推进过的批次
+    一律拒绝并计入 `errors`，绝不谎报已处置。因此这里刻意**不**把改库循环放进
+    锁内——那会让锁的持有时间随批次数与磁盘核验线性增长。
 
     | 中断点 | 处置 |
     |---|---|
@@ -229,17 +243,31 @@ def recover_interrupted_batches(control: ControlStore, *, layout: StorageLayout,
         components = list(batch.get("components") or ())
         keys = {str(c.get("embedding_key") or "") for c in components if c.get("embedding_key")}
         recoverable: set[str] = set()
+        verify_ok = True
         if callable(verify_recoverable) and keys:
             try:
                 recoverable = {str(item) for item in verify_recoverable(components) or ()}
             except Exception as exc:  # noqa: BLE001
+                # 核验器不可用 ≠ 成果不存在。绝不能据此下发 held_*（那是不可逆的
+                # 状态推进，且 `held_*` 会冻结整个 profile）。只记账并跳过本批次，
+                # 让它保持当前状态（仍然占用输入身份、仍然阻塞重发）等下一轮。
                 summary["errors"].append(f"verify_failed:{batch_id}:{exc}")
+                verify_ok = False
+        if not verify_ok:
+            continue
         try:
             if state == "reserved":
                 # `reserved` 从未进入 sending：状态本身证明此前没有发送。
-                control.resolve_embedding_work(batch_id, action="release",
-                                               note="recover:reserved-before-send")
-                summary["released_reserved"] += 1
+                # 快照在锁内、处置在锁外，所以必须把快照状态交给 store 复核
+                # （`expected_state`）：被推进过就拒绝，且**不得**计入已处置。
+                result = control.resolve_embedding_work(
+                    batch_id, action="release", note="recover:reserved-before-send",
+                    expected_state="reserved")
+                if result.get("applied"):
+                    summary["released_reserved"] += 1
+                else:
+                    summary["errors"].append(
+                        f"{batch_id}:{result.get('error') or 'RESUME_RELEASE_REFUSED'}")
                 continue
             if state == "sending":
                 if keys and keys <= recoverable:
@@ -248,7 +276,8 @@ def recover_interrupted_batches(control: ControlStore, *, layout: StorageLayout,
                     # `result_pending`，直接对 `sending` 调用会整事务回滚、什么都没做成。
                     if not control.record_embedding_outcome(
                             batch_id, owner, OUTCOME_SUCCEEDED,
-                            reason="recover:sending-artifact-persisted"):
+                            reason="recover:sending-artifact-persisted",
+                            from_states=("sending",)):
                         summary["errors"].append(f"{batch_id}:RESUME_ADVANCE_REFUSED")
                         continue
                     result = control.confirm_embedding_checkpoint(batch_id, owner, recoverable)
@@ -257,10 +286,17 @@ def recover_interrupted_batches(control: ControlStore, *, layout: StorageLayout,
                     else:
                         summary["errors"].append(f"{batch_id}:RESUME_CHECKPOINT_REFUSED")
                 else:
-                    control.record_embedding_outcome(
-                        batch_id, owner, "transport_unknown",
-                        reason="recover:sending-owner-lost", component_state="held_unknown")
-                    summary["held_sending"] += 1
+                    # `from_states` 只认 `sending`：快照之后状态若已被推进（例如旧
+                    # owner 其实拿到了响应并落了 `result_pending`），绝不能把它降级
+                    # 成 `held_unknown` —— 那是"已成功"被误判成"结果未知"，且
+                    # `held_*` 会冻结整条路由。拒绝并按未处置记账。
+                    if control.record_embedding_outcome(
+                            batch_id, owner, "transport_unknown",
+                            reason="recover:sending-owner-lost",
+                            component_state="held_unknown", from_states=("sending",)):
+                        summary["held_sending"] += 1
+                    else:
+                        summary["errors"].append(f"{batch_id}:RESUME_HELD_REFUSED")
                 continue
             if state == "result_pending":
                 result = control.confirm_embedding_checkpoint(batch_id, owner, recoverable)
