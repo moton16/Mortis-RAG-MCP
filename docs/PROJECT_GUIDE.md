@@ -6,9 +6,11 @@
 
 ## 在这里，你才需要详细描述每次commit的代码逻辑、技术框架的更改，请标明提交commit人员的GitHub账户名，如果是agent执行的，请一并标出是什么agent处理的。如editor:moton16,codex.
 
-> **版本**：对应 v0.9.1（2026-10-10，补丁）。v0.9.1 变更：零成本回环端点不受付费闸门管辖（补齐媒体 route）、`prepared` 意图落账补位与租约回收 + `kb_stats.paid_route_blocked`、检索可见性过滤与 `.vaultignore` 匹配器缓存、`kb_rebuild` 单轮全量 + FTS 单事务回填、读路径不再抢跑全量同步。
+> **版本**：对应 v0.9.2（2026-10-12，补丁）。v0.9.2 变更：付费/外部请求「每次调用恰好一个物理 POST、零自动重发、不跟随 3xx」；未知结果改为按组件占用 hold 受影响的后台批次（新增续算表与 `kb_request_control` 处置出口），不再按 profile 整体暂停；`kb_rebuild` 付费路径需 `confirm_cost`；`--doctor` 门禁与付费探活两处阻断项修复；文本 input 模态显式声明与 embedding 失败隔离（issue #17）。
 >
-> **上一里程碑**：v0.9.0（2026-10-09）。文本模板与 estimated_tokens/legacy_chars 双模式、virtual 文档库（`doc_store`）成为默认解析事实落点、`kb_read_media` 与跨模态检索、请求意图记录与 `retry`/`index_state`；音频转录与 ffmpeg 转码链路物理移除（Breaking）。
+> **上一里程碑**：v0.9.1（2026-10-10）。零成本回环端点不受付费闸门管辖（补齐媒体 route）、`prepared` 意图落账补位与租约回收 + `kb_stats.paid_route_blocked`、检索可见性过滤与 `.vaultignore` 匹配器缓存、`kb_rebuild` 单轮全量 + FTS 单事务回填、读路径不再抢跑全量同步。
+>
+> **更早里程碑**：v0.9.0（2026-10-09）。文本模板与 estimated_tokens/legacy_chars 双模式、virtual 文档库（`doc_store`）成为默认解析事实落点、`kb_read_media` 与跨模态检索、请求意图记录与 `retry`/`index_state`；音频转录与 ffmpeg 转码链路物理移除（Breaking）。
 >
 > ⚠️ **数据目录与包名迁移说明（v0.7.1+）**：Python 包目录为 `mortis_rag_mcp`（历史包名 `vault_mcp` 保持只读兼容别名），数据根目录为 `~/.mortis_rag_mcp`（缓存 `~/.mortis_rag_mcp_cache`）与环境变量 `MORTIS_RAG_*`，保持对旧路径 `~/.vault_mcp*` 与 `VAULT_MCP_*` 的零破坏原子迁移与只读回退支持。
 > **读者**：任何要查阅、二次开发或改进本项目的开发者。读完本文应能：理解项目全貌与每个模块的职责、独立搭建开发环境、按本文的 how-to 完成常见改动、知道改动会牵动哪些缓存/测试/文档。
@@ -42,6 +44,21 @@
 不按模型品牌或同维向量推定。导入 `index_state/next_action`、unknown 请求台账、取消重试
 checkpoint 边界、旧切块兼容与存档续页均保留在对应参考。宿主图片展示与具体外部端点质量
 仍需单独验证，配套 Skill 更新本身不是这些验证。
+
+## 0.9.2 增量：付费请求审计与计费安全（2026-10-12）
+
+补丁版本，新增 1 个工具（`kb_request_control`，共 17 个）与 1 个配置键
+（`[embedding].input_modality_declaration`）；`doc_store` 新增续算表，数据布局向后兼容
+（旧控制库惰性补齐，只读路径不落 DDL）。
+
+1. **一次调用 = 一个物理 POST**：`_JsonHttpProvider` 去掉重试/退避循环，429 / 5xx / 网络 / URLError / 非法 JSON 一律分类上抛为结构化 `RequestOutcome`（`not_sent` / `rejected` / `http_error` / `transport_unknown` / `response_invalid`）。`max_retries` / `retry_backoff` 键仍被接受并校验范围，但**不再驱动发送**（去掉属破坏性配置变更）；`_retry_after_seconds` 只用于诊断展示。
+2. **不跟随 3xx**：`providers` 自建不注册 `HTTPRedirectHandler` 的 opener，`ingest/mineru` 复用同一出口。避免三件事——`Authorization` 被转发到重定向目标、重定向目标的响应被当成本次结果、302 + 目标 DNS 失败把「已发出并可能计费」误判成 `not_sent` 从而放行重发。
+3. **未知结果改为按组件 hold**：新增 `embedding_batches` / `embedding_components` 续算表与组件级占用（CAS + 部分唯一索引），「结果未知」只约束受影响的后台输入，不再 `has_unresolved_paid_intents` 冻结整个 profile。`recover_interrupted_batches` 逐操作 CAS 并按返回值记账（不再谎报处置量，不再把已落成功结果的 `sending` 降级成 `held_unknown`）。
+4. **`kb_request_control`（10 个 action）**：`list` / `retry` / `abandon` / `release` / `pause_route` / `resume_route` / `resolve_legacy` / `audit_complete` / `prune_audit`，默认 `dry_run=true`；CLI 侧 `--request-control` 同源。`resolve_embedding_work` 新增 `expected_state` 关闭 release 的 TOCTOU；`prune_audit` 不再删未登记 disposition 的旧行（返回体新增 `skipped_legacy_pending`）。
+5. **付费面只读路径不落 DDL**：`_payment_schema_ready` 只读判据，`open(write=False)` 不做 `ALTER TABLE`；`_ensure_payment_schema` 仍在写路径惰性补齐。
+6. **阻断项修复**：裸 `python -m mortis_rag_mcp --doctor` 不再被 `--vault` 门禁拦成 exit 2；`doctor` 付费探活的 guard 调用形态与 reranker 指纹口径修正；`kb_export.overwrite` 补进 inputSchema。
+7. **文本模态声明与失败隔离（issue #17）**：`input_modality_declaration` 三态只在 `_embed_batch` 请求体边界序列化；文本 HTTP 失败读取有界响应体、`failed_files` 给 `HTTP <code> · <detail> · batch=<n> sha256:<16位>`；按 source 的进程内连续失败计数第 3 次起指数退避跳过（`_sync_progress.quarantined`）。
+8. **本版未改**：`.gitignore` / `docs/` 忽略与白名单口径、`doc_store` 既有表结构、其余配置键、`CHANGELOG_user.md` 的既有版本条目。
 
 ## 0.9.1 增量：付费闸门与热路径（2026-10-10）
 
@@ -994,6 +1011,7 @@ python -m pytest -q -o addopts= -m real_carrier
 |0.8.1|2026-10-07|读优先后台刷新、自动摄取闭环（auto_watch + 20MiB 门禁）、compact 极简投影与整条 chunk 预算、物理行号越界诊断与源码级 heading 章节读取|
 |0.9.0|2026-10-09|文本模板与 estimated_tokens/legacy_chars 双模式、virtual 文档库（`doc_store`）成为默认解析事实落点、`kb_read_media` 与跨模态检索、请求意图记录与 `retry`/`index_state`；**音频转录与 ffmpeg 转码链路物理移除（Breaking）**|
 |0.9.1|2026-10-10|（补丁）零成本回环端点不受付费闸门管辖（补齐媒体 route）、`prepared` 意图落账补位与租约回收 + `kb_stats.paid_route_blocked`、可见性过滤与 `.vaultignore` 匹配器缓存、`kb_rebuild` 单轮全量 + FTS 单事务回填、读路径不再抢跑全量同步|
+|0.9.2|2026-10-12|（补丁）付费/外部请求一次调用恰好一个物理 POST 且不跟随 3xx、未知结果按组件占用 hold（续算表 + `kb_request_control` 处置出口，不再冻结整个 profile）、付费面只读路径不落 DDL、`--doctor` 门禁与付费探活修复、文本 input 模态显式声明与 embedding 失败隔离（issue #17）|
 
 ### 14.3 关键不变量（改代码前请自查）
 

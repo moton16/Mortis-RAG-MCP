@@ -2,10 +2,10 @@
 name: mortis-rag-mcp
 description: "使用 Mortis'RAG MCP 搜索与读取本地知识库、查笔记和图片，或管理知识库、摄取 PDF/Office/图片、迁移索引。适用于 kb_* 工具调用，不代替网页搜索。"
 metadata:
-  version: "0.9.1"
+  version: "0.9.2"
 ---
 
-# Mortis 知识库调用指南（v0.9.1）
+# Mortis 知识库调用指南（v0.9.2）
 
 以连接返回的 server instructions、实际工具 schema 和当前响应为准。普通查询直接调用工具；已有有效 `~/.mortis_rag_mcp/STATUS.md` 时不重复环境预检，缺失/过期也不自动探活。实际错误优先于旧状态；用户要求诊断时才运行一次 `python -m mortis_rag_mcp --doctor --vault "库的绝对路径"`（按需加 `--app-config`），它可能访问真实端点，失败后不循环重试。
 

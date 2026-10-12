@@ -45,7 +45,23 @@ Mortis'RAG MCP 是一个**本地 Markdown 知识库 RAG 服务器**，通过 MCP
 中途仅相关单文件，全量在整合末或 CI。不要写默认 `%TEMP%`，不要共用 basetemp。
 本地完成检查后只 `git add -- 明确路径` 并及时 commit，保留 hooks，不自动远端操作。
 
-### 1.2 0.9.1 补丁范围（2026-10-10）
+### 1.2 0.9.2 补丁范围（2026-10-12）
+
+补丁版本：新增 1 个工具（`kb_request_control`，共 17 个）、1 个配置键
+（`[embedding].input_modality_declaration`）、`doc_store` 新增续算表（惰性补齐，旧库兼容）。
+改动面与不变量见 `PROJECT_GUIDE.md` 的「0.9.2 增量」。动手前注意三条：
+
+- **付费路径零自动重发是硬约束**：`_JsonHttpProvider` 不再重试/退避，任何新增外部调用点
+  都不得自行包重试循环；「结果未知」只能 hold，不能当可重试失败。测试桩若要模拟 provider，
+  注意 `_send_once` 现在支持 `defer_success`（用 `accepts_keyword` 判签名，旧桩照旧工作）。
+- **付费 POST 必须走模块出口**：新增外部请求一律用 `providers.urlopen`（不注册
+  `HTTPRedirectHandler`），不要直接 `urllib.request.urlopen`；`ingest/mineru` 用
+  `mineru._urlopen`，测试注入缝也随之改变（patch `urllib.request.urlopen` 对它已失效）。
+- **未知结果是组件级占用**：判断「能否再次发送」要看 `embedding_components` 的 active 状态，
+  不要用旧的 profile 级冻结口径；新增后台发送路径必须考虑是否 `reserve_embedding_batch`
+  （`RequestContext.ledger_managed` 决定是否走意图级闸门）。
+
+### 1.3 0.9.1 补丁范围（2026-10-10）
 
 补丁版本：无工具 schema / 配置键 / 文档库 schema / 数据布局变更。改动面与不变量见
 `PROJECT_GUIDE.md` 的「0.9.1 增量」；逐 commit 技术流水见 `Changelog_developer.md` 的

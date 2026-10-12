@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/moton16/Mortis-RAG-MCP/actions/workflows/ci.yml/badge.svg)](https://github.com/moton16/Mortis-RAG-MCP/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-[![Version: 0.9.1](https://img.shields.io/badge/Version-0.9.1-blue.svg)](CHANGELOG_user.md)
+[![Version: 0.9.2](https://img.shields.io/badge/Version-0.9.2-blue.svg)](CHANGELOG_user.md)
 
 [English](README_EN.md) | 简体中文
 
@@ -11,18 +11,28 @@
 
 ---
 
-## 🚀 当前版本：v0.9.1（修复与性能补丁）
+## 🚀 当前版本：v0.9.2（付费请求审计与计费安全补丁）
 
-v0.9.1 修复了「本机零成本推理端点被付费闸门误拦、导致索引长时间停摆」的问题，并显著提升大知识库下的检索与重建性能。面向付费端点的安全闸门行为保持不变。
+v0.9.2 把「外部付费端点」这条链路改成**可审计、可处置、绝不重复计费**：每次调用恰好一个物理 POST，失败不再自动重试；未知结果只冻结受影响的后台批次，不再冻死整条索引；新增 `kb_request_control` 控制台账给出明确的人工出口。数据布局与已有配置向后兼容。
 
-- 🛡️ **零成本端点不再被误拦**：指向回环地址（如 `127.0.0.1`）且未配置 API 凭据的端点不再进入付费台账，也不会被历史未决请求牵连；已计费风险一侧的 fail-closed 闸门一字未动。
-- 🔓 **未决请求不再永久冻死索引**：结果落账失败会补位重试一次；零成本端点上的 `prepared` 请求超过租约后自动放行，可能已计费的 `submission_unknown` 仍需人工对账。
-- 🔎 **堵点可观测**：`kb_stats` 新增 `paid_route_blocked`，指出每个请求类型当前被哪一条真正卡住（确有堵点时才出现）。
-- ⚡ **更快更省**：单次检索的读库次数由 3 次降至 1 次（同步预热后实测 0 次）。本机同一脚本对照下，2,892 文档 / 9,316 切片规模 `kb_search` 中位耗时 36.1 ms → 20.3 ms（探针相对口径，非跨环境保证）；一次 `kb_rebuild` 只执行一轮全量同步（冷启动 3 → 1、温启动 2 → 1）。
+- 🔒 **一次调用 = 一次发送，绝不重复计费**：429 / 5xx / 网络错误 / 非法 JSON 一律分类上抛，不再退避重发；付费 POST **不跟随 3xx**，`Authorization` 不会被转发到重定向目标，已发出的请求也不会被误判成「未发出」而放行重发。
+- 🎛️ **未知结果只冻结受影响的批次**：新增组件级占用账本与续算表，「结果未知」改为 hold 受影响的后台输入，不再冻结整个 profile；`retry` / `release` 给了明确的人工出口。
+- 🧭 **新增第 17 个工具 `kb_request_control`**：查看未知结果 hold、明确暂停的路由、旧记录迁移待处置项，并显式处置（`retry` / `abandon` / `release` / `pause_route` / `resume_route` / `resolve_legacy` / `audit_complete` / `prune_audit`）；默认 `dry_run=true`，不联网、不启动监听。
+- 💰 **`kb_rebuild` 付费前先给预览**：文本或原生媒体任一路径为付费端点时必须传 `confirm_cost=true`，否则只返回预览，零请求、零副作用。
+- 🩺 **诊断命令修好两处照抄即错**：裸 `python -m mortis_rag_mcp --doctor` 不再被 `--vault` 门禁拦成 exit 2；付费 embed / rerank 探活不再恒失败。`kb_export` 的 `overwrite` 也已在其工具 schema 中声明。
+- 🧩 **文本模态声明与失败隔离（issue #17）**：`[embedding].input_modality_declaration` 支持 `none` / `typed` / `hint`（默认 `none` 保持 OpenAI 兼容）；文本 HTTP 失败给出有界摘要，同一来源连续失败按指数退避隔离，不再每轮重发。
 
 ---
 
-## 🏁 上一里程碑：v0.9.0（重大功能发布）
+## 🏁 上一里程碑：v0.9.1（修复与性能补丁）
+
+- 🛡️ **零成本端点不再被误拦**：指向回环地址（如 `127.0.0.1`）且未配置 API 凭据的端点不再进入付费台账；已计费风险一侧的 fail-closed 闸门一字未动。
+- 🔓 **未决请求不再永久冻死索引**：结果落账失败会补位重试一次；零成本端点上的 `prepared` 请求超过租约后自动放行。
+- ⚡ **更快更省**：单次检索的读库次数由 3 次降至 1 次；一次 `kb_rebuild` 只执行一轮全量同步（冷启动 3 → 1、温启动 2 → 1）。
+
+---
+
+## 🏁 更早里程碑：v0.9.0（重大功能发布）
 
 v0.9.0 迎来了架构级的全面跃迁，正式切换至商业友好的 **Apache-2.0** 开源许可，并带来以下核心突破：
 

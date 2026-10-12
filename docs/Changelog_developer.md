@@ -2063,3 +2063,61 @@ issue #12/#13 付费闸门与 issue #15 性能四条根因的修复随本补丁�
 - 靶向：`test_v092_review_fixes` **26 passed**、`test_ingest_mineru` 24 passed、`test_http_json_admission` 3 passed、`resume + review_fixes + drill` 46 passed、六文件 109 passed；`tests/test_diaglog.py + tests/test_improvements.py` **5/5**。
 - 全量（工作区外运行器）：主树 r1 **1415 passed / 1 failed**、r2 **1416 passed / 0 failed**；HEAD 对照 worktree **1389 passed / 0 failed**。唯一失败 `tests/test_ingest_auto.py::test_a_b_a_version_changes_eligible_again` 单独跑 3/3 通过（52 passed），与本批改动领域无交集（未动 ingest/seen 逻辑，conftest fixture 只作用于 `MarkdownIndexer.start_watching`）→ 判为既有的间歇时序用例。
 - 未 push、未开 PR、未打 tag / Release、**未改版本号**、未发 PyPI、未发起真实计费请求。
+
+### [release-v0.9.2] — moton16,2026-10-12,CodeBuddy,Hy4-Preview — chore(release): 版本号 0.9.1 → 0.9.2 + 用户文档与配套 Skill 同步
+
+> **涵盖提交**：`1e015b9`（付费发送链路）、`0d83bce`（续算与运维面）、`d60c9d2`（回归）、
+> `1d5881a`（文档）与本条所在提交（版本号 + 用户文档）。前置：v0.9.2 请求控制
+> `aad0c36..1feb2ce` 与三批评审条目 `[FIX-v092-review2]` / `[review3]` / `[review4]`，
+> 以及 issue #17 的 `[FIX-issue17-BC]`（`fdcfab2..49980d2`）。
+
+**版本号**
+
+- `pyproject.toml` & `mortis_rag_mcp/__init__.py`：`0.9.1` → `0.9.2`；包顶层 `__version__`
+  是单一真源，`server.SERVER_INFO` 与 `diaglog.PACKAGE_VERSION` 均从它取，一致性由
+  `tests/test_version_sync.py` 钉住。
+
+**用户文档**
+
+- `README.md` / `README_EN.md`：Version badge 同步 `0.9.2`；首页「当前版本」区块改写为
+  v0.9.2（一次调用一个物理 POST、不跟随 3xx、未知结果按组件 hold、`kb_request_control`、
+  `kb_rebuild` 付费预览、`--doctor` 两处修复、文本模态声明与失败隔离），v0.9.1 降级为
+  「上一里程碑」、v0.9.0 降级为「更早里程碑」保留。
+- `CHANGELOG_user.md`：顶部新增 `## [0.9.2] - 2026-10-12`，按 Added / Fixed /
+  Changed & Improved / Upgrade Guide 写用户可感知内容（不含实现细节）。
+- `QUICKSTART_user.md`：新增 §0.6「0.9.2 补丁速查」（六条：零重发、按组件 hold、
+  `kb_request_control` 处置出口、`kb_rebuild` 预览、诊断命令、文本模态与失败隔离），
+  原 0.9.1 段降级为 §0.7。
+
+**开发者文档与配套 Skill**
+
+- `docs/PROJECT_GUIDE.md`：头部版本口径改 v0.9.2（v0.9.1 降为「上一里程碑」、v0.9.0 为
+  「更早里程碑」）；新增「0.9.2 增量：付费请求审计与计费安全」八条；§14.2 版本历史速览
+  新增 0.9.2 行。
+- `docs/Quick-start_developer.md`：新增 §1.2「0.9.2 补丁范围」（零重发硬约束、付费 POST
+  必须走模块出口、未知结果是组件级占用三条易踩点），原 0.9.1 段顺延为 §1.3。
+- `docs/Docs_Folder-descriptions.md`：登记 v0.9.2 为补丁版，未新增 tracked 版本目录，
+  `docs/v0.9.2/` 仍属本机本地交付。
+- `skills/mortis-rag-mcp/`：`SKILL.md` frontmatter `version` 与标题版本标注改 `0.9.2`；
+  `references/maintenance.md` / `references/media-and-ingest.md` 标题版本一并同步。
+
+**发版前评审（本批新增，未施工、登记顺延）**
+
+对 v0.9.2 全量 diff 做了一轮独立静态评审，两条 P2 已确诊但**本批不施工**（避免发版前改动
+核心续算路径），列入 v0.9.3 清单：
+
+- `doc_store.embedding_component_states` 的 `SELECT ... WHERE component_key IN (...)` 既不过滤
+  `state` 也不带 `ORDER BY`，同一 `component_key` 允许同时存在历史终态行（active 唯一索引是
+  部分索引），于是「能否再次付费发送」取决于哪一行最后返回——现状侥幸正确（active 行 rowid
+  更大），`prune_audit` 清掉终态行后行序变化即可能反转。建议改为按
+  `ACTIVE_COMPONENT_STATES` 过滤。
+- `doctor._configure_probe_paid` 装配付费 provider 时未显式传 `mode=`，与 `indexer` /
+  `server` 两处装配点口径不一致（实际仍会回落到 `get_request_control_mode()` 读配置，
+  故未造成行为差异），建议对齐为显式传参。
+
+**验证**
+
+- 版本号一致性：靶向 `tests/test_version_sync.py`（随发版前全量通过）。
+- 发版前全量（工作区外运行器 `E:/coding/.mortis-runs/run-offline.ps1`，改动全部落盘后）：
+  **1416 passed / 14 skipped / 3 deselected / 0 failed**（141.83 s）。
+- 未验证：真实供应商计费与幂等、宿主侧媒体显示、PyPI 发布。
