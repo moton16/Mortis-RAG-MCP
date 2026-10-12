@@ -9,6 +9,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from mortis_rag_mcp.ingest import mineru
 from mortis_rag_mcp.ingest.mineru import (
     MineruClient,
     MineruError,
@@ -120,7 +121,7 @@ def test_http_json_429_rate_limit(monkeypatch):
     def fake_urlopen(*args, **kwargs):
         raise urllib.error.HTTPError("http://example.com", 429, "Too Many Requests", headers, io.BytesIO(b"{}"))
 
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr("mortis_rag_mcp.ingest.mineru._urlopen",fake_urlopen)
 
     req = urllib.request.Request("http://example.com")
     with pytest.raises(MineruError) as exc_info:
@@ -136,7 +137,7 @@ def test_http_json_network_error(monkeypatch):
     def fake_urlopen(*args, **kwargs):
         raise urllib.error.URLError("Connection refused")
 
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr("mortis_rag_mcp.ingest.mineru._urlopen",fake_urlopen)
 
     req = urllib.request.Request("http://example.com")
     with pytest.raises(MineruError) as exc_info:
@@ -150,14 +151,14 @@ def test_put_upload_status(monkeypatch):
     # 200 success
     resp_200 = MagicMock()
     resp_200.__enter__.return_value.status = 200
-    monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **kw: resp_200)
+    monkeypatch.setattr("mortis_rag_mcp.ingest.mineru._urlopen",lambda *a, **kw: resp_200)
     _put_upload("http://example.com/put", b"payload", timeout=5.0)
 
     # 500 error -> retryable
     def fake_500(*a, **kw):
         raise urllib.error.HTTPError("http://example.com", 500, "Server Error", {}, io.BytesIO(b"err"))
 
-    monkeypatch.setattr(urllib.request, "urlopen", fake_500)
+    monkeypatch.setattr("mortis_rag_mcp.ingest.mineru._urlopen",fake_500)
     with pytest.raises(MineruError) as exc_info:
         _put_upload("http://example.com/put", b"payload", timeout=5.0)
     assert exc_info.value.retryable is True
@@ -167,7 +168,7 @@ def test_put_upload_status(monkeypatch):
     def fake_400(*a, **kw):
         raise urllib.error.HTTPError("http://example.com", 400, "Bad Request", {}, io.BytesIO(b"err"))
 
-    monkeypatch.setattr(urllib.request, "urlopen", fake_400)
+    monkeypatch.setattr("mortis_rag_mcp.ingest.mineru._urlopen",fake_400)
     with pytest.raises(MineruError) as exc_info:
         _put_upload("http://example.com/put", b"payload", timeout=5.0)
     assert exc_info.value.retryable is False
@@ -207,13 +208,13 @@ def test_put_upload_sets_empty_content_type_not_form_urlencoded(monkeypatch):
     thread.start()
 
     seen_requests: list[urllib.request.Request] = []
-    real_urlopen = urllib.request.urlopen
+    real_urlopen = mineru._urlopen
 
     def _spy(req, *args, **kwargs):
         seen_requests.append(req)
         return real_urlopen(req, *args, **kwargs)
 
-    monkeypatch.setattr(urllib.request, "urlopen", _spy)
+    monkeypatch.setattr("mortis_rag_mcp.ingest.mineru._urlopen",_spy)
     try:
         port = httpd.server_address[1]
         _put_upload(f"http://127.0.0.1:{port}/upload", b"payload", timeout=5.0)
@@ -553,7 +554,7 @@ def test_401_with_token_never_falls_back_to_agent(monkeypatch, tmp_path: Path):
     def forbidden_agent(*args, **kwargs):  # pragma: no cover
         raise AssertionError("有 key 时 401 绝不允许回落到免登 Agent 通道")
 
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr("mortis_rag_mcp.ingest.mineru._urlopen",fake_urlopen)
     monkeypatch.setattr(MineruClient, "_parse_agent", forbidden_agent)
 
     with pytest.raises(MineruError) as exc_info:
@@ -598,3 +599,65 @@ def test_endpoint_redaction_drops_path_query_and_fragment():
     assert redact_endpoint("https://oss.example.com/up?Signature=SECRET&Expires=1") == "https://oss.example.com"
     assert redact_endpoint("https://a.b/c#frag") == "https://a.b"
     assert "SECRET" not in redact_endpoint("https://a.b/c?token=SECRET")
+
+
+def test_paid_post_does_not_follow_redirect_or_forward_the_token():
+    """302 不得被自动跟随：跟随会把 `Authorization` 交给重定向目标（CPython 只剥
+    Content-Length/Content-Type）。与 `providers` / `media_providers` 同口径。"""
+    import http.server
+    import threading
+
+    target_hits: list[str] = []
+    forwarded_auth: list[str] = []
+
+    class _Target(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            target_hits.append(self.path)
+            forwarded_auth.append(self.headers.get("Authorization", "<absent>"))
+            self.send_response(200)
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(b"{}")
+
+        def log_message(self, fmt, *args):
+            pass
+
+    class _Origin(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):  # noqa: N802
+            length = int(self.headers.get("Content-Length") or 0)
+            if length:
+                self.rfile.read(length)
+            self.send_response(302)
+            self.send_header("Location", f"http://127.0.0.1:{target_port}/stolen")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, fmt, *args):
+            pass
+
+    target = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Target)
+    target_port = target.server_address[1]
+    origin = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Origin)
+    threads = []
+    for server in (target, origin):
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        threads.append(thread)
+    try:
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{origin.server_address[1]}/api/v4/file-urls/batch",
+            data=b'{"files":[]}',
+            headers={"Authorization": "Bearer sk-mineru-SECRET",
+                     "Content-Type": "application/json"},
+            method="POST")
+        with pytest.raises(MineruError) as exc_info:
+            _http_json(req, timeout=5.0)
+        assert exc_info.value.http_status == 302
+        assert target_hits == [], "重定向目标不得收到任何请求"
+        assert forwarded_auth == [], "Authorization 绝不能出现在重定向目标上"
+    finally:
+        for server in (target, origin):
+            server.shutdown()
+            server.server_close()
+        for thread in threads:
+            thread.join(timeout=5.0)

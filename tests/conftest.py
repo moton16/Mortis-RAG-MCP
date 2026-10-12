@@ -93,6 +93,39 @@ def isolated_cache_dir(request, monkeypatch, isolated_host):
     return cache_dir
 
 
+@pytest.fixture(autouse=True)
+def stop_background_watchers(monkeypatch):
+    """用例结束后停掉本用例拉起的监听线程，杜绝跨用例污染。
+
+    首轮全量 sync 由监听线程在后台跑（`_watch.start_watching`，interval 0.25s），
+    而历史上没有任何用例级清理 → 上一个用例的线程会活到下一个用例里继续读自己
+    的 vault。典型后果：`test_improvements.py::test_fast_stat_skips_disk_read_when_unmodified`
+    全局 patch `Path.read_bytes` 数「未修改文件是否被读」，残留线程读 `my_vault/note1.md`
+    被一并计入，断言从 0 变 2/3（间歇红，主树与 HEAD 对照树都会红，属既有时序泄漏）
+
+    只做 teardown 清理，不改用例内的时序：依赖后台首建的用例（那张「抢跑」卡）仍
+    按原样跑，只是不再把线程留给下一个用例。
+    """
+    from mortis_rag_mcp.indexer import MarkdownIndexer
+
+    started: list = []
+    original = MarkdownIndexer.start_watching
+
+    def tracked(self, *args, **kwargs):
+        started.append(self)
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(MarkdownIndexer, "start_watching", tracked)
+    try:
+        yield started
+    finally:
+        for owner in started:
+            try:
+                owner.stop_watching()
+            except Exception:  # noqa: BLE001 - py3.13 join 未启动线程会抛；清理失败不能让用例红
+                pass
+
+
 def pytest_sessionfinish(session, exitstatus):
     try:
         if os.getenv("MORTIS_RAG_NO_STATUS_HOOK") == "1":
