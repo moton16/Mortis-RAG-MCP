@@ -163,6 +163,22 @@ def _paid_embedding_allowed(owner: MarkdownIndexer) -> bool:
     may = getattr(owner, "may_use_paid_profile", None)
     if not callable(may):
         return False
+    # 回滚兼容模式（legacy_profile）的防重放安全网：旧路径不读组件表，所以必须在这里
+    # 把新表的组件 hold 当成 profile 级暂停。否则 `held_result_missing` /
+    # `held_response_invalid`（结果已知但没落盘）这类 hold 在切回旧模式后会被旧路径
+    # 自动重发 —— 等于裸撤锁、重复计费（v0.9.2 §5 反方复核 R2）。
+    from .._indexer import embedding_resume
+    try:
+        control = owner._paid_control_store()
+        if control is not None:
+            fingerprint = str(getattr(owner._embedding_profile, "fingerprint", "") or "")
+            for batch in embedding_resume.list_embedding_work(
+                    control, states=embedding_resume.HELD_COMPONENT_STATES):
+                if not fingerprint or str(batch.get("profile_fingerprint") or "") == fingerprint:
+                    return False
+    except Exception:
+        # 读不到续算状态时 fail closed：宁可 0 请求也不冒重复计费风险。
+        return False
     try:
         fingerprint = owner._embedding_profile.fingerprint
         if not may(fingerprint, kind="embed"):
@@ -492,6 +508,25 @@ def _embed_missing_bounded(owner: MarkdownIndexer, pending: dict[str, list[Chunk
         owner._sync_progress["phase"] = "embedding_paused"
         owner._sync_progress["reason"] = "BACKGROUND_BATCH_CAPABILITY_UNAVAILABLE"
         return False
+    # 崩溃恢复扫描（每实例一次）：只处置**本进程**遗留的 active 批次 ——
+    # `reserved` 释放（状态本身证明此前没有发送）、`sending` 转持久 hold（结果不可证，
+    # 不自动重发）。跨进程的他人 token 没有可靠存活证明，一律不减不释放。
+    if not getattr(owner, "_resume_recovered", False):
+        owner._resume_recovered = True
+        token = _resume_owner_token(owner)
+        try:
+            layout = _resume_layout(owner)
+            recovery = embedding_resume.recover_interrupted_batches(
+                control, layout=layout, owner_token="",
+                owner_predicate=lambda owner_token: str(owner_token) == token)
+            if recovery.get("errors"):
+                owner._sync_progress["resume_recovery_errors"] = recovery["errors"][:3]
+            owner._sync_progress["resume_recovery"] = {
+                key: int(recovery.get(key) or 0)
+                for key in ("released_reserved", "held_sending", "completed_pending",
+                            "missing_result", "held_complete", "skipped_unproven")}
+        except Exception as exc:  # noqa: BLE001 - 恢复不可用必须可观测，不能静默
+            owner._sync_progress["resume_recovery_errors"] = [str(exc)[:200]]
 
     operation_id = getattr(owner, "_resume_operation_id", "") or embedding_resume.new_operation_id("sync")
     owner._resume_operation_id = operation_id
@@ -604,7 +639,10 @@ def _embed_missing_bounded(owner: MarkdownIndexer, pending: dict[str, list[Chunk
             else:
                 # 有结果但没保存成功：只保留 RAM 与占用，停止本轮后续付费批次。
                 _record_hold_failure(owner, component["source"], "held_result_missing", batch_id)
-        if not confirmed:
+        # 反方复核 R2：**部分**确认同样必须停付。磁盘后端逐 chunk upsert 可能只成功
+        # 一部分，只拦「零确认」会让剩余未确认组件继续堆后面的付费批次。
+        # 停付只推迟后续批次，不影响本轮已确认的检查点。
+        if len(confirmed) < len(group):
             owner._sync_progress["phase"] = "embedding_checkpoint_failed"
             break
         owner._sync_progress["files_done"] = int(owner._sync_progress.get("files_done", 0)) + len(group)

@@ -173,10 +173,11 @@ def active_component_states(control: ControlStore, component_keys: Sequence[str]
 
 
 def recover_interrupted_batches(control: ControlStore, *, layout: StorageLayout,
-                                owner_token: str, live_owners: Iterable[str] = (),
-                                verify_recoverable: Any = None,
-                                audit_complete: bool = False,
-                                timeout: float = 30.0) -> dict:
+                               owner_token: str, live_owners: Iterable[str] = (),
+                               verify_recoverable: Any = None,
+                               audit_complete: bool = False,
+                               owner_predicate: Any = None,
+                               timeout: float = 30.0) -> dict:
     """重启恢复扫描：**必须先取得 dispatch 锁**才能判定旧调度者已退出。
 
     | 中断点 | 处置 |
@@ -186,11 +187,16 @@ def recover_interrupted_batches(control: ControlStore, *, layout: StorageLayout,
     | `result_pending` | 核验持久向量：有则 `complete`，无则 `held_result_missing` |
     | `complete` | 仅在 `audit_complete` 且成果不可恢复时转 `held_result_missing` |
 
+    `owner_predicate`：可选过滤（接收 owner_token，返回是否可判定为「已退出」）。
+    跨进程场景下**没有**可靠的存活证明时不得判定他人已死，调用方应只传入自己
+    进程的 token；为 None 时沿用旧语义（只看 live_owners）。
+
     返回处置明细；**不发送任何请求**。
     """
     live = {str(item) for item in live_owners or ()} | {str(owner_token)}
     summary = {"released_reserved": 0, "held_sending": 0, "completed_pending": 0,
-               "missing_result": 0, "held_complete": 0, "skipped_live": 0, "errors": []}
+               "missing_result": 0, "held_complete": 0, "skipped_live": 0,
+               "skipped_unproven": 0, "errors": []}
     try:
         with dispatch_lock(layout, timeout=timeout):
             work = control.list_embedding_work()
@@ -202,6 +208,9 @@ def recover_interrupted_batches(control: ControlStore, *, layout: StorageLayout,
         owner = str(batch.get("owner_token") or "")
         if owner in live:
             summary["skipped_live"] += 1
+            continue
+        if callable(owner_predicate) and not owner_predicate(owner):
+            summary["skipped_unproven"] += 1
             continue
         batch_id = str(batch.get("batch_id") or "")
         components = list(batch.get("components") or ())

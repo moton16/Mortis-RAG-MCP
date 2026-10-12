@@ -257,6 +257,46 @@ def test_partial_checkpoint_confirmation(tmp_path):
         control.close()
 
 
+def test_recovery_owner_predicate_never_touches_unproven_owners(tmp_path):
+    """R2：没有存活证明的他人 token 不得被恢复/释放（跨进程纪律）。"""
+    control = _control(tmp_path)
+    try:
+        mine = _component(1)
+        other = _component(2)
+        embedding_resume.reserve_embedding_batch(control, _plan("batch-mine", [mine]), "owner-mine")
+        embedding_resume.reserve_embedding_batch(control, _plan("batch-other", [other]), "owner-other")
+        summary = embedding_resume.recover_interrupted_batches(
+            control, layout=control.layout, owner_token="",
+            owner_predicate=lambda token: token == "owner-mine")
+        assert summary["released_reserved"] == 1
+        assert summary["skipped_unproven"] == 1
+        states = control.embedding_component_states(
+            [mine["component_key"], other["component_key"]])
+        assert states[mine["component_key"]] == "released"
+        # 他人批次原封不动：仍在 active 占用里，不会被静默解除。
+        assert states[other["component_key"]] == "reserved"
+    finally:
+        control.close()
+
+
+def test_recovery_marks_interrupted_sending_as_held(tmp_path):
+    """R2：本进程中断在 sending 的批次转持久 hold，绝不自动重发。"""
+    control = _control(tmp_path)
+    try:
+        component = _component(1)
+        owner = "pid1:dispatch:abc"
+        embedding_resume.reserve_embedding_batch(control, _plan("batch-1", [component]), owner)
+        embedding_resume.begin_embedding_send(control, "batch-1", owner)
+        summary = embedding_resume.recover_interrupted_batches(
+            control, layout=control.layout, owner_token="",
+            owner_predicate=lambda token: token == owner)
+        assert summary["held_sending"] == 1
+        states = control.embedding_component_states([component["component_key"]])
+        assert states[component["component_key"]] == "held_unknown"
+    finally:
+        control.close()
+
+
 def test_abandon_keeps_claim_and_retry_requires_confirmation(tmp_path):
     """T27/T28：abandon 只退出自动队列；retry 必须显式确认且不解除其他记录。"""
     control = _control(tmp_path)

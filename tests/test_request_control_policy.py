@@ -239,6 +239,95 @@ def test_component_key_is_stable_across_batch_sizes():
     assert component_key(**kwargs) != component_key(**{**kwargs, "purpose_family_name": "native_media"})
 
 
+def test_legacy_mode_cannot_bypass_component_hold(tmp_path, monkeypatch):
+    """R2 反例 1：切回 legacy_profile 不得裸撤新表 hold（held_result_missing 会重发）。"""
+    from mortis_rag_mcp.doc_store import resolve_storage_layout
+    from mortis_rag_mcp.request_lifecycle import OUTCOME_SUCCEEDED
+
+    (tmp_path / "a.md").write_text("A BODY", encoding="utf-8")
+    config = _bounded_config(tmp_path)
+    object.__setattr__(config.request_control, "mode", "legacy_profile")
+    calls: list[list[str]] = []
+    monkeypatch.setattr("mortis_rag_mcp.providers.urlopen", _ok_transport(calls))
+    indexer = MarkdownIndexer(tmp_path, config)
+    try:
+        control = indexer._paid_control_store()
+        assert control is not None
+        fingerprint = indexer._embedding_profile.fingerprint
+        # 造出「POST 已成功、结果却没落盘」的批次：journal=success + 组件 held。
+        plan = {"batch_id": "batch-stale", "operation_id": "op-stale",
+                "purpose_family": "document", "profile_fingerprint": fingerprint,
+                "endpoint": ENDPOINT,
+                "components": [{"component_key": "ck-stale", "embedding_key": "ek-stale",
+                                "input_sha256": "sha", "source": "a.md",
+                                "source_kind": "document", "source_sha256": "s",
+                                "revision_id": "", "chunk_id": "c1"}]}
+        from mortis_rag_mcp._indexer import embedding_resume
+        assert embedding_resume.reserve_embedding_batch(control, plan, "owner-stale").ok
+        embedding_resume.begin_embedding_send(control, "batch-stale", "owner-stale")
+        embedding_resume.record_embedding_outcome(
+            control, "batch-stale", "owner-stale", OUTCOME_SUCCEEDED)
+        embedding_resume.confirm_embedding_checkpoint(control, "batch-stale", "owner-stale", [])
+        assert control.embedding_component_states(["ck-stale"]) == {"ck-stale": "held_result_missing"}
+        # 旧路径必须把这条 hold 当成暂停判据，零 POST。
+        indexer.sync()
+        assert calls == []
+        assert indexer._embedding_paused is True
+    finally:
+        indexer.close_document_store()
+
+
+def test_partial_checkpoint_stops_further_paid_batches(tmp_path, monkeypatch):
+    """R2 反例 2：部分确认同样停付，不得继续堆后面的付费批次。"""
+    for name in ("a.md", "b.md", "c.md"):
+        (tmp_path / name).write_text(f"{name[0]} BODY", encoding="utf-8")
+    calls: list[list[str]] = []
+    monkeypatch.setattr("mortis_rag_mcp.providers.urlopen", _ok_transport(calls))
+    indexer = MarkdownIndexer(tmp_path, _bounded_config(tmp_path, batch_size=2))
+    try:
+        original = indexer.checkpoint_embeddings
+        monkeypatch.setattr(indexer, "checkpoint_embeddings",
+                            lambda bindings: list(original(bindings))[:1])
+        indexer.sync()
+        assert len(calls) == 1, "首组部分确认后必须停付，不得再发第二组"
+        assert len(calls[0]) == 2
+        # 未落盘的那一条必须变成持久 hold（可观测、不自动重发）。
+        assert any(value.startswith("RESULT_NOT_RECOVERED")
+                   for value in indexer.failed_files.values())
+    finally:
+        indexer.close_document_store()
+
+
+def test_same_process_stale_reservation_is_cleaned_at_sync_boundary(tmp_path, monkeypatch):
+    """R2 反例 4：本进程上一轮遗留的 reserved 必须在同步边界释放，否则永久卡死。"""
+    from mortis_rag_mcp._indexer import embedding_resume
+
+    (tmp_path / "a.md").write_text("A BODY", encoding="utf-8")
+    calls: list[list[str]] = []
+    monkeypatch.setattr("mortis_rag_mcp.providers.urlopen", _ok_transport(calls))
+    indexer = MarkdownIndexer(tmp_path, _bounded_config(tmp_path))
+    try:
+        from mortis_rag_mcp._indexer.sync_engine import _resume_owner_token
+
+        control = indexer._paid_control_store()
+        token = _resume_owner_token(indexer)
+        plan = {"batch_id": "batch-leftover", "operation_id": "op-1",
+                "purpose_family": "document",
+                "profile_fingerprint": indexer._embedding_profile.fingerprint,
+                "endpoint": ENDPOINT,
+                "components": [{"component_key": "ck-leftover", "embedding_key": "ek-leftover",
+                                "input_sha256": "sha", "source": "a.md",
+                                "source_kind": "document", "source_sha256": "s",
+                                "revision_id": "", "chunk_id": "c1"}]}
+        assert embedding_resume.reserve_embedding_batch(control, plan, token).ok
+        indexer.sync()
+        states = control.embedding_component_states(["ck-leftover"])
+        assert states.get("ck-leftover") == "released", "本进程遗留占用必须被释放"
+        assert len(calls) == 1
+    finally:
+        indexer.close_document_store()
+
+
 def test_held_components_survive_indexer_restart(tmp_path, monkeypatch):
     """跨重启：held 组件仍在，重建 indexer 后零自动 POST。"""
     (tmp_path / "a.md").write_text("A BODY", encoding="utf-8")
