@@ -271,6 +271,134 @@ def test_missing_batch_id_is_reported(tmp_path):
         control.close()
 
 
+def test_release_unlocks_a_dead_owner_sending_batch(tmp_path):
+    """v0.9.2 复核修正：跨进程崩溃遗留的 `sending` 批次必须有人工出口。
+
+    自动恢复按设计**不**处置无法判定存活的旧 owner；此前 `retry` 又拒绝 `sending`，
+    于是这个输入身份既不会自动补嵌、也没有任何可用动作（release 不在动作表里）。
+    """
+    vault = _vault(tmp_path)
+    control = _control(tmp_path, vault)
+    try:
+        _seed_batch(control, batch_id="batch-1", owner="pid999:sync:dead", state="sending")
+        assert "release" in REQUEST_CONTROL_ACTIONS
+        refused = request_control_action(vault_path=vault, action="release",
+                                        batch_id="batch-1", dry_run=False)
+        assert refused["applied"] is False
+        assert refused["error"] == "RELEASE_NEEDS_CONFIRMATION"
+        applied = request_control_action(vault_path=vault, action="release", batch_id="batch-1",
+                                        confirm_repeat_cost=True, dry_run=False)
+        assert applied["applied"] is True
+        assert applied["state"] == "released"
+    finally:
+        control.close()
+
+
+def test_release_of_a_reserved_batch_needs_no_cost_confirmation(tmp_path):
+    """`reserved` 从未进入发送：释放它不可能重复计费，不该逼运维确认。"""
+    vault = _vault(tmp_path)
+    control = _control(tmp_path, vault)
+    try:
+        _seed_batch(control, batch_id="batch-1", owner="pid999:sync:dead", state="reserved")
+        result = request_control_action(vault_path=vault, action="release",
+                                        batch_id="batch-1", dry_run=False)
+        assert result["applied"] is True
+        assert result["state"] == "released"
+    finally:
+        control.close()
+
+
+def test_prune_audit_clears_terminal_rows_only(tmp_path, monkeypatch):
+    """v0.9.2 复核修正：`audit_retention_days` 必须真的能清终态，且绝不碰 hold。
+
+    此前这个键没有任何消费者，于是"只清终态审计"的承诺从未发生。
+    """
+    from mortis_rag_mcp._indexer import embedding_resume as resume
+    from mortis_rag_mcp.request_lifecycle import OUTCOME_SUCCEEDED
+
+    vault = _vault(tmp_path)
+    control = _control(tmp_path, vault)
+    try:
+        held = _seed_batch(control, batch_id="batch-held", owner="owner-1", state="sending")
+        resume.record_embedding_outcome(control, "batch-held", "owner-1", "transport_unknown")
+        done = _seed_batch(control, batch_id="batch-done", owner="owner-1", state="sending", index=2)
+        resume.record_embedding_outcome(control, "batch-done", "owner-1", OUTCOME_SUCCEEDED)
+        resume.confirm_embedding_checkpoint(control, "batch-done", "owner-1", [done["embedding_key"]])
+        assert control.embedding_component_states([done["component_key"]]) == \
+            {done["component_key"]: "complete"}
+        # 把"现在"推到保留期之外：行本身是刚写的，只有推进时钟才能验证清理判据。
+        # 先抓住原函数再打补丁（`doc_store.time` 就是全局 time 模块，直接调 time.time 会递归）。
+        import time as _time_module
+        real_time = _time_module.time
+        monkeypatch.setattr("mortis_rag_mcp.doc_store.time.time",
+                            lambda: real_time() + 40 * 86400)
+        result = request_control_action(vault_path=vault, action="prune_audit", dry_run=False)
+        assert result["applied"] is True
+        assert result["batches"] >= 1
+        remaining = {b["batch_id"] for b in resume.list_embedding_work(control)}
+        assert "batch-done" not in remaining, "终态批次应被清理"
+        assert "batch-held" in remaining, "hold 是防重放判据，绝不能被清理"
+        assert held["component_key"]  # 组件仍在占用，未受影响
+    finally:
+        control.close()
+
+
+def test_prune_audit_is_disabled_when_retention_is_zero(tmp_path, monkeypatch):
+    """`audit_retention_days=0` = 全保留：动作必须明确拒绝而不是偷偷按默认值清。"""
+    vault = _vault(tmp_path)
+    cfg = _config(tmp_path)
+    object.__setattr__(cfg.request_control, "audit_retention_days", 0)
+    monkeypatch.setattr("mortis_rag_mcp.server.load_config", lambda *a, **k: cfg)
+    control = _control(tmp_path, vault)
+    try:
+        _seed_batch(control, batch_id="batch-1", owner="owner-1")
+        result = request_control_action(vault_path=vault, action="prune_audit", dry_run=False)
+        assert result["applied"] is False
+        assert result["error"] == "RETENTION_DISABLED"
+    finally:
+        control.close()
+
+
+def test_audit_complete_requires_vector_evidence(tmp_path):
+    """成果审计需要持久向量证据：拿不到就明确拒绝，不假装审计过。"""
+    vault = _vault(tmp_path)
+    control = _control(tmp_path, vault)
+    try:
+        result = request_control_action(vault_path=vault, action="audit_complete", dry_run=False)
+        assert result["applied"] is False
+        assert result["error"] == "AUDIT_REQUIRES_INDEXER"
+    finally:
+        control.close()
+
+
+def test_resume_route_reports_a_config_side_pause(tmp_path, monkeypatch):
+    """v0.9.2 复核修正：`resume_route` 不能谎报已恢复。
+
+    暂停有两个来源（配置 `paused_profiles` ∪ 旧库 revoked），工具只能清 DB 侧；
+    配置侧仍拦请求时必须如实报告，否则运维据此以为已经放行。
+    """
+    vault = _vault(tmp_path)
+    cfg = _config(tmp_path)
+    object.__setattr__(cfg.request_control, "paused_profiles", ("fp-config",))
+    monkeypatch.setattr("mortis_rag_mcp.server.load_config", lambda *a, **k: cfg)
+    control = _control(tmp_path, vault)
+    try:
+        control.revoke_paid_authorization("fp-config")
+        blocked = request_control_action(vault_path=vault, action="resume_route",
+                                        profile_fingerprint="fp-config", dry_run=False)
+        assert blocked["applied"] is False
+        assert blocked["error"] == "ROUTE_PAUSED_BY_CONFIG"
+        assert blocked["paused_by_config"] is True
+        # 不在配置清单里的指纹照旧可以直接恢复。
+        control.revoke_paid_authorization("fp-other")
+        resumed = request_control_action(vault_path=vault, action="resume_route",
+                                        profile_fingerprint="fp-other", dry_run=False)
+        assert resumed["applied"] is True
+        assert resumed["paused_by_config"] is False
+    finally:
+        control.close()
+
+
 def test_rollback_legacy_mode_still_sees_new_holds(tmp_path):
     """T34：切回 legacy_profile 时新表 hold 仍在，不能被忽略。"""
     vault = _vault(tmp_path)

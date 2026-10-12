@@ -278,8 +278,14 @@ MODE_BOUNDED_RESUME = "bounded_resume"
 MODE_LEGACY_PROFILE = "legacy_profile"
 ALL_MODES = (MODE_BOUNDED_RESUME, MODE_LEGACY_PROFILE)
 
-#: 模块级默认模式。P1—P3 期间保持 `legacy_profile`（旧的保护仍然生效），
-#: P4 联合验收通过后由 `RequestControlConfig` 把它切到 `bounded_resume`。
+#: 模块级默认模式：**未装配** provider 的 fail-closed 兜底，故意保持 `legacy_profile`。
+#:
+#: 产品默认（`RequestControlConfig.mode`）是 `bounded_resume`，但那是**按实例**装配的
+#: （`indexer._configure_paid_providers` / `server._media_provider_and_error` 都显式传
+#: `mode=`）。这里不是"还没切"的遗留值：`providers._send_once` 在阻塞模式下会对
+#: 「没有 journal/guard 的付费 provider」直接拒发（`PAID_REQUEST_CONTROL_UNAVAILABLE`），
+#: 把它改成 bounded_resume 等于让任何漏装配的付费 provider 自由 POST。所以**不要**
+#: 为了"和配置默认对齐"而改这个常量；漏装配应当修装配点。
 _DEFAULT_MODE = MODE_LEGACY_PROFILE
 
 

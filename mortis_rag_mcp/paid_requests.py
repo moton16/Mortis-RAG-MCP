@@ -158,6 +158,18 @@ class PaidRequestJournal:
         self._mark(request_id, "submission_unknown", str(reason)[:200],
                    expected_states=("prepared",))
 
+    def mark_not_sent(self, request_id: str, reason: str = "request_never_sent") -> None:
+        """请求**确定没有发出**（本地校验/能力缺失，远端一个字都没收到）：终态化。
+
+        复用 `abandoned` 终态（无 schema 变更），`reason` 区分「从未发出」与
+        「响应不可用」/「人工放弃」。留成 `submission_unknown` 会把一条从未发出的
+        请求当成未决付费意图，于是 `has_unresolved_paid_intents` 让整条路由停摆。
+        只有 `prepared` 能转移，晚到的响应无法把它翻回来。
+        """
+        if self._mark(request_id, "abandoned", str(reason)[:200], expected_states=("prepared",)):
+            return
+        raise ProviderError("REQUEST_INTENT_FINALIZED: late response discarded")
+
     def mark_response_failed(self, request_id: str, reason: str = "media_response_contract_failed") -> None:
         """A confirmed unusable response is terminal, not success or unknown.
 

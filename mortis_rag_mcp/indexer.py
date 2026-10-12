@@ -1201,6 +1201,14 @@ class MarkdownIndexer:
     def _chunk_has_vector(self, chunk: Chunk) -> bool:
         return _sync_engine.chunk_has_vector(self, chunk)
 
+    def resume_recoverable_probe(self):
+        """恢复/审计扫描的成果核验回调（v0.9.2 §5）。
+
+        返回的 closure 内部缓存 chunk id 索引，可跨多个批次复用；判据与
+        `checkpoint_embeddings` 一致（磁盘后端只认后端确认写入的 id）。
+        """
+        return _sync_engine._resume_verifier(self)
+
     def _stamp_embedding_keys(self) -> None:
         return _sync_engine._stamp_embedding_keys(self)
 

@@ -477,9 +477,12 @@ class RequestControlConfig:
     * `mode`：`bounded_resume` = 组件级占用 + 持久 unknown hold（目标默认）；
       `legacy_profile` = 临时回滚兼容模式，恢复旧 profile 级未决暂停。
     * `background_embedding`：`manual` 时后台不自动计算外部文档/媒体向量，
-      普通读取 / stats / watch 启动也不隐式付费。
-    * 预算是**操作内计数器**，不是账户金额预算/票据。
+      普通读取 / stats / watch 启动也不隐式付费（文档与原生媒体两条路径共用判据）。
+    * 预算是**操作内计数器**，不是账户金额预算/票据；`background_max_posts_per_round`
+      对文档与媒体 POST **共享**，`query_max_posts` 限制一次 fan-out 检索里的付费查询嵌入数。
     * `paused_profiles` 是明确的暂停清单（精确 fingerprint），不是审批清单。
+    * `audit_retention_days` 由显式动作执行（`kb_request_control action=prune_audit`
+      / CLI `--request-control prune_audit --apply`），只清终态审计行；0 = 全保留。
     """
 
     #: P4 联合验收通过后切换为目标默认：组件级占用 + 持久 unknown hold。

@@ -629,7 +629,7 @@ def _configure_probe_paid(provider: object, cfg: object, *, kind: str, fingerpri
         return True
     from .config import AppConfig
     from .doc_store import resolve_storage_layout
-    from .paid_requests import PaidRequestJournal, open_paid_control
+    from .paid_requests import PaidRequestJournal, open_paid_control, paid_request_guard
 
     if not isinstance(cfg, AppConfig):
         # 非 AppConfig（测试桩/自定义对象）无法证明控制面可用：交给调用方按
@@ -650,7 +650,23 @@ def _configure_probe_paid(provider: object, cfg: object, *, kind: str, fingerpri
     except Exception:
         return False
     journal = PaidRequestJournal(control, f"doctor-probe-{kind}")
-    configure(journal, lambda profile: profile == fingerprint, fingerprint)
+    # 探活只授权"这一次"，但**不**覆盖显式撤销与配置暂停：那两条表达的是用户
+    # "不要再为这个 profile 花钱"，探活同样必须尊重。此前 guard 只做精确 fingerprint
+    # 比对，于是 `pause_route`（写 revoked）之后 `--doctor` 仍会发出一次真实付费请求。
+    # fingerprint 为空（自定义 endpoint 未经验证 profile）时保持原语义：只用精确匹配，
+    # 不去查授权表（空串在授权表里恒为"未授权"，会把受支持的场景误杀）。
+    paused = {str(item) for item in (getattr(getattr(cfg, "request_control", None),
+                                             "paused_profiles", ()) or ())}
+    db_allowed = paid_request_guard(control, str(fingerprint)) if str(fingerprint) else None
+
+    def probe_guard(profile: str) -> bool:
+        if str(profile) != str(fingerprint):
+            return False
+        if str(profile) in paused:
+            return False
+        return True if db_allowed is None else bool(db_allowed(profile))
+
+    configure(journal, probe_guard, str(fingerprint))
     return True
 
 

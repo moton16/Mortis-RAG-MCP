@@ -20,6 +20,18 @@ from .request_lifecycle import (
 _MAX_RESPONSE_BYTES = 10 * 1024 * 1024  # 10 MiB response body limit
 
 
+def _pre_send_error(message: str) -> ProviderError:
+    """**尚未发送**的本地校验失败（参数/批量/体积/MIME 不合规）。
+
+    必须与「远端影响未知」分开：这些检查都在 `journal.before_send` 之前，远端一个字
+    都没收到。把它们记成 `transport_unknown` 会写下一条 `submission_unknown` 意图，
+    于是下一轮 `has_unresolved_paid_intents` 让整条媒体路由停摆 —— 一条从未发出的
+    请求冻死付费媒体（v0.9.2 复核修正）。
+    """
+    return ProviderError(message, outcome=OUTCOME_NOT_SENT, response_received=False,
+                         remote_effect_unknown=False)
+
+
 def _media_outcome(exc: BaseException) -> RequestOutcome:
     """把媒体 transport/adapter 抛出的异常归一为结构化结果。
 
@@ -28,10 +40,19 @@ def _media_outcome(exc: BaseException) -> RequestOutcome:
     """
     if isinstance(exc, MediaResponseError):
         reason = getattr(exc, "reason", "media_response_contract_failed")
-        outcome = "rejected" if reason == "media_response_rejected" else OUTCOME_RESPONSE_INVALID
-        return RequestOutcome(outcome=outcome, response_received=True,
-                              remote_effect_unknown=True, http_status=getattr(exc, "http_status", None),
+        rejected = reason == "media_response_rejected"
+        # 与文本路径同一口径：4xx 类明确拒绝 = 远端确定没处理（remote_effect_unknown
+        # 为 False）；响应到了但契约不满足 = 远端影响未知（True）。此前一律置 True，
+        # 让同一个 `rejected` 值在两条路径上含义不同。
+        return RequestOutcome(outcome="rejected" if rejected else OUTCOME_RESPONSE_INVALID,
+                              response_received=True, remote_effect_unknown=not rejected,
+                              http_status=getattr(exc, "http_status", None),
                               detail=str(exc)[:200])
+    # 已经带结构化分类的 ProviderError（例如 transport 的发送前校验 `not_sent`）：
+    # 尊重它的 outcome，不要一律按「远端影响未知」覆盖 —— 那会把一条从未发出的请求
+    # 记成未决付费意图，冻死整条媒体路由。
+    if isinstance(exc, ProviderError) and getattr(exc, "outcome", ""):
+        return exc.as_outcome()
     cause = getattr(exc, "__cause__", None)
     if cause is not None:
         return _transport_outcome(cause)
@@ -43,8 +64,9 @@ def _media_outcome(exc: BaseException) -> RequestOutcome:
 class MediaResponseError(ProviderError):
     """The endpoint responded, but its response is not an indexable success."""
 
-    def __init__(self, message: str, reason: str = "media_response_contract_failed") -> None:
-        super().__init__(message)
+    def __init__(self, message: str, reason: str = "media_response_contract_failed",
+                 http_status: int | None = None) -> None:
+        super().__init__(message, http_status=http_status)
         self.reason = reason
 
 
@@ -138,15 +160,15 @@ class HttpMediaTransport:
         if not items:
             return []
         if len(items) > self.max_batch_size:
-            raise ProviderError(f"media batch size {len(items)} exceeds limit {self.max_batch_size}")
+            raise _pre_send_error(f"media batch size {len(items)} exceeds limit {self.max_batch_size}")
         input_payloads: list[dict[str, Any]] = []
         for item in items:
             if item.modality != "image":
-                raise ProviderError(f"media modality {item.modality!r} unsupported by VL embedding transport (only 'image' supported)")
+                raise _pre_send_error(f"media modality {item.modality!r} unsupported by VL embedding transport (only 'image' supported)")
             if item.mime_type not in self.allowed_mime_types:
-                raise ProviderError(f"media mime type {item.mime_type!r} not in allowed types {self.allowed_mime_types}")
+                raise _pre_send_error(f"media mime type {item.mime_type!r} not in allowed types {self.allowed_mime_types}")
             if len(item.data) > self.max_input_bytes:
-                raise ProviderError(f"media data size {len(item.data)} exceeds limit {self.max_input_bytes}")
+                raise _pre_send_error(f"media data size {len(item.data)} exceeds limit {self.max_input_bytes}")
             b64_data = base64.b64encode(item.data).decode("ascii")
             data_uri = f"data:{item.mime_type};base64,{b64_data}"
             input_payloads.append({"image": data_uri})
@@ -194,8 +216,10 @@ class HttpMediaTransport:
                 except Exception:
                     msg += f" - {err_text[:200]}"
             if 400 <= exc.code < 500 and exc.code != 429:
-                raise MediaResponseError(f"media embedding HTTP failure: {msg}", "media_response_rejected") from exc
-            raise ProviderError(f"media embedding HTTP failure: {msg}") from exc
+                raise MediaResponseError(f"media embedding HTTP failure: {msg}",
+                                         "media_response_rejected", http_status=exc.code) from exc
+            raise ProviderError(f"media embedding HTTP failure: {msg}",
+                                http_status=exc.code) from exc
         except (URLError, OSError) as exc:
             raise ProviderError(f"media embedding network error: {exc}") from exc
 
@@ -207,7 +231,10 @@ class HttpMediaTransport:
         if isinstance(result, dict) and "error" in result:
             err = result["error"]
             err_msg = err.get("message") if isinstance(err, dict) else str(err)
-            raise MediaResponseError(f"media embedding API error: {err_msg}", "media_response_rejected")
+            # HTTP 是 200，但 body 里带 error 对象：响应确实收到了（2xx），供应商明确
+            # 拒绝这次请求 → 记 200 而不是丢掉状态码。
+            raise MediaResponseError(f"media embedding API error: {err_msg}",
+                                     "media_response_rejected", http_status=200)
 
         data = result.get("data") if isinstance(result, dict) else None
         if not isinstance(data, list):
@@ -264,10 +291,10 @@ class GeminiMediaTransport:
         if not items:
             return []
         if len(items) > self.max_batch_size:
-            raise ProviderError(f"media batch size {len(items)} exceeds limit {self.max_batch_size}")
+            raise _pre_send_error(f"media batch size {len(items)} exceeds limit {self.max_batch_size}")
 
         if self.endpoint.endswith(":embedContent") and len(items) > 1:
-            raise ProviderError(
+            raise _pre_send_error(
                 f"Gemini single :embedContent endpoint does not accept batch requests (got {len(items)} items); "
                 "use :batchEmbedContents endpoint for batched requests"
             )
@@ -277,14 +304,14 @@ class GeminiMediaTransport:
         requests_payload: list[dict[str, Any]] = []
         for item in items:
             if item.modality not in ("image", "audio"):
-                raise ProviderError(
+                raise _pre_send_error(
                     f"media modality {item.modality!r} unsupported by Gemini media embedding transport "
                     "(only 'image' and 'audio' supported)"
                 )
             if item.mime_type not in self.allowed_mime_types:
-                raise ProviderError(f"media mime type {item.mime_type!r} not in allowed types {self.allowed_mime_types}")
+                raise _pre_send_error(f"media mime type {item.mime_type!r} not in allowed types {self.allowed_mime_types}")
             if len(item.data) > self.max_input_bytes:
-                raise ProviderError(f"media data size {len(item.data)} exceeds limit {self.max_input_bytes}")
+                raise _pre_send_error(f"media data size {len(item.data)} exceeds limit {self.max_input_bytes}")
             b64_data = base64.b64encode(item.data).decode("ascii")
             part_content = {
                 "parts": [
@@ -355,8 +382,10 @@ class GeminiMediaTransport:
                 except Exception:
                     msg += f" - {err_text[:200]}"
             if 400 <= exc.code < 500 and exc.code != 429:
-                raise MediaResponseError(f"Gemini media embedding HTTP failure: {msg}", "media_response_rejected") from exc
-            raise ProviderError(f"Gemini media embedding HTTP failure: {msg}") from exc
+                raise MediaResponseError(f"Gemini media embedding HTTP failure: {msg}",
+                                         "media_response_rejected", http_status=exc.code) from exc
+            raise ProviderError(f"Gemini media embedding HTTP failure: {msg}",
+                                http_status=exc.code) from exc
         except (URLError, OSError) as exc:
             raise ProviderError(f"Gemini media embedding network error: {exc}") from exc
 
@@ -368,7 +397,8 @@ class GeminiMediaTransport:
         if isinstance(result, dict) and "error" in result:
             err = result["error"]
             err_msg = err.get("message") if isinstance(err, dict) else str(err)
-            raise MediaResponseError(f"Gemini media embedding API error: {err_msg}", "media_response_rejected")
+            raise MediaResponseError(f"Gemini media embedding API error: {err_msg}",
+                                     "media_response_rejected", http_status=200)
 
         mapped_records: list[dict[str, Any]] = []
         if isinstance(result, dict) and "embeddings" in result:
@@ -622,6 +652,10 @@ class NativeMediaProvider:
         try:
             if outcome.outcome == OUTCOME_SUCCEEDED:
                 journal.mark_success(request_id)
+            elif outcome.outcome == OUTCOME_NOT_SENT:
+                # 本地校验失败：远端一个字都没收到。留成未决意图会把整条媒体路由
+                # 冻死（`PAID_REQUEST_UNRESOLVED`），而那条请求从未发出。
+                journal.mark_not_sent(request_id, f"{outcome.outcome}: {outcome.detail}")
             elif outcome.outcome == "rejected" and cause is not None:
                 reason = getattr(cause, "reason", "media_response_contract_failed")
                 journal.mark_response_failed(request_id, reason)

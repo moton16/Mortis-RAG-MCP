@@ -14,7 +14,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
 import json
 import time
-from typing import Any, Iterable, TYPE_CHECKING
+from typing import Any, Iterable, Mapping, Sequence, TYPE_CHECKING
 
 from ..providers import EmbeddingProvider, ProviderError
 from ..embedding_capabilities import embed_with_profile
@@ -131,6 +131,17 @@ def _bounded_resume_mode(owner: MarkdownIndexer) -> bool:
         if getattr(_request_control(owner), "mode", "") else bounded_resume_enabled()
 
 
+def _background_embedding_is_manual(owner: MarkdownIndexer) -> bool:
+    """后台策略 `manual`：不得自动计算外部向量（文本**与**媒体共用同一判据）。
+
+    这个判据必须对所有付费后台路径生效，而不是只在文档嵌入路径里判一次 ——
+    否则配了 `manual` 的用户会以为已经停止自动付费，媒体阶段却照发 POST
+    （v0.9.2 复核修正）。
+    """
+    rc = _request_control(owner)
+    return str(getattr(rc, "background_embedding", "enabled") or "enabled").strip().lower() == "manual"
+
+
 def _paid_embedding_allowed(owner: MarkdownIndexer) -> bool:
     """索引批量路径的付费闸门查询（§20.7B / §20.7F）。
 
@@ -147,7 +158,7 @@ def _paid_embedding_allowed(owner: MarkdownIndexer) -> bool:
     if getattr(getattr(owner, "embedding_provider", None), "is_local_free", False) is True:
         return True
     # manual 背景策略：普通读取/stats/watch 启动都不允许自动计算外部向量。
-    if str(getattr(_request_control(owner), "background_embedding", "enabled")) == "manual":
+    if _background_embedding_is_manual(owner):
         return False
     if _bounded_resume_mode(owner):
         # 新模式：**取消** profile 级未决暂停。防重放由组件级持久 hold 承担，
@@ -232,14 +243,31 @@ class _TemplatingProvider:
 
         调用方（`_embed_missing_bounded`）传的是原始正文，模板由 `embed_with_profile`
         统一应用一次 —— 计划层的组件身份用同一模板后的文本计算，因此两端一致且
-        不会二次格式化。`embed_with_profile(single_batch=True)` 同时保留了「内层
-        provider 没有单批能力时退回 `embed`」的兼容路径。
+        不会二次格式化。内层 provider 没有单批能力时这里会明确报错（契约），由
+        `_single_batch_capable` 在**进入续算路径之前**就判掉，不会走到这一步。
         """
         return embed_with_profile(self._provider, texts, self._profile,
                                   request_context=request_context, single_batch=True)
 
+    def supports_single_batch(self) -> bool:
+        """wrapper 的单批能力**取决于内层 provider**，不能靠 wrapper 自己声明。
+
+        wrapper 永远有 `embed_batch_once` 方法，如果只用 `hasattr` 判断能力，任何
+        第三方/测试 provider 都会被当成"支持单批"，进而在 `embed_with_profile` 里
+        失败或被静默降级成多批（账实不符）。
+        """
+        return callable(getattr(self._provider, "embed_batch_once", None))
+
     def __getattr__(self, name: str) -> Any:
         return getattr(self._provider, name)
+
+
+def _single_batch_capable(provider: Any) -> bool:
+    """该 provider（含模板 wrapper）能保证「一次调用 = 一个物理 POST」吗？"""
+    if not callable(getattr(provider, "embed_batch_once", None)):
+        return False
+    probe = getattr(provider, "supports_single_batch", None)
+    return not callable(probe) or bool(probe())
 
 
 def _document_provider(owner: MarkdownIndexer) -> Any:
@@ -451,6 +479,47 @@ def _resume_layout(owner: MarkdownIndexer):
     return layout
 
 
+def _resume_verifier(owner: MarkdownIndexer):
+    """恢复扫描的**严格成果核验**：复用 `checkpoint_embeddings` 的同一条持久判据。
+
+    返回 closure 而非一次算好的集合：库里没有中断批次时零成本；只有真的存在
+    `sending` / `result_pending` 批次时才建 chunk id 索引（O(chunks) 一次）。
+
+    判据与确认路径一致 —— 磁盘后端只认后端确认写入的 id；内存/缓存后端看 chunk
+    是否仍带向量（重启后它只可能来自已落盘的缓存）。查不到证据一律不算可恢复，
+    于是走 `held_*`，绝不因为"看起来算过"就省掉一次付费确认。
+    """
+    index: dict[str, Chunk] = {}
+
+    def verify(components: Sequence[Mapping[str, Any]]) -> set[str]:
+        pairs: dict[str, str] = {}
+        for component in components:
+            chunk_id = str(component.get("chunk_id") or "")
+            key = str(component.get("embedding_key") or "")
+            if chunk_id and key:
+                pairs.setdefault(chunk_id, key)
+        if not pairs:
+            return set()
+        if not index:
+            for chunks in getattr(owner, "_chunks", {}).values():
+                for chunk in chunks:
+                    index[chunk.id] = chunk
+        on_disk = bool(getattr(owner, "_vectors_on_disk", False))
+        confirmed: set[str] = set()
+        for chunk_id, key in pairs.items():
+            chunk = index.get(chunk_id)
+            if chunk is None:
+                continue
+            if on_disk:
+                if chunk_id in getattr(owner, "_disk_vectors", ()):
+                    confirmed.add(key)
+            elif owner._chunk_has_vector(chunk):
+                confirmed.add(key)
+        return confirmed
+
+    return verify
+
+
 def _pending_components(owner: MarkdownIndexer, pending: dict[str, list[Chunk]]) -> dict[str, dict]:
     """按**稳定输入身份**聚合待补嵌输入；相同输入只发一个代表，回填所有绑定。"""
     from ..request_lifecycle import PURPOSE_BACKGROUND_DOCUMENT, component_key, purpose_family, sha256_hex
@@ -497,6 +566,31 @@ def _record_hold_failure(owner: MarkdownIndexer, source: str, state: str, batch_
     owner.failed_files[source] = f"{code} · batch={batch_id[:16]} · automatic replay held"
 
 
+#: 确定**没有**产生远端影响的失败码：这些不是 hold，下一轮会自动重新计划。
+_NON_HOLD_REASON_CODES = {
+    "not_sent": "REQUEST_NOT_SENT",
+    "rejected": "REQUEST_REJECTED",
+}
+
+
+def _record_outcome_failure(owner: MarkdownIndexer, source: str, outcome: Any, batch_id: str) -> None:
+    """按结果**事实**写失败名单：hold 用 hold 码，明确被拒/未发送不用 hold 语义。
+
+    此前一律写 `outcome.hold_state or "held_unknown"`：`rejected`（4xx，组件已被控制库
+    释放、下一轮会自动重新计划）也被标成「AUTOMATIC_REPLAY_HELD · automatic replay
+    held」，既误导运维去手工处置，又因为走的是 hold 分支而不累加退避 streak ——
+    一个持续 4xx 的源会永远每轮重试。
+    """
+    state = outcome.hold_state
+    if state:
+        _record_hold_failure(owner, source, state, batch_id)
+        return
+    code = _NON_HOLD_REASON_CODES.get(str(getattr(outcome, "outcome", "")), "REQUEST_NOT_SENT")
+    _record_embedding_failure(owner, source)
+    owner.failed_files[source] = (
+        f"{code} · batch={batch_id[:16]} · request not billed; next round retries automatically")
+
+
 def _embed_missing_bounded(owner: MarkdownIndexer, pending: dict[str, list[Chunk]],
                            pending_chunks: list[Chunk], failed_before: dict[str, str],
                            reused: int) -> bool:
@@ -519,25 +613,32 @@ def _embed_missing_bounded(owner: MarkdownIndexer, pending: dict[str, list[Chunk
         owner._sync_progress["phase"] = "embedding_paused"
         owner._sync_progress["reason"] = "BACKGROUND_BATCH_CAPABILITY_UNAVAILABLE"
         return False
-    # 崩溃恢复扫描（每实例一次）：只处置**本进程**遗留的 active 批次 ——
-    # `reserved` 释放（状态本身证明此前没有发送）、`sending` 转持久 hold（结果不可证，
-    # 不自动重发）。跨进程的他人 token 没有可靠存活证明，一律不减不释放。
-    if not getattr(owner, "_resume_recovered", False):
-        owner._resume_recovered = True
-        token = _resume_owner_token(owner)
-        try:
-            layout = _resume_layout(owner)
-            recovery = embedding_resume.recover_interrupted_batches(
-                control, layout=layout, owner_token="",
-                owner_predicate=lambda owner_token: str(owner_token) == token)
-            if recovery.get("errors"):
-                owner._sync_progress["resume_recovery_errors"] = recovery["errors"][:3]
-            owner._sync_progress["resume_recovery"] = {
-                key: int(recovery.get(key) or 0)
-                for key in ("released_reserved", "held_sending", "completed_pending",
-                            "missing_result", "held_complete", "skipped_unproven")}
-        except Exception as exc:  # noqa: BLE001 - 恢复不可用必须可观测，不能静默
-            owner._sync_progress["resume_recovery_errors"] = [str(exc)[:200]]
+    # 崩溃/中断恢复扫描：**每次调用都扫**，只处置**本进程**遗留的 active 批次 ——
+    # `reserved` 释放（状态本身证明此前没有发送）、`sending` 在有持久成果时完成、
+    # 否则转持久 hold（结果不可证，不自动重发）。
+    #
+    # 此前写成"每实例只扫一次"，而扫描发生在本次调用**创建任何批次之前**：那时库里
+    # 不可能存在本进程 token 的批次，于是谓词恒假、所有批次都被 `skipped_unproven`
+    # 跳过 → 这段恢复在生产里从未处置过任何一行，同进程中断残留（例如 `begin_send`
+    # 遇到控制库瞬时错误后 `continue` 留下的 `reserved`）会永久占用输入身份并静默不补嵌。
+    #
+    # 跨进程的他人 token 依然**不做**自动处置：没有可靠存活证明就不能判定对方已死
+    # （R2 纪律）。这类残留由运维用 `kb_request_control action=release` 显式解锁。
+    token = _resume_owner_token(owner)
+    try:
+        layout = _resume_layout(owner)
+        recovery = embedding_resume.recover_interrupted_batches(
+            control, layout=layout, owner_token="",
+            verify_recoverable=_resume_verifier(owner),
+            owner_predicate=lambda owner_token: str(owner_token) == token)
+        if recovery.get("errors"):
+            owner._sync_progress["resume_recovery_errors"] = recovery["errors"][:3]
+        owner._sync_progress["resume_recovery"] = {
+            key: int(recovery.get(key) or 0)
+            for key in ("released_reserved", "held_sending", "completed_pending",
+                        "missing_result", "held_complete", "skipped_unproven")}
+    except Exception as exc:  # noqa: BLE001 - 恢复不可用必须可观测，不能静默
+        owner._sync_progress["resume_recovery_errors"] = [str(exc)[:200]]
 
     operation_id = getattr(owner, "_resume_operation_id", "") or embedding_resume.new_operation_id("sync")
     owner._resume_operation_id = operation_id
@@ -609,8 +710,7 @@ def _embed_missing_bounded(owner: MarkdownIndexer, pending: dict[str, list[Chunk
             outcome = exc.as_outcome()
             embedding_resume.record_embedding_outcome(control, batch_id, owner_token, outcome)
             for component in group:
-                _record_hold_failure(owner, component["source"],
-                                     outcome.hold_state or "held_unknown", batch_id)
+                _record_outcome_failure(owner, component["source"], outcome, batch_id)
             continue
         except Exception as exc:  # noqa: BLE001 - 非 transport 异常不得冒充远端未知
             from ..request_lifecycle import OUTCOME_RESPONSE_INVALID, RequestOutcome
@@ -644,6 +744,15 @@ def _embed_missing_bounded(owner: MarkdownIndexer, pending: dict[str, list[Chunk
             control, batch_id, owner_token, OUTCOME_SUCCEEDED)
         confirmed = owner.checkpoint_embeddings(bindings)
         result = embedding_resume.confirm_embedding_checkpoint(control, batch_id, owner_token, confirmed)
+        if not result.get("applied"):
+            # 控制库拒绝了这次检查点（owner/状态 CAS 未命中）：账本仍停在 result_pending。
+            # 此时绝不能清失败、更不能继续堆后面的付费批次 —— 本地以为"已保存"而账本
+            # 没有，就会在下一次恢复扫描里被当成成果丢失，甚至反复重算。
+            owner._sync_progress["phase"] = "embedding_checkpoint_failed"
+            owner._sync_progress["checkpoint_refused"] = True
+            for component in group:
+                _record_hold_failure(owner, component["source"], "held_result_missing", batch_id)
+            break
         for component in group:
             if component["embedding_key"] in confirmed:
                 _clear_embedding_failure(owner, component["source"])
@@ -726,7 +835,13 @@ def embed_missing(owner: MarkdownIndexer) -> bool:
             and not getattr(owner.embedding_provider, "is_local_free", False)
             and str(owner.config.embedding.endpoint or "").strip()):
         # 没有端点就无法标识路由，续算不可用 → 继续走旧的按文件分组路径。
-        return _embed_missing_bounded(owner, pending, pending_chunks, failed_before, reused)
+        #
+        # 续算台账按「一次调用 = 一个物理 POST」记账（占用/预算/检查点都据此），
+        # 所以只有内层 provider 真能单批发送时才走这条路；能力缺失退回旧路径而不是
+        # 暂停整库嵌入。
+        if _single_batch_capable(_document_provider(owner)):
+            return _embed_missing_bounded(owner, pending, pending_chunks, failed_before, reused)
+        owner._sync_progress["bounded_resume_skipped"] = "BACKGROUND_BATCH_CAPABILITY_UNAVAILABLE"
 
     if owner.config.embedding.mode != "external":
         provider = _document_provider(owner)
@@ -972,6 +1087,13 @@ def media_native_for_revision(owner: MarkdownIndexer, store: Any, source: str, r
     # 结果每轮都被后置的短路丢弃——纯浪费，且破坏了「零成本端点完全不触意图库」
     # 这条性质。判序改为先看成本，付费路径一行未动。
     local_free = bool(getattr(provider, "is_local_free", False))
+    # 后台策略 `manual`（v0.9.2 复核修正）：付费媒体同样不得自动计算 —— 这个键此前
+    # 只在文档嵌入路径生效，配了 manual 的用户仍会被 watch/启动触发的原生媒体 POST
+    # 扣费。只拦「发送」，不拦「复用」：上面已有向量的 chunk 照常返回（零成本）。
+    if not local_free and _background_embedding_is_manual(owner):
+        owner._sync_progress["media_deferred"] = True
+        owner._sync_progress["media_deferred_reason"] = "BACKGROUND_MANUAL"
+        return chunks
     control = None if local_free else owner._paid_control_store()
     unresolved = False
     if not local_free:
@@ -981,9 +1103,22 @@ def media_native_for_revision(owner: MarkdownIndexer, store: Any, source: str, r
                 control, "media", provider.profile.fingerprint)
     if control is not None and unresolved:
         raise MediaStageError("PAID_REQUEST_UNRESOLVED: native media outcome unknown; automatic retry disabled", chunks)
+    # 一轮预算由文档与媒体**共享**（§8）：此前只有文档批自增，媒体每次 POST 都不计数，
+    # 于是 `background_max_posts_per_round` 对媒体完全不设限，`kb_stats` 的
+    # posts_used/posts_limit 也会系统性少报。
+    budget_limit = int(getattr(_request_control(owner), "background_max_posts_per_round", 32) or 32)
+    budget = int(getattr(owner, "_post_budget_used", 0) or 0)
     for start in range(0, len(pending), batch):
+        if not local_free and budget >= budget_limit:
+            owner._sync_progress["budget_deferred"] = True
+            owner._sync_progress["media_deferred"] = True
+            owner._sync_progress["media_deferred_reason"] = "BUDGET_DEFERRED"
+            break
         batch_inputs = pending[start:start + batch]
         try:
+            if not local_free:
+                budget += 1
+                owner._post_budget_used = budget
             vectors = provider.embed_media(batch_inputs)
             if len(vectors) != len(batch_inputs):
                 raise ProviderError("native media response count mismatch")

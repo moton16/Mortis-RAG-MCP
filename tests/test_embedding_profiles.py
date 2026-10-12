@@ -89,6 +89,51 @@ def test_query_document_fake_compatibility():
     assert calls == [["q:x"], ["d:x"]]
 
 
+def test_context_is_passed_only_when_the_signature_accepts_it():
+    """上下文透传靠读签名：既不漏传，也不为了"试一下"多调一次。"""
+    seen = []
+
+    def with_kw(texts, *, request_context=None):
+        seen.append(request_context)
+        return [[1.0, 0.0] for _ in texts]
+
+    def without_kw(texts):
+        seen.append("no-kwarg")
+        return [[1.0, 0.0] for _ in texts]
+
+    p = replace(profile(), document_template="d:{text}")
+    embed_with_profile(SimpleNamespace(embed=with_kw), ["x"], p, request_context="ctx-1")
+    assert seen == ["ctx-1"]
+    embed_with_profile(SimpleNamespace(embed=without_kw), ["x"], p, request_context="ctx-2")
+    assert seen == ["ctx-1", "no-kwarg"]
+
+
+def test_provider_type_error_never_triggers_a_second_send():
+    """v0.9.2 复核修正：`except TypeError` 兜底会重发**完全相同**的请求（重复计费）。
+
+    `request_context is None` 时旧代码的两次调用字面相同，provider 内部任何 TypeError
+    都会变成第二次物理 POST。
+    """
+    calls = []
+
+    def boom(texts, **kwargs):
+        calls.append(list(texts))
+        raise TypeError("internal desync inside the provider")
+
+    p = replace(profile(), document_template="d:{text}")
+    with pytest.raises(TypeError):
+        embed_with_profile(SimpleNamespace(embed=boom), ["x"], p)
+    assert calls == [["d:x"]], "provider 内部 TypeError 不得触发第二次发送"
+
+
+def test_single_batch_requires_a_single_batch_entry_point():
+    """单批契约缺失必须**在发送前**报错，不能静默退回多批（账实不符）。"""
+    p = replace(profile(), document_template="d:{text}")
+    fake = SimpleNamespace(embed=lambda texts: [[1.0, 0.0] for _ in texts])
+    with pytest.raises(EmbeddingContractError):
+        embed_with_profile(fake, ["x"], p, single_batch=True)
+
+
 def test_post_gate_and_single_send_unknown(monkeypatch):
     provider = ExternalEmbeddingProvider("https://example.test", max_retries=99)
     sends = []

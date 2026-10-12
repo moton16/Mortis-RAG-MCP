@@ -35,6 +35,9 @@ HELD_COMPONENT_STATES = (
 
 BATCH_ACTIVE_STATES = ("reserved", "sending", "result_pending")
 
+#: 恢复扫描默认考虑的中断态；`complete` 只在显式审计时纳入（避免每轮全表扫）。
+RECOVERY_ACTIVE_STATES = ("reserved", "sending", "result_pending")
+
 
 def new_operation_id(purpose: str) -> str:
     """逻辑操作 id：一次 sync / 一次 query / 一次显式 retry 一个。"""
@@ -177,13 +180,14 @@ def recover_interrupted_batches(control: ControlStore, *, layout: StorageLayout,
                                verify_recoverable: Any = None,
                                audit_complete: bool = False,
                                owner_predicate: Any = None,
-                               timeout: float = 30.0) -> dict:
+                               timeout: float = 30.0,
+                               states: Sequence[str] = RECOVERY_ACTIVE_STATES) -> dict:
     """重启恢复扫描：**必须先取得 dispatch 锁**才能判定旧调度者已退出。
 
     | 中断点 | 处置 |
     |---|---|
     | `reserved` | 旧 owner 已不在 → 释放（状态保证此前没有发送），零自动重发 |
-    | `sending` | 有可能已发出 → 无可恢复成果时转 `held_unknown` |
+    | `sending` | 有可恢复成果 → 先推进 `result_pending` 再确认；否则转 `held_unknown` |
     | `result_pending` | 核验持久向量：有则 `complete`，无则 `held_result_missing` |
     | `complete` | 仅在 `audit_complete` 且成果不可恢复时转 `held_result_missing` |
 
@@ -191,7 +195,16 @@ def recover_interrupted_batches(control: ControlStore, *, layout: StorageLayout,
     跨进程场景下**没有**可靠的存活证明时不得判定他人已死，调用方应只传入自己
     进程的 token；为 None 时沿用旧语义（只看 live_owners）。
 
-    返回处置明细；**不发送任何请求**。
+    `verify_recoverable`：接收该批次的 `components` 列表（含 `embedding_key` /
+    `chunk_id`），返回**被严格确认已持久化**的 `embedding_key` 集合。缺省 None =
+    一律不可恢复（fail closed，走 held 路线）。
+
+    `states`：只考虑这些批次状态。默认只扫中断态；`complete` 的成果审计必须走
+    显式调用（`states=("complete",), audit_complete=True`），否则每轮同步都要全表
+    回扫历史批次。
+
+    返回处置明细；**不发送任何请求**。计数器只在控制库真的接受变更后自增，
+    否则计入 `errors`（绝不谎报已处置）。
     """
     live = {str(item) for item in live_owners or ()} | {str(owner_token)}
     summary = {"released_reserved": 0, "held_sending": 0, "completed_pending": 0,
@@ -199,7 +212,7 @@ def recover_interrupted_batches(control: ControlStore, *, layout: StorageLayout,
                "skipped_unproven": 0, "errors": []}
     try:
         with dispatch_lock(layout, timeout=timeout):
-            work = control.list_embedding_work()
+            work = control.list_embedding_work(states=tuple(states))
     except Exception as exc:  # noqa: BLE001 - 恢复不可用必须显式报告，不静默
         summary["errors"].append(f"BACKGROUND_RESUME_UNAVAILABLE: {exc}")
         return summary
@@ -214,11 +227,11 @@ def recover_interrupted_batches(control: ControlStore, *, layout: StorageLayout,
             continue
         batch_id = str(batch.get("batch_id") or "")
         components = list(batch.get("components") or ())
-        keys = [str(c.get("embedding_key") or "") for c in components]
+        keys = {str(c.get("embedding_key") or "") for c in components if c.get("embedding_key")}
         recoverable: set[str] = set()
         if callable(verify_recoverable) and keys:
             try:
-                recoverable = {str(item) for item in verify_recoverable(keys) or ()}
+                recoverable = {str(item) for item in verify_recoverable(components) or ()}
             except Exception as exc:  # noqa: BLE001
                 summary["errors"].append(f"verify_failed:{batch_id}:{exc}")
         try:
@@ -229,9 +242,20 @@ def recover_interrupted_batches(control: ControlStore, *, layout: StorageLayout,
                 summary["released_reserved"] += 1
                 continue
             if state == "sending":
-                if recoverable and len(recoverable) == len(keys) and keys:
-                    control.confirm_embedding_checkpoint(batch_id, owner, recoverable)
-                    summary["completed_pending"] += 1
+                if keys and keys <= recoverable:
+                    # 有成果：先把「已收到响应」这件事落库（sending → result_pending），
+                    # 再走检查点确认 —— `confirm_embedding_checkpoint` 的 CAS 只接受
+                    # `result_pending`，直接对 `sending` 调用会整事务回滚、什么都没做成。
+                    if not control.record_embedding_outcome(
+                            batch_id, owner, OUTCOME_SUCCEEDED,
+                            reason="recover:sending-artifact-persisted"):
+                        summary["errors"].append(f"{batch_id}:RESUME_ADVANCE_REFUSED")
+                        continue
+                    result = control.confirm_embedding_checkpoint(batch_id, owner, recoverable)
+                    if result.get("applied"):
+                        summary["completed_pending"] += 1
+                    else:
+                        summary["errors"].append(f"{batch_id}:RESUME_CHECKPOINT_REFUSED")
                 else:
                     control.record_embedding_outcome(
                         batch_id, owner, "transport_unknown",
@@ -240,38 +264,68 @@ def recover_interrupted_batches(control: ControlStore, *, layout: StorageLayout,
                 continue
             if state == "result_pending":
                 result = control.confirm_embedding_checkpoint(batch_id, owner, recoverable)
-                if result.get("applied") and int(result.get("confirmed") or 0) == int(result.get("total") or 0):
+                if not result.get("applied"):
+                    summary["errors"].append(f"{batch_id}:RESUME_CHECKPOINT_REFUSED")
+                elif int(result.get("confirmed") or 0) == int(result.get("total") or 0):
                     summary["completed_pending"] += 1
                 else:
                     summary["missing_result"] += 1
                 continue
             if state == "complete" and audit_complete and keys:
-                missing = [k for k in keys if k not in recoverable]
+                missing = sorted(keys - recoverable)
                 if missing:
-                    control.record_embedding_outcome(
+                    applied = control.record_embedding_outcome(
                         batch_id, owner, "response_invalid",
                         reason="recover:complete-artifact-missing",
                         component_state="held_result_missing", from_states=("complete",))
-                    summary["held_complete"] += 1
+                    if applied:
+                        summary["held_complete"] += 1
+                    else:
+                        summary["errors"].append(f"{batch_id}:RESUME_AUDIT_REFUSED")
         except Exception as exc:  # noqa: BLE001
             summary["errors"].append(f"{batch_id}:{exc}")
     return summary
 
 
 def held_summary(control: ControlStore) -> dict[str, Any]:
-    """`kb_stats` 用的只读摘要：当前 hold 的批次/组件数与最后更新时间。"""
+    """`kb_stats` 用的只读摘要：hold 与**在飞行中**的批次/组件数、最后更新时间。
+
+    `active_*` 覆盖 `reserved` / `sending` / `result_pending`：它们同样占用输入身份
+    且会阻塞后续轮次，但**不在** `HELD_COMPONENT_STATES` 里。中断残留的批次只出现在
+    这里——只统计 hold 会让"卡住的活跃批次"完全不可见（v0.9.2 复核修正）。
+    """
+    if not control.resume_schema_present():
+        # 续算台账还没建（例如从未跑过付费后台）：报 available=False，与"有表但为空"
+        # 区分开，避免把"没有台账"读成"一切正常零 hold"。
+        return {"available": False, "held_batches": 0, "held_components": 0,
+                "active_batches": 0, "active_components": 0, "updated_at": 0.0}
     try:
-        work = control.list_embedding_work(states=HELD_COMPONENT_STATES)
+        held = control.list_embedding_work(states=HELD_COMPONENT_STATES)
     except Exception:  # noqa: BLE001 - 不可读必须显式报告，不返回假空列表
-        return {"available": False, "held_batches": 0, "held_components": 0, "updated_at": 0.0}
+        return {"available": False, "held_batches": 0, "held_components": 0,
+                "active_batches": 0, "active_components": 0, "updated_at": 0.0}
+    try:
+        active = control.list_embedding_work(states=BATCH_ACTIVE_STATES)
+    except Exception:  # noqa: BLE001 - 同上：不可读不能退化成"没有活跃批次"
+        return {"available": False, "held_batches": 0, "held_components": 0,
+                "active_batches": 0, "active_components": 0, "updated_at": 0.0}
     components = 0
     updated = 0.0
-    for batch in work:
+    for batch in held:
         rows = [c for c in batch.get("components") or () if c.get("state") in HELD_COMPONENT_STATES]
         components += len(rows)
         try:
             updated = max(updated, float(batch.get("updated_at") or 0.0))
         except (TypeError, ValueError):
             pass
-    return {"available": True, "held_batches": len(work), "held_components": components,
+    active_components = 0
+    for batch in active:
+        rows = [c for c in batch.get("components") or () if c.get("state") in BATCH_ACTIVE_STATES]
+        active_components += len(rows)
+        try:
+            updated = max(updated, float(batch.get("updated_at") or 0.0))
+        except (TypeError, ValueError):
+            pass
+    return {"available": True, "held_batches": len(held), "held_components": components,
+            "active_batches": len(active), "active_components": active_components,
             "updated_at": updated}

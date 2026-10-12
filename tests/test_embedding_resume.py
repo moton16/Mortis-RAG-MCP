@@ -167,9 +167,11 @@ def test_complete_row_is_not_a_permanent_claim_until_audit(tmp_path):
         embedding_resume.confirm_embedding_checkpoint(control, "batch-1", owner, [component["embedding_key"]])
         assert control.embedding_component_states([component["component_key"]]) == \
             {component["component_key"]: "complete"}
+        # `complete` 的成果审计是**显式**动作：默认扫描只看中断态，避免每轮全表回扫。
         summary = embedding_resume.recover_interrupted_batches(
             control, layout=control.layout, owner_token="owner-other",
-            verify_recoverable=lambda keys: set(), audit_complete=True)
+            verify_recoverable=lambda components: set(), audit_complete=True,
+            states=("complete",))
         assert summary["held_complete"] == 1
         assert control.embedding_component_states([component["component_key"]]) == \
             {component["component_key"]: "held_result_missing"}
@@ -205,7 +207,7 @@ def test_crash_after_begin_send_holds_unknown(tmp_path):
         assert embedding_resume.begin_embedding_send(control, "batch-1", "owner-dead").allowed
         summary = embedding_resume.recover_interrupted_batches(
             control, layout=control.layout, owner_token="owner-live",
-            verify_recoverable=lambda keys: set())
+            verify_recoverable=lambda components: set())
         assert summary["held_sending"] == 1
         assert control.embedding_component_states([component["component_key"]]) == \
             {component["component_key"]: "held_unknown"}
@@ -226,7 +228,7 @@ def test_result_pending_recovers_from_confirmed_vectors(tmp_path):
             embedding_resume.record_embedding_outcome(control, name, owner, OUTCOME_SUCCEEDED)
         summary = embedding_resume.recover_interrupted_batches(
             control, layout=control.layout, owner_token="owner-new",
-            verify_recoverable=lambda keys: {saved["embedding_key"]})
+            verify_recoverable=lambda components: {saved["embedding_key"]})
         assert control.embedding_component_states([saved["component_key"]]) == \
             {saved["component_key"]: "complete"}
         assert control.embedding_component_states([lost["component_key"]]) == \
@@ -355,5 +357,93 @@ def test_schema_version_is_unchanged_by_resume_tables(tmp_path):
             "SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()}
         assert {"embedding_batches", "embedding_components"} <= tables
         assert SCHEMA_VERSION == 1
+    finally:
+        control.close()
+
+
+def test_sending_batch_with_persisted_vectors_completes(tmp_path):
+    """v0.9.2 复核修正：`sending` + 成果已持久化 必须先推进 `result_pending` 再确认。
+
+    `confirm_embedding_checkpoint` 的 CAS 只接受 `result_pending`；直接对 `sending`
+    调用会整事务回滚（什么都没做成）却仍然把 `completed_pending` 加一 —— 既不完成
+    也不报告失败。
+    """
+    control = _control(tmp_path)
+    try:
+        component = _component(1)
+        owner = "owner-1"
+        embedding_resume.reserve_embedding_batch(control, _plan("batch-1", [component]), owner)
+        embedding_resume.begin_embedding_send(control, "batch-1", owner)
+        summary = embedding_resume.recover_interrupted_batches(
+            control, layout=control.layout, owner_token="owner-other",
+            verify_recoverable=lambda components: {component["embedding_key"]})
+        assert summary["completed_pending"] == 1
+        assert summary["held_sending"] == 0
+        assert summary["errors"] == []
+        assert control.embedding_component_states([component["component_key"]]) == \
+            {component["component_key"]: "complete"}
+        assert control.list_embedding_work(batch_id="batch-1")[0]["state"] == "complete"
+    finally:
+        control.close()
+
+
+def test_recovery_never_counts_what_the_store_refused(tmp_path, monkeypatch):
+    """计数器只在控制库真的接受变更后自增：拒绝时必须进 `errors` 且计数为 0。"""
+    control = _control(tmp_path)
+    try:
+        component = _component(1)
+        owner = "owner-1"
+        embedding_resume.reserve_embedding_batch(control, _plan("batch-1", [component]), owner)
+        embedding_resume.begin_embedding_send(control, "batch-1", owner)
+        monkeypatch.setattr(control, "record_embedding_outcome", lambda *a, **k: False)
+        summary = embedding_resume.recover_interrupted_batches(
+            control, layout=control.layout, owner_token="owner-other",
+            verify_recoverable=lambda components: {component["embedding_key"]})
+        assert summary["completed_pending"] == 0
+        assert summary["errors"] == ["batch-1:RESUME_ADVANCE_REFUSED"]
+    finally:
+        control.close()
+
+
+def test_default_scan_skips_complete_batches(tmp_path):
+    """默认扫描只看中断态：历史 `complete` 批次不参与每轮恢复，避免全表回扫。"""
+    control = _control(tmp_path)
+    try:
+        component = _component(1)
+        owner = "owner-1"
+        embedding_resume.reserve_embedding_batch(control, _plan("batch-1", [component]), owner)
+        embedding_resume.begin_embedding_send(control, "batch-1", owner)
+        embedding_resume.record_embedding_outcome(control, "batch-1", owner, OUTCOME_SUCCEEDED)
+        embedding_resume.confirm_embedding_checkpoint(
+            control, "batch-1", owner, [component["embedding_key"]])
+        summary = embedding_resume.recover_interrupted_batches(
+            control, layout=control.layout, owner_token="owner-other",
+            verify_recoverable=lambda components: set())
+        assert summary["held_complete"] == 0
+        assert summary["completed_pending"] == 0
+        assert summary["missing_result"] == 0
+        assert control.embedding_component_states([component["component_key"]]) == \
+            {component["component_key"]: "complete"}
+    finally:
+        control.close()
+
+
+def test_held_summary_exposes_active_and_held_separately(tmp_path):
+    """中断残留的 active 批次必须可见：只统计 hold 会让卡死的批次完全隐形。"""
+    control = _control(tmp_path)
+    try:
+        held = _component(1)
+        active = _component(2)
+        owner = "owner-1"
+        embedding_resume.reserve_embedding_batch(control, _plan("batch-held", [held]), owner)
+        embedding_resume.begin_embedding_send(control, "batch-held", owner)
+        embedding_resume.record_embedding_outcome(
+            control, "batch-held", owner, OUTCOME_TRANSPORT_UNKNOWN)
+        embedding_resume.reserve_embedding_batch(control, _plan("batch-active", [active]), owner)
+        embedding_resume.begin_embedding_send(control, "batch-active", owner)
+        summary = embedding_resume.held_summary(control)
+        assert summary["available"] is True
+        assert summary["held_batches"] == 1 and summary["held_components"] == 1
+        assert summary["active_batches"] == 1 and summary["active_components"] == 1
     finally:
         control.close()

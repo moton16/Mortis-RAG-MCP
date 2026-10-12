@@ -1466,6 +1466,21 @@ class ControlStore:
                 self._rollback_quietly(conn)
             raise
 
+    @staticmethod
+    def _resume_schema_ready(conn: sqlite3.Connection) -> bool:
+        """只读判据：续算表是否已存在。读路径**不得**因为"顺便建一下"而写库。"""
+        row = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'embedding_batches'"
+        ).fetchone()
+        return row is not None
+
+    def resume_schema_present(self) -> bool:
+        """续算表是否已建（只读；不建表、不提交）。"""
+        try:
+            return self._resume_schema_ready(self._require_conn())
+        except sqlite3.Error:
+            return False
+
     def reserve_embedding_batch(self, batch_id: str, *, operation_id: str, purpose_family: str,
                                 profile_fingerprint: str, endpoint: str, owner_token: str,
                                 components: Sequence[Mapping[str, Any]], vault_epoch: int = 0,
@@ -1622,7 +1637,10 @@ class ControlStore:
             return {}
         states: dict[str, str] = {}
         with self.mutation() as conn:
-            self._ensure_resume_schema(conn)
+            # 读路径不建表：`list` / `dry_run` 对外承诺只读，DDL 会让只读库上的
+            # 一次查询变成一个与语义无关的写失败（v0.9.2 复核修正）。
+            if not self._resume_schema_ready(conn):
+                return {}
             for start in range(0, len(keys), 400):
                 chunk = keys[start:start + 400]
                 placeholders = ",".join("?" for _ in chunk)
@@ -1635,9 +1653,14 @@ class ControlStore:
 
     def list_embedding_work(self, *, source: str = "", batch_id: str = "",
                             states: Sequence[str] = ()) -> list[dict]:
-        """按 source / batch / 状态列出续算工作（只读，不安排任何网络动作）。"""
+        """按 source / batch / 状态列出续算工作（只读，不安排任何网络动作）。
+
+        只读：续算表还不存在时返回空列表，**不**顺手建表（否则 `list` / `dry_run`
+        会在控制库里落 DDL 与一次 commit）。
+        """
         with self.mutation() as conn:
-            self._ensure_resume_schema(conn)
+            if not self._resume_schema_ready(conn):
+                return []
             rows = conn.execute(
                 "SELECT batch_id, operation_id, purpose_family, profile_fingerprint, endpoint, "
                 "payload_hash, owner_token, vault_epoch, generation_id, state, outcome, "
@@ -1664,7 +1687,8 @@ class ControlStore:
 
     def _embedding_components(self, batch_id: str) -> list[dict]:
         with self.mutation() as conn:
-            self._ensure_resume_schema(conn)
+            if not self._resume_schema_ready(conn):
+                return []
             rows = conn.execute(
                 "SELECT ordinal, component_key, embedding_key, input_sha256, source, source_kind, "
                 "source_sha256, revision_id, chunk_id, state FROM embedding_components "
@@ -1706,7 +1730,11 @@ class ControlStore:
                 if current == "sending":
                     self._rollback_quietly(conn)
                     return {"batch_id": batch_id, "applied": False,
-                            "error": "RESUME_BATCH_STILL_SENDING"}
+                            "error": "RESUME_BATCH_STILL_SENDING",
+                            # `retry` 只重放**已确定不再发送**的批次；仍在 sending 的批次
+                            # 需要先由运维判定旧 owner 已死 → 用 `release` 解锁。
+                            "hint": "this batch may still be sending; use action=release "
+                                    "(with confirm_repeat_cost=true) to unlock a dead owner"}
                 target = "released"
             component_target = "manual_only" if action == "abandon" else "released"
             cursor = conn.execute(
@@ -1741,6 +1769,51 @@ class ControlStore:
                 (request_id, str(kind)[:64], str(state)[:32], str(note)[:400], time.time()))
             conn.commit()
             return cursor.rowcount == 1
+
+    def prune_audit(self, retention_days: int, *, now: float | None = None) -> dict:
+        """按保留期清理**终态**审计行（`request_control.audit_retention_days`）。
+
+        `retention_days <= 0` = 保留全部（不做任何删除）。只清终态：
+        `request_intents` 的 `success` / `abandoned`，以及 `embedding_batches` 里
+        不在 active/hold 集合内的批次（`complete` / `released` / `rejected`）。
+        **绝不动** still-active 的占用（`reserved`/`sending`/`result_pending`）与
+        `held_*` / `manual_only` —— 那些是防重放的判据，删掉等于放开重复计费。
+        """
+        days = int(retention_days or 0)
+        if days <= 0:
+            return {"applied": False, "pruned": False, "reason": "RETENTION_DISABLED"}
+        cutoff = float(now if now is not None else time.time()) - days * 86400.0
+        pruned_intents = 0
+        pruned_batches = 0
+        pruned_components = 0
+        with self.mutation() as conn:
+            if not self._resume_schema_ready(conn):
+                # 审计表都还没建：没有任何可清的行，也不替调用方建表。
+                pruned_intents = conn.execute(
+                    "DELETE FROM request_intents WHERE state IN ('success', 'abandoned') "
+                    "AND updated_at < ?", (cutoff,)).rowcount or 0
+                conn.commit()
+                return {"applied": bool(pruned_intents), "pruned": True,
+                        "request_intents": int(pruned_intents), "batches": 0,
+                        "components": 0, "cutoff": cutoff, "retention_days": days}
+            terminal = ("complete", "released", "rejected")
+            placeholders = ",".join("?" for _ in terminal)
+            pruned_components = conn.execute(
+                "DELETE FROM embedding_components WHERE state IN "
+                "('complete', 'released') AND batch_id IN ("
+                f"SELECT batch_id FROM embedding_batches WHERE state IN ({placeholders}) "
+                "AND updated_at < ?)", (*terminal, cutoff)).rowcount or 0
+            pruned_batches = conn.execute(
+                f"DELETE FROM embedding_batches WHERE state IN ({placeholders}) AND updated_at < ?",
+                (*terminal, cutoff)).rowcount or 0
+            pruned_intents = conn.execute(
+                "DELETE FROM request_intents WHERE state IN ('success', 'abandoned') "
+                "AND updated_at < ?", (cutoff,)).rowcount or 0
+            conn.commit()
+        return {"applied": bool(pruned_intents or pruned_batches), "pruned": True,
+                "request_intents": int(pruned_intents), "batches": int(pruned_batches),
+                "components": int(pruned_components), "cutoff": cutoff,
+                "retention_days": days}
 
     def legacy_disposition_ids(self) -> set[str]:
         """已处置的旧记录 id 集合（只读；表不存在时返回空集，不掩盖读取错误）。"""

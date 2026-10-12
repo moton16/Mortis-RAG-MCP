@@ -26,6 +26,18 @@ _HTTP_ERROR_READ_LIMIT = 1024
 _HTTP_ERROR_DETAIL_LIMIT = 200
 
 
+def _post_response_contract_error(message: str, **kwargs: Any) -> ProviderError:
+    """**已收到 2xx 响应**、但产物不可用：分类为 `response_invalid`。
+
+    这类错误不是「远端影响未知」——请求确实发出去并收到了响应（很可能已经计费）。
+    裸抛 `ProviderError(...)` 会让 `as_outcome()` 退化成 `transport_unknown` +
+    `response_received=False`，于是运维看到的是「请求没到」，实际是「响应到了但不可用」；
+    正确状态是 `held_response_invalid` / `RESPONSE_INVALID`（v0.9.2 复核修正）。
+    """
+    return ProviderError(message, outcome=OUTCOME_RESPONSE_INVALID, response_received=True,
+                         remote_effect_unknown=True, **kwargs)
+
+
 class ProviderError(RuntimeError):
     """Provider 失败。结构化字段表达「发生了什么」，不表达「供应商是否收费」。"""
 
@@ -281,6 +293,10 @@ class _JsonHttpProvider:
         try:
             if outcome.outcome == "succeeded":
                 journal.mark_success(request_id)
+            elif outcome.outcome == OUTCOME_NOT_SENT:
+                # 确定没发出去（本地校验/能力缺失）：终态化，别留成未决意图 ——
+                # 否则一条从未发出的请求会让整条路由被 `has_unresolved_paid_intents` 冻住。
+                journal.mark_not_sent(request_id, f"{outcome.outcome}: {outcome.detail}")
             else:
                 journal.mark_unknown(request_id, f"{outcome.outcome}: {outcome.detail}")
         except Exception as exc:  # noqa: BLE001
@@ -447,25 +463,25 @@ class ExternalEmbeddingProvider(_JsonHttpProvider):
             raise
         data = response.get("data") if isinstance(response, dict) else None
         if not isinstance(data, list):
-            raise ProviderError("embedding response must contain a data list")
+            raise _post_response_contract_error("embedding response must contain a data list")
         # 少返回向量会让后续 chunk 的向量整体错位（静默污染整个向量库），
         # 这里拦住。默认 batch_size=32，多数文件走的就是这条单批路径。
         if len(data) != len(batch):
-            raise ProviderError(
+            raise _post_response_contract_error(
                 f"embedding response returned {len(data)} vectors for {len(batch)} inputs"
             )
         # OpenAI 兼容接口不保证返回顺序，data[i].index 才是权威位置。
         indexes = []
         indexed = [isinstance(item, dict) and "index" in item for item in data]
         if any(indexed) and not all(indexed):
-            raise ProviderError("embedding response mixes indexed and unindexed items")
+            raise _post_response_contract_error("embedding response mixes indexed and unindexed items")
         for position, item in enumerate(data):
             index = item.get("index", position) if isinstance(item, dict) else None
             if isinstance(index, bool) or not isinstance(index, int):
-                raise ProviderError("embedding response contains invalid indexes")
+                raise _post_response_contract_error("embedding response contains invalid indexes")
             indexes.append(index)
         if sorted(indexes) != list(range(len(batch))):
-            raise ProviderError(
+            raise _post_response_contract_error(
                 f"embedding response indexes {sorted(indexes)} do not match {len(batch)} inputs"
             )
         ordered = [item for _, item in sorted(zip(indexes, data), key=lambda pair: pair[0])]
@@ -477,7 +493,7 @@ class ExternalEmbeddingProvider(_JsonHttpProvider):
                 profile = ResolvedEmbeddingProfile("legacy-text", "openai", self.model, self.endpoint, "", "", dim, dim, None, "unsupported")
             return [validate_vector(vector, profile) for vector in vectors]
         except (KeyError, TypeError, EmbeddingContractError) as exc:
-            raise ProviderError("embedding response contains invalid vectors") from exc
+            raise _post_response_contract_error("embedding response contains invalid vectors") from exc
 
 
 class ExternalRerankerProvider(_JsonHttpProvider):
@@ -493,7 +509,7 @@ class ExternalRerankerProvider(_JsonHttpProvider):
         response = self._send_once(payload, request_context=request_context)
         results = response.get("results") if isinstance(response, dict) else None
         if not isinstance(results, list):
-            raise ProviderError("reranker response must contain a results list")
+            raise _post_response_contract_error("reranker response must contain a results list")
         return results
 
     def rerank_once(self, query: str, documents: Sequence[str], *,
