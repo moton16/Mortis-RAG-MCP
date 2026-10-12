@@ -1301,6 +1301,12 @@ class ControlStore:
         # 不改 schema_version。
         conn.execute("CREATE INDEX IF NOT EXISTS idx_request_intents_kind_fp_state "
                      "ON request_intents(kind, profile_fingerprint, state)")
+        # v0.9.2：区分「新代码写的意图」与「旧版本遗留记录」。旧行没有这一列，
+        # 补列后取默认空串 → 只有空串（= 旧版本写入）才是无法可靠映射的待处置对象。
+        # 与上面同策略：只加列，不改 schema_version。
+        columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(request_intents)")}
+        if "writer" not in columns:
+            conn.execute("ALTER TABLE request_intents ADD COLUMN writer TEXT NOT NULL DEFAULT ''")
         conn.commit()
 
     def authorize_paid_profile(self, profile_fingerprint: str, *, scope: str,
@@ -1361,7 +1367,7 @@ class ControlStore:
 
     def record_send_intent(self, request_id: str, *, kind: str, payload_hash: str, endpoint: str,
                            profile_fingerprint: str = "", attempt: int | None = 1,
-                           reject_unresolved: bool = False) -> None:
+                           reject_unresolved: bool = False, writer: str = "v092") -> None:
         """在同一 mutation 锁内检查未决并落意图；网络发送始终在锁外。
 
         journal 使用 reject_unresolved=True / attempt=None，自动计数而不授权重发。
@@ -1391,9 +1397,10 @@ class ControlStore:
             conn.execute(
                 "INSERT INTO request_intents "
                 "(request_id, kind, payload_hash, endpoint, profile_fingerprint, attempt, state, reason, "
-                "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'prepared', '', ?, ?)",
+                "created_at, updated_at, writer) VALUES (?, ?, ?, ?, ?, ?, 'prepared', '', ?, ?, ?)",
                 (request_id, kind, payload_hash, endpoint, profile_fingerprint, int(attempt),
-                 time.time(), time.time()),
+                 time.time(), time.time(),
+                 "" if writer is None else str(writer)[:32]),
             )
             conn.commit()
 
@@ -1429,12 +1436,12 @@ class ControlStore:
             self._ensure_payment_schema(conn)
             rows = conn.execute(
                 "SELECT request_id, kind, payload_hash, endpoint, profile_fingerprint, attempt, state, "
-                "reason, created_at, updated_at FROM request_intents "
+                "reason, created_at, updated_at, writer FROM request_intents "
                 "WHERE (? = '' OR state = ?) ORDER BY created_at",
                 (state, state),
             ).fetchall()
         keys = ("request_id", "kind", "payload_hash", "endpoint", "profile_fingerprint",
-                "attempt", "state", "reason", "created_at", "updated_at")
+                "attempt", "state", "reason", "created_at", "updated_at", "writer")
         return [dict(zip(keys, row)) for row in rows]
 
     # ------------------------------------------- 续算表：embedding_batches/components
@@ -1717,6 +1724,33 @@ class ControlStore:
         return {"batch_id": batch_id, "applied": True, "state": target,
                 "component_state": component_target, "previous_state": current}
 
+    def record_legacy_disposition(self, request_id: str, *, kind: str = "", state: str = "",
+                                  note: str = "") -> bool:
+        """登记一条旧 journal 记录已人工处置。返回 True 表示本次新登记。
+
+        `success`/`abandoned` 是历史事实、不允许改状态，所以处置只能登记在
+        `legacy_dispositions` 里；重复登记返回 False（幂等，不谎报 applied）。
+        """
+        if not isinstance(request_id, str) or not request_id:
+            raise StoreContractError("request_id 必填")
+        with self.mutation() as conn:
+            self._ensure_resume_schema(conn)
+            cursor = conn.execute(
+                "INSERT OR IGNORE INTO legacy_dispositions "
+                "(request_id, kind, state, note, decided_at) VALUES (?, ?, ?, ?, ?)",
+                (request_id, str(kind)[:64], str(state)[:32], str(note)[:400], time.time()))
+            conn.commit()
+            return cursor.rowcount == 1
+
+    def legacy_disposition_ids(self) -> set[str]:
+        """已处置的旧记录 id 集合（只读；表不存在时返回空集，不掩盖读取错误）。"""
+        conn = self._require_conn()
+        try:
+            rows = conn.execute("SELECT request_id FROM legacy_dispositions").fetchall()
+        except sqlite3.OperationalError:
+            return set()
+        return {str(row[0]) for row in rows}
+
     def close(self) -> None:
         conn = self._conn()
         if conn is not None:
@@ -1763,6 +1797,12 @@ _RESUME_SCHEMA_STATEMENTS = (
     "ON embedding_components(source, source_sha256, revision_id)",
     "CREATE INDEX IF NOT EXISTS idx_embedding_component_history "
     "ON embedding_components(component_key, state)",
+    # 旧 journal 记录的人工处置台账（v0.9.2 §10）：`success`/`abandoned` 是历史事实，
+    # 不能被改写状态；它们只能通过这里「已处置」登记来退出待迁移集合，否则那些记录
+    # 会永远留在待处置列表里（既无法解除、又会误报 applied）。
+    "CREATE TABLE IF NOT EXISTS legacy_dispositions ("
+    "request_id TEXT PRIMARY KEY, kind TEXT NOT NULL DEFAULT '', state TEXT NOT NULL DEFAULT '', "
+    "note TEXT NOT NULL DEFAULT '', decided_at REAL NOT NULL)",
 )
 
 _DOCSTORE_SCHEMA = """

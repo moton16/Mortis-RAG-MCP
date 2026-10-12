@@ -83,7 +83,7 @@ def test_list_is_read_only_and_reports_legacy_pending(tmp_path):
     control = _control(tmp_path, vault)
     try:
         _seed_batch(control)
-        control.record_send_intent("legacy-1", kind="embed", payload_hash="ph",
+        control.record_send_intent("legacy-1", writer="", kind="embed", payload_hash="ph",
                                    endpoint=ENDPOINT, profile_fingerprint="fp", attempt=None)
         result = request_control_action(vault_path=vault, action="list", config_path=None)
         assert result["applied"] is False and result["read_only"] is True
@@ -172,9 +172,9 @@ def test_resolve_legacy_only_touches_listed_records(tmp_path):
     vault = _vault(tmp_path)
     control = _control(tmp_path, vault)
     try:
-        control.record_send_intent("legacy-1", kind="embed", payload_hash="p1",
+        control.record_send_intent("legacy-1", writer="", kind="embed", payload_hash="p1",
                                    endpoint=ENDPOINT, profile_fingerprint="fp", attempt=None)
-        control.record_send_intent("legacy-2", kind="embed", payload_hash="p2",
+        control.record_send_intent("legacy-2", writer="", kind="embed", payload_hash="p2",
                                    endpoint=ENDPOINT, profile_fingerprint="fp", attempt=None)
         without_confirm = request_control_action(vault_path=vault, action="resolve_legacy",
                                                  request_ids=["legacy-1"], dry_run=False)
@@ -189,6 +189,74 @@ def test_resolve_legacy_only_touches_listed_records(tmp_path):
         assert control.intent_state("legacy-2") == "prepared"
     finally:
         control.close()
+
+
+def test_resolve_legacy_disposition_is_idempotent_and_truthful(tmp_path):
+    """R3 反例 1：success/abandoned 不可改状态，但必须能被处置且不谎报 applied。"""
+    vault = _vault(tmp_path)
+    control = _control(tmp_path, vault)
+    try:
+        control.record_send_intent("legacy-done", writer="", kind="embed", payload_hash="p1",
+                                   endpoint=ENDPOINT, profile_fingerprint="fp", attempt=1)
+        control.mark_intent("legacy-done", "success", "settled earlier")
+        control.record_send_intent("legacy-gone", writer="", kind="embed", payload_hash="p2",
+                                   endpoint=ENDPOINT, profile_fingerprint="fp", attempt=1)
+        control.mark_intent("legacy-gone", "abandoned", "given up earlier")
+        pending = request_control_action(vault_path=vault, action="list")
+        assert {item["request_id"] for item in pending["legacy_migration_pending"]} == \
+            {"legacy-done", "legacy-gone"}
+        result = request_control_action(vault_path=vault, action="resolve_legacy",
+                                        request_ids=["legacy-done", "legacy-gone"],
+                                        confirm_repeat_cost=True, dry_run=False)
+        assert result["applied"] is True
+        assert all(item["applied"] for item in result["dispositions"])
+        # 不可变状态保持不变（历史事实不得被改写）。
+        assert control.intent_state("legacy-done") == "success"
+        assert control.intent_state("legacy-gone") == "abandoned"
+        # 已退出待处置集合，且重复处置不谎报成功。
+        after = request_control_action(vault_path=vault, action="list")
+        assert after["legacy_migration_pending"] == []
+        again = request_control_action(vault_path=vault, action="resolve_legacy",
+                                       request_ids=["legacy-done"],
+                                       confirm_repeat_cost=True, dry_run=False)
+        assert again["applied"] is False
+        assert again["dispositions"][0]["error"] == "NOT_IN_PENDING_SET"
+    finally:
+        control.close()
+
+
+def test_legacy_mode_hold_blocks_but_abandon_is_not_a_dead_end(tmp_path):
+    """R3 反例 2：held_* 冻结旧模式；manual_only（显式 abandon）不得让整库停摆。"""
+    from mortis_rag_mcp._indexer import embedding_resume
+    from mortis_rag_mcp._indexer.sync_engine import _paid_embedding_allowed
+    from mortis_rag_mcp.indexer import MarkdownIndexer
+
+    vault = _vault(tmp_path)
+    (vault / "a.md").write_text("A BODY", encoding="utf-8")
+    cfg = _config(tmp_path)
+    object.__setattr__(cfg.request_control, "mode", "legacy_profile")
+    indexer = MarkdownIndexer(vault, cfg)
+    try:
+        control = indexer._paid_control_store()
+        fingerprint = indexer._embedding_profile.fingerprint
+        plan = {"batch_id": "batch-1", "operation_id": "op-1", "purpose_family": "document",
+                "profile_fingerprint": fingerprint, "endpoint": ENDPOINT,
+                "components": [{"component_key": "ck-1", "embedding_key": "ek-1",
+                                "input_sha256": "sha", "source": "a.md",
+                                "source_kind": "document", "source_sha256": "s",
+                                "revision_id": "", "chunk_id": "c1"}]}
+        assert embedding_resume.reserve_embedding_batch(control, plan, "owner-1").ok
+        embedding_resume.begin_embedding_send(control, "batch-1", "owner-1")
+        embedding_resume.record_embedding_outcome(
+            control, "batch-1", "owner-1", "transport_unknown")
+        assert control.embedding_component_states(["ck-1"]) == {"ck-1": "held_unknown"}
+        assert _paid_embedding_allowed(indexer) is False, "held_* 必须在旧模式也冻结"
+        # 运维显式 abandon → 不再是全库死结。
+        embedding_resume.resolve_embedding_work(control, "batch-1", action="abandon")
+        assert control.embedding_component_states(["ck-1"]) == {"ck-1": "manual_only"}
+        assert _paid_embedding_allowed(indexer) is True
+    finally:
+        indexer.close_document_store()
 
 
 def test_missing_batch_id_is_reported(tmp_path):

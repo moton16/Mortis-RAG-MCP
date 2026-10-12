@@ -124,7 +124,7 @@ def test_old_unresolved_audit_does_not_freeze_the_profile(tmp_path, monkeypatch)
     try:
         control = indexer._paid_control_store()
         control.record_send_intent(
-            "legacy-request-1", kind="embed", payload_hash="deadbeef",
+            "legacy-request-1", writer="", kind="embed", payload_hash="deadbeef",
             endpoint=ENDPOINT, profile_fingerprint=indexer._embedding_profile.fingerprint,
             attempt=None)
         indexer.sync()
@@ -237,6 +237,44 @@ def test_component_key_is_stable_across_batch_sizes():
     assert component_key(**kwargs) == component_key(**kwargs)
     assert component_key(**kwargs) != component_key(**{**kwargs, "exact_input_sha256": "other"})
     assert component_key(**kwargs) != component_key(**{**kwargs, "purpose_family_name": "native_media"})
+
+
+def test_budget_deferral_is_not_reported_as_unknown_outcome(tmp_path, monkeypatch):
+    """R3 反例 4：预算延期是良性上限，不得冒充 AUTOMATIC_REPLAY_HELD。"""
+    for name in ("a.md", "b.md"):
+        (tmp_path / name).write_text(f"{name[0]} BODY", encoding="utf-8")
+    calls: list[list[str]] = []
+    monkeypatch.setattr("mortis_rag_mcp.providers.urlopen", _ok_transport(calls))
+    indexer = MarkdownIndexer(tmp_path, _bounded_config(tmp_path, limit=1))
+    try:
+        indexer.sync()
+        assert len(calls) == 1
+        values = list(indexer.failed_files.values())
+        assert any(value.startswith("BUDGET_DEFERRED") for value in values)
+        assert not any(value.startswith("AUTOMATIC_REPLAY_HELD") for value in values)
+    finally:
+        indexer.close_document_store()
+
+
+def test_content_change_clears_embedding_quarantine(tmp_path, monkeypatch):
+    """R3 反例 3：内容修正后旧退避 streak 必须清零（新身份不该被旧退避误伤）。
+
+    新内容同样打不通，所以「清空」只能来自内容变更分支本身，不可能是成功路径顺带清掉。
+    """
+    target = tmp_path / "a.md"
+    target.write_text("A BODY", encoding="utf-8")
+    calls: list[list[str]] = []
+    monkeypatch.setattr("mortis_rag_mcp.providers.urlopen",
+                        _ok_transport(calls, fail_on=("A BODY",)))
+    indexer = MarkdownIndexer(tmp_path, _bounded_config(tmp_path))
+    try:
+        indexer._embed_failure_quarantine["a.md"] = 3
+        target.write_text("A BODY STILL BROKEN", encoding="utf-8")
+        indexer.sync()
+        assert "a.md" not in indexer._embed_failure_quarantine
+        assert calls[-1] == ["A BODY STILL BROKEN"]
+    finally:
+        indexer.close_document_store()
 
 
 def test_legacy_mode_cannot_bypass_component_hold(tmp_path, monkeypatch):

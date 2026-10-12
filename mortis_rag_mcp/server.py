@@ -2406,6 +2406,11 @@ def _legacy_migration_pending(control: Any) -> list[dict[str, Any]]:
                 mapped.add(operation[len("legacy:"):])
     except Exception:
         mapped = set()
+    try:
+        # 已人工处置（含 success/abandoned 这类不可改状态的历史事实）→ 退出待处置集合。
+        mapped |= control.legacy_disposition_ids()
+    except Exception:
+        pass
     pending = []
     for row in intents:
         request_id = str(row.get("request_id") or "")
@@ -2413,6 +2418,11 @@ def _legacy_migration_pending(control: Any) -> list[dict[str, Any]]:
         if state not in {"prepared", "submission_unknown", "success", "abandoned"}:
             continue
         if request_id in mapped:
+            continue
+        # 新代码（v0.9.2 起）写的意图自带 writer 标记：它的决策不依赖 journal，
+        # 也不可能「无法映射到组件」，所以不属于待处置对象。旧版本写入的行
+        # writer 为空串 → 无法可靠排除，保守列入。
+        if str(row.get("writer") or "") == "v092":
             continue
         pending.append({"request_id": request_id, "kind": str(row.get("kind") or ""),
                         "state": state, "reason": str(row.get("reason") or ""),
@@ -2497,17 +2507,34 @@ def request_control_action(*, vault_path: str | Path, action: str, batch_id: str
                         "hint": "confirm_repeat_cost=true is required; legacy records may "
                                 "already have been charged"}
             dispositions = []
+            applied_any = False
             for request_id in request_ids:
-                record = next((row for row in legacy if row["request_id"] == str(request_id)), None)
+                rid = str(request_id)
+                record = next((row for row in legacy if row["request_id"] == rid), None)
                 if record is None:
-                    dispositions.append({"request_id": str(request_id), "applied": False,
+                    dispositions.append({"request_id": rid, "applied": False,
                                          "error": "NOT_IN_PENDING_SET"})
                     continue
-                control.mark_intent(str(request_id), "abandoned",
-                                    reason="resolve_legacy: confirmed repeat-cost disposition",
-                                    expected_states=("prepared", "submission_unknown"))
-                dispositions.append({"request_id": str(request_id), "applied": True})
-            return {**base, "applied": True, "dispositions": dispositions}
+                # `prepared` / `submission_unknown` 仍未决：按旧语义转 abandoned。
+                moved = False
+                if record["state"] in {"prepared", "submission_unknown"}:
+                    moved = control.mark_intent(
+                        rid, "abandoned",
+                        reason="resolve_legacy: confirmed repeat-cost disposition",
+                        expected_states=("prepared", "submission_unknown"))
+                # success / abandoned 是历史事实：状态不可改，只登记「已处置」。
+                # 幂等：重复处置返回 False，且不谎报 applied。
+                registered = control.record_legacy_disposition(
+                    rid, kind=record["kind"], state=record["state"],
+                    note="resolve_legacy: operator confirmed repeat-cost disposition")
+                row_applied = bool(moved or registered)
+                applied_any = applied_any or row_applied
+                dispositions.append({"request_id": rid, "applied": row_applied,
+                                     "state": record["state"],
+                                     "state_moved": bool(moved),
+                                     "disposition_registered": bool(registered),
+                                     **({} if row_applied else {"error": "ALREADY_DISPOSED"})})
+            return {**base, "applied": applied_any, "dispositions": dispositions}
         result = embedding_resume.resolve_embedding_work(
             control, str(batch_id), action=action, confirm_repeat_cost=confirm_repeat_cost,
             note="operator via kb_request_control")

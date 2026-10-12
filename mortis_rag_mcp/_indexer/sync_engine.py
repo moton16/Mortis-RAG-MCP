@@ -168,12 +168,16 @@ def _paid_embedding_allowed(owner: MarkdownIndexer) -> bool:
     # `held_response_invalid`（结果已知但没落盘）这类 hold 在切回旧模式后会被旧路径
     # 自动重发 —— 等于裸撤锁、重复计费（v0.9.2 §5 反方复核 R2）。
     from .._indexer import embedding_resume
+    # `manual_only` 例外：那是运维显式 abandon 的决定（已带「可能重复计费」警示），
+    # 若也算暂停，旧模式下一次 abandon 会让整库永久不能嵌入 —— abandon 成了死路，
+    # 只有付费 retry 能解锁。`held_*`（结果未知/未落盘）继续 fail closed。
+    legacy_blocking = tuple(state for state in embedding_resume.HELD_COMPONENT_STATES
+                            if state != "manual_only")
     try:
         control = owner._paid_control_store()
         if control is not None:
             fingerprint = str(getattr(owner._embedding_profile, "fingerprint", "") or "")
-            for batch in embedding_resume.list_embedding_work(
-                    control, states=embedding_resume.HELD_COMPONENT_STATES):
+            for batch in embedding_resume.list_embedding_work(control, states=legacy_blocking):
                 if not fingerprint or str(batch.get("profile_fingerprint") or "") == fingerprint:
                     return False
     except Exception:
@@ -419,7 +423,14 @@ _HELD_REASON_CODES = {
     "held_unknown": "AUTOMATIC_REPLAY_HELD",
     "held_response_invalid": "RESPONSE_INVALID",
     "held_result_missing": "RESULT_NOT_RECOVERED",
+    # 预算延期是良性上限，不是「远端结果未知」：不得复用 AUTOMATIC_REPLAY_HELD，
+    # 否则运维会把纯预算跳过误判成可能需要人工处置的未知计费。
+    "budget_deferred": "BUDGET_DEFERRED",
 }
+
+
+#: 预算延期使用的伪状态码（只用于 failed_files 观测，不写组件状态）。
+BUDGET_DEFERRED_STATE = "budget_deferred"
 
 
 def _resume_owner_token(owner: MarkdownIndexer) -> str:
@@ -553,7 +564,8 @@ def _embed_missing_bounded(owner: MarkdownIndexer, pending: dict[str, list[Chunk
         if budget >= limit:
             owner._sync_progress["budget_deferred"] = True
             for component in group:
-                _record_hold_failure(owner, component["source"], "held_unknown", "budget")
+                _record_hold_failure(owner, component["source"],
+                                     BUDGET_DEFERRED_STATE, "budget")
             break
         batch_id = embedding_resume.new_batch_id()
         plan = {
@@ -1355,6 +1367,12 @@ def run_sync(owner: MarkdownIndexer) -> list[Chunk]:
         owner._stat_confirmations[source] = 1
         owner.fast_path_warnings.pop(source, None)
         owner.failed_files.pop(source, None)
+        # 内容已变更 → 旧退避 streak 归零：新内容的输入身份是新的，继续按旧 streak 隔离
+        # 属误伤（用户修好文件却要再等几轮退避才重试）。
+        try:
+            owner._embed_failure_quarantine.pop(source, None)
+        except AttributeError:
+            pass
         owner._fts_upsert(source, chunks)
         # Disk-backed mode: re-chunking a file orphans its old vector ids.
         if owner._vectors_on_disk and old_chunks:
