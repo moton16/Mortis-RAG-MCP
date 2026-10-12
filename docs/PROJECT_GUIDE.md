@@ -166,7 +166,7 @@ checkpoint 边界、旧切块兼容与存档续页均保留在对应参考。宿
 ┌──────────────────────────────────────────────────────────────────┐
 │ server.py  VaultMcpServer / serve_stdio                          │
 │  ├─ 协议层：initialize / ping / tools/list / tools/call          │
-│  ├─ 16 个工具的分发 + 参数防御性解析 + fan-out 编排               │
+│  ├─ 17 个工具的分发 + 参数防御性解析 + fan-out 编排               │
 │  └─ _indexers: {vault_path → MarkdownIndexer}（双检锁缓存）      │
 └───────┬──────────────────────┬───────────────────────────────────┘
         │                      │
@@ -570,7 +570,7 @@ query 为空 → 直接返回（过滤+分页后）的 chunk 列表
 
 ## 六、MCP 工具 API 参考
 
-`tools/list` 返回 16 个工具。所有 `vault_path` 参数均可省略：仅注册一个库时自动取它（该库为 solo 时 `kb_search` 例外——直接报错，见 4.8）；多个库时必须显式（`kb_search` 例外——缺省触发跨库 fan-out，solo 库除外）。
+`tools/list` 返回 17 个工具。所有 `vault_path` 参数均可省略：仅注册一个库时自动取它（该库为 solo 时 `kb_search` 例外——直接报错，见 4.8）；多个库时必须显式（`kb_search` 例外——缺省触发跨库 fan-out，solo 库除外）。
 
 |工具|参数|语义|
 |-|-|-|
@@ -583,7 +583,8 @@ query 为空 → 直接返回（过滤+分页后）的 chunk 列表
 |`kb_ingest`|`action`(必: submit/status/pending/retry), `source`?, `sources`?, `job_id`?, `force`?, `vault_path`?|PDF/Office 异步解析摄取管理（默认关闭，双闸门受 20MiB size 策略保护，MinerU 双通道 / 本地 PyMuPDF 兜底，带 `auto_seen` 账本去重；`retry` 只对 failed/cancelled 生效，unknown 结果不自动重发）|
 |`kb_export`|`out_path`(必, 绝对路径+.zip), `vault_path`?, `overwrite`?|导出索引快照 zip；已存在须显式 `overwrite=true`|
 |`kb_import`|`snapshot`(必), `force`=false, `vault_path`?|从快照恢复；模型/维度/切块参数不符时拒绝，force 只导文本层并本地重嵌|
-|`kb_rebuild`|`vault_path`?|删缓存强制全量重建。**高危：全量重新 embedding，见 SKILL.md 限流警告**|
+|`kb_rebuild`|`vault_path`?, `confirm_cost`(bool, 付费路径必填)|删缓存强制全量重建。**高危：全量重新 embedding，见 SKILL.md 限流警告**。文本或原生媒体任一路径为付费端点时，缺 `confirm_cost=true` 只返回预览（`paid_paths`/`held_components`/`active_components`），零副作用、零请求|
+|`kb_request_control`|`vault_path`(必), `action`(必: list/inspect/retry/abandon/release/pause_route/resume_route/resolve_legacy/audit_complete/prune_audit), `batch_id`?, `profile_fingerprint`?, `request_ids`?, `confirm_repeat_cost`=false, `dry_run`=true|0.9.2 新增：外部付费请求控制台账。`list`/`inspect` 只读；`retry` 需 `confirm_repeat_cost=true`（可能重复计费）；`release` 解锁无法判定存活的旧 owner 占用（非 `reserved` 需确认）；`audit_complete` 用持久向量证据复核历史 `complete`（需该库索引器）；`prune_audit` 按 `request_control.audit_retention_days` 只清终态审计行。所有变更默认 `dry_run=true`，必须显式 `dry_run=false` 才落库|
 |`kb_list_files`|`vault_path`?, `path_prefix`?, `limit`?, `offset`?|列已索引文件列表，支持按目录前缀过滤与分页切片，返回 `total`, `files`, `next_offset`, `page_truncated`|
 |`kb_search`|`query`(必), `top_k`=10, `use_rerank`=true, `vault_path`?, `vault_paths`?, `path_prefix`?, `tags`?, `mtime_after`?, `mtime_before`?, `offset`?, `limit`?, `group_by_vault`=false, `dedupe`=true, `budget_bytes`?, `exact_terms`?, `compact`=false, `group_offsets`?|核心检索；读优先（不前台阻塞等锁）；支持 `compact=true` 极简四键投影；支持整条 chunk 字节预算控制，首条超限提供 hint，最小 envelope 溢出显式申报 `budget_exceeded`；分组跨库以 `group_next_offsets` 返回各组独立游标，并由 `group_offsets` 同路由无损续页|
 |`kb_read`|`source`? 或 `chunk_id`? (二选一), `expand_lines`=30, `heading`?, `start_line`?, `end_line`?, `start_char`=0, `vault_path`?|读原文（Markdown/TXT）；`start_line/end_line` 越界具名抛错并提示实际物理行数；长单行支持 `start_char` 跨页无损续读；`heading` 基于轻量级源码扫描包含完整子节，同名歧义 fail-closed；`chunk_id` 支持跨库 fail-closed 只读探测（solo 库隐私保密）；超 `read_max_chars` 截断并回显物理行游标|

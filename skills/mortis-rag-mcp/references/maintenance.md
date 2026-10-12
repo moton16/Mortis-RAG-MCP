@@ -3,11 +3,12 @@
 仅在注册、排除、维护、迁移或诊断任务中读本页；正常检索沿入口及检索/媒体参考执行。
 只执行用户指定库、动作与写入范围；查询不授权上传/改配置，注销不授权清事实，迁移不授权覆盖。不另建审批系统。
 
-## 16 个工具按任务分组
+## 17 个工具按任务分组
 
 |任务|工具|
 |---|---|
 |注册与维护（7）|`kb_init`、`kb_init_solo`、`kb_remove`、`kb_describe`、`kb_set_weight`、`kb_exempt`、`kb_rebuild`|
+|请求控制（1）|`kb_request_control`|
 |清点与状态（3）|`kb_list`、`kb_list_files`、`kb_stats`|
 |快照迁移（2）|`kb_export`、`kb_import`|
 |解析任务（1）|`kb_ingest`|
@@ -20,7 +21,9 @@
 - `kb_init_solo`：未注册则建库；普通库原地转 solo；已 solo 幂等确认。转换不动索引/监听，`name` 仅新注册生效。
 - 取消 solo 走 `kb_remove(purge_cache=false)` → `kb_init`；恢复需保留的名称、description、weight，不当元数据无损转换。
 - `kb_remove` 必填 `path`：停监听和摄取 manager、注销，不删笔记目录。默认保留缓存；`purge_cache=true` 只清派生层，保留文档事实/control 账本，以 `cache_purged` 判断清理结果。
-- 16 工具没有解析事实 purge 工具，不臆造参数；`kb_rebuild` 同样保留事实，不等于清空库。
+- 17 工具没有解析事实 purge 工具，不臆造参数；`kb_rebuild` 同样保留事实，不等于清空库。
+- `kb_rebuild` 在文本或原生媒体任一路径为付费端点时需显式 `confirm_cost=true`（布尔，字符串不算）；缺确认只返回 `rebuild=preview` 预览，零副作用、零请求。
+- `kb_request_control` 处理外部付费请求台账：`list/inspect` 只读；`retry` 需 `confirm_repeat_cost=true`（可能重复计费）；`release` 解锁无法判定存活的旧 owner 占用（非 `reserved` 状态同样需确认）；`audit_complete` 复核历史 `complete` 的成果；`prune_audit` 只清终态审计行。变更默认 `dry_run=true`。
 - `kb_set_weight(vault_path, weight)` 只改跨库排序；`kb_describe(vault_path, description)` 写非空具体描述；均不重嵌、不修漏检。
 
 ## 豁免：选对写入面

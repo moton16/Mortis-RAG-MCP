@@ -1868,3 +1868,53 @@ issue #12/#13 付费闸门与 issue #15 性能四条根因的修复随本补丁�
 - 付费 journal 的未决 POST 仍按 profile 整体暂停，优先级高于 source quarantine；需先人工处理未决意图，不把「结果未知」误判为可重试失败。
 - 单条坏输入定位的 doctor 人工确认入口未实现；索引路径仅留 TODO，绝不自动逐条/二分重发。
 - 未 push、未开 PR、未改版本号、未发起真实计费请求。
+
+### [FIX-v092-review] — moton16,2026-10-12,CodeBuddy,DeepSeek-V4.1-Flash — fix(requests): 补丁评审修复 20 处缺陷与 2 处反方向订正
+
+> **涵盖提交**：`784f2c5`（生产代码 + 回归测试）；同批文档同步随本条目所在提交（3 份跟踪文档 + 本条目 + 被忽略的 `docs/v0.9.2/PAID_REQUEST_CONTROL_EXECUTION.md` §19）。
+
+**评审范围与判据**
+
+对 v0.9.2 六个提交（`aad0c36..307fdfb`）做补丁评审：两轮全新上下文的反方独立复核（第 2 轮被明确要求证伪第 1 轮结论）+ 两次实机复现探针。共 21 条发现，其中 5 条为 P1。结论是**计费安全主线达标**（未知结果一律 hold、部分确认即停付、`component_key` 唯一索引兜底、`retry` 无旁路、`writer` 列无漏写），真问题是**「设计文档写了、代码没接上」**——崩溃恢复、后台策略开关、两级预算、迁移台账四项属"看起来有保护、实际零保护"。
+
+**修复（生产代码）**
+
+- 恢复链路（P1）：`recover_interrupted_batches` 原来只在每实例**首次**调用时扫一次，而那次扫描发生在本次调用创建任何批次**之前**，谓词恒假 → 全部走 `skipped_unproven`，整段恢复从未处置过一行。改为每次调用都扫，且只看 `reserved/sending/result_pending`；接入 `verify_recoverable`（新增 `indexer.resume_recoverable_probe()`，判据与 `checkpoint_embeddings` 的严格持久化口径一致）。`sending` + 成果已持久化分支原来直接对 `sending` 调 `confirm_embedding_checkpoint`（CAS 只接受 `result_pending`）→ 整事务回滚却仍把 `completed_pending` 加一；改为先 `record_embedding_outcome(SUCCEEDED)` 推进状态，计数器只在 `applied` 为真时自增。修复前复现：`completed_pending=1` 而 `BATCH_STATE sending`、`retry` 返回 `RESUME_BATCH_STILL_SENDING`。
+- 人工出口：`release` 进入 `REQUEST_CONTROL_ACTIONS`（跨进程崩溃遗留 `sending` 批次的唯一出口；非 `reserved` 状态要求 `confirm_repeat_cost=true`）；`retry` 的拒绝信息补 `release` 提示。新增 `audit_complete`：用持久向量证据复核历史 `complete`，成果丢失转 `held_result_missing`；需要该库索引器，CLI 侧无证据时明确拒绝（`AUDIT_REQUIRES_INDEXER`）。
+- 策略闸门（P1）：抽出 `_background_embedding_is_manual`，`background_embedding=manual` 从「只拦文档嵌入」改为文档与原生媒体共用同一判据（只拦发送、不拦复用）。
+- `kb_rebuild` 确认（P1）：付费判定改为 `_rebuild_paid_paths()`（文本 ∪ 原生媒体两条独立装配的 provider），`confirm_cost` 增加 `isinstance(..., bool)` 校验（此前 `bool("false")` 会放行付费重建），预览补 `paid_paths` / `media_profile_fingerprint` / `active_components`。
+- 预算（P2）：媒体 POST 计入 `background_max_posts_per_round`（此前只有文档批自增，媒体不设限而 `kb_stats` 把它当全局预算报）；`query_max_posts` 在 fan-out 内生效（按 profile 去重计数，含失败尝试）。
+- 保留期（P2）：新增 `ControlStore.prune_audit` 与 `kb_request_control action=prune_audit`，按 `request_control.audit_retention_days` 只清终态（`complete/released/rejected`、`success/abandoned`），绝不碰 `held_*` / `manual_only` / 在飞状态；`0` = 全保留并明确报 `RETENTION_DISABLED`。
+- 分类口径（P2）：2xx 之后的产物契约失败改抛 `_post_response_contract_error`（`response_invalid` + `response_received=True`），不再退化成「远端影响未知」；媒体 transport 的发送前校验改 `_pre_send_error`（`not_sent`），并新增 `PaidRequestJournal.mark_not_sent` —— 此前 `not_sent` 落到 `mark_unknown`，一条**从未发出**的本地错误会留下未决意图冻死整条媒体路由。`rejected` 的 `remote_effect_unknown` 与 HTTP 状态码同步修正。
+- 失败文案（P2）：`not_sent`/`rejected` 不再写 `AUTOMATIC_REPLAY_HELD · automatic replay held`（改用 `REQUEST_NOT_SENT` / `REQUEST_REJECTED` 并恢复退避 streak）；预算延期保持 `BUDGET_DEFERRED`。
+- 双重发送（P2）：`embed_with_profile` 不再用 `try/except TypeError` 试调用上下文关键字 —— `request_context is None` 时两次调用字面相同，provider 内部任何 `TypeError` 都会变成第二次物理 POST。改为读签名决定是否传参；`single_batch=True` 缺单批入口时**发送前**报错，并由新增 `_single_batch_capable()`（`_TemplatingProvider.supports_single_batch` 看内层 provider）在进入续算路径前判掉：能力缺失退回旧按文件路径，不暂停整库嵌入。
+- 观测面（P2/P3）：`held_summary` 增加 `active_batches` / `active_components`（中断残留的 active 占用此前在 `kb_stats` 完全不可见）；`kb_stats.request_control` 增加 `background_embedding` / `query_max_posts` / `audit_retention_days` / `active_*`；按 `manual` 策略暂停时不再误报「需要 `--approve-reembedding`」。
+- 只读合同（P3）：`list`/`inspect`（含 `dry_run`）不再顺手建续算表（`_resume_schema_ready` 只读判据）；表不存在时返回空并把 `resume_store_available` 报为 false。
+- `resume_route` 诚实化（P2）：只清 DB 侧 revoked；命中配置 `paused_profiles` 时返回 `applied=false` + `ROUTE_PAUSED_BY_CONFIG`，不再谎报已恢复。
+- 模式装配与检查点（P3）：`server._media_provider_and_error` 的两条装配分支补 `mode=`（此前回落到模块级默认）；`checkpoint_embeddings` 的确认结果被使用（CAS 未命中即停付，不再按成功清失败并计数）。
+- doctor 探活（P3）：探活 guard 增加显式撤销与配置暂停判据（`pause_route` 之后 `--doctor` 不再发真实付费请求）；空 fingerprint（未经验证 profile）保持原精确匹配语义。
+- 文档同步：`docs/PROJECT_GUIDE.md`、`docs/Quick-start_developer.md`、`skills/mortis-rag-mcp/references/maintenance.md` 的工具计数 16 → 17，补 `kb_request_control` 与 `kb_rebuild confirm_cost` 条目。
+
+**反方向订正（两处，勿改回去）**
+
+1. `request_lifecycle._DEFAULT_MODE` 保持 `legacy_profile`。它是**未装配** provider 的 fail-closed 兜底：`providers._send_once` 在阻塞模式下对「没有 journal/guard 的付费 provider」直接 `PAID_REQUEST_CONTROL_UNAVAILABLE` 拒发。把它对齐成配置默认（`bounded_resume`）等于让任何漏装配的付费 provider 自由 POST。漏装配要修装配点（本轮已修 `server._media_provider_and_error` 两条分支），不改这个常量。
+2. `_legacy_migration_pending` 不加任何请求闸门。§10 早期文字写「暂停相关旧路由的后台切换」，但本分支的验收演练 `tests/test_v092_migration_rollback_drill.py::test_drill_c_isolated_old_records_do_not_freeze_new_work` 用**同一个 fingerprint** 明确断言「旧孤立审计不再冻结整条路由」，`test_drill_a` 才是真正的保护机制（旧 `success` 无成果 → 组件级 `held_*`）。该集合是**人工处置台账**，不是暂停判据；接成 profile 级暂停等于重演 v0.8.x 的「一条 unknown 冻死整库」。docstring 已按演练口径订正。
+
+**明确不改的既有行为**
+
+- 4xx `rejected` 的组件已由控制库释放、下一轮自然重试（不再误标 hold），但不新增自动重发。
+- 2xx 之后的非 `ProviderError` 异常仍按 `response_invalid`（hold）处理：第三方 provider 可能"发完才抛"，保守优先。
+- `sync_engine` 中 `len(vectors) != len(group)` 的防御分支保留（同类 provider 已先在 `providers._embed_batch` 拦下，属无害冗余）。
+- 跨进程死进程遗留批次不做自动清理（无存活登记表前 fail closed），只提供 `release` 人工出口。
+
+**验证**
+
+- 靶向（各批 `exit=0`，`V092_EXTERNAL_NETWORK_LOG` 均未生成 = 零外网尝试）：`test_providers + test_embedding_profiles + test_embedding_resume + test_paid_request_journal + test_request_control_policy + test_request_control_management` → **125 passed**；`test_lane_be_server + test_mcp_stdio + test_multivault + test_solo_vault + test_subvaults + test_compact_search + test_search_filters + test_exact_terms + test_registry_server + test_snapshot + test_beta2_docs_contract + test_ingest_server` → **99 passed**；`test_e20_media_connection + test_e20_media_outcome + test_media_production_wiring + test_media_transport_contract + test_e15_service_contracts + test_text_to_image_search_e2e + test_providers + test_embedding_profiles + test_request_control_policy` → **214 passed**（该批首跑 10 failed，暴露单批契约收紧后测试替身 `FakeText` 缺 `embed_batch_once` 的兼容面，前置 `_single_batch_capable` 判据后转绿）；`test_request_control_management + test_embedding_profiles + test_e20_media_outcome + test_embedding_resume` → **103 passed**；`test_doctor + test_e20_ops + test_management_recovery + test_lane_be_config + test_request_control_management + test_e20_media_outcome + test_embedding_profiles + test_beta2_docs_contract` → **176 passed**。
+- 全量：**1389 passed / 14 skipped / 3 deselected / 0 failed**（156.09 s）；发版基线 1372 passed，差额即本批新增用例（恢复完成、拒绝时不谎报计数、默认扫描跳过 `complete`、`held_summary` 分列 active/held、`release` 出口与确认口径、`prune_audit` 只清终态、`resume_route` 配置侧暂停、manual 拦媒体、媒体计入预算、从未发出的本地拒绝不冻路由、`embed_with_profile` 不重发、单批契约缺失在发送前报错）。
+- 行为缺陷均由实机复现探针定案（`E:/coding/.mortis-runs/v092/repro-a|b`，用完即删），不靠静态推断。
+
+**边界 / 未做**
+
+- 未 commit 之外的动作：未 push、未开 PR、未打 tag / Release、未改版本号、未发 PyPI。
+- 未验证：真实供应商计费与幂等、`real_carrier` 标记用例、跨进程死进程遗留清理（缺存活登记表）、宿主侧媒体显示。
+- 本机交付记录与两处反方向订正的完整依据在 `docs/v0.9.2/PAID_REQUEST_CONTROL_EXECUTION.md` §19（`docs/` 被 `.gitignore` 忽略，属本地交付，需手工复制）。
