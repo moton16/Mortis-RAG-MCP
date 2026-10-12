@@ -2121,3 +2121,19 @@ issue #12/#13 付费闸门与 issue #15 性能四条根因的修复随本补丁�
 - 发版前全量（工作区外运行器 `E:/coding/.mortis-runs/run-offline.ps1`，改动全部落盘后）：
   **1416 passed / 14 skipped / 3 deselected / 0 failed**（141.83 s）。
 - 未验证：真实供应商计费与幂等、宿主侧媒体显示、PyPI 发布。
+
+**CI 首轮红与修复（`test(ci)` 提交）**
+
+首轮 CI 只有 `pytest (ubuntu-latest, py3.10)` 红，其余 6 个 job 全绿：
+`tests/test_anti_contention.py::test_set_file_exemption_is_non_blocking` 断言
+`set_file_exemption(True)` 耗时 74.35 ms < 50 ms。判定为**既有的墙钟抖动，不是本批引入**：
+
+- 该文件与 `_indexer/exemptions.py` 在本分支**零改动**（`git diff main...HEAD --stat` 无这两个文件），
+  本批也没碰 `set_file_exemption` 的任何调用点；断言的另一半（`success`、`sync == "background"`、
+  `sync` 被 monkeypatch 成调用即抛）全部通过，即「没有阻塞在前台同步」这一契约本身成立。
+- 计时包住的是「写 frontmatter + `_prune_ignored_sources` + 拉后台线程」，首次调用还要把索引
+  与文件元数据拉进热态；本机靶向同一用例 8 passed、耗时 0.01 s，CI 上 74 ms 全在冷启动侧。
+
+修法只动测试：计时前**先预热一次**（不计入断言），把 50 ms 上界留给稳态调用；前台同步若真的
+发生仍会被 `_fail_sync` 直接判死，计时只是第二道护栏。本机复验 8 passed。
+同类（墙钟上界 + 冷启动）的其余用例未一并改，登记在既有的「测试隔离改造」一卡里。
