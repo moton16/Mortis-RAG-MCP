@@ -239,6 +239,32 @@ def test_component_key_is_stable_across_batch_sizes():
     assert component_key(**kwargs) != component_key(**{**kwargs, "purpose_family_name": "native_media"})
 
 
+def test_external_rebuild_requires_confirm_cost(tmp_path, monkeypatch):
+    """T36/P7：外部全量重算缺确认时只返回预览，且零副作用（不清缓存、不启监听）。"""
+    from mortis_rag_mcp.server import VaultMcpServer
+
+    (tmp_path / "a.md").write_text("A BODY", encoding="utf-8")
+    indexer = MarkdownIndexer(tmp_path, _bounded_config(tmp_path))
+    server = object.__new__(VaultMcpServer)
+    server.config = indexer.config
+    monkeypatch.setattr(server, "_indexer_for", lambda arguments, **kw: indexer)
+    called: list[bool] = []
+    monkeypatch.setattr(indexer, "rebuild", lambda: called.append(True))
+    try:
+        preview = server._kb_rebuild({"vault_path": str(tmp_path)})
+        assert preview["rebuild"] == "preview"
+        assert preview["applied"] is False
+        assert preview["requires"] == "confirm_cost=true"
+        assert "estimated_posts" in preview
+        assert called == [], "预览阶段绝不能真的重建"
+        confirmed = server._kb_rebuild({"vault_path": str(tmp_path), "confirm_cost": True})
+        assert called == [True], "确认后必须真正重建"
+        assert "rebuild" not in confirmed or confirmed.get("rebuild") != "preview"
+    finally:
+        indexer.stop_watching()
+        indexer.close_document_store()
+
+
 def test_budget_deferral_is_not_reported_as_unknown_outcome(tmp_path, monkeypatch):
     """R3 反例 4：预算延期是良性上限，不得冒充 AUTOMATIC_REPLAY_HELD。"""
     for name in ("a.md", "b.md"):
