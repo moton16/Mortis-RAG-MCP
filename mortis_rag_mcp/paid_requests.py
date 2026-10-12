@@ -23,7 +23,8 @@ import uuid
 from typing import Any
 
 from .doc_store import ControlStore, DocStoreError, StoreContractError
-from .providers import ProviderError, _is_loopback_endpoint
+from .providers import PaidRequestRefused, ProviderError, _is_loopback_endpoint
+from .request_lifecycle import OUTCOME_NOT_SENT
 
 #: 发送意图状态：prepared = 已落意图但结果未知（重启后只能人工确认）。
 INTENT_STATES = ("prepared", "success", "submission_unknown", "abandoned")
@@ -96,11 +97,15 @@ class PaidRequestJournal:
             )
         return control
 
-    def before_send(self, payload_hash: str, endpoint: str, profile_fingerprint: str = "") -> str:
+    def before_send(self, payload_hash: str, endpoint: str, profile_fingerprint: str = "", *,
+                    reject_unresolved: bool = True) -> str:
         """落一条持久意图并返回 request_id。
 
         两种情况都抛 `ProviderError`（fail closed）：
         控制面不可用；或同一载荷已有未决意图（结果未知，禁止自动重发）。
+
+        `reject_unresolved=False`：供**组件账本管辖**的发送使用（该路径的重发只可能
+        来自操作者显式确认，见 `RequestContext.ledger_managed`）。
         """
         if not isinstance(payload_hash, str) or not payload_hash:
             raise ProviderError("paid request journal requires a payload hash")
@@ -112,11 +117,16 @@ class PaidRequestJournal:
             control.record_send_intent(
                 request_id, kind=self._kind, payload_hash=payload_hash, endpoint=endpoint,
                 profile_fingerprint=str(profile_fingerprint or ""), attempt=None,
-                reject_unresolved=True,
+                reject_unresolved=reject_unresolved,
             )
         except (DocStoreError, StoreContractError) as exc:
             if "PAID_REQUEST_UNRESOLVED" in str(exc):
-                raise ProviderError(str(exc)) from exc
+                # 闸门**主动拒绝**：不能用 `ProviderError` 裸抛，否则会被
+                # `providers._audit_before_send` 的非阻塞分支当成「审计写失败」吞掉，
+                # 同一载荷会被第二次物理 POST（实机复现见 `PaidRequestRefused`）。
+                raise PaidRequestRefused(
+                    str(exc), outcome=OUTCOME_NOT_SENT, response_received=False,
+                    remote_effect_unknown=False) from exc
             raise ProviderError(
                 "PAID_REQUEST_JOURNAL_UNAVAILABLE: 无法持久化发送意图，已拒绝外部付费请求"
             ) from exc
@@ -165,6 +175,19 @@ class PaidRequestJournal:
         「响应不可用」/「人工放弃」。留成 `submission_unknown` 会把一条从未发出的
         请求当成未决付费意图，于是 `has_unresolved_paid_intents` 让整条路由停摆。
         只有 `prepared` 能转移，晚到的响应无法把它翻回来。
+        """
+        if self._mark(request_id, "abandoned", str(reason)[:200], expected_states=("prepared",)):
+            return
+        raise ProviderError("REQUEST_INTENT_FINALIZED: late response discarded")
+
+    def mark_rejected(self, request_id: str, reason: str = "request_rejected") -> None:
+        """远端**明确拒绝**这次请求（HTTP 4xx，远端未处理）：终态化。
+
+        与 `mark_not_sent` 同型：复用 `abandoned` 终态、用 `reason` 区分来源。留成
+        `submission_unknown` 会让一条确定被拒的请求永久留在未决集合（它不适用
+        `INTENT_LEASE_SECONDS`），于是旧闸门下 `has_unresolved_paid_intents` 永久冻结
+        整条付费路由——而远端一个字都没处理（`classify_http_status` 对 4xx 判
+        `remote_effect_unknown=False`）。只有 `prepared` 能转移，晚到的响应翻不回来。
         """
         if self._mark(request_id, "abandoned", str(reason)[:200], expected_states=("prepared",)):
             return

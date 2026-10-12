@@ -5,13 +5,14 @@ import http.client
 import json
 import math
 import socket
-from typing import Any, Protocol, Sequence
+from typing import Any, NamedTuple, Protocol, Sequence
+import urllib.request
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import Request
 
 from .config import EmbeddingConfig, RerankerConfig
 from .embedding_capabilities import (
-    EmbeddingContractError, ResolvedEmbeddingProfile,
+    EmbeddingContractError, ResolvedEmbeddingProfile, accepts_keyword,
     resolve_embedding_profile, validate_vector,
 )
 from .request_lifecycle import (
@@ -26,6 +27,51 @@ _HTTP_ERROR_READ_LIMIT = 1024
 _HTTP_ERROR_DETAIL_LIMIT = 200
 
 
+def _build_no_redirect_opener() -> urllib.request.OpenerDirector:
+    """构造一个**不注册 `HTTPRedirectHandler`** 的 opener。
+
+    付费请求非幂等，跟随 3xx 有三个真实后果（2026-10-12 本地探针实测确认，
+    `E:/coding/.mortis-runs/v092/probe-gaierror/`）：
+
+    1. `302` + 重定向目标 DNS 解析失败 → 第一跳**已收到完整付费 POST**，而
+       `_transport_outcome` 会把它归成 `not_sent`（`remote_effect_unknown=False`）→
+       经 `mark_not_sent` 终态化 → **放行同载荷重发**（重复计费）；
+    2. 目标可解析时，调用会把**重定向目标的响应**当成本次结果（结果被归因到另一个主机）；
+    3. CPython 的 `redirect_request` 只剥 `Content-Length` / `Content-Type`，
+       **保留 `Authorization`** → 端点只要回一个 302 就能把 API key 引到任意主机。
+
+    不跟随则 3xx 以 `HTTPError` 上抛，由 `classify_http_status` 归
+    `http_error` + `remote_effect_unknown=True`（保守且正确：不宣称未收费）。
+    """
+    opener = urllib.request.OpenerDirector()
+    for factory in (urllib.request.ProxyHandler, urllib.request.UnknownHandler,
+                    urllib.request.HTTPHandler, urllib.request.HTTPDefaultErrorHandler,
+                    urllib.request.HTTPErrorProcessor):
+        try:
+            opener.add_handler(factory())
+        except Exception:  # noqa: BLE001 - 缺 ssl 等环境差异不该致命
+            continue
+    https = getattr(urllib.request, "HTTPSHandler", None)
+    if https is not None:
+        try:
+            opener.add_handler(https())
+        except Exception:  # noqa: BLE001
+            pass
+    return opener
+
+
+_NO_REDIRECT_OPENER = _build_no_redirect_opener()
+
+
+def urlopen(request: Any, timeout: float | None = None, **kwargs: Any) -> Any:
+    """模块级物理请求出口：**刻意不跟随 3xx**（理由见 `_build_no_redirect_opener`）。
+
+    沿用 `urlopen` 这个名字，是因为它是既有的测试注入点
+    （`monkeypatch.setattr("mortis_rag_mcp.providers.urlopen", ...)`）。
+    """
+    return _NO_REDIRECT_OPENER.open(request, timeout=timeout, **kwargs)
+
+
 def _post_response_contract_error(message: str, **kwargs: Any) -> ProviderError:
     """**已收到 2xx 响应**、但产物不可用：分类为 `response_invalid`。
 
@@ -36,6 +82,20 @@ def _post_response_contract_error(message: str, **kwargs: Any) -> ProviderError:
     """
     return ProviderError(message, outcome=OUTCOME_RESPONSE_INVALID, response_received=True,
                          remote_effect_unknown=True, **kwargs)
+
+
+class _PostReceipt(NamedTuple):
+    """一次物理 POST 的记账凭据（`defer_success=True` 时交回调用方补落终态）。
+
+    2xx 只证明**传输**成功；产物合同由调用方校验。把终态记账延后到校验之后，
+    是为了避免「形状非法的 2xx」被记成 `success` —— 那会让同一载荷的重发不再被
+    意图闸门看见，与 `paid_requests` 的「success 只在产物通过后落账」承诺相反。
+    """
+
+    request_id: str | None
+    mode: str
+    status: int | None
+    base: dict[str, Any]
 
 
 class ProviderError(RuntimeError):
@@ -83,6 +143,17 @@ class ProviderError(RuntimeError):
             operation_id=self.operation_id,
             batch_id=self.batch_id,
         )
+
+
+class PaidRequestRefused(ProviderError):
+    """付费闸门**主动拒绝**（不是「审计写失败」）。
+
+    典型场景：同一 `(kind, payload_hash, endpoint, profile_fingerprint)` 已有未决意图
+    （`PAID_REQUEST_UNRESOLVED`）。这类拒绝表达「不许再发同一载荷」，因此
+    `_audit_before_send` 必须**无条件上抛**，不能按「审计尽力而为」吞掉——
+    吞掉会让字节完全一致的第二次 POST 照发（2026-10-12 实机复现：
+    `E:/coding/.mortis-runs/v092/probe-resend/`，同 sha256 两次 POST、无用户确认）。
+    """
 
 
 def _transport_outcome(exc: BaseException) -> RequestOutcome:
@@ -271,14 +342,32 @@ class _JsonHttpProvider:
         self.audit_errors.append({"phase": phase, "error": type(exc).__name__,
                                   "detail": str(exc)[:_HTTP_ERROR_DETAIL_LIMIT]})
 
-    def _audit_before_send(self, fingerprint: str, mode: str) -> str | None:
-        """非阻塞审计：写失败只记账，绝不丢掉已验证响应、也绝不拒绝发送。"""
+    def _audit_before_send(self, fingerprint: str, mode: str, *,
+                           reject_unresolved: bool = True) -> str | None:
+        """非阻塞审计：**写失败**只记账，不丢掉已验证响应。
+
+        但「闸门主动拒绝」（`PaidRequestRefused`，例如同一载荷已有未决意图）**不是**
+        写失败：它表达「不许再发」，必须无条件上抛。此前二者被同一个 `except` 吞掉，
+        于是默认 `bounded_resume` 模式下同一载荷会被第二次物理 POST（实机复现见
+        `PaidRequestRefused` 的 docstring）。
+
+        `reject_unresolved=False` 供**组件账本管辖**的发送使用（见
+        `RequestContext.ledger_managed`）：那条路径的重发已由占用 + CAS 挡住，只可能
+        来自操作者显式确认，再按意图拒一次会把操作者刚批准的重发拦回去。
+        """
         journal = self.request_journal
         if journal is None or self.is_local_free:
             return None
+        # 不认识的 journal 实现（第三方/测试替身）不传新关键字，避免把它们打成
+        # `TypeError` —— 与 `embed_with_profile` 用 `accepts_keyword` 是同一口径。
+        extra = ({"reject_unresolved": reject_unresolved}
+                 if accepts_keyword(journal.before_send, "reject_unresolved") else {})
         try:
-            return journal.before_send(fingerprint, self.endpoint, self.request_profile)
-        except Exception as exc:  # noqa: BLE001 - 审计必须尽力而为
+            return journal.before_send(fingerprint, self.endpoint, self.request_profile, **extra)
+        except PaidRequestRefused as exc:
+            self._record_audit_error("before_send", exc)
+            raise
+        except Exception as exc:  # noqa: BLE001 - 审计写失败必须尽力而为
             self._record_audit_error("before_send", exc)
             if audit_is_blocking(mode):
                 raise
@@ -297,6 +386,12 @@ class _JsonHttpProvider:
                 # 确定没发出去（本地校验/能力缺失）：终态化，别留成未决意图 ——
                 # 否则一条从未发出的请求会让整条路由被 `has_unresolved_paid_intents` 冻住。
                 journal.mark_not_sent(request_id, f"{outcome.outcome}: {outcome.detail}")
+            elif outcome.outcome == OUTCOME_REJECTED:
+                # 远端**明确拒绝**（4xx，`classify_http_status` 判 remote_effect_unknown=False）：
+                # 同属「远端未处理」，必须终态化。否则 `submission_unknown` 永久占用未决集合
+                # （它不适用租约）→ 旧闸门下整条付费路由被永久冻住，而远端一个字都没处理。
+                # 媒体路径（`media_providers._finish`）早已这样处理，此处对齐口径。
+                journal.mark_rejected(request_id, f"{outcome.outcome}: {outcome.detail}")
             else:
                 journal.mark_unknown(request_id, f"{outcome.outcome}: {outcome.detail}")
         except Exception as exc:  # noqa: BLE001
@@ -325,8 +420,16 @@ class _JsonHttpProvider:
         )
 
     def _send_once(self, payload: dict[str, Any], *,
-                   request_context: RequestContext | None = None) -> Any:
-        """恰好一个物理 POST；零自动重发（429/5xx/网络/JSON 都不重发）。"""
+                   request_context: RequestContext | None = None,
+                   defer_success: bool = False) -> Any:
+        """恰好一个物理 POST；零自动重发（429/5xx/网络/JSON 都不重发）。
+
+        `defer_success=True`：2xx 只代表**传输**成功，产物合同由调用方校验，终态记账
+        一并交回调用方 —— 返回 `(result, _PostReceipt)`，调用方在校验通过后调
+        `_finalize_receipt`。默认 False 保持原语义（解码成功即落 `success`）。
+        调用方必须先确认本方法接受该关键字：测试桩/自定义 provider 会用只接受
+        `(payload, request_context=None)` 的 lambda 替换 `_send_once`。
+        """
         context = request_context if isinstance(request_context, RequestContext) else manual_context("manual_query")
         mode = self.request_mode
         headers = {"Content-Type": "application/json", "Accept": "application/json"}
@@ -357,7 +460,9 @@ class _JsonHttpProvider:
                 outcome=OUTCOME_NOT_SENT, response_received=False,
                 remote_effect_unknown=False, **base)
 
-        request_id = self._audit_before_send(fingerprint, mode)
+        request_id = self._audit_before_send(
+            fingerprint, mode,
+            reject_unresolved=not bool(getattr(context, "ledger_managed", False)))
         try:
             with urlopen(request, timeout=self.timeout) as response:
                 status = int(getattr(response, "status", 0) or 0) or None
@@ -381,10 +486,29 @@ class _JsonHttpProvider:
                 summary=classified.summary, **base)
             self._audit_finish(request_id, outcome, mode)
             self._raise_classified(outcome, mode, local=self.is_local_free)
+        if defer_success:
+            return result, _PostReceipt(request_id=request_id, mode=mode, status=status, base=base)
         self._audit_finish(request_id, RequestOutcome(
             outcome="succeeded", response_received=True, remote_effect_unknown=True,
             http_status=status, **base), mode)
         return result
+
+    def _finalize_receipt(self, receipt: "_PostReceipt | None", outcome: str,
+                          detail: str = "") -> None:
+        """`defer_success=True` 的另一半：调用方校验完产物后补落终态。
+
+        `receipt is None`（`_send_once` 被测试桩替换，没有可延后的账）时不动任何账。
+        """
+        if receipt is None:
+            return
+        self._audit_finish(
+            receipt.request_id,
+            RequestOutcome(outcome=outcome, response_received=True,
+                           remote_effect_unknown=(outcome != OUTCOME_NOT_SENT),
+                           http_status=receipt.status,
+                           detail=str(detail)[:_HTTP_ERROR_DETAIL_LIMIT],
+                           **receipt.base),
+            receipt.mode)
 
     def _post(self, payload: dict[str, Any], *, request_context: RequestContext | None = None) -> Any:
         """兼容入口：等价于 `_send_once`（一次物理 POST，零自动重发）。"""
@@ -456,11 +580,31 @@ class ExternalEmbeddingProvider(_JsonHttpProvider):
         # TODO(issue-17): 单条定位只能由 doctor 人工确认入口显式重发；
         # 索引路径不得自动逐条探测或二分，以免未知结果的 POST 重复计费。
         try:
-            response = self._send_once(payload, request_context=request_context)
+            if accepts_keyword(self._send_once, "defer_success"):
+                response, receipt = self._send_once(
+                    payload, request_context=request_context, defer_success=True)
+            else:
+                # 测试桩/自定义 provider 的替换件：它自己记账，没有可延后的凭据。
+                response, receipt = self._send_once(payload, request_context=request_context), None
         except ProviderError as exc:
             exc.batch_count = len(batch)
             exc.batch_fingerprint = batch_fingerprint
             raise
+        try:
+            parsed = self._parse_embedding_response(response, batch)
+        except ProviderError as exc:
+            # 2xx 但产物不可用：**不能**在账上留 success。按同一结果分类补落
+            # `response_invalid`（与 `_send_once` 内 JSON 解码失败同口径），
+            # 于是意图仍是「可能已计费的未知结果」，而不是「已成功」。
+            self._finalize_receipt(receipt, OUTCOME_RESPONSE_INVALID, str(exc))
+            exc.batch_count = len(batch)
+            exc.batch_fingerprint = batch_fingerprint
+            raise
+        self._finalize_receipt(receipt, "succeeded")
+        return parsed
+
+    def _parse_embedding_response(self, response: Any, batch: list[str]) -> list[list[float]]:
+        """校验一个 2xx 响应体并转成向量；不合约一律抛 `response_invalid`。"""
         data = response.get("data") if isinstance(response, dict) else None
         if not isinstance(data, list):
             raise _post_response_contract_error("embedding response must contain a data list")
@@ -506,10 +650,18 @@ class ExternalRerankerProvider(_JsonHttpProvider):
         if not documents:
             return []
         payload = {"model": self.model, "query": query, "documents": list(documents)}
-        response = self._send_once(payload, request_context=request_context)
+        if accepts_keyword(self._send_once, "defer_success"):
+            response, receipt = self._send_once(
+                payload, request_context=request_context, defer_success=True)
+        else:
+            response, receipt = self._send_once(payload, request_context=request_context), None
         results = response.get("results") if isinstance(response, dict) else None
         if not isinstance(results, list):
-            raise _post_response_contract_error("reranker response must contain a results list")
+            # 同 embedding：形状非法的 2xx 不得记成 success。
+            exc = _post_response_contract_error("reranker response must contain a results list")
+            self._finalize_receipt(receipt, OUTCOME_RESPONSE_INVALID, str(exc))
+            raise exc
+        self._finalize_receipt(receipt, "succeeded")
         return results
 
     def rerank_once(self, query: str, documents: Sequence[str], *,

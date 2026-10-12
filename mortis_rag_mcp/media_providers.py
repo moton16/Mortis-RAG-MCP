@@ -8,10 +8,17 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol, Sequence
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import Request
 
 from .embedding_capabilities import ResolvedEmbeddingProfile, validate_profile, validate_vector
-from .providers import ProviderError, _is_loopback_endpoint, _transport_outcome
+# `urlopen` 必须仍然是**本模块的模块级名字**：它是既有的测试注入点
+# （`patch("mortis_rag_mcp.media_providers.urlopen", ...)`）。这里刻意复用
+# `providers` 那个**不跟随 3xx** 的实现（付费请求非幂等，理由见
+# `providers._build_no_redirect_opener`）。
+from .providers import (
+    PaidRequestRefused, ProviderError, _is_loopback_endpoint, _transport_outcome,
+)
+from .providers import urlopen as urlopen  # noqa: PLC0414 - 保持模块级可替换名
 from .request_lifecycle import (
     OUTCOME_NOT_SENT, OUTCOME_RESPONSE_INVALID, OUTCOME_SUCCEEDED,
     RequestContext, RequestOutcome, audit_is_blocking, get_request_control_mode,
@@ -590,7 +597,12 @@ class NativeMediaProvider:
             try:
                 request_id = journal.before_send(
                     payload_hash, self.profile.endpoint, self.profile.fingerprint)
-            except Exception as exc:  # noqa: BLE001 - 审计是非阻塞的
+            except PaidRequestRefused as exc:
+                # 闸门主动拒绝（同一载荷已有未决意图）**不是**审计写失败：无条件上抛，
+                # 否则同一媒体载荷会被第二次物理 POST。
+                self._record_audit_error("before_send", exc)
+                raise
+            except Exception as exc:  # noqa: BLE001 - 审计写失败是非阻塞的
                 self._record_audit_error("before_send", exc)
                 if audit_is_blocking(mode):
                     raise

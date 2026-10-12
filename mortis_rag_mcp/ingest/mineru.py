@@ -38,6 +38,9 @@ import urllib.parse
 import urllib.request
 import zipfile
 from contextlib import contextmanager
+from typing import Any
+
+from ..providers import urlopen as _no_redirect_urlopen
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterator
@@ -225,6 +228,19 @@ def _read_bounded(resp: Any, limit: int | None) -> bytes:
     return b"".join(chunks)
 
 
+def _urlopen(request: Any, timeout: float | None = None) -> Any:
+    """模块级物理出口（也是测试注入点）：**不跟随 3xx**。
+
+    MinerU 的付费接口带 `Authorization: Bearer`，而 CPython 的 `redirect_request`
+    只剥 `Content-Length` / `Content-Type`、**保留 `Authorization`** → 端点只要回
+    一个 302 就能把 token 引到任意主机；预签名 PUT 被跟随还会降级成 GET（上传内容
+    丢失却返回 2xx）。与 `providers` / `media_providers` 同一口径：3xx 一律以
+    `HTTPError` 上抛，交由调用方分类——付费 POST 不宣称「未收费」，上传/下载报一条
+    可诊断的失败，而不是把结果归因到另一个主机。
+    """
+    return _no_redirect_urlopen(request, timeout=timeout)
+
+
 def _error_body(exc: urllib.error.HTTPError) -> str:
     """读取错误响应体（有界）用作诊断；不记完整 URL。"""
     try:
@@ -245,7 +261,7 @@ def _http_json(req: urllib.request.Request, timeout: float) -> dict:
     if ctx is not None and ctx.enforce_remote_policy:
         _validate_remote_url(req.full_url, allow_loopback=ctx.allow_loopback)
     try:
-        with urllib.request.urlopen(req, timeout=_remaining_seconds(timeout)) as resp:
+        with _urlopen(req, timeout=_remaining_seconds(timeout)) as resp:
             payload = _read_bounded(resp, ctx.limit_bytes if ctx is not None else None)
     except urllib.error.HTTPError as exc:
         body = _error_body(exc)
@@ -280,7 +296,7 @@ def _http_bytes(url: str, timeout: float) -> bytes:
         _validate_remote_url(url, allow_loopback=ctx.allow_loopback)
     req = urllib.request.Request(url)
     try:
-        with urllib.request.urlopen(req, timeout=_remaining_seconds(timeout)) as resp:
+        with _urlopen(req, timeout=_remaining_seconds(timeout)) as resp:
             return _read_bounded(resp, ctx.limit_bytes if ctx is not None else None)
     except urllib.error.HTTPError as exc:
         raise MineruError(f"download failed: HTTP {exc.code}", http_status=exc.code,
@@ -305,7 +321,7 @@ def _put_upload(url: str, payload: bytes, timeout: float) -> None:
         _validate_remote_url(url, allow_loopback=ctx.allow_loopback)
     req = urllib.request.Request(url, data=payload, headers={"Content-Type": ""}, method="PUT")
     try:
-        with urllib.request.urlopen(req, timeout=_remaining_seconds(timeout)) as resp:
+        with _urlopen(req, timeout=_remaining_seconds(timeout)) as resp:
             if resp.status not in (200, 201):
                 raise MineruError(f"upload failed: HTTP {resp.status}", http_status=resp.status)
     except urllib.error.HTTPError as exc:

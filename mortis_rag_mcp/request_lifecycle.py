@@ -88,9 +88,16 @@ class RequestContext:
     operation_id: str
     purpose: str = PURPOSE_MANUAL_QUERY
     batch_id: str = ""
+    #: 本次发送是否由**组件账本**管辖（`reserve_embedding_batch` 占用的那一批）。
+    #: 账本路径下「同一输入身份不得重发」已由占用+CAS 强制，重发只可能来自操作者
+    #: 显式确认（`retry` / `release` 的 `confirm_repeat_cost`），因此意图级闸门在这条
+    #: 路径上是多余的，且会把操作者刚批准的重发拦回去；非账本路径（能力缺失的按文件
+    #: 回退、人工查询）才需要意图级闸门兜底防重复计费。
+    ledger_managed: bool = False
 
     def with_batch(self, batch_id: str) -> "RequestContext":
-        return RequestContext(self.operation_id, self.purpose, str(batch_id))
+        return RequestContext(self.operation_id, self.purpose, str(batch_id),
+                              ledger_managed=self.ledger_managed)
 
 
 def manual_context(purpose: str, *, operation_id: str = "") -> RequestContext:

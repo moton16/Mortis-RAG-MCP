@@ -303,7 +303,7 @@ def embedding_key(profile: ResolvedEmbeddingProfile, text: str, modality: str = 
     return hashlib.sha256(material.encode()).hexdigest()
 
 
-def _accepts_keyword(func: Any, name: str) -> bool:
+def accepts_keyword(func: Any, name: str) -> bool:
     """该可调用对象接受关键字 `name` 吗？只读签名，**绝不**用 try/except 试调用。
 
     拿不到签名时按「接受」处理：宁可让它在参数校验阶段报错，也不要在"可能已经发出
@@ -353,7 +353,7 @@ def embed_with_profile(provider: Any, texts: Any, profile: ResolvedEmbeddingProf
         if not callable(target):
             raise EmbeddingContractError("provider has no embedding entry point")
     keyword = {} if request_context is None else {"request_context": request_context}
-    if keyword and not _accepts_keyword(target, "request_context"):
+    if keyword and not accepts_keyword(target, "request_context"):
         # 第三方 provider 不认识 `request_context`：退回旧签名。这里只是**少传一个**
         # 关键字，不会造成第二次请求。
         keyword = {}
